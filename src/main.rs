@@ -1,5 +1,5 @@
 use clap::Parser;
-mod processor;
+use fold::Processor;
 
 #[derive(Parser)]
 struct Args {
@@ -9,6 +9,6 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let processor = processor::Processor::new();
+    let processor = Processor::new();
     processor.process(&args.file);
 }
