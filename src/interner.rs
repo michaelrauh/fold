@@ -17,15 +17,15 @@ impl Interner {
         todo!()
     }
 
-    pub(crate) fn get_required_bits(&self, required: &[Vec<u16>]) -> Vec<u64> {
+    pub(crate) fn get_required_bits(&self, _required: &[Vec<u16>]) -> Vec<u64> {
         todo!()
     }
 
-    pub(crate) fn get_forbidden_bits(&self, forbidden: &[u16]) -> Vec<u64> {
+    pub(crate) fn get_forbidden_bits(&self, _forbidden: &[u16]) -> Vec<u64> {
         todo!()
     }
 
-    pub fn intersect(&self, required: Vec<u64>, forbidden: Vec<u64>) -> Vec<u16> {
+    pub fn intersect(&self, _required: Vec<u64>, _forbidden: Vec<u64>) -> Vec<u16> {
         todo!()
     }
 }

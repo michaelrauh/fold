@@ -39,7 +39,6 @@ impl Processor {
     
             follower.remediate(&mut work, &mut repository, &mut interner);
         }
-        
     }
 }
 
