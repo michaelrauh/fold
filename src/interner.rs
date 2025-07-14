@@ -1,8 +1,10 @@
-pub struct Interner {}
+pub struct Interner {
+    version: u64,
+}
 
 impl Interner {
     pub fn new() -> Self {
-        Interner {}
+        Interner { version: 0 }
     }
 
     pub fn add(&mut self, _vocabulary: Vec<String>, _phrases: Vec<Vec<u16>>) {
@@ -10,7 +12,7 @@ impl Interner {
     }
 
     pub fn version(&self) -> u64 {
-        todo!()
+        self.version
     }
 
     pub fn update(&self) -> Interner {
@@ -27,5 +29,16 @@ impl Interner {
 
     pub fn intersect(&self, _required: Vec<u64>, _forbidden: Vec<u64>) -> Vec<u16> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_creates_interner() {
+        let interner = Interner::new();
+        assert_eq!(interner.version(), 0);
     }
 }
