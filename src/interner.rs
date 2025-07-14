@@ -5,7 +5,7 @@ impl Interner {
         Interner {}
     }
 
-    pub fn add(&mut self, _vocabulary: Vec<String>, _phrases: Vec<Vec<u16>>) -> u64 {
+    pub fn add(&mut self, _vocabulary: Vec<String>, _phrases: Vec<Vec<u16>>) {
         todo!()
     }
 
