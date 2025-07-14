@@ -16,8 +16,10 @@ impl Splitter {
     pub fn vocabulary(&self, text: &str) -> Vec<String> {
         use std::collections::BTreeSet;
         
-        text.split_whitespace()
-            .map(|word| word.to_lowercase())
+        // Use the same cleaning logic as phrases to ensure consistency
+        self.split_into_sentences(text)
+            .into_iter()
+            .flat_map(|sentence| self.clean_sentence(&sentence))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
