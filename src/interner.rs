@@ -39,14 +39,6 @@ mod tests {
     #[test]
     fn test_new_creates_interner() {
         let interner = Interner::new();
-        // Verify that new() successfully creates an Interner instance
-        assert_eq!(interner.version(), 0);
-    }
-
-    #[test]
-    fn test_version_returns_zero() {
-        let interner = Interner::new();
-        // Verify that version field is initialized to 0
         assert_eq!(interner.version(), 0);
     }
 }
