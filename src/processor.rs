@@ -8,6 +8,12 @@ use std::{fs, vec};
 
 pub struct Processor;
 
+impl Default for Processor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Processor {
     pub fn new() -> Self {
         Processor
@@ -27,7 +33,7 @@ impl Processor {
                 break;
             }
             let cur = work.pop().unwrap();
-            if &cur.version() > &interner.version() {
+            if cur.version() > interner.version() {
                 interner = interner.update();
             }
     
