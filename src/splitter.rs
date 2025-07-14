@@ -2,6 +2,12 @@ use std::collections::BTreeSet;
 
 pub struct Splitter;
 
+impl Default for Splitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Splitter {
     pub fn new() -> Self {
         Splitter
@@ -35,7 +41,7 @@ impl Splitter {
     fn split_into_sentences(&self, text: &str) -> Vec<String> {
         text.split("\n\n")
             .flat_map(|paragraph| {
-                paragraph.split(|c| matches!(c, '.' | '?' | ';' | '!'))
+                paragraph.split(['.', '?', ';', '!'])
                     .map(|sentence| sentence.trim().to_string())
                     .filter(|sentence| !sentence.is_empty())
             })

@@ -7,6 +7,12 @@ pub struct Interner {
     prefix_to_completions: HashMap<Vec<u16>, BitSet>,
 }
 
+impl Default for Interner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Interner {
     pub fn new() -> Self {
         Interner { 
@@ -43,7 +49,7 @@ impl Interner {
                 let completion = phrase_indices[phrase_indices.len() - 1];
                 
                 // Get or create bitset for this prefix
-                let bitset = self.prefix_to_completions.entry(prefix).or_insert_with(BitSet::new);
+                let bitset = self.prefix_to_completions.entry(prefix).or_default();
                 
                 // Set the bit for the completion (suffixes that appear twice are counted once)
                 bitset.insert(completion as usize);
