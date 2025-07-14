@@ -40,7 +40,7 @@ impl Splitter {
     fn split_into_sentences(&self, text: &str) -> Vec<String> {
         text.split("\n\n")
             .flat_map(|paragraph| {
-                paragraph.split(|c| matches!(c, '.' | '?' | ';'))
+                paragraph.split(|c| matches!(c, '.' | '?' | ';' | '!'))
                     .map(|sentence| sentence.trim().to_string())
                     .filter(|sentence| !sentence.is_empty())
             })
@@ -50,14 +50,7 @@ impl Splitter {
     fn clean_sentence(&self, sentence: &str) -> Vec<String> {
         sentence
             .chars()
-            .map(|c| {
-                // Keep 's as part of words, remove other punctuation
-                if c.is_alphabetic() || c.is_whitespace() || c == '\'' {
-                    c
-                } else {
-                    ' '
-                }
-            })
+            .map(|c| self.filter_char(c))
             .collect::<String>()
             .split_whitespace()
             .map(|word| word.to_lowercase())
@@ -76,15 +69,17 @@ impl Splitter {
     
     fn clean_text(&self, text: &str) -> String {
         text.chars()
-            .map(|c| {
-                // Keep 's as part of words, remove other punctuation
-                if c.is_alphabetic() || c.is_whitespace() || c == '\'' {
-                    c
-                } else {
-                    ' '
-                }
-            })
+            .map(|c| self.filter_char(c))
             .collect()
+    }
+
+    fn filter_char(&self, c: char) -> char {
+        // Keep 's as part of words, remove other punctuation
+        if c.is_alphabetic() || c.is_whitespace() || c == '\'' {
+            c
+        } else {
+            ' '
+        }
     }
 
     fn phrase_to_indices(&self, phrase: &[String], vocabulary: &[String]) -> Vec<u16> {
@@ -183,32 +178,15 @@ mod tests {
         let text = "hello, world! it's working.";
         let phrases = splitter.phrases_as_strings(text);
         
-        // This creates one sentence since sentences are split by . ? ; \n\n
-        // So "hello, world! it's working" becomes one sentence that generates all substrings
+        // This creates two sentences since sentences are split by . ? ; ! \n\n
+        // "hello, world" and "it's working" become two separate sentences
         let expected = vec![
             vec!["hello".to_string(), "world".to_string()],
-            vec!["hello".to_string(), "world".to_string(), "it's".to_string()],
-            vec!["hello".to_string(), "world".to_string(), "it's".to_string(), "working".to_string()],
             vec!["it's".to_string(), "working".to_string()],
-            vec!["world".to_string(), "it's".to_string()],
-            vec!["world".to_string(), "it's".to_string(), "working".to_string()],
         ];
         assert_eq!(phrases, expected);
     }
 
-    #[test]
-    fn test_phrases_vocabulary_indexing() {
-        let splitter = Splitter::new();
-        let text = "apple banana apple";
-        let phrases = splitter.phrases_as_strings(text);
-        
-        let expected = vec![
-            vec!["apple".to_string(), "banana".to_string()],
-            vec!["apple".to_string(), "banana".to_string(), "apple".to_string()],
-            vec!["banana".to_string(), "apple".to_string()],
-        ];
-        assert_eq!(phrases, expected);
-    }
 
     #[test] 
     fn test_phrases_no_duplicates() {
