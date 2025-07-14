@@ -17,13 +17,8 @@ impl Splitter {
             .collect()
     }
 
-    pub fn phrases(&self, text: &str) -> Vec<Vec<u16>> {
-        let string_phrases = self.phrases_as_strings(text);
-        let vocabulary = self.vocabulary(&self.clean_text(text));
-        
-        string_phrases.into_iter()
-            .map(|phrase| self.phrase_to_indices(&phrase, &vocabulary))
-            .collect()
+    pub fn phrases(&self, text: &str) -> Vec<Vec<String>> {
+        self.phrases_as_strings(text)
     }
 
     pub fn phrases_as_strings(&self, text: &str) -> Vec<Vec<String>> {
@@ -67,11 +62,7 @@ impl Splitter {
             .collect()
     }
     
-    fn clean_text(&self, text: &str) -> String {
-        text.chars()
-            .map(|c| self.filter_char(c))
-            .collect()
-    }
+
 
     fn filter_char(&self, c: char) -> char {
         // Keep 's as part of words, remove other punctuation
@@ -82,15 +73,7 @@ impl Splitter {
         }
     }
 
-    fn phrase_to_indices(&self, phrase: &[String], vocabulary: &[String]) -> Vec<u16> {
-        phrase.iter()
-            .map(|word| {
-                vocabulary.iter()
-                    .position(|v| v == word)
-                    .expect("Word should be in vocabulary") as u16
-            })
-            .collect()
-    }
+
 }
 
 #[cfg(test)]
@@ -264,18 +247,18 @@ mod tests {
     }
 
     #[test]
-    fn test_phrases_indexing() {
+    fn test_phrases_returns_strings() {
         let splitter = Splitter::new();
         let text = "these words are test";
         let phrases = splitter.phrases(text);
         
         let expected = vec![
-            vec![0, 1],        // "are", "test"  
-            vec![2, 3],        // "these", "words"
-            vec![2, 3, 0],     // "these", "words", "are"
-            vec![2, 3, 0, 1],  // "these", "words", "are", "test"
-            vec![3, 0],        // "words", "are"
-            vec![3, 0, 1],     // "words", "are", "test"
+            vec!["are".to_string(), "test".to_string()],
+            vec!["these".to_string(), "words".to_string()],
+            vec!["these".to_string(), "words".to_string(), "are".to_string()],
+            vec!["these".to_string(), "words".to_string(), "are".to_string(), "test".to_string()],
+            vec!["words".to_string(), "are".to_string()],
+            vec!["words".to_string(), "are".to_string(), "test".to_string()],
         ];
         assert_eq!(phrases, expected);
     }
