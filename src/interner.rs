@@ -41,7 +41,7 @@ impl Interner {
                     .map(|word| {
                         self.vocabulary.iter()
                             .position(|v| v == word)
-                            .expect("Word should be in vocabulary") as u16
+                            .unwrap_or_else(|| panic!("Word '{}' should be in vocabulary", word)) as u16
                     })
                     .collect();
                 
