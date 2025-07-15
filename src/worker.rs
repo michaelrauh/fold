@@ -5,7 +5,7 @@ pub struct Worker;
 impl Worker {
     pub fn process(
         ortho: crate::ortho::Ortho,
-        interner: &mut Interner,
+        interner: &Interner,
     ) -> Vec<crate::ortho::Ortho> {
         // Version check moved to caller
 

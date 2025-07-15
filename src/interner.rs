@@ -7,12 +7,47 @@ pub struct Interner {
     prefix_to_completions: HashMap<Vec<u16>, BitSet>,
 }
 
+pub struct InternerRegistry {
+    // TODO: Add registry functionality
+}
+
 impl Default for Interner {
     fn default() -> Self {
         Self::new()
     }
 }
 
+impl Default for InternerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InternerRegistry {
+    pub fn new() -> Self {
+        todo!()
+    }
+
+    /// TODO: Get interner at latest version (replacement for update)
+    pub fn get_latest(&self) -> Interner {
+        todo!()
+    }
+
+    /// TODO: Find phrases with discrepancies across versions
+    pub fn find_discrepancies(&self, _phrases: &[Vec<String>], _versions: &[u64]) -> Vec<Vec<String>> {
+        todo!()
+    }
+
+    /// TODO: Deprecate a version by collapsing it into the next one
+    pub fn deprecate_version(&mut self, _version: u64) {
+        todo!()
+    }
+
+    /// TODO: Add interner to registry
+    pub fn add_interner(&mut self, _interner: Interner) {
+        todo!()
+    }
+}
 impl Interner {
     pub fn new() -> Self {
         Interner { 
@@ -22,16 +57,16 @@ impl Interner {
         }
     }
 
-    pub fn add(&mut self, vocabulary: Vec<String>, phrases: Vec<Vec<String>>) {
-        // Increment version by one
-        self.version += 1;
+    pub fn add(self, vocabulary: Vec<String>, phrases: Vec<Vec<String>>) -> Self {
+        // Create resultant vocabulary immutably
+        let new_words: Vec<String> = vocabulary.into_iter()
+            .filter(|word| !self.vocabulary.contains(word))
+            .collect();
+        let mut resultant_vocabulary = self.vocabulary.clone();
+        resultant_vocabulary.extend(new_words);
         
-        // Extend vocabulary with new vocab, avoiding duplicates (append-only to keep indices stable)
-        for word in vocabulary {
-            if !self.vocabulary.contains(&word) {
-                self.vocabulary.push(word);
-            }
-        }
+        // Create prefix_to_completions mapping
+        let mut new_prefix_to_completions = self.prefix_to_completions.clone();
         
         // Process each phrase to extract prefix and completion
         for phrase in phrases {
@@ -39,9 +74,9 @@ impl Interner {
                 // Convert string phrase to u16 indices
                 let phrase_indices: Vec<u16> = phrase.iter()
                     .map(|word| {
-                        self.vocabulary.iter()
+                        resultant_vocabulary.iter()
                             .position(|v| v == word)
-                            .unwrap_or_else(|| panic!("Word '{}' should be in vocabulary", word)) as u16
+                            .unwrap_or_else(|| panic!("Word '{word}' should be in vocabulary")) as u16
                     })
                     .collect();
                 
@@ -49,11 +84,18 @@ impl Interner {
                 let completion = phrase_indices[phrase_indices.len() - 1];
                 
                 // Get or create bitset for this prefix
-                let bitset = self.prefix_to_completions.entry(prefix).or_default();
+                let bitset = new_prefix_to_completions.entry(prefix).or_default();
                 
                 // Set the bit for the completion (suffixes that appear twice are counted once)
                 bitset.insert(completion as usize);
             }
+        }
+        
+        // Create new interner at the end with all the pieces
+        Interner {
+            version: self.version + 1,
+            vocabulary: resultant_vocabulary,
+            prefix_to_completions: new_prefix_to_completions,
         }
     }
 
@@ -61,18 +103,19 @@ impl Interner {
         self.version
     }
 
-    pub fn update(&self) -> Interner {
-        todo!()
-    }
 
+
+    /// TODO: Get required bits for required phrases 
     pub(crate) fn get_required_bits(&self, _required: &[Vec<u16>]) -> Vec<u64> {
         todo!()
     }
 
+    /// TODO: Get forbidden bits for forbidden terms
     pub(crate) fn get_forbidden_bits(&self, _forbidden: &[u16]) -> Vec<u64> {
         todo!()
     }
 
+    /// TODO: Intersect required and forbidden bits to get valid completions
     pub fn intersect(&self, _required: Vec<u64>, _forbidden: Vec<u64>) -> Vec<u16> {
         todo!()
     }
@@ -90,44 +133,44 @@ mod tests {
 
     #[test]
     fn test_add_increments_version() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         assert_eq!(interner.version(), 0);
         
-        interner.add(vec!["hello".to_string(), "world".to_string()], vec![vec!["hello".to_string(), "world".to_string()]]);
+        let interner = interner.add(vec!["hello".to_string(), "world".to_string()], vec![vec!["hello".to_string(), "world".to_string()]]);
         assert_eq!(interner.version(), 1);
         
-        interner.add(vec!["foo".to_string()], vec![vec!["hello".to_string(), "foo".to_string()]]);
+        let interner = interner.add(vec!["foo".to_string()], vec![vec!["hello".to_string(), "foo".to_string()]]);
         assert_eq!(interner.version(), 2);
     }
 
     #[test]
     fn test_add_extends_vocabulary() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
-        interner.add(vec!["hello".to_string(), "world".to_string()], vec![vec!["hello".to_string(), "world".to_string()]]);
+        let interner = interner.add(vec!["hello".to_string(), "world".to_string()], vec![vec!["hello".to_string(), "world".to_string()]]);
         assert_eq!(interner.vocabulary, vec!["hello", "world"]);
         
-        interner.add(vec!["foo".to_string(), "bar".to_string()], vec![vec!["foo".to_string(), "bar".to_string()]]);
+        let interner = interner.add(vec!["foo".to_string(), "bar".to_string()], vec![vec!["foo".to_string(), "bar".to_string()]]);
         assert_eq!(interner.vocabulary, vec!["hello", "world", "foo", "bar"]);
     }
 
     #[test]
     fn test_add_avoids_duplicate_vocabulary() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
-        interner.add(vec!["hello".to_string(), "world".to_string()], vec![vec!["hello".to_string(), "world".to_string()]]);
+        let interner = interner.add(vec!["hello".to_string(), "world".to_string()], vec![vec!["hello".to_string(), "world".to_string()]]);
         assert_eq!(interner.vocabulary, vec!["hello", "world"]);
         
-        interner.add(vec!["hello".to_string(), "foo".to_string()], vec![vec!["hello".to_string(), "foo".to_string()]]);
+        let interner = interner.add(vec!["hello".to_string(), "foo".to_string()], vec![vec!["hello".to_string(), "foo".to_string()]]);
         assert_eq!(interner.vocabulary, vec!["hello", "world", "foo"]);
     }
 
     #[test]
     fn test_add_creates_prefix_to_completions_mapping() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
         // Add phrases: ["word0", "word1"] and ["word0", "word2"] 
-        interner.add(
+        let interner = interner.add(
             vec!["word0".to_string(), "word1".to_string(), "word2".to_string()], 
             vec![vec!["word0".to_string(), "word1".to_string()], vec!["word0".to_string(), "word2".to_string()]]
         );
@@ -142,10 +185,10 @@ mod tests {
 
     #[test]
     fn test_add_deduplicates_suffixes() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
         // Add the same phrase twice: ["word0", "word1"] appears twice
-        interner.add(
+        let interner = interner.add(
             vec!["word0".to_string(), "word1".to_string()], 
             vec![vec!["word0".to_string(), "word1".to_string()], vec!["word0".to_string(), "word1".to_string()]]
         );
@@ -162,10 +205,10 @@ mod tests {
 
     #[test]
     fn test_add_handles_different_prefix_lengths() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
         // Add phrases with different lengths
-        interner.add(
+        let interner = interner.add(
             vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], 
             vec![
                 vec!["a".to_string(), "b".to_string()], 
@@ -192,10 +235,10 @@ mod tests {
 
     #[test]
     fn test_add_ignores_single_word_phrases() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
         // Add single word phrases (should be ignored) and valid phrases
-        interner.add(
+        let interner = interner.add(
             vec!["word0".to_string(), "word1".to_string()], 
             vec![vec!["word0".to_string()], vec!["word1".to_string()], vec!["word0".to_string(), "word1".to_string()]]
         );
@@ -210,10 +253,10 @@ mod tests {
 
     #[test]
     fn test_add_example_from_issue() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
         // Example from issue: phrases ["word0", "word1"] and ["word0", "word2"] should create prefix [0] -> 110 (bits 1 and 2)
-        interner.add(
+        let interner = interner.add(
             vec!["word0".to_string(), "word1".to_string(), "word2".to_string()], 
             vec![vec!["word0".to_string(), "word1".to_string()], vec!["word0".to_string(), "word2".to_string()]]
         );
@@ -232,16 +275,16 @@ mod tests {
 
     #[test]
     fn test_add_multiple_calls_accumulate() {
-        let mut interner = Interner::new();
+        let interner = Interner::new();
         
         // First call
-        interner.add(
+        let interner = interner.add(
             vec!["a".to_string(), "b".to_string()], 
             vec![vec!["a".to_string(), "b".to_string()]]
         );
         
         // Second call with overlapping prefix but different completion
-        interner.add(
+        let interner = interner.add(
             vec!["c".to_string()], 
             vec![vec!["a".to_string(), "c".to_string()]]
         );
