@@ -35,7 +35,7 @@ impl Processor {
             }
             let cur = work.pop().unwrap();
             if cur.version() > interner.version() {
-                interner = interner.update();
+                interner = interner_registry.get_latest();
             }
     
             let new_orthos = Worker::process(cur, &interner);
