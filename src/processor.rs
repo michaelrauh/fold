@@ -1,4 +1,4 @@
-use crate::interner::Interner;
+use crate::interner::{Interner, InternerRegistry};
 use crate::ortho::Ortho;
 use crate::repository::Repository;
 use crate::splitter::Splitter;
@@ -21,6 +21,7 @@ impl Processor {
 
     pub fn process(&self, file_path: &str) {
         let mut interner = configure_interner(file_path);
+        let mut interner_registry = InternerRegistry::new();
         let seed = Ortho::new(interner.version());
         let mut work = vec![seed];
         let mut dbq: Vec<Ortho> = Vec::new();
@@ -37,13 +38,13 @@ impl Processor {
                 interner = interner.update();
             }
     
-            let new_orthos = Worker::process(cur, &mut interner);
+            let new_orthos = Worker::process(cur, &interner);
     
             dbq.extend(new_orthos);
     
             feeder.feed(&mut dbq, &mut work, &mut repository);
     
-            follower.remediate(&mut work, &mut repository, &mut interner);
+            follower.remediate(&mut work, &mut repository, &mut interner_registry);
         }
     }
 }
@@ -54,7 +55,6 @@ fn configure_interner(file_path: &str) -> Interner {
     let vocabulary = splitter.vocabulary(&contents);
     let phrases = splitter.phrases(&contents);
 
-    let mut interner = Interner::new();
-    interner.add(vocabulary, phrases);
-    interner
+    let interner = Interner::new();
+    interner.add(vocabulary, phrases)
 }

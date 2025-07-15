@@ -15,7 +15,7 @@ impl Follower {
         &self,
         _work: &mut [crate::ortho::Ortho],
         _repository: &mut crate::repository::Repository,
-        _interner: &mut crate::interner::Interner,
+        _interner_registry: &mut crate::interner::InternerRegistry,
     ) {
         todo!()
     }
