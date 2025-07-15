@@ -16,17 +16,10 @@ impl Ortho {
     }
     
     pub fn with_dimensions(version: u64, dimensions: Vec<u16>) -> Self {
-        // Ensure minimum dimensions are at least [2,2]
-        let dims = if dimensions.len() < 2 || dimensions.iter().any(|&d| d < 2) {
-            vec![2, 2]
-        } else {
-            dimensions
-        };
-        
         Ortho {
             version,
             storage: Vec::new(),
-            dimensions: dims,
+            dimensions,
         }
     }
 
@@ -37,44 +30,23 @@ impl Ortho {
     /// Generate all logical coordinates sorted by shell (sum) then by components
     fn generate_logical_coordinates(&self) -> Vec<Vec<u16>> {
         // Generate Cartesian product of all dimension ranges
-        let coords = self.cartesian_product(vec![], 0);
+        let mut coords = cartesian_product(&self.dimensions);
         
         // Sort by shell (sum of coordinates) first, then by components
-        let mut sorted_coords = coords;
-        sorted_coords.sort_by(|a, b| {
+        coords.sort_by(|a, b| {
             let sum_a: u16 = a.iter().sum();
             let sum_b: u16 = b.iter().sum();
             sum_a.cmp(&sum_b).then_with(|| a.cmp(b))
         });
         
-        sorted_coords
-    }
-    
-    fn cartesian_product(&self, current: Vec<u16>, dim_index: usize) -> Vec<Vec<u16>> {
-        if dim_index == self.dimensions.len() {
-            return vec![current];
-        }
-        
-        let mut result = Vec::new();
-        for i in 0..self.dimensions[dim_index] {
-            let mut new_current = current.clone();
-            new_current.push(i);
-            let sub_results = self.cartesian_product(new_current, dim_index + 1);
-            result.extend(sub_results);
-        }
-        result
+        coords
     }
     
     /// Get the current logical coordinate based on storage length
     fn get_current_logical_coordinate(&self) -> Vec<u16> {
         let logical_coords = self.generate_logical_coordinates();
         let index = self.storage.len();
-        
-        if index < logical_coords.len() {
-            logical_coords[index].clone()
-        } else {
-            panic!("Index out of bounds for logical coordinates")
-        }
+        logical_coords[index].clone()
     }
     
     /// Get the current shell (sum of logical coordinates)
@@ -158,6 +130,25 @@ impl Ortho {
             dimensions: self.dimensions.clone(),
         }
     }
+}
+
+fn cartesian_product(dimensions: &[u16]) -> Vec<Vec<u16>> {
+    if dimensions.is_empty() {
+        return vec![vec![]];
+    }
+    
+    let first_dim = dimensions[0];
+    let rest = cartesian_product(&dimensions[1..]);
+    
+    (0..first_dim)
+        .flat_map(|i| {
+            rest.iter().map(move |suffix| {
+                let mut result = vec![i];
+                result.extend(suffix);
+                result
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
