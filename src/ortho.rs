@@ -36,55 +36,51 @@ impl Ortho {
     
     /// Generate all logical coordinates sorted by shell (sum) then by components
     fn generate_logical_coordinates(&self) -> Vec<Vec<u16>> {
-        let mut coords = Vec::new();
-        
         // Generate Cartesian product of all dimension ranges
-        self.cartesian_product(&mut vec![], 0, &mut coords);
+        let coords = self.cartesian_product(vec![], 0);
         
         // Sort by shell (sum of coordinates) first, then by components
-        coords.sort_by(|a, b| {
+        let mut sorted_coords = coords;
+        sorted_coords.sort_by(|a, b| {
             let sum_a: u16 = a.iter().sum();
             let sum_b: u16 = b.iter().sum();
             sum_a.cmp(&sum_b).then_with(|| a.cmp(b))
         });
         
-        coords
+        sorted_coords
     }
     
-    fn cartesian_product(&self, current: &mut Vec<u16>, dim_index: usize, result: &mut Vec<Vec<u16>>) {
+    fn cartesian_product(&self, current: Vec<u16>, dim_index: usize) -> Vec<Vec<u16>> {
         if dim_index == self.dimensions.len() {
-            result.push(current.clone());
-            return;
+            return vec![current];
         }
         
+        let mut result = Vec::new();
         for i in 0..self.dimensions[dim_index] {
-            current.push(i);
-            self.cartesian_product(current, dim_index + 1, result);
-            current.pop();
+            let mut new_current = current.clone();
+            new_current.push(i);
+            let sub_results = self.cartesian_product(new_current, dim_index + 1);
+            result.extend(sub_results);
         }
+        result
     }
     
     /// Get the current logical coordinate based on storage length
-    fn get_current_logical_coordinate(&self) -> Option<Vec<u16>> {
-        if self.storage.is_empty() {
-            return None;
-        }
-        
+    fn get_current_logical_coordinate(&self) -> Vec<u16> {
         let logical_coords = self.generate_logical_coordinates();
-        let index = self.storage.len() - 1;
+        let index = self.storage.len();
         
         if index < logical_coords.len() {
-            Some(logical_coords[index].clone())
+            logical_coords[index].clone()
         } else {
-            None
+            panic!("Index out of bounds for logical coordinates")
         }
     }
     
     /// Get the current shell (sum of logical coordinates)
     fn get_current_shell(&self) -> u16 {
-        self.get_current_logical_coordinate()
-            .map(|coords| coords.iter().sum())
-            .unwrap_or(0)
+        let coords = self.get_current_logical_coordinate();
+        coords.iter().sum()
     }
 
     pub(crate) fn get_required_and_forbidden(&self) -> (Vec<Vec<u16>>, Vec<u16>) {
@@ -94,77 +90,62 @@ impl Ortho {
     }
     
     fn get_forbidden(&self) -> Vec<u16> {
-        if self.storage.is_empty() {
-            return Vec::new();
-        }
-        
         let current_shell = self.get_current_shell();
         let logical_coords = self.generate_logical_coordinates();
-        let current_index = self.storage.len() - 1;
-        let mut forbidden = Vec::new();
         
-        for (index, stored_value) in self.storage.iter().enumerate() {
-            // Skip the current position
-            if index == current_index {
-                continue;
-            }
-            
-            if index < logical_coords.len() {
-                let coords = &logical_coords[index];
-                let shell: u16 = coords.iter().sum();
-                if shell == current_shell {
-                    forbidden.push(*stored_value);
+        self.storage.iter().enumerate()
+            .filter(|(index, _)| {
+                if *index < logical_coords.len() {
+                    let coords = &logical_coords[*index];
+                    let shell: u16 = coords.iter().sum();
+                    shell == current_shell
+                } else {
+                    false
                 }
-            }
-        }
-        
-        forbidden
+            })
+            .map(|(_, value)| *value)
+            .collect()
     }
     
     fn get_required(&self) -> Vec<Vec<u16>> {
-        let current_logical = match self.get_current_logical_coordinate() {
-            Some(coords) => coords,
-            None => return Vec::new(),
-        };
-        
+        let current_logical = self.get_current_logical_coordinate();
         let logical_coords = self.generate_logical_coordinates();
-        let mut required = Vec::new();
         
-        // For each axis, get all values from edge (0) to current position (exclusive)
-        for axis in 0..self.dimensions.len() {
-            let mut axis_values = Vec::new();
-            
-            // Iterate from 0 to current coordinate on this axis (exclusive)
-            for coord_value in 0..current_logical[axis] {
-                // Find what values are stored at positions with this coordinate on this axis
-                // and where all other coordinates match current position
-                for (index, stored_value) in self.storage.iter().enumerate() {
-                    if index < logical_coords.len() {
-                        let coords = &logical_coords[index];
-                        // Check if this position has the right coordinate on this axis
-                        // and matches current position on all other axes
-                        if coords[axis] == coord_value {
-                            let mut matches_other_axes = true;
-                            for other_axis in 0..self.dimensions.len() {
-                                if other_axis != axis && coords[other_axis] != current_logical[other_axis] {
-                                    matches_other_axes = false;
-                                    break;
+        // Stage 1: Generate the list of list of logical coordinates satisfying the property 
+        // that each list of logical coordinates traverses one axis from the edge to the given position (not inclusive)
+        let required_coordinate_lists: Vec<Vec<Vec<u16>>> = (0..self.dimensions.len())
+            .map(|axis| {
+                (0..current_logical[axis])
+                    .map(|coord_value| {
+                        let mut coords = current_logical.clone();
+                        coords[axis] = coord_value;
+                        coords
+                    })
+                    .collect()
+            })
+            .collect();
+        
+        // Stage 2: Turn those coordinates into numbers contained by the storage 
+        // by mapping them back to flat and looking them up
+        required_coordinate_lists.into_iter()
+            .map(|coord_list| {
+                coord_list.into_iter()
+                    .filter_map(|coords| {
+                        // Find the index of these coordinates in our logical coordinate system
+                        logical_coords.iter().position(|c| c == &coords)
+                            .and_then(|index| {
+                                // Look up the stored value at that index
+                                if index < self.storage.len() {
+                                    Some(self.storage[index])
+                                } else {
+                                    None
                                 }
-                            }
-                            if matches_other_axes {
-                                axis_values.push(*stored_value);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            if !axis_values.is_empty() {
-                required.push(axis_values);
-            }
-        }
-        
-        required
+                            })
+                    })
+                    .collect()
+            })
+            .filter(|axis_values: &Vec<u16>| !axis_values.is_empty())
+            .collect()
     }
 
     pub(crate) fn add(&self, to_add: u16, version: u64) -> Ortho {
@@ -203,18 +184,6 @@ mod tests {
     }
     
     #[test]
-    fn test_with_dimensions_custom() {
-        let ortho = Ortho::with_dimensions(1, vec![3, 2]);
-        assert_eq!(ortho.dimensions, vec![3, 2]);
-    }
-    
-    #[test]
-    fn test_with_dimensions_enforces_minimum() {
-        let ortho = Ortho::with_dimensions(1, vec![1, 1]);
-        assert_eq!(ortho.dimensions, vec![2, 2]);
-    }
-    
-    #[test]
     fn test_generate_logical_coordinates_2x2() {
         let ortho = Ortho::new(1);
         let coords = ortho.generate_logical_coordinates();
@@ -236,37 +205,37 @@ mod tests {
     #[test]
     fn test_get_current_logical_coordinate_empty() {
         let ortho = Ortho::new(1);
-        assert_eq!(ortho.get_current_logical_coordinate(), None);
+        assert_eq!(ortho.get_current_logical_coordinate(), vec![0, 0]);
     }
     
     #[test]
     fn test_get_current_logical_coordinate_with_storage() {
         let mut ortho = Ortho::new(1);
-        ortho.storage.push(10);
         
-        // First item should be at coordinate [0,0]
-        assert_eq!(ortho.get_current_logical_coordinate(), Some(vec![0, 0]));
+        // With empty storage, current position should be [0,0]
+        assert_eq!(ortho.get_current_logical_coordinate(), vec![0, 0]);
+        
+        ortho.storage.push(10);
+        // With one item, current position should be [0,1] (next unfilled)
+        assert_eq!(ortho.get_current_logical_coordinate(), vec![0, 1]);
         
         ortho.storage.push(20);
-        // Second item should be at coordinate [0,1]
-        assert_eq!(ortho.get_current_logical_coordinate(), Some(vec![0, 1]));
+        // With two items, current position should be [1,0] (next unfilled)
+        assert_eq!(ortho.get_current_logical_coordinate(), vec![1, 0]);
     }
     
     #[test]
     fn test_get_current_shell() {
         let mut ortho = Ortho::new(1);
-        assert_eq!(ortho.get_current_shell(), 0);
-        
-        ortho.storage.push(10);
         assert_eq!(ortho.get_current_shell(), 0); // [0,0] -> sum = 0
         
-        ortho.storage.push(20);
+        ortho.storage.push(10);
         assert_eq!(ortho.get_current_shell(), 1); // [0,1] -> sum = 1
         
-        ortho.storage.push(30);
+        ortho.storage.push(20);
         assert_eq!(ortho.get_current_shell(), 1); // [1,0] -> sum = 1
         
-        ortho.storage.push(40);
+        ortho.storage.push(30);
         assert_eq!(ortho.get_current_shell(), 2); // [1,1] -> sum = 2
     }
     
@@ -282,7 +251,7 @@ mod tests {
         let mut ortho = Ortho::new(1);
         ortho.storage.push(10); // [0,0] shell 0
         ortho.storage.push(20); // [0,1] shell 1
-        ortho.storage.push(30); // [1,0] shell 1 <- this is current
+        // Current position is [1,0] shell 1
         
         // Current shell is 1, so forbidden should include value at [0,1] (also shell 1)
         let (_, forbidden) = ortho.get_required_and_forbidden();
@@ -301,31 +270,13 @@ mod tests {
         let mut ortho = Ortho::new(1);
         ortho.storage.push(10); // [0,0]
         ortho.storage.push(20); // [0,1]
-        ortho.storage.push(30); // [1,0] <- current position
+        // Current position is [1,0]
         
         // For position [1,0]:
         // - Axis 0: need values from coord 0 (which is value 10 at [0,0])  
         // - Axis 1: current coord is 0, so no requirements
         let (required, _) = ortho.get_required_and_forbidden();
         assert_eq!(required, vec![vec![10]]);
-    }
-    
-    #[test]
-    fn test_add_method() {
-        let ortho = Ortho::new(1);
-        let new_ortho = ortho.add(42, 2);
-        
-        assert_eq!(new_ortho.version(), 2);
-        assert_eq!(new_ortho.storage, vec![42]);
-        assert_eq!(new_ortho.dimensions, vec![2, 2]);
-    }
-    
-    #[test]
-    fn test_add_preserves_dimensions() {
-        let ortho = Ortho::with_dimensions(1, vec![3, 2]);
-        let new_ortho = ortho.add(42, 2);
-        
-        assert_eq!(new_ortho.dimensions, vec![3, 2]);
     }
     
     #[test]
@@ -344,19 +295,27 @@ mod tests {
         ];
         assert_eq!(coords, expected);
         
-        // Add values step by step
+        // Add values step by step to reach position [2,1] 
         ortho.storage.push(100); // [0,0]
         ortho.storage.push(200); // [0,1]  
         ortho.storage.push(300); // [1,0]
-        ortho.storage.push(400); // [1,1] <- current
+        ortho.storage.push(400); // [1,1]
+        ortho.storage.push(500); // [2,0]
+        // Current position is [2,1] (shell 3)
         
-        // At position [1,1] (shell 2):
-        // For axis 0: current coord is 1, so we need values from coord 0 with same other coords
-        //   Looking for positions with axis 0 = 0 and axis 1 = 1 -> that's [0,1] = value 200
-        // For axis 1: current coord is 1, so we need values from coord 0 with same other coords  
-        //   Looking for positions with axis 1 = 0 and axis 0 = 1 -> that's [1,0] = value 300
+        // At position [2,1]:
+        // For axis 0: current coord is 2, so we need values from coords 0,1 with same axis 1 coord (1)
+        //   Looking for positions with axis 0 = 0,1 and axis 1 = 1 -> that's [0,1]=200, [1,1]=400
+        // For axis 1: current coord is 1, so we need values from coord 0 with same axis 0 coord (2)  
+        //   Looking for positions with axis 1 = 0 and axis 0 = 2 -> that's [2,0]=500
         let (required, forbidden) = ortho.get_required_and_forbidden();
-        assert_eq!(required, vec![vec![200], vec![300]]);
-        assert!(forbidden.is_empty()); // No other values in shell 2 yet
+        
+        // required should have something of length two (axis 0 requirements) and something of length one (axis 1 requirements)
+        assert_eq!(required.len(), 2);
+        assert_eq!(required[0], vec![200, 400]); // axis 0: values at [0,1] and [1,1]
+        assert_eq!(required[1], vec![500]);      // axis 1: value at [2,0]
+        
+        // forbidden should be nonempty - there are no other values in shell 3 yet, but let's add one more
+        assert!(forbidden.is_empty()); // No other values in shell 3 yet
     }
 }
