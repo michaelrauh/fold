@@ -59,19 +59,14 @@ impl Interner {
 
     pub fn add(self, vocabulary: Vec<String>, phrases: Vec<Vec<String>>) -> Self {
         // Create resultant vocabulary immutably
+        let new_words: Vec<String> = vocabulary.into_iter()
+            .filter(|word| !self.vocabulary.contains(word))
+            .collect();
         let mut resultant_vocabulary = self.vocabulary.clone();
-        for word in vocabulary {
-            if !resultant_vocabulary.contains(&word) {
-                resultant_vocabulary.push(word);
-            }
-        }
+        resultant_vocabulary.extend(new_words);
         
-        // Create new interner with incremented version and immutable vocabulary
-        let mut new_interner = Interner {
-            version: self.version + 1,
-            vocabulary: resultant_vocabulary,
-            prefix_to_completions: self.prefix_to_completions.clone(),
-        };
+        // Create prefix_to_completions mapping
+        let mut new_prefix_to_completions = self.prefix_to_completions.clone();
         
         // Process each phrase to extract prefix and completion
         for phrase in phrases {
@@ -79,7 +74,7 @@ impl Interner {
                 // Convert string phrase to u16 indices
                 let phrase_indices: Vec<u16> = phrase.iter()
                     .map(|word| {
-                        new_interner.vocabulary.iter()
+                        resultant_vocabulary.iter()
                             .position(|v| v == word)
                             .unwrap_or_else(|| panic!("Word '{word}' should be in vocabulary")) as u16
                     })
@@ -89,24 +84,26 @@ impl Interner {
                 let completion = phrase_indices[phrase_indices.len() - 1];
                 
                 // Get or create bitset for this prefix
-                let bitset = new_interner.prefix_to_completions.entry(prefix).or_default();
+                let bitset = new_prefix_to_completions.entry(prefix).or_default();
                 
                 // Set the bit for the completion (suffixes that appear twice are counted once)
                 bitset.insert(completion as usize);
             }
         }
         
-        new_interner
+        // Create new interner at the end with all the pieces
+        Interner {
+            version: self.version + 1,
+            vocabulary: resultant_vocabulary,
+            prefix_to_completions: new_prefix_to_completions,
+        }
     }
 
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// TODO: Request a new interner at the latest version (replacement for update)
-    pub fn update(&self) -> Interner {
-        todo!()
-    }
+
 
     /// TODO: Get required bits for required phrases 
     pub(crate) fn get_required_bits(&self, _required: &[Vec<u16>]) -> Vec<u64> {
