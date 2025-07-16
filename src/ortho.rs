@@ -14,8 +14,8 @@ static LOGICAL_COORDINATES_CACHE: OnceLock<Mutex<HashMap<Vec<u16>, Vec<Vec<u16>>
 // Global cache for forbidden values keyed by (dimensions, storage_length)
 static FORBIDDEN_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, usize), Vec<u16>>>> = OnceLock::new();
 
-// Global cache for required values keyed by (dimensions, storage)
-static REQUIRED_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, Vec<u16>), Vec<Vec<u16>>>>> = OnceLock::new();
+// Global cache for required coordinate lists keyed by (dimensions, current_logical_coordinate)
+static REQUIRED_COORDS_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, Vec<u16>), Vec<Vec<Vec<u16>>>>>> = OnceLock::new();
 
 /// Get cached logical coordinates or compute and cache them
 fn get_logical_coordinates(dimensions: &[u16]) -> Vec<Vec<u16>> {
@@ -60,18 +60,15 @@ fn get_forbidden_values(dimensions: &[u16], storage: &[u16]) -> Vec<u16> {
         forbidden
     }
 }
-/// Get cached required values or compute and cache them
-fn get_required_values(dimensions: &[u16], storage: &[u16]) -> Vec<Vec<u16>> {
-    let cache = REQUIRED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache_key = (dimensions.to_vec(), storage.to_vec());
+/// Get cached required coordinate lists or compute and cache them
+fn get_required_coordinate_lists(dimensions: &[u16], current_logical: &[u16]) -> Vec<Vec<Vec<u16>>> {
+    let cache = REQUIRED_COORDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = (dimensions.to_vec(), current_logical.to_vec());
     let mut cache_guard = cache.lock().unwrap();
     
-    if let Some(required) = cache_guard.get(&cache_key) {
-        required.clone()
+    if let Some(coord_lists) = cache_guard.get(&cache_key) {
+        coord_lists.clone()
     } else {
-        let logical_coords = get_logical_coordinates(dimensions);
-        let current_logical = logical_coords[storage.len()].clone();
-        
         // Stage 1: Generate the list of list of logical coordinates satisfying the property 
         // that each list of logical coordinates traverses one axis from the edge to the given position (not inclusive)
         let required_coordinate_lists: Vec<Vec<Vec<u16>>> = (0..dimensions.len())
@@ -86,31 +83,42 @@ fn get_required_values(dimensions: &[u16], storage: &[u16]) -> Vec<Vec<u16>> {
             })
             .collect();
         
-        // Stage 2: Turn those coordinates into numbers contained by the storage 
-        // by mapping them back to flat and looking them up
-        let required: Vec<Vec<u16>> = required_coordinate_lists.into_iter()
-            .map(|coord_list| {
-                coord_list.into_iter()
-                    .filter_map(|coords| {
-                        // Find the index of these coordinates in our logical coordinate system
-                        logical_coords.iter().position(|c| c == &coords)
-                            .and_then(|index| {
-                                // Look up the stored value at that index
-                                if index < storage.len() {
-                                    Some(storage[index])
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .collect()
-            })
-            .filter(|axis_values: &Vec<u16>| !axis_values.is_empty())
-            .collect();
-        
-        cache_guard.insert(cache_key, required.clone());
-        required
+        cache_guard.insert(cache_key, required_coordinate_lists.clone());
+        required_coordinate_lists
     }
+}
+
+/// Get required values by computing coordinate lists and mapping to storage
+fn get_required_values(dimensions: &[u16], storage: &[u16]) -> Vec<Vec<u16>> {
+    let logical_coords = get_logical_coordinates(dimensions);
+    let current_logical = logical_coords[storage.len()].clone();
+    
+    // Get cached coordinate lists
+    let required_coordinate_lists = get_required_coordinate_lists(dimensions, &current_logical);
+    
+    // Stage 2: Turn those coordinates into numbers contained by the storage 
+    // by mapping them back to flat and looking them up
+    let required: Vec<Vec<u16>> = required_coordinate_lists.into_iter()
+        .map(|coord_list| {
+            coord_list.into_iter()
+                .filter_map(|coords| {
+                    // Find the index of these coordinates in our logical coordinate system
+                    logical_coords.iter().position(|c| c == &coords)
+                        .and_then(|index| {
+                            // Look up the stored value at that index
+                            if index < storage.len() {
+                                Some(storage[index])
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .collect()
+        })
+        .filter(|axis_values: &Vec<u16>| !axis_values.is_empty())
+        .collect();
+    
+    required
 }
 
 impl Ortho {
