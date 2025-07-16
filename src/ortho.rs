@@ -11,6 +11,12 @@ pub struct Ortho {
 // Global cache for logical coordinates keyed by dimensions
 static LOGICAL_COORDINATES_CACHE: OnceLock<Mutex<HashMap<Vec<u16>, Vec<Vec<u16>>>>> = OnceLock::new();
 
+// Global cache for shell calculations keyed by (dimensions, storage_length)
+static SHELL_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, usize), u16>>> = OnceLock::new();
+
+// Global cache for required coordinate lists keyed by (dimensions, current_logical_coordinate)
+static REQUIRED_COORDS_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, Vec<u16>), Vec<Vec<Vec<u16>>>>>> = OnceLock::new();
+
 /// Get cached logical coordinates or compute and cache them
 fn get_logical_coordinates(dimensions: &[u16]) -> Vec<Vec<u16>> {
     let cache = LOGICAL_COORDINATES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -22,6 +28,50 @@ fn get_logical_coordinates(dimensions: &[u16]) -> Vec<Vec<u16>> {
         let coords = generate_logical_coordinates(dimensions);
         cache_guard.insert(dimensions.to_vec(), coords.clone());
         coords
+    }
+}
+
+/// Get cached shell value or compute and cache it
+fn get_shell_for_position(dimensions: &[u16], storage_length: usize) -> u16 {
+    let cache = SHELL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = (dimensions.to_vec(), storage_length);
+    let mut cache_guard = cache.lock().unwrap();
+    
+    if let Some(&shell) = cache_guard.get(&cache_key) {
+        shell
+    } else {
+        let logical_coords = get_logical_coordinates(dimensions);
+        let shell = logical_coords[storage_length].iter().sum();
+        cache_guard.insert(cache_key, shell);
+        shell
+    }
+}
+
+/// Get cached required coordinate lists or compute and cache them (stage one logic)
+fn get_required_coordinate_lists(dimensions: &[u16], current_logical: &[u16]) -> Vec<Vec<Vec<u16>>> {
+    let cache = REQUIRED_COORDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = (dimensions.to_vec(), current_logical.to_vec());
+    let mut cache_guard = cache.lock().unwrap();
+    
+    if let Some(coord_lists) = cache_guard.get(&cache_key) {
+        coord_lists.clone()
+    } else {
+        // Stage 1: Generate the list of list of logical coordinates satisfying the property 
+        // that each list of logical coordinates traverses one axis from the edge to the given position (not inclusive)
+        let required_coordinate_lists: Vec<Vec<Vec<u16>>> = (0..dimensions.len())
+            .map(|axis| {
+                (0..current_logical[axis])
+                    .map(|coord_value| {
+                        let mut coords = current_logical.to_vec();
+                        coords[axis] = coord_value;
+                        coords
+                    })
+                    .collect()
+            })
+            .collect();
+        
+        cache_guard.insert(cache_key, required_coordinate_lists.clone());
+        required_coordinate_lists
     }
 }
 
@@ -56,8 +106,7 @@ impl Ortho {
     
     /// Get the current shell (sum of logical coordinates)
     fn get_current_shell(&self) -> u16 {
-        let coords = self.get_current_logical_coordinate();
-        coords.iter().sum()
+        get_shell_for_position(&self.dimensions, self.storage.len())
     }
 
     pub(crate) fn get_required_and_forbidden(&self) -> (Vec<Vec<u16>>, Vec<u16>) {
@@ -88,19 +137,8 @@ impl Ortho {
         let current_logical = self.get_current_logical_coordinate();
         let logical_coords = get_logical_coordinates(&self.dimensions);
         
-        // Stage 1: Generate the list of list of logical coordinates satisfying the property 
-        // that each list of logical coordinates traverses one axis from the edge to the given position (not inclusive)
-        let required_coordinate_lists: Vec<Vec<Vec<u16>>> = (0..self.dimensions.len())
-            .map(|axis| {
-                (0..current_logical[axis])
-                    .map(|coord_value| {
-                        let mut coords = current_logical.clone();
-                        coords[axis] = coord_value;
-                        coords
-                    })
-                    .collect()
-            })
-            .collect();
+        // Stage 1: Use cached required coordinate lists
+        let required_coordinate_lists = get_required_coordinate_lists(&self.dimensions, &current_logical);
         
         // Stage 2: Turn those coordinates into numbers contained by the storage 
         // by mapping them back to flat and looking them up
@@ -374,5 +412,48 @@ mod tests {
         let coords1 = get_logical_coordinates(&ortho.dimensions);
         let coords2 = get_logical_coordinates(&ortho.dimensions);
         assert_eq!(coords1, coords2);
+    }
+
+    #[test]
+    fn test_shell_caching() {
+        // Test that shell calculations are cached
+        let ortho = Ortho::with_dimensions(1, vec![3, 2]);
+        
+        // Multiple calls should return same values (from cache)
+        assert_eq!(ortho.get_current_shell(), 0); // Position 0 -> [0,0] -> shell 0
+        assert_eq!(ortho.get_current_shell(), 0); // Should use cached value
+        
+        let ortho2 = ortho.add(100, 2);
+        assert_eq!(ortho2.get_current_shell(), 1); // Position 1 -> [0,1] -> shell 1
+        assert_eq!(ortho2.get_current_shell(), 1); // Should use cached value
+        
+        let ortho3 = ortho2.add(200, 3);  
+        assert_eq!(ortho3.get_current_shell(), 1); // Position 2 -> [1,0] -> shell 1
+        
+        // Test different dimensions cache separately
+        let ortho_diff = Ortho::with_dimensions(1, vec![2, 2]);
+        assert_eq!(ortho_diff.get_current_shell(), 0); // Should work with different dimensions
+    }
+
+    #[test]
+    fn test_required_coordinate_lists_caching() {
+        let mut ortho = Ortho::with_dimensions(1, vec![3, 2]);
+        ortho.storage.push(100); // [0,0]
+        ortho.storage.push(200); // [0,1] 
+        ortho.storage.push(300); // [1,0]
+        // Current position is [1,1]
+        
+        // Get required values multiple times - should use cache after first call
+        let required1 = ortho.get_required();
+        let required2 = ortho.get_required();
+        assert_eq!(required1, required2);
+        
+        // The required logic should be:
+        // At position [1,1]:
+        // - Axis 0: need values from coord 0 with same axis 1 coord (1) -> that's [0,1]=200
+        // - Axis 1: need values from coord 0 with same axis 0 coord (1) -> that's [1,0]=300
+        assert_eq!(required1.len(), 2);
+        assert_eq!(required1[0], vec![200]); // axis 0 requirement
+        assert_eq!(required1[1], vec![300]); // axis 1 requirement
     }
 }
