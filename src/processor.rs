@@ -1,4 +1,5 @@
 use crate::interner::{Interner, InternerRegistry};
+use crate::logical_coords::LogicalCoordinateCache;
 use crate::ortho::Ortho;
 use crate::repository::Repository;
 use crate::splitter::Splitter;
@@ -28,6 +29,7 @@ impl Processor {
         let mut repository = Repository::new();
         let feeder = feeder::Feeder::new();
         let follower = follower::Follower::new();
+        let mut cache = LogicalCoordinateCache::new();
 
         loop {
             if work.is_empty() {
@@ -38,7 +40,7 @@ impl Processor {
                 interner = interner_registry.get_latest();
             }
     
-            let new_orthos = Worker::process(cur, &interner);
+            let new_orthos = Worker::process(cur, &interner, &mut cache);
     
             dbq.extend(new_orthos);
     
