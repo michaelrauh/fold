@@ -1,31 +1,45 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 #[derive(Debug, Clone)]
 pub struct Ortho {
     version: u64,
     storage: Vec<u16>,
     dimensions: Vec<u16>,
-    logical_coordinates: Vec<Vec<u16>>,
+}
+
+// Global cache for logical coordinates keyed by dimensions
+static LOGICAL_COORDINATES_CACHE: OnceLock<Mutex<HashMap<Vec<u16>, Vec<Vec<u16>>>>> = OnceLock::new();
+
+/// Get cached logical coordinates or compute and cache them
+fn get_logical_coordinates(dimensions: &[u16]) -> Vec<Vec<u16>> {
+    let cache = LOGICAL_COORDINATES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache_guard = cache.lock().unwrap();
+    
+    if let Some(coords) = cache_guard.get(dimensions) {
+        coords.clone()
+    } else {
+        let coords = generate_logical_coordinates(dimensions);
+        cache_guard.insert(dimensions.to_vec(), coords.clone());
+        coords
+    }
 }
 
 impl Ortho {
     pub fn new(version: u64) -> Self {
         // Use minimum dimensions [2,2] for orthogonality
-        let dimensions = vec![2, 2];
-        let logical_coordinates = generate_logical_coordinates(&dimensions);
         Ortho { 
             version,
             storage: Vec::new(),
-            dimensions,
-            logical_coordinates,
+            dimensions: vec![2, 2],
         }
     }
     
     pub fn with_dimensions(version: u64, dimensions: Vec<u16>) -> Self {
-        let logical_coordinates = generate_logical_coordinates(&dimensions);
         Ortho {
             version,
             storage: Vec::new(),
             dimensions,
-            logical_coordinates,
         }
     }
 
@@ -35,8 +49,9 @@ impl Ortho {
     
     /// Get the current logical coordinate based on storage length
     fn get_current_logical_coordinate(&self) -> Vec<u16> {
+        let logical_coords = get_logical_coordinates(&self.dimensions);
         let index = self.storage.len();
-        self.logical_coordinates[index].clone()
+        logical_coords[index].clone()
     }
     
     /// Get the current shell (sum of logical coordinates)
@@ -53,11 +68,12 @@ impl Ortho {
     
     fn get_forbidden(&self) -> Vec<u16> {
         let current_shell = self.get_current_shell();
+        let logical_coords = get_logical_coordinates(&self.dimensions);
         
         self.storage.iter().enumerate()
             .filter(|(index, _)| {
-                if *index < self.logical_coordinates.len() {
-                    let coords = &self.logical_coordinates[*index];
+                if *index < logical_coords.len() {
+                    let coords = &logical_coords[*index];
                     let shell: u16 = coords.iter().sum();
                     shell == current_shell
                 } else {
@@ -70,6 +86,7 @@ impl Ortho {
     
     fn get_required(&self) -> Vec<Vec<u16>> {
         let current_logical = self.get_current_logical_coordinate();
+        let logical_coords = get_logical_coordinates(&self.dimensions);
         
         // Stage 1: Generate the list of list of logical coordinates satisfying the property 
         // that each list of logical coordinates traverses one axis from the edge to the given position (not inclusive)
@@ -92,7 +109,7 @@ impl Ortho {
                 coord_list.into_iter()
                     .filter_map(|coords| {
                         // Find the index of these coordinates in our logical coordinate system
-                        self.logical_coordinates.iter().position(|c| c == &coords)
+                        logical_coords.iter().position(|c| c == &coords)
                             .and_then(|index| {
                                 // Look up the stored value at that index
                                 if index < self.storage.len() {
@@ -116,7 +133,6 @@ impl Ortho {
             version,
             storage: new_storage,
             dimensions: self.dimensions.clone(),
-            logical_coordinates: self.logical_coordinates.clone(),
         }
     }
 }
@@ -180,8 +196,8 @@ mod tests {
     
     #[test]
     fn test_generate_logical_coordinates_2x2() {
-        let ortho = Ortho::new(1);
-        let coords = &ortho.logical_coordinates;
+        let dimensions = vec![2, 2];
+        let coords = get_logical_coordinates(&dimensions);
         
         // Should be sorted by shell (sum) then by components
         // Shell 0: [0,0]
@@ -194,7 +210,7 @@ mod tests {
             vec![1, 1],  // shell 2
         ];
         
-        assert_eq!(*coords, expected);
+        assert_eq!(coords, expected);
     }
     
     #[test]
@@ -279,7 +295,7 @@ mod tests {
         let mut ortho = Ortho::with_dimensions(1, vec![3, 2]);
         
         // Generate coordinates for 3x2: [0,0], [0,1], [1,0], [1,1], [2,0], [2,1]
-        let coords = &ortho.logical_coordinates;
+        let coords = get_logical_coordinates(&ortho.dimensions);
         let expected = vec![
             vec![0, 0],  // shell 0
             vec![0, 1],  // shell 1
@@ -288,7 +304,7 @@ mod tests {
             vec![2, 0],  // shell 2
             vec![2, 1],  // shell 3
         ];
-        assert_eq!(*coords, expected);
+        assert_eq!(coords, expected);
         
         // Add values step by step to reach position [2,1] 
         ortho.storage.push(100); // [0,0]
@@ -315,10 +331,28 @@ mod tests {
     }
     
     #[test]
+    fn test_shared_cache_across_instances() {
+        // Create two different ortho instances with same dimensions
+        let ortho1 = Ortho::with_dimensions(1, vec![2, 3]);
+        let ortho2 = Ortho::with_dimensions(2, vec![2, 3]);
+        
+        // Both should get the same logical coordinates from the shared cache
+        let coords1 = get_logical_coordinates(&ortho1.dimensions);
+        let coords2 = get_logical_coordinates(&ortho2.dimensions);
+        assert_eq!(coords1, coords2);
+        
+        // Test different dimensions get different coordinates
+        let ortho3 = Ortho::with_dimensions(3, vec![3, 2]);
+        let coords3 = get_logical_coordinates(&ortho3.dimensions);
+        assert_ne!(coords1, coords3);
+    }
+
+    #[test]
     fn test_logical_coordinates_cached() {
         let ortho = Ortho::with_dimensions(1, vec![3, 2]);
         
-        // Verify the cache is populated with correct coordinates
+        // Verify that the logical coordinates are generated correctly
+        let logical_coords = get_logical_coordinates(&ortho.dimensions);
         let expected = vec![
             vec![0, 0],  // shell 0
             vec![0, 1],  // shell 1
@@ -327,7 +361,7 @@ mod tests {
             vec![2, 0],  // shell 2
             vec![2, 1],  // shell 3
         ];
-        assert_eq!(ortho.logical_coordinates, expected);
+        assert_eq!(logical_coords, expected);
         
         // Verify that methods use the cached coordinates consistently
         assert_eq!(ortho.get_current_logical_coordinate(), vec![0, 0]);
@@ -335,6 +369,10 @@ mod tests {
         // Add some items and verify cache is still used correctly
         let ortho2 = ortho.add(100, 2);
         assert_eq!(ortho2.get_current_logical_coordinate(), vec![0, 1]);
-        assert_eq!(ortho2.logical_coordinates, expected); // Cache should be same
+        
+        // Verify that calling get_logical_coordinates multiple times returns consistent results
+        let coords1 = get_logical_coordinates(&ortho.dimensions);
+        let coords2 = get_logical_coordinates(&ortho.dimensions);
+        assert_eq!(coords1, coords2);
     }
 }
