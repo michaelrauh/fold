@@ -11,11 +11,11 @@ pub struct Ortho {
 // Global cache for logical coordinates keyed by dimensions
 static LOGICAL_COORDINATES_CACHE: OnceLock<Mutex<HashMap<Vec<u16>, Vec<Vec<u16>>>>> = OnceLock::new();
 
-// Global cache for shell calculations keyed by (dimensions, storage_length)
-static SHELL_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, usize), u16>>> = OnceLock::new();
+// Global cache for forbidden values keyed by (dimensions, storage_length)
+static FORBIDDEN_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, usize), Vec<u16>>>> = OnceLock::new();
 
-// Global cache for required coordinate lists keyed by (dimensions, current_logical_coordinate)
-static REQUIRED_COORDS_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, Vec<u16>), Vec<Vec<Vec<u16>>>>>> = OnceLock::new();
+// Global cache for required values keyed by (dimensions, storage)
+static REQUIRED_CACHE: OnceLock<Mutex<HashMap<(Vec<u16>, Vec<u16>), Vec<Vec<u16>>>>> = OnceLock::new();
 
 /// Get cached logical coordinates or compute and cache them
 fn get_logical_coordinates(dimensions: &[u16]) -> Vec<Vec<u16>> {
@@ -31,31 +31,47 @@ fn get_logical_coordinates(dimensions: &[u16]) -> Vec<Vec<u16>> {
     }
 }
 
-/// Get cached shell value or compute and cache it
-fn get_shell_for_position(dimensions: &[u16], storage_length: usize) -> u16 {
-    let cache = SHELL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache_key = (dimensions.to_vec(), storage_length);
+/// Get cached forbidden values or compute and cache them
+fn get_forbidden_values(dimensions: &[u16], storage: &[u16]) -> Vec<u16> {
+    let cache = FORBIDDEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = (dimensions.to_vec(), storage.len());
     let mut cache_guard = cache.lock().unwrap();
     
-    if let Some(&shell) = cache_guard.get(&cache_key) {
-        shell
+    if let Some(forbidden) = cache_guard.get(&cache_key) {
+        forbidden.clone()
     } else {
         let logical_coords = get_logical_coordinates(dimensions);
-        let shell = logical_coords[storage_length].iter().sum();
-        cache_guard.insert(cache_key, shell);
-        shell
+        let current_shell: u16 = logical_coords[storage.len()].iter().sum();
+        
+        let forbidden: Vec<u16> = storage.iter().enumerate()
+            .filter(|(index, _)| {
+                if *index < logical_coords.len() {
+                    let coords = &logical_coords[*index];
+                    let shell: u16 = coords.iter().sum();
+                    shell == current_shell
+                } else {
+                    false
+                }
+            })
+            .map(|(_, value)| *value)
+            .collect();
+        
+        cache_guard.insert(cache_key, forbidden.clone());
+        forbidden
     }
 }
-
-/// Get cached required coordinate lists or compute and cache them (stage one logic)
-fn get_required_coordinate_lists(dimensions: &[u16], current_logical: &[u16]) -> Vec<Vec<Vec<u16>>> {
-    let cache = REQUIRED_COORDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let cache_key = (dimensions.to_vec(), current_logical.to_vec());
+/// Get cached required values or compute and cache them
+fn get_required_values(dimensions: &[u16], storage: &[u16]) -> Vec<Vec<u16>> {
+    let cache = REQUIRED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = (dimensions.to_vec(), storage.to_vec());
     let mut cache_guard = cache.lock().unwrap();
     
-    if let Some(coord_lists) = cache_guard.get(&cache_key) {
-        coord_lists.clone()
+    if let Some(required) = cache_guard.get(&cache_key) {
+        required.clone()
     } else {
+        let logical_coords = get_logical_coordinates(dimensions);
+        let current_logical = logical_coords[storage.len()].clone();
+        
         // Stage 1: Generate the list of list of logical coordinates satisfying the property 
         // that each list of logical coordinates traverses one axis from the edge to the given position (not inclusive)
         let required_coordinate_lists: Vec<Vec<Vec<u16>>> = (0..dimensions.len())
@@ -70,8 +86,30 @@ fn get_required_coordinate_lists(dimensions: &[u16], current_logical: &[u16]) ->
             })
             .collect();
         
-        cache_guard.insert(cache_key, required_coordinate_lists.clone());
-        required_coordinate_lists
+        // Stage 2: Turn those coordinates into numbers contained by the storage 
+        // by mapping them back to flat and looking them up
+        let required: Vec<Vec<u16>> = required_coordinate_lists.into_iter()
+            .map(|coord_list| {
+                coord_list.into_iter()
+                    .filter_map(|coords| {
+                        // Find the index of these coordinates in our logical coordinate system
+                        logical_coords.iter().position(|c| c == &coords)
+                            .and_then(|index| {
+                                // Look up the stored value at that index
+                                if index < storage.len() {
+                                    Some(storage[index])
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .collect()
+            })
+            .filter(|axis_values: &Vec<u16>| !axis_values.is_empty())
+            .collect();
+        
+        cache_guard.insert(cache_key, required.clone());
+        required
     }
 }
 
@@ -97,16 +135,11 @@ impl Ortho {
         self.version
     }
     
-    /// Get the current logical coordinate based on storage length
+    /// Get the current logical coordinate based on storage length (for testing)
+    #[cfg(test)]
     fn get_current_logical_coordinate(&self) -> Vec<u16> {
         let logical_coords = get_logical_coordinates(&self.dimensions);
-        let index = self.storage.len();
-        logical_coords[index].clone()
-    }
-    
-    /// Get the current shell (sum of logical coordinates)
-    fn get_current_shell(&self) -> u16 {
-        get_shell_for_position(&self.dimensions, self.storage.len())
+        logical_coords[self.storage.len()].clone()
     }
 
     pub(crate) fn get_required_and_forbidden(&self) -> (Vec<Vec<u16>>, Vec<u16>) {
@@ -116,51 +149,11 @@ impl Ortho {
     }
     
     fn get_forbidden(&self) -> Vec<u16> {
-        let current_shell = self.get_current_shell();
-        let logical_coords = get_logical_coordinates(&self.dimensions);
-        
-        self.storage.iter().enumerate()
-            .filter(|(index, _)| {
-                if *index < logical_coords.len() {
-                    let coords = &logical_coords[*index];
-                    let shell: u16 = coords.iter().sum();
-                    shell == current_shell
-                } else {
-                    false
-                }
-            })
-            .map(|(_, value)| *value)
-            .collect()
+        get_forbidden_values(&self.dimensions, &self.storage)
     }
     
     fn get_required(&self) -> Vec<Vec<u16>> {
-        let current_logical = self.get_current_logical_coordinate();
-        let logical_coords = get_logical_coordinates(&self.dimensions);
-        
-        // Stage 1: Use cached required coordinate lists
-        let required_coordinate_lists = get_required_coordinate_lists(&self.dimensions, &current_logical);
-        
-        // Stage 2: Turn those coordinates into numbers contained by the storage 
-        // by mapping them back to flat and looking them up
-        required_coordinate_lists.into_iter()
-            .map(|coord_list| {
-                coord_list.into_iter()
-                    .filter_map(|coords| {
-                        // Find the index of these coordinates in our logical coordinate system
-                        logical_coords.iter().position(|c| c == &coords)
-                            .and_then(|index| {
-                                // Look up the stored value at that index
-                                if index < self.storage.len() {
-                                    Some(self.storage[index])
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .collect()
-            })
-            .filter(|axis_values: &Vec<u16>| !axis_values.is_empty())
-            .collect()
+        get_required_values(&self.dimensions, &self.storage)
     }
 
     pub(crate) fn add(&self, to_add: u16, version: u64) -> Ortho {
@@ -274,18 +267,26 @@ mod tests {
     }
     
     #[test]
-    fn test_get_current_shell() {
+    fn test_get_current_logical_coordinate_shells() {
         let mut ortho = Ortho::new(1);
-        assert_eq!(ortho.get_current_shell(), 0); // [0,0] -> sum = 0
+        let current = ortho.get_current_logical_coordinate();
+        assert_eq!(current, vec![0, 0]); // shell = 0
+        assert_eq!(current.iter().sum::<u16>(), 0);
         
         ortho.storage.push(10);
-        assert_eq!(ortho.get_current_shell(), 1); // [0,1] -> sum = 1
+        let current = ortho.get_current_logical_coordinate();
+        assert_eq!(current, vec![0, 1]); // shell = 1
+        assert_eq!(current.iter().sum::<u16>(), 1);
         
         ortho.storage.push(20);
-        assert_eq!(ortho.get_current_shell(), 1); // [1,0] -> sum = 1
+        let current = ortho.get_current_logical_coordinate();
+        assert_eq!(current, vec![1, 0]); // shell = 1
+        assert_eq!(current.iter().sum::<u16>(), 1);
         
         ortho.storage.push(30);
-        assert_eq!(ortho.get_current_shell(), 2); // [1,1] -> sum = 2
+        let current = ortho.get_current_logical_coordinate();
+        assert_eq!(current, vec![1, 1]); // shell = 2
+        assert_eq!(current.iter().sum::<u16>(), 2);
     }
     
     #[test]
@@ -415,28 +416,34 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_caching() {
-        // Test that shell calculations are cached
-        let ortho = Ortho::with_dimensions(1, vec![3, 2]);
+    fn test_forbidden_caching() {
+        // Test that forbidden calculations are cached
+        let mut ortho = Ortho::with_dimensions(1, vec![3, 2]);
         
         // Multiple calls should return same values (from cache)
-        assert_eq!(ortho.get_current_shell(), 0); // Position 0 -> [0,0] -> shell 0
-        assert_eq!(ortho.get_current_shell(), 0); // Should use cached value
+        let forbidden1 = ortho.get_forbidden(); 
+        let forbidden2 = ortho.get_forbidden(); 
+        assert_eq!(forbidden1, forbidden2);
+        assert!(forbidden1.is_empty()); // Empty storage means no forbidden values
         
-        let ortho2 = ortho.add(100, 2);
-        assert_eq!(ortho2.get_current_shell(), 1); // Position 1 -> [0,1] -> shell 1
-        assert_eq!(ortho2.get_current_shell(), 1); // Should use cached value
+        ortho.storage.push(100); // [0,0] shell 0
+        ortho.storage.push(200); // [0,1] shell 1
+        // Current position is [1,0] shell 1
         
-        let ortho3 = ortho2.add(200, 3);  
-        assert_eq!(ortho3.get_current_shell(), 1); // Position 2 -> [1,0] -> shell 1
+        // Should cache forbidden values for this state
+        let forbidden3 = ortho.get_forbidden(); 
+        let forbidden4 = ortho.get_forbidden();
+        assert_eq!(forbidden3, forbidden4);
+        assert_eq!(forbidden3, vec![200]); // Value at [0,1] has same shell as current [1,0]
         
         // Test different dimensions cache separately
         let ortho_diff = Ortho::with_dimensions(1, vec![2, 2]);
-        assert_eq!(ortho_diff.get_current_shell(), 0); // Should work with different dimensions
+        let forbidden_diff = ortho_diff.get_forbidden();
+        assert!(forbidden_diff.is_empty()); // Should work with different dimensions
     }
 
     #[test]
-    fn test_required_coordinate_lists_caching() {
+    fn test_required_values_caching() {
         let mut ortho = Ortho::with_dimensions(1, vec![3, 2]);
         ortho.storage.push(100); // [0,0]
         ortho.storage.push(200); // [0,1] 
