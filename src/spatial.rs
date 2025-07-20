@@ -10,6 +10,10 @@ thread_local! {
     static FULL_CACHE: RefCell<HashMap<(usize, Vec<usize>), bool>> = RefCell::new(HashMap::new());
 }
 
+pub fn base(dims: &[usize]) -> bool {
+    dims.iter().all(|&x| x == 2)
+}
+
 fn _next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
     let mut results = Vec::new();
 
@@ -213,6 +217,10 @@ fn cartesian_product<T: Clone>(lists: Vec<Vec<T>>) -> Vec<Vec<T>> {
     }
 }
 
+fn capacity(dims: &[usize]) -> usize {
+    dims.iter().product()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,4 +353,29 @@ mod tests {
         // over squat
         assert_eq!(next_shapes(&vec![3, 3]), vec![vec![4, 3]]);
     }
+
+    #[test]
+    fn it_provides_capacity_information_by_shape() {
+        assert_eq!(capacity(&vec![2, 2]), 4);
+        assert_eq!(capacity(&vec![2, 2, 2]), 8);
+        assert_eq!(capacity(&vec![3, 2]), 6);
+        assert_eq!(capacity(&vec![4, 2]), 8);
+        assert_eq!(capacity(&vec![3, 3]), 9);
+    }
+
+    #[test]
+    fn it_determines_if_dims_are_base() {
+        assert_eq!(base(&vec![]), true);
+        assert_eq!(base(&vec![2]), true);
+        assert_eq!(base(&vec![2, 2]), true);
+        assert_eq!(base(&vec![2, 2, 2]), true);
+        assert_eq!(base(&vec![3, 2]), false);
+        assert_eq!(base(&vec![4, 2]), false);
+        assert_eq!(base(&vec![3, 3]), false);
+    }
+
+    // one for shape up and one for shape over - shape up takes an insert position. Both take dims. Bear in mind no convolution (pad) for over even on up.
+    // special case of over on [2] - don't produce [3].
+    // cache all functions called by ortho and nothing else 
+    // up and over shape returns both the new shape and the reorganization pattern for the payload paired together.
 }

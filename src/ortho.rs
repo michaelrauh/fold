@@ -38,4 +38,8 @@ mod tests {
         assert_eq!(ortho.dims, vec![2, 2]);
         assert_eq!(ortho.payload, vec![]);
     }
+
+    // check capacity to see if a shape change is needed
+    // start at rank 0: []
+    // one call for requirements, one for capacity, one for whether it is base, one for shape up and one for shape over
 }
