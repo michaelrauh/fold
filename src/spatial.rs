@@ -1,6 +1,87 @@
+use std::cell::RefCell;
 use std::{cmp::Ordering, collections::HashMap};
 
 use itertools::Itertools;
+
+thread_local! {
+    static IMPACTED_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<Vec<usize>>>>> = RefCell::new(HashMap::new());
+    static DIAGONAL_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
+    static NEXT_SHAPES_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
+    static FULL_CACHE: RefCell<HashMap<(usize, Vec<usize>), bool>> = RefCell::new(HashMap::new());
+}
+
+fn _next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
+    let mut results = Vec::new();
+
+    if dims.iter().all(|&x| x == 2) {
+        let mut up = dims.to_vec();
+        up.push(2);
+        results.push(up);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for (i, &val) in dims.iter().enumerate() {
+        if seen.insert(val) {
+            let mut new_shape = dims.to_vec();
+            new_shape[i] += 1;
+            results.push(new_shape);
+        }
+    }
+
+    results
+}
+
+pub fn next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
+    NEXT_SHAPES_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
+            .entry(dims.to_vec())
+            .or_insert_with(|| _next_shapes(dims))
+            .clone()
+    })
+}
+
+fn _full(length: usize, dims: &[usize]) -> bool {
+    let total = dims.iter().product::<usize>();
+    length == total
+}
+
+pub fn full(length: usize, dims: &[usize]) -> bool {
+    FULL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
+            .entry((length, dims.to_vec()))
+            .or_insert_with(|| _full(length, dims))
+            .clone()
+    })
+}
+
+fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
+    (
+        impacted_phrase_location_at(loc, dims),
+        diagonal_at(loc, dims),
+    )
+}
+
+fn impacted_phrase_location_at(loc: usize, dims: &[usize]) -> Vec<Vec<usize>> {
+    IMPACTED_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let impacted = cache
+            .entry(dims.to_vec())
+            .or_insert_with(|| get_impacted_phrase_locations(dims));
+        impacted[loc].clone()
+    })
+}
+
+fn diagonal_at(loc: usize, dims: &[usize]) -> Vec<usize> {
+    DIAGONAL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let diagonal = cache
+            .entry(dims.to_vec())
+            .or_insert_with(|| get_diagonals(dims));
+        diagonal[loc].clone()
+    })
+}
 
 fn indices_in_order(dims: &[usize]) -> Vec<Vec<usize>> {
     order_by_distance(index_array(dims))
@@ -43,7 +124,7 @@ fn impacted_locations(
     res
 }
 
-pub fn get_impacted_phrase_locations(dims: &[usize]) -> Vec<Vec<Vec<usize>>> {
+fn get_impacted_phrase_locations(dims: &[usize]) -> Vec<Vec<Vec<usize>>> {
     let location_to_index = location_to_index_mapping(dims);
     let index_to_location = index_to_location_mapping(dims);
 
@@ -53,7 +134,7 @@ pub fn get_impacted_phrase_locations(dims: &[usize]) -> Vec<Vec<Vec<usize>>> {
         .collect()
 }
 
-pub fn get_diagonals(dims: &[usize]) -> Vec<Vec<usize>> {
+fn get_diagonals(dims: &[usize]) -> Vec<Vec<usize>> {
     let location_to_index = location_to_index_mapping(dims);
     let index_to_location = index_to_location_mapping(dims);
     let indices = indices_in_order(dims);
@@ -66,8 +147,7 @@ pub fn get_diagonals(dims: &[usize]) -> Vec<Vec<usize>> {
             indices
                 .iter()
                 .filter(|index| {
-                    *index < current_index
-                        && index.iter().sum::<usize>() == current_distance
+                    *index < current_index && index.iter().sum::<usize>() == current_distance
                 })
                 .map(|x| location_to_index[x])
                 .collect_vec()
@@ -225,5 +305,44 @@ mod tests {
                 vec![]
             ]
         )
+    }
+
+    #[test]
+    fn it_takes_a_position_and_returns_impacted_phrases() {
+        assert_eq!(
+            impacted_phrase_location_at(3, &[2, 2]),
+            vec![vec![1], vec![2]]
+        )
+    }
+
+    #[test]
+    fn it_takes_a_position_and_returns_impacted_diagonal() {
+        assert_eq!(diagonal_at(5, &[3, 3]), vec![3, 4])
+    }
+
+    #[test]
+    fn it_determines_if_a_shape_is_full() {
+        assert_eq!(full(5, &[3, 3]), false);
+        assert_eq!(full(9, &[3, 3]), true);
+    }
+
+    #[test]
+    fn it_finds_next_shapes() {
+        assert_eq!(next_shapes(&vec![2, 2]), vec![vec![2, 2, 2], vec![3, 2]]);
+
+        // up result
+        assert_eq!(
+            next_shapes(&vec![2, 2, 2]),
+            vec![vec![2, 2, 2, 2], vec![3, 2, 2]]
+        );
+
+        // over result
+        assert_eq!(next_shapes(&vec![3, 2]), vec![vec![4, 2], vec![3, 3]]);
+
+        // over tall
+        assert_eq!(next_shapes(&vec![4, 2]), vec![vec![5, 2], vec![4, 3]]);
+
+        // over squat
+        assert_eq!(next_shapes(&vec![3, 3]), vec![vec![4, 3]]);
     }
 }
