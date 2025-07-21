@@ -42,7 +42,7 @@ pub fn base(dims: &[usize]) -> bool {
 
 
 
-pub fn next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
+fn next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
     if dims.len() < 2 {
         return Vec::new();
     }
@@ -74,10 +74,6 @@ pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
         .collect()
 }
 
-fn _full(length: usize, dims: &[usize]) -> bool {
-    let total = dims.iter().product::<usize>();
-    length == total
-}
 
 fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
     (
