@@ -19,6 +19,18 @@ pub fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+pub fn remap_for_up(old_dims: &[usize], position: usize) -> Vec<usize> {
+    let padded_positions = pad(old_dims, position);
+    let mut new_dims = old_dims.to_vec();
+    new_dims.insert(old_dims.len() - position, 2);
+    let mapping = location_to_index_mapping(&new_dims);
+
+    padded_positions
+        .iter()
+        .map(|pos| *mapping.get(pos).expect("Position not found in new dimensions"))
+        .collect()
+}
+
 pub fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
     indices_in_order(dims)
         .into_iter()
@@ -390,6 +402,24 @@ mod tests {
         assert_eq!(pad(&vec![2, 2], 0), vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]);
         assert_eq!(pad(&vec![2, 2], 1), vec![vec![0, 0, 0], vec![0, 0, 1], vec![1, 0, 0], vec![1, 0, 1]]);
         assert_eq!(pad(&vec![2, 2], 2), vec![vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1]]);
+    }
+
+    #[test]
+    fn it_determines_the_reorganization_pattern_for_up() {
+        assert_eq!(remap_for_up(&vec![2, 2], 0), vec![0, 2, 3, 6]);
+        assert_eq!(remap_for_up(&vec![2, 2], 1), vec![0, 1, 3, 5]);
+        assert_eq!(remap_for_up(&vec![2, 2], 2), vec![0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn it_handles_remap_for_up_with_larger_dimensions() {
+        // Test with 3x2 dimensions, position 0 -> should become 2x3x2
+        let result = remap_for_up(&vec![3, 2], 0);
+        assert_eq!(result.len(), 6); // original size
+        
+        // Test with 2x2x2 dimensions, position 0 -> should become 2x2x2x2
+        let result = remap_for_up(&vec![2, 2, 2], 0);
+        assert_eq!(result.len(), 8); // original size
     }
 
     // define remap for up - use pad and reference remap. 
