@@ -25,13 +25,7 @@ pub fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
 
 pub fn remap_for_up(old_dims: &[usize], position: usize) -> Vec<usize> {
     let padded_positions = pad(old_dims, position);
-    let insert_at = old_dims.len() - position;
-    let new_dims = old_dims[..insert_at]
-        .iter()
-        .chain(std::iter::once(&2))
-        .chain(old_dims[insert_at..].iter())
-        .cloned()
-        .collect::<Vec<usize>>();
+    let new_dims = old_dims.iter().chain(std::iter::once(&2)).cloned().collect::<Vec<usize>>();
     let mapping = location_to_index_mapping(&new_dims);
 
     apply_mapping(&padded_positions, &mapping)
