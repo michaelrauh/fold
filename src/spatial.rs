@@ -46,34 +46,23 @@ pub fn base(dims: &[usize]) -> bool {
 }
 
 fn _next_shapes_up(dims: &[usize]) -> Vec<Vec<usize>> {
-    let mut results = Vec::new();
-    if dims.iter().all(|&x| x == 2) {
-        let mut up = dims.to_vec();
-        up.push(2);
-        results.push(up);
-    }
-    results
+    vec![dims.iter().cloned().chain(std::iter::once(2)).collect()]
 }
 
 fn _next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
+    if dims.len() < 2 {
+        return Vec::new();
+    }
+    
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, &val) in dims.iter().enumerate() {
         if seen.insert(val) {
             let mut new_shape = dims.to_vec();
             new_shape[i] += 1;
-            if !(dims == &[2] && new_shape == &[3]) {
-                results.push(new_shape);
-            }
+            results.push(new_shape);
         }
     }
-    results
-}
-
-fn _next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
-    let mut results = Vec::new();
-    results.extend(_next_shapes_up(dims));
-    results.extend(_next_shapes_over(dims));
     results
 }
 
@@ -82,7 +71,14 @@ pub fn next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
         let mut cache = cache.borrow_mut();
         cache
             .entry(dims.to_vec())
-            .or_insert_with(|| _next_shapes(dims))
+            .or_insert_with(|| {
+                let mut results = Vec::new();
+                if dims.iter().all(|&x| x == 2) {
+                    results.extend(_next_shapes_up(dims));
+                }
+                results.extend(_next_shapes_over(dims));
+                results
+            })
             .clone()
     })
 }
@@ -455,13 +451,16 @@ mod tests {
 
         assert_eq!(
             expand_for_over(&vec![3, 3]),
-            vec![(vec![4, 3], remap(&vec![3, 3], &vec![4, 3]))]
+            vec![(vec![4, 3], vec![0, 1, 2, 3, 4, 5, 6, 7, 9])]
         );
     }
 
     #[test]
     fn it_expands_for_over_edge_cases() {
         let result = expand_for_over(&vec![2]);
+        assert_eq!(result, vec![]);
+        
+        let result = expand_for_over(&vec![]);
         assert_eq!(result, vec![]);
     }
 
