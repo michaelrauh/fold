@@ -9,26 +9,32 @@ thread_local! {
     static NEXT_SHAPES_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
 }
 
-pub fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
-    let old_positions = indices_in_order(old_dims);
-    let mapping = location_to_index_mapping(new_dims);
-
-    old_positions
+fn apply_mapping(positions: &[Vec<usize>], mapping: &HashMap<Vec<usize>, usize>) -> Vec<usize> {
+    positions
         .iter()
         .map(|pos| *mapping.get(pos).expect("Position not found in new dimensions"))
         .collect()
 }
 
+pub fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
+    let old_positions = indices_in_order(old_dims);
+    let mapping = location_to_index_mapping(new_dims);
+
+    apply_mapping(&old_positions, &mapping)
+}
+
 pub fn remap_for_up(old_dims: &[usize], position: usize) -> Vec<usize> {
     let padded_positions = pad(old_dims, position);
     let insert_at = old_dims.len() - position;
-    let new_dims = [&old_dims[..insert_at], &[2], &old_dims[insert_at..]].concat();
+    let new_dims = old_dims[..insert_at]
+        .iter()
+        .chain(std::iter::once(&2))
+        .chain(old_dims[insert_at..].iter())
+        .cloned()
+        .collect::<Vec<usize>>();
     let mapping = location_to_index_mapping(&new_dims);
 
-    padded_positions
-        .iter()
-        .map(|pos| *mapping.get(pos).expect("Position not found in new dimensions"))
-        .collect()
+    apply_mapping(&padded_positions, &mapping)
 }
 
 pub fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
@@ -413,7 +419,6 @@ mod tests {
 
 
 
-    // define remap for up - use pad and reference remap. 
     // define expand for over - return new shape paired with the reorganization pattern for the payload. Take in the old shape
     // define expand for up - return new shape paired with the reorganization pattern for the payload. Take in the old shape and the position to pad.
     // special case of over on [2] - don't produce [3].
