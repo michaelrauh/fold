@@ -7,7 +7,26 @@ thread_local! {
     static IMPACTED_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<Vec<usize>>>>> = RefCell::new(HashMap::new());
     static DIAGONAL_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
     static NEXT_SHAPES_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
-    static FULL_CACHE: RefCell<HashMap<(usize, Vec<usize>), bool>> = RefCell::new(HashMap::new());
+}
+
+pub fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
+    let old_positions = indices_in_order(old_dims);
+    let mapping = location_to_index_mapping(new_dims);
+
+    old_positions
+        .iter()
+        .map(|pos| *mapping.get(pos).expect("Position not found in new dimensions"))
+        .collect()
+}
+
+pub fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
+    indices_in_order(dims)
+        .into_iter()
+        .map(|mut indices| {
+            indices.insert(position, 0);
+            indices
+        })
+        .collect()
 }
 
 pub fn base(dims: &[usize]) -> bool {
@@ -48,16 +67,6 @@ pub fn next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
 fn _full(length: usize, dims: &[usize]) -> bool {
     let total = dims.iter().product::<usize>();
     length == total
-}
-
-pub fn full(length: usize, dims: &[usize]) -> bool {
-    FULL_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache
-            .entry((length, dims.to_vec()))
-            .or_insert_with(|| _full(length, dims))
-            .clone()
-    })
 }
 
 fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
@@ -329,12 +338,6 @@ mod tests {
     }
 
     #[test]
-    fn it_determines_if_a_shape_is_full() {
-        assert_eq!(full(5, &[3, 3]), false);
-        assert_eq!(full(9, &[3, 3]), true);
-    }
-
-    #[test]
     fn it_finds_next_shapes() {
         assert_eq!(next_shapes(&vec![2, 2]), vec![vec![2, 2, 2], vec![3, 2]]);
 
@@ -374,8 +377,24 @@ mod tests {
         assert_eq!(base(&vec![3, 3]), false);
     }
 
-    // one for shape up and one for shape over - shape up takes an insert position. Both take dims. Bear in mind no convolution (pad) for over even on up.
+    #[test]
+    fn it_determines_the_reorganization_pattern_for_over() {
+        assert_eq!(remap(&vec![2, 2], &vec![3, 2]), vec![0, 1, 2, 3]);
+        assert_eq!(remap(&vec![3, 2], &vec![4, 2]), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(remap(&vec![3, 2], &vec![3, 3]), vec![0, 1, 2, 4, 5, 7]);
+
+    }
+
+    #[test]
+    fn it_pads_at_a_position_for_up() {
+        assert_eq!(pad(&vec![2, 2], 0), vec![vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1]]);
+        assert_eq!(pad(&vec![2, 2], 1), vec![vec![0, 0, 0], vec![0, 0, 1], vec![1, 0, 0], vec![1, 0, 1]]);
+        assert_eq!(pad(&vec![2, 2], 2), vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]);
+    }
+
+    // define remap for up - use pad and reference remap. 
+    // define expand for over - return new shape paired with the reorganization pattern for the payload. Take in the old shape
+    // define expand for up - return new shape paired with the reorganization pattern for the payload. Take in the old shape and the position to pad.
     // special case of over on [2] - don't produce [3].
     // cache all functions called by ortho and nothing else 
-    // up and over shape returns both the new shape and the reorganization pattern for the payload paired together.
 }
