@@ -23,7 +23,7 @@ pub fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
     indices_in_order(dims)
         .into_iter()
         .map(|mut indices| {
-            indices.insert(position, 0);
+            indices.insert(dims.len() - position, 0);
             indices
         })
         .collect()
@@ -387,9 +387,9 @@ mod tests {
 
     #[test]
     fn it_pads_at_a_position_for_up() {
-        assert_eq!(pad(&vec![2, 2], 0), vec![vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1]]);
+        assert_eq!(pad(&vec![2, 2], 0), vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]);
         assert_eq!(pad(&vec![2, 2], 1), vec![vec![0, 0, 0], vec![0, 0, 1], vec![1, 0, 0], vec![1, 0, 1]]);
-        assert_eq!(pad(&vec![2, 2], 2), vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]);
+        assert_eq!(pad(&vec![2, 2], 2), vec![vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1]]);
     }
 
     // define remap for up - use pad and reference remap. 
