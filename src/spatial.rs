@@ -1,13 +1,8 @@
-use std::cell::RefCell;
 use std::{cmp::Ordering, collections::HashMap};
 
 use itertools::Itertools;
 
-thread_local! {
-    static IMPACTED_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<Vec<usize>>>>> = RefCell::new(HashMap::new());
-    static DIAGONAL_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
-    static NEXT_SHAPES_CACHE: RefCell<HashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(HashMap::new());
-}
+
 
 fn apply_mapping(positions: &[Vec<usize>], mapping: &HashMap<Vec<usize>, usize>) -> Vec<usize> {
     positions
@@ -45,11 +40,9 @@ pub fn base(dims: &[usize]) -> bool {
     dims.iter().all(|&x| x == 2)
 }
 
-fn _next_shapes_up(dims: &[usize]) -> Vec<Vec<usize>> {
-    vec![dims.iter().cloned().chain(std::iter::once(2)).collect()]
-}
 
-fn _next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
+
+pub fn next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
     if dims.len() < 2 {
         return Vec::new();
     }
@@ -66,26 +59,8 @@ fn _next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
     results
 }
 
-pub fn next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
-    NEXT_SHAPES_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache
-            .entry(dims.to_vec())
-            .or_insert_with(|| {
-                let mut results = Vec::new();
-                if dims.iter().all(|&x| x == 2) {
-                    results.extend(_next_shapes_up(dims));
-                }
-                results.extend(_next_shapes_over(dims));
-                results
-            })
-            .clone()
-    })
-}
 
-pub fn next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
-    _next_shapes_over(dims)
-}
+
 
 pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
     let over_shapes = next_shapes_over(old_dims);
@@ -112,23 +87,13 @@ fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec
 }
 
 fn impacted_phrase_location_at(loc: usize, dims: &[usize]) -> Vec<Vec<usize>> {
-    IMPACTED_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let impacted = cache
-            .entry(dims.to_vec())
-            .or_insert_with(|| get_impacted_phrase_locations(dims));
-        impacted[loc].clone()
-    })
+    let impacted = get_impacted_phrase_locations(dims);
+    impacted[loc].clone()
 }
 
 fn diagonal_at(loc: usize, dims: &[usize]) -> Vec<usize> {
-    DIAGONAL_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let diagonal = cache
-            .entry(dims.to_vec())
-            .or_insert_with(|| get_diagonals(dims));
-        diagonal[loc].clone()
-    })
+    let diagonal = get_diagonals(dims);
+    diagonal[loc].clone()
 }
 
 fn indices_in_order(dims: &[usize]) -> Vec<Vec<usize>> {
@@ -372,25 +337,7 @@ mod tests {
         assert_eq!(diagonal_at(5, &[3, 3]), vec![3, 4])
     }
 
-    #[test]
-    fn it_finds_next_shapes() {
-        assert_eq!(next_shapes(&vec![2, 2]), vec![vec![2, 2, 2], vec![3, 2]]);
 
-        // up result
-        assert_eq!(
-            next_shapes(&vec![2, 2, 2]),
-            vec![vec![2, 2, 2, 2], vec![3, 2, 2]]
-        );
-
-        // over result
-        assert_eq!(next_shapes(&vec![3, 2]), vec![vec![4, 2], vec![3, 3]]);
-
-        // over tall
-        assert_eq!(next_shapes(&vec![4, 2]), vec![vec![5, 2], vec![4, 3]]);
-
-        // over squat
-        assert_eq!(next_shapes(&vec![3, 3]), vec![vec![4, 3]]);
-    }
 
     #[test]
     fn it_provides_capacity_information_by_shape() {
