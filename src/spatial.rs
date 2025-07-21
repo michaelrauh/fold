@@ -76,6 +76,29 @@ pub fn next_shapes(dims: &[usize]) -> Vec<Vec<usize>> {
     })
 }
 
+pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let all_next_shapes = next_shapes(old_dims);
+    
+    // Filter to only "over" shapes (same number of dimensions, but values increased)
+    // Special case: [2] should not produce [3] for over operations
+    let over_shapes: Vec<Vec<usize>> = all_next_shapes
+        .into_iter()
+        .filter(|shape| {
+            shape.len() == old_dims.len() && 
+            !(old_dims == &[2] && shape == &[3])  // Special case exclusion
+        })
+        .collect();
+    
+    // For each over shape, calculate the reorganization pattern
+    over_shapes
+        .into_iter()
+        .map(|new_shape| {
+            let reorganization_pattern = remap(old_dims, &new_shape);
+            (new_shape, reorganization_pattern)
+        })
+        .collect()
+}
+
 fn _full(length: usize, dims: &[usize]) -> bool {
     let total = dims.iter().product::<usize>();
     length == total
@@ -409,6 +432,41 @@ mod tests {
         assert_eq!(remap_for_up(&vec![2, 2], 0), vec![0, 2, 3, 6]);
         assert_eq!(remap_for_up(&vec![2, 2], 1), vec![0, 1, 3, 5]);
         assert_eq!(remap_for_up(&vec![2, 2], 2), vec![0, 1, 2, 4]);
+    }
+
+    #[test]
+    fn it_expands_for_over() {
+        // Test case: [2, 2] -> [(3, 2), (0, 1, 2, 3)]
+        assert_eq!(
+            expand_for_over(&vec![2, 2]),
+            vec![(vec![3, 2], vec![0, 1, 2, 3])]
+        );
+
+        // Test case: [3, 2] -> [(4, 2), (0, 1, 2, 3, 4, 5)] and [(3, 3), (0, 1, 2, 4, 5, 7)]
+        assert_eq!(
+            expand_for_over(&vec![3, 2]),
+            vec![
+                (vec![4, 2], vec![0, 1, 2, 3, 4, 5]),
+                (vec![3, 3], vec![0, 1, 2, 4, 5, 7])
+            ]
+        );
+
+        // Test case: [3, 3] -> [(4, 3), reorganization_pattern]
+        let result = expand_for_over(&vec![3, 3]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![4, 3]);
+        // The reorganization pattern should be calculated by remap
+        assert_eq!(result[0].1, remap(&vec![3, 3], &vec![4, 3]));
+    }
+
+    #[test]
+    fn it_expands_for_over_edge_cases() {
+        // Test case: [2] should not produce [3] (special case mentioned in comments)
+        let result = expand_for_over(&vec![2]);
+        
+        // Based on the special case comment, this should be empty
+        // because [2] -> [3] should not be produced for over operations
+        assert_eq!(result, vec![]);
     }
 
 
