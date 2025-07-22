@@ -75,51 +75,43 @@ pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
 }
 
 pub fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
-    // Handle edge case for empty dims
+    // Handle edge case for empty dims - return [2]
     if old_dims.is_empty() {
-        return vec![];
+        let new_dims = vec![2];
+        let reorganization_pattern = vec![0];
+        return vec![(new_dims, reorganization_pattern)];
     }
     
-    // For [2, 2] cases, the expected behavior seems to be:
-    // Position 0: [3, 2, 2] - expand at position from start
-    // Position 1: [2, 3, 2] 
-    // Position 2: [2, 2, 3]
+    // Always apply up (append 2) followed by over transformations
+    let up_dims = create_up_dims(old_dims);
+    let over_shapes = next_shapes_over(&up_dims);
     
-    // For other cases like [3, 2], generate multiple over expansions
-    if old_dims.iter().all(|&x| x == 2) {
-        // All-2 case: just insert 3 at the specified position from the end
-        let mut final_shape = old_dims.to_vec();
-        final_shape.insert(position, 3);
-        let reorganization_pattern = remap_for_up(old_dims, position);
-        vec![(final_shape, reorganization_pattern)]
-    } else {
-        // Non-all-2 case: apply the up+over pattern
-        let up_dims = create_up_dims(old_dims);
-        let over_shapes = next_shapes_over(&up_dims);
-        
-        over_shapes
-            .into_iter()
-            .map(|final_shape| {
-                let reorganization_pattern = compute_up_over_remap(old_dims, position, &final_shape);
-                (final_shape, reorganization_pattern)
-            })
-            .collect()
-    }
+    // Return only the over transformations applied to the up result
+    over_shapes
+        .into_iter()
+        .map(|over_shape| {
+            let reorganization_pattern = compute_up_over_remap(old_dims, position, &over_shape);
+            (over_shape, reorganization_pattern)
+        })
+        .collect()
 }
 
 fn create_up_dims(old_dims: &[usize]) -> Vec<usize> {
     // Always append dimension of size 2, matching remap_for_up behavior
-    let mut up_dims = old_dims.to_vec();
-    up_dims.push(2);
+    let up_dims = old_dims.iter().chain(std::iter::once(&2)).cloned().collect();
     up_dims
 }
 
 fn compute_up_over_remap(old_dims: &[usize], position: usize, final_dims: &[usize]) -> Vec<usize> {
-    // Get the padded positions (what remap_for_up computes internally)
-    let padded_positions = pad(old_dims, position);
-    let mapping = location_to_index_mapping(final_dims);
+    // First apply up transformation
+    let up_remap = remap_for_up(old_dims, position);
+    let up_dims = create_up_dims(old_dims);
     
-    apply_mapping(&padded_positions, &mapping)
+    // Then apply over transformation from up_dims to final_dims
+    let over_remap = remap(&up_dims, final_dims);
+    
+    // Chain the transformations: apply up_remap first, then over_remap
+    up_remap.into_iter().map(|i| over_remap[i]).collect()
 }
 
 
@@ -465,12 +457,12 @@ mod tests {
         
         assert_eq!(
             expand_for_up(&vec![2, 2], 1),
-            vec![(vec![2, 3, 2], vec![0, 1, 3, 5])]
+            vec![(vec![3, 2, 2], vec![0, 1, 3, 5])]
         );
         
         assert_eq!(
             expand_for_up(&vec![2, 2], 2),
-            vec![(vec![2, 2, 3], vec![0, 1, 2, 4])]
+            vec![(vec![3, 2, 2], vec![0, 1, 2, 4])]
         );
     }
 
@@ -495,9 +487,9 @@ mod tests {
         let result = expand_for_up(&vec![2], 0);
         assert_eq!(result, vec![(vec![3, 2], vec![0, 2])]);
         
-        // Test with empty dims
+        // Test with empty dims - should return [2]
         let result = expand_for_up(&vec![], 0);
-        assert_eq!(result, vec![]);
+        assert_eq!(result, vec![(vec![2], vec![0])]);
     }
 
 
