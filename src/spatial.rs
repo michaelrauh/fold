@@ -75,44 +75,36 @@ pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
 }
 
 pub fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
-    // Handle edge case for empty dims - return [2]
-    if old_dims.is_empty() {
-        let new_dims = vec![2];
-        let reorganization_pattern = vec![0];
-        return vec![(new_dims, reorganization_pattern)];
+    // Get over transformations from the base shape
+    let over_results = expand_for_over(old_dims);
+    
+    if over_results.is_empty() {
+        // Handle cases where expand_for_over returns empty (single dims, empty dims)
+        if old_dims.is_empty() {
+            // For empty dims, return [2]
+            return vec![(vec![2], vec![0])];
+        } else if old_dims.len() == 1 {
+            // For single dimension [n], create [n+1, 2] with up reorganization
+            let up_over_shape = vec![old_dims[0] + 1, 2];
+            let reorganization_pattern = remap_for_up(old_dims, position);
+            return vec![(up_over_shape, reorganization_pattern)];
+        }
+        return vec![];
     }
     
-    // Always apply up (append 2) followed by over transformations
-    let up_dims = create_up_dims(old_dims);
-    let over_shapes = next_shapes_over(&up_dims);
-    
-    // Return only the over transformations applied to the up result
-    over_shapes
+    // For each over result, add an up dimension and use up reorganization
+    over_results
         .into_iter()
-        .map(|over_shape| {
-            let reorganization_pattern = compute_up_over_remap(old_dims, position, &over_shape);
-            (over_shape, reorganization_pattern)
+        .map(|(over_shape, _)| {
+            // Add up dimension to the over shape
+            let up_over_shape = over_shape.iter().chain(std::iter::once(&2)).cloned().collect();
+            // Use the up reorganization pattern from original dims
+            let reorganization_pattern = remap_for_up(old_dims, position);
+            (up_over_shape, reorganization_pattern)
         })
         .collect()
 }
 
-fn create_up_dims(old_dims: &[usize]) -> Vec<usize> {
-    // Always append dimension of size 2, matching remap_for_up behavior
-    let up_dims = old_dims.iter().chain(std::iter::once(&2)).cloned().collect();
-    up_dims
-}
-
-fn compute_up_over_remap(old_dims: &[usize], position: usize, final_dims: &[usize]) -> Vec<usize> {
-    // First apply up transformation
-    let up_remap = remap_for_up(old_dims, position);
-    let up_dims = create_up_dims(old_dims);
-    
-    // Then apply over transformation from up_dims to final_dims
-    let over_remap = remap(&up_dims, final_dims);
-    
-    // Chain the transformations: apply up_remap first, then over_remap
-    up_remap.into_iter().map(|i| over_remap[i]).collect()
-}
 
 
 fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
