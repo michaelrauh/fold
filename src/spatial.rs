@@ -75,34 +75,19 @@ pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
 }
 
 pub fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
-    // Get over transformations from the base shape
+    // Get over results from expand_for_over on the base shape
     let over_results = expand_for_over(old_dims);
     
-    if over_results.is_empty() {
-        // Handle cases where expand_for_over returns empty (single dims, empty dims)
-        if old_dims.is_empty() {
-            // For empty dims, return [2]
-            return vec![(vec![2], vec![0])];
-        } else if old_dims.len() == 1 {
-            // For single dimension [n], create [n+1, 2] with up reorganization
-            let up_over_shape = vec![old_dims[0] + 1, 2];
-            let reorganization_pattern = remap_for_up(old_dims, position);
-            return vec![(up_over_shape, reorganization_pattern)];
-        }
-        return vec![];
-    }
+    // Create the up result: new shape is old_dims ++ [2], reorganization is remap_for_up
+    let up_shape = old_dims.iter().chain(std::iter::once(&2)).cloned().collect();
+    let up_reorganization = remap_for_up(old_dims, position);
+    let up_result = (up_shape, up_reorganization);
     
-    // For each over result, add an up dimension and use up reorganization
-    over_results
-        .into_iter()
-        .map(|(over_shape, _)| {
-            // Add up dimension to the over shape
-            let up_over_shape = over_shape.iter().chain(std::iter::once(&2)).cloned().collect();
-            // Use the up reorganization pattern from original dims
-            let reorganization_pattern = remap_for_up(old_dims, position);
-            (up_over_shape, reorganization_pattern)
-        })
-        .collect()
+    // Combine over results and up result in a single vector
+    let mut results = over_results;
+    results.push(up_result);
+    
+    results
 }
 
 
