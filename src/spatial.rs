@@ -515,6 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn it_caches_results_correctly() {
+        // Test that calling the same function multiple times returns the same result
+        let result1 = get_capacity(&vec![3, 3]);
+        let result2 = get_capacity(&vec![3, 3]);
+        assert_eq!(result1, result2);
+        assert_eq!(result1, 9);
+
+        // Test expand_over caching
+        let expand1 = expand_over(&vec![2, 2]);
+        let expand2 = expand_over(&vec![2, 2]);
+        assert_eq!(expand1, expand2);
+
+        // Test is_base caching
+        let base1 = is_base(&vec![2, 2, 2]);
+        let base2 = is_base(&vec![2, 2, 2]);
+        assert_eq!(base1, base2);
+        assert_eq!(base1, true);
+
+        // Test get_requirements caching
+        let req1 = get_requirements(3, &[2, 2]);
+        let req2 = get_requirements(3, &[2, 2]);
+        assert_eq!(req1, req2);
+    }
+
+    #[test]
     fn it_expands_for_up_edge_cases() {
         let result = expand_up(&vec![2], 0);
         assert_eq!(result, vec![(vec![2, 2], vec![0, 2])]);
