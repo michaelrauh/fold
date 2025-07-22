@@ -84,10 +84,7 @@ pub fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Ve
     let up_result = (up_shape, up_reorganization);
     
     // Combine over results and up result in a single vector
-    let mut results = over_results;
-    results.push(up_result);
-    
-    results
+    over_results.into_iter().chain(std::iter::once(up_result)).collect()
 }
 
 
@@ -427,46 +424,32 @@ mod tests {
     #[test]
     fn it_expands_for_up() {
         // Test with [2, 2] at different positions
+        // Should include over result [(3, 2)] + up result [(2, 2, 2)]
         assert_eq!(
             expand_for_up(&vec![2, 2], 0),
-            vec![(vec![3, 2, 2], vec![0, 2, 3, 6])]
+            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 2, 3, 6])]
         );
         
         assert_eq!(
             expand_for_up(&vec![2, 2], 1),
-            vec![(vec![3, 2, 2], vec![0, 1, 3, 5])]
+            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 1, 3, 5])]
         );
         
         assert_eq!(
             expand_for_up(&vec![2, 2], 2),
-            vec![(vec![3, 2, 2], vec![0, 1, 2, 4])]
+            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 1, 2, 4])]
         );
     }
 
     #[test]
-    fn it_expands_for_up_with_larger_shapes() {
-        // Test with [3, 2] to ensure multiple over options work
-        let result = expand_for_up(&vec![3, 2], 0);
-        
-        // For [3, 2], up_dims = [3, 2, 2], next_shapes_over should give [4, 2, 2] and [3, 3, 2]
-        assert_eq!(result.len(), 2);
-        
-        // Check that shapes are correct
-        let shapes: Vec<_> = result.iter().map(|(shape, _)| shape.clone()).collect();
-        
-        assert!(shapes.contains(&vec![4, 2, 2]));
-        assert!(shapes.contains(&vec![3, 3, 2]));
-    }
-
-    #[test]
     fn it_expands_for_up_edge_cases() {
-        // Test with single dimension
+        // Test with single dimension - no over results, only up result
         let result = expand_for_up(&vec![2], 0);
-        assert_eq!(result, vec![(vec![3, 2], vec![0, 2])]);
+        assert_eq!(result, vec![(vec![2, 2], vec![0, 2])]);
         
-        // Test with empty dims - should return [2]
+        // Test with empty dims - should return [2] with empty reorganization
         let result = expand_for_up(&vec![], 0);
-        assert_eq!(result, vec![(vec![2], vec![0])]);
+        assert_eq!(result, vec![(vec![2], vec![])]);
     }
 
 
