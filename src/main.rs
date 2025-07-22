@@ -1,5 +1,5 @@
-mod ortho;
-mod spatial;
+pub mod ortho;
+pub mod spatial;
 
 fn main() {
     println!("Hello, world!");

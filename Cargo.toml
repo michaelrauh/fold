@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 itertools = "0.12"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "spatial_bench"
+harness = false
