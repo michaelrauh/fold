@@ -75,15 +75,12 @@ pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
 }
 
 pub fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
-    // Get over results from expand_for_over on the base shape
     let over_results = expand_for_over(old_dims);
     
-    // Create the up result: new shape is old_dims ++ [2], reorganization is remap_for_up
     let up_shape = old_dims.iter().chain(std::iter::once(&2)).cloned().collect();
     let up_reorganization = remap_for_up(old_dims, position);
     let up_result = (up_shape, up_reorganization);
     
-    // Combine over results and up result in a single vector
     over_results.into_iter().chain(std::iter::once(up_result)).collect()
 }
 
@@ -423,8 +420,6 @@ mod tests {
 
     #[test]
     fn it_expands_for_up() {
-        // Test with [2, 2] at different positions
-        // Should include over result [(3, 2)] + up result [(2, 2, 2)]
         assert_eq!(
             expand_for_up(&vec![2, 2], 0),
             vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 2, 3, 6])]
@@ -443,11 +438,9 @@ mod tests {
 
     #[test]
     fn it_expands_for_up_edge_cases() {
-        // Test with single dimension - no over results, only up result
         let result = expand_for_up(&vec![2], 0);
         assert_eq!(result, vec![(vec![2, 2], vec![0, 2])]);
         
-        // Test with empty dims - should return [2] with empty reorganization
         let result = expand_for_up(&vec![], 0);
         assert_eq!(result, vec![(vec![2], vec![])]);
     }
