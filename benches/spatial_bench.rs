@@ -28,7 +28,7 @@ fn bench_is_base(c: &mut Criterion) {
 fn bench_expand_up(c: &mut Criterion) {
     c.bench_function("expand_up", |b| {
         b.iter(|| {
-            expand_up(black_box(&[3, 2]), black_box(1))
+            expand_up(black_box(&[2, 2]), black_box(1))
         })
     });
 }
