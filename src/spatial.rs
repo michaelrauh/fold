@@ -74,6 +74,17 @@ pub fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
         .collect()
 }
 
+pub fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let over_results = expand_for_over(old_dims);
+    
+    let up_shape = old_dims.iter().chain(std::iter::once(&2)).cloned().collect();
+    let up_reorganization = remap_for_up(old_dims, position);
+    let up_result = (up_shape, up_reorganization);
+    
+    over_results.into_iter().chain(std::iter::once(up_result)).collect()
+}
+
+
 
 fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
     (
@@ -405,6 +416,33 @@ mod tests {
         
         let result = expand_for_over(&vec![]);
         assert_eq!(result, vec![]);
+    }
+
+    #[test]
+    fn it_expands_for_up() {
+        assert_eq!(
+            expand_for_up(&vec![2, 2], 0),
+            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 2, 3, 6])]
+        );
+        
+        assert_eq!(
+            expand_for_up(&vec![2, 2], 1),
+            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 1, 3, 5])]
+        );
+        
+        assert_eq!(
+            expand_for_up(&vec![2, 2], 2),
+            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 1, 2, 4])]
+        );
+    }
+
+    #[test]
+    fn it_expands_for_up_edge_cases() {
+        let result = expand_for_up(&vec![2], 0);
+        assert_eq!(result, vec![(vec![2, 2], vec![0, 2])]);
+        
+        let result = expand_for_up(&vec![], 0);
+        assert_eq!(result, vec![(vec![2], vec![])]);
     }
 
 
