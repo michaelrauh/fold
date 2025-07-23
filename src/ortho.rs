@@ -13,8 +13,8 @@ impl Ortho {
     pub fn new(version: usize) -> Self {
         Ortho {
             version,
-            dims: vec![],
-            payload: vec![],
+            dims: vec![2, 2],
+            payload: vec![None, None, None, None],
         }
     }
 
@@ -33,14 +33,44 @@ impl Ortho {
 
     pub fn add(&self, value: usize) -> Vec<Self> {
         if let Some(position) = self.get_current_position() {
+            // Check if adding this value would make the ortho full
+            let remaining_positions = self.payload.iter().skip(position + 1).filter(|x| x.is_none()).count();
+            
+            if remaining_positions == 0 {
+                // This would be the last item - expand eagerly before adding
+                if spatial::is_base(&self.dims) {
+                    return Self::expand(self, spatial::expand_up(&self.dims, self.get_insert_position(value)), value);
+                } else {
+                    return Self::expand(self, spatial::expand_over(&self.dims), value);
+                }
+            }
+            
+            // Regular insertion - not the last position
             let mut new_payload = self.payload.clone();
-            new_payload[position] = Some(value);
+            
+            // Special case: if this is the second item in a [2,2] structure (position 1), 
+            // we need to sort the first two items to establish axis order
+            if self.dims == vec![2, 2] && position == 1 {
+                let first_value = self.payload[0].unwrap();
+                if value < first_value {
+                    // Insert in sorted order
+                    new_payload[0] = Some(value);
+                    new_payload[1] = Some(first_value);
+                } else {
+                    new_payload[1] = Some(value);
+                }
+            } else {
+                new_payload[position] = Some(value);
+            }
+            
             return vec![Ortho {
                 version: self.version,
                 dims: self.dims.clone(),
                 payload: new_payload,
             }];
         }
+        
+        // This should not happen with eager expansion, but keep as fallback
         if spatial::is_base(&self.dims) {
             Self::expand(self, spatial::expand_up(&self.dims, self.get_insert_position(value)), value)
         } else {
@@ -90,7 +120,7 @@ impl Ortho {
     }
 
     /// Returns (forbidden_diagonals, required_prefixes) for the current position.
-    /// If the shape is full, returns requirements for the first position after expansion.
+    /// With eager expansion, there should always be a current position available.
     /// forbidden_diagonals: Vec<Option<usize>> (diagonal indices in payload)
     /// required_prefixes: Vec<Vec<Option<usize>>> (prefix indices in payload)
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<Option<usize>>>) {
@@ -108,37 +138,7 @@ impl Ortho {
                 (forbidden, required)
             }
             None => {
-                // Shape is full - look ahead to expansion requirements
-                // We'll use position 0 as a representative case for expansion requirements
-                let expansions = if spatial::is_base(&self.dims) {
-                    spatial::expand_up(&self.dims, 0)
-                } else {
-                    spatial::expand_over(&self.dims)
-                };
-                
-                if let Some((new_dims, _, reorganization_pattern)) = expansions.first() {
-                    // Create the expanded payload with existing elements reorganized
-                    let mut new_payload = vec![None; spatial::capacity(new_dims)];
-                    for (i, &pos) in reorganization_pattern.iter().enumerate() {
-                        new_payload[pos] = self.payload.get(i).cloned().flatten();
-                    }
-                    
-                    // Find the first empty position in the expanded shape
-                    if let Some(first_empty_pos) = new_payload.iter().position(|x| x.is_none()) {
-                        let (prefixes, diagonals) = spatial::get_requirements(first_empty_pos, new_dims);
-                        let forbidden: Vec<usize> = diagonals
-                            .into_iter()
-                            .filter_map(|i| new_payload.get(i).and_then(|v| *v))
-                            .collect();
-                        let required: Vec<Vec<Option<usize>>> = prefixes
-                            .into_iter()
-                            .map(|prefix| prefix.into_iter().map(|i| new_payload.get(i).cloned().unwrap_or(None)).collect())
-                            .collect();
-                        return (forbidden, required);
-                    }
-                }
-                
-                // Fallback to empty if expansion calculation fails
+                // With eager expansion, this should not happen, but provide fallback
                 (vec![], vec![])
             }
         }
@@ -153,14 +153,14 @@ mod tests {
     fn test_new() {
         let ortho = Ortho::new(1);
         assert_eq!(ortho.version, 1);
-        assert_eq!(ortho.dims, vec![]);
-        assert_eq!(ortho.payload, vec![]);
+        assert_eq!(ortho.dims, vec![2, 2]);
+        assert_eq!(ortho.payload, vec![None, None, None, None]);
     }
 
     #[test]
     fn test_get_current() {
         let ortho = Ortho::new(1);
-        assert_eq!(ortho.get_current_position(), None);
+        assert_eq!(ortho.get_current_position(), Some(0));
 
         assert_eq!(
             Ortho {
@@ -275,8 +275,8 @@ mod tests {
         let orthos = ortho.add(10);
         assert_eq!(orthos, vec![Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), None],
+            dims: vec![2, 2],
+            payload: vec![Some(10), None, None, None],
         }]);
     }
 
@@ -288,8 +288,8 @@ mod tests {
         let orthos2 = ortho.add(2);
         assert_eq!(orthos2, vec![Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(1), Some(2)],
+            dims: vec![2, 2],
+            payload: vec![Some(1), Some(2), None, None],
         }]);
     }
 
@@ -318,8 +318,8 @@ mod tests {
         let ortho = &orthos[0];
         let orthos2 = ortho.add(2);
         let ortho = &orthos2[0];
-        assert_eq!(ortho.dims, vec![2]);
-        assert_eq!(ortho.payload, vec![Some(1), Some(2)]);
+        assert_eq!(ortho.dims, vec![2, 2]);
+        assert_eq!(ortho.payload, vec![Some(1), Some(2), None, None]);
         let orthos3 = ortho.add(3);
         let ortho = &orthos3[0];
         assert_eq!(ortho.dims, vec![2, 2]);
@@ -333,16 +333,12 @@ mod tests {
         let ortho = &ortho.add(2)[0];
         let ortho = &ortho.add(3)[0];
         let ortho = &ortho.add(4)[0];
-        assert_eq!(ortho.dims, vec![2, 2]);
-        assert_eq!(ortho.payload, vec![Some(1), Some(2), Some(3), Some(4)]);
+        // With eager expansion, the 4th add should trigger expansion
+        assert_eq!(ortho.dims, vec![3, 2]);
+        assert_eq!(ortho.payload, vec![Some(1), Some(2), Some(3), Some(4), None, None]);
         let mut expansions = ortho.add(5);
         expansions.sort_by(|a, b| a.dims.cmp(&b.dims));
         assert_eq!(expansions, vec![
-            Ortho {
-                version: 1,
-                dims: vec![2, 2, 2],
-                payload: vec![Some(1), Some(2), Some(3), Some(5), Some(4), None, None, None],
-            },
             Ortho {
                 version: 1,
                 dims: vec![3, 2],
@@ -398,8 +394,8 @@ mod tests {
         let ortho = Ortho::new(1);
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
-        // Empty ortho with dims=[] will look ahead to expansion to [2] which has requirements
-        assert_eq!(required, vec![vec![]]);
+        // New ortho with dims=[2,2] has requirements based on position 0
+        assert_eq!(required, vec![vec![], vec![]]);
     }
 
     #[test]
@@ -408,7 +404,7 @@ mod tests {
         let ortho = &ortho.add(10)[0];
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
-        assert_eq!(required, vec![vec![Some(10)]]);
+        assert_eq!(required, vec![vec![], vec![Some(10)]]);
     }
 
     #[test]
@@ -417,9 +413,11 @@ mod tests {
         let ortho = &ortho.add(10)[0];
         let ortho = &ortho.add(20)[0];
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, Vec::<usize>::new());
-        // Full [2] shape will look ahead to expansion to [2,2] which has requirements
-        assert_eq!(required, vec![vec![], vec![Some(10)]]);
+        assert_eq!(forbidden, vec![20]);
+        // In [2,2] shape with two items, the requirements are for position 2
+        // Position 2 has diagonal [1] (forbidden position 1 which has value 20)
+        // And prefixes [[0], []] meaning position 0 is required in first axis
+        assert_eq!(required, vec![vec![Some(10)], vec![]]);
     }
 
     #[test]
