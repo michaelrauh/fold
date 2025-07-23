@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fixedbitset = "0.5.7"
 itertools = "0.12"
 
 [dev-dependencies]
@@ -15,4 +16,8 @@ harness = false
 
 [[bench]]
 name = "ortho_bench"
+harness = false
+
+[[bench]]
+name = "interner_bench"
 harness = false

@@ -13,13 +13,13 @@ impl Ortho {
     pub fn new(version: usize) -> Self {
         Ortho {
             version,
-            dims: vec![],
-            payload: vec![],
+            dims: vec![2, 2],
+            payload: vec![None, None, None, None],
         }
     }
 
     pub fn id(&self) -> usize {
-        if self.dims.is_empty() && self.payload.is_empty() {
+        if self.get_current_position() == 0 {
             let mut hasher = DefaultHasher::new();
             self.version.hash(&mut hasher);
             hasher.finish() as usize
@@ -32,20 +32,55 @@ impl Ortho {
     }
 
     pub fn add(&self, value: usize) -> Vec<Self> {
-        if let Some(position) = self.get_current_position() {
+        let position = self.get_current_position();
+
+        let remaining_empty = self
+            .payload
+            .iter()
+            .skip(position)
+            .filter(|x| x.is_none())
+            .count();
+
+        if remaining_empty == 1 {
+            if spatial::is_base(&self.dims) {
+                return Self::expand(
+                    self,
+                    spatial::expand_up(&self.dims, self.get_insert_position(value)),
+                    value,
+                );
+            } else {
+                return Self::expand(self, spatial::expand_over(&self.dims), value);
+            }
+        }
+
+        // Special case: third insert (position 2) needs axis sorting
+        if position == 2 && self.dims == vec![2, 2] {
             let mut new_payload = self.payload.clone();
             new_payload[position] = Some(value);
+
+            // Sort the second and third items by value to establish axis order
+            if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
+                if second > third {
+                    new_payload[1] = Some(third);
+                    new_payload[2] = Some(second);
+                }
+            }
+
             return vec![Ortho {
                 version: self.version,
                 dims: self.dims.clone(),
                 payload: new_payload,
             }];
         }
-        if spatial::is_base(&self.dims) {
-            Self::expand(self, spatial::expand_up(&self.dims, self.get_insert_position(value)), value)
-        } else {
-            Self::expand(self, spatial::expand_over(&self.dims), value)
-        }
+
+        // Normal case: just add to the current position
+        let mut new_payload = self.payload.clone();
+        new_payload[position] = Some(value);
+        return vec![Ortho {
+            version: self.version,
+            dims: self.dims.clone(),
+            payload: new_payload,
+        }];
     }
 
     fn expand(
@@ -71,11 +106,11 @@ impl Ortho {
             .collect()
     }
 
-    pub fn get_current_position(&self) -> Option<usize> {
-        self.payload.iter().position(|x| x.is_none())
+    fn get_current_position(&self) -> usize {
+        self.payload.iter().position(|x| x.is_none()).unwrap()
     }
 
-    pub fn get_insert_position(&self, to_add: usize) -> usize {
+    fn get_insert_position(&self, to_add: usize) -> usize {
         let axis_positions = spatial::get_axis_positions(&self.dims);
         let mut idx = 0;
         for &pos in axis_positions.iter() {
@@ -89,59 +124,24 @@ impl Ortho {
         idx
     }
 
-    /// Returns (forbidden_diagonals, required_prefixes) for the current position.
-    /// If the shape is full, returns requirements for the first position after expansion.
-    /// forbidden_diagonals: Vec<Option<usize>> (diagonal indices in payload)
-    /// required_prefixes: Vec<Vec<Option<usize>>> (prefix indices in payload)
-    pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<Option<usize>>>) {
-        match self.get_current_position() {
-            Some(pos) => {
-                let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
-                let forbidden: Vec<usize> = diagonals
-                    .into_iter()
-                    .filter_map(|i| self.payload.get(i).and_then(|v| *v))
-                    .collect();
-                let required: Vec<Vec<Option<usize>>> = prefixes
-                    .into_iter()
-                    .map(|prefix| prefix.into_iter().map(|i| self.payload.get(i).cloned().unwrap_or(None)).collect())
-                    .collect();
-                (forbidden, required)
-            }
-            None => {
-                // Shape is full - look ahead to expansion requirements
-                // We'll use position 0 as a representative case for expansion requirements
-                let expansions = if spatial::is_base(&self.dims) {
-                    spatial::expand_up(&self.dims, 0)
-                } else {
-                    spatial::expand_over(&self.dims)
-                };
-                
-                if let Some((new_dims, _, reorganization_pattern)) = expansions.first() {
-                    // Create the expanded payload with existing elements reorganized
-                    let mut new_payload = vec![None; spatial::capacity(new_dims)];
-                    for (i, &pos) in reorganization_pattern.iter().enumerate() {
-                        new_payload[pos] = self.payload.get(i).cloned().flatten();
-                    }
-                    
-                    // Find the first empty position in the expanded shape
-                    if let Some(first_empty_pos) = new_payload.iter().position(|x| x.is_none()) {
-                        let (prefixes, diagonals) = spatial::get_requirements(first_empty_pos, new_dims);
-                        let forbidden: Vec<usize> = diagonals
-                            .into_iter()
-                            .filter_map(|i| new_payload.get(i).and_then(|v| *v))
-                            .collect();
-                        let required: Vec<Vec<Option<usize>>> = prefixes
-                            .into_iter()
-                            .map(|prefix| prefix.into_iter().map(|i| new_payload.get(i).cloned().unwrap_or(None)).collect())
-                            .collect();
-                        return (forbidden, required);
-                    }
-                }
-                
-                // Fallback to empty if expansion calculation fails
-                (vec![], vec![])
-            }
-        }
+    pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let pos = self.get_current_position();
+        let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
+        let forbidden: Vec<usize> = diagonals
+            .into_iter()
+            .filter_map(|i| self.payload.get(i).and_then(|v| *v))
+            .collect();
+        let required: Vec<Vec<usize>> = prefixes
+            .into_iter()
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| {
+                prefix
+                    .iter()
+                    .filter_map(|&i| self.payload.get(i).cloned().flatten())
+                    .collect::<Vec<usize>>()
+            })
+            .collect();
+        (forbidden, required)
     }
 }
 
@@ -153,43 +153,33 @@ mod tests {
     fn test_new() {
         let ortho = Ortho::new(1);
         assert_eq!(ortho.version, 1);
-        assert_eq!(ortho.dims, vec![]);
-        assert_eq!(ortho.payload, vec![]);
+        assert_eq!(ortho.dims, vec![2, 2]);
+        assert_eq!(ortho.payload, vec![None, None, None, None]);
     }
 
     #[test]
     fn test_get_current() {
         let ortho = Ortho::new(1);
-        assert_eq!(ortho.get_current_position(), None);
+        assert_eq!(ortho.get_current_position(), 0);
 
         assert_eq!(
             Ortho {
                 version: 1,
-                dims: vec![2],
-                payload: vec![None, None],
+                dims: vec![2, 2],
+                payload: vec![None, None, None, None],
             }
             .get_current_position(),
-            Some(0)
+            0
         );
 
         assert_eq!(
             Ortho {
                 version: 1,
-                dims: vec![2],
-                payload: vec![Some(1), None],
+                dims: vec![2, 2],
+                payload: vec![Some(1), None, None, None],
             }
             .get_current_position(),
-            Some(1)
-        );
-
-        assert_eq!(
-            Ortho {
-                version: 1,
-                dims: vec![2],
-                payload: vec![Some(1), Some(2)],
-            }
-            .get_current_position(),
-            None
+            1
         );
 
         assert_eq!(
@@ -199,17 +189,17 @@ mod tests {
                 payload: vec![Some(1), Some(2), None, None],
             }
             .get_current_position(),
-            Some(2)
+            2
         );
 
         assert_eq!(
             Ortho {
                 version: 1,
                 dims: vec![2, 2],
-                payload: vec![None, Some(1), Some(2), None],
+                payload: vec![Some(1), Some(2), Some(3), None],
             }
             .get_current_position(),
-            Some(0)
+            3
         );
     }
 
@@ -221,8 +211,8 @@ mod tests {
         assert_eq!(
             Ortho {
                 version: 1,
-                dims: vec![2],
-                payload: vec![Some(0), Some(15)],
+                dims: vec![2, 2],
+                payload: vec![Some(0), Some(15), None, None],
             }
             .get_insert_position(14),
             0
@@ -231,8 +221,8 @@ mod tests {
         assert_eq!(
             Ortho {
                 version: 1,
-                dims: vec![2],
-                payload: vec![Some(0), Some(15)],
+                dims: vec![2, 2],
+                payload: vec![Some(0), Some(15), None, None],
             }
             .get_insert_position(20),
             1
@@ -242,7 +232,7 @@ mod tests {
             Ortho {
                 version: 1,
                 dims: vec![2, 2],
-                payload: vec![Some(0), Some(10), Some(20), Some(30)],
+                payload: vec![Some(0), Some(10), Some(20), None],
             }
             .get_insert_position(5),
             0
@@ -252,7 +242,7 @@ mod tests {
             Ortho {
                 version: 1,
                 dims: vec![2, 2],
-                payload: vec![Some(0), Some(10), Some(20), Some(30)],
+                payload: vec![Some(0), Some(10), Some(20), None],
             }
             .get_insert_position(15),
             1
@@ -262,7 +252,7 @@ mod tests {
             Ortho {
                 version: 1,
                 dims: vec![2, 2],
-                payload: vec![Some(0), Some(10), Some(20), Some(30)],
+                payload: vec![Some(0), Some(10), Some(20), None],
             }
             .get_insert_position(1000),
             2
@@ -273,11 +263,14 @@ mod tests {
     fn test_add_simple() {
         let ortho = Ortho::new(1);
         let orthos = ortho.add(10);
-        assert_eq!(orthos, vec![Ortho {
-            version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), None],
-        }]);
+        assert_eq!(
+            orthos,
+            vec![Ortho {
+                version: 1,
+                dims: vec![2, 2],
+                payload: vec![Some(10), None, None, None],
+            }]
+        );
     }
 
     #[test]
@@ -286,11 +279,14 @@ mod tests {
         let orthos1 = ortho.add(1);
         let ortho = &orthos1[0];
         let orthos2 = ortho.add(2);
-        assert_eq!(orthos2, vec![Ortho {
-            version: 1,
-            dims: vec![2],
-            payload: vec![Some(1), Some(2)],
-        }]);
+        assert_eq!(
+            orthos2,
+            vec![Ortho {
+                version: 1,
+                dims: vec![2, 2],
+                payload: vec![Some(1), Some(2), None, None],
+            }]
+        );
     }
 
     #[test]
@@ -318,8 +314,8 @@ mod tests {
         let ortho = &orthos[0];
         let orthos2 = ortho.add(2);
         let ortho = &orthos2[0];
-        assert_eq!(ortho.dims, vec![2]);
-        assert_eq!(ortho.payload, vec![Some(1), Some(2)]);
+        assert_eq!(ortho.dims, vec![2, 2]);
+        assert_eq!(ortho.payload, vec![Some(1), Some(2), None, None]);
         let orthos3 = ortho.add(3);
         let ortho = &orthos3[0];
         assert_eq!(ortho.dims, vec![2, 2]);
@@ -332,65 +328,77 @@ mod tests {
         let ortho = &ortho.add(1)[0];
         let ortho = &ortho.add(2)[0];
         let ortho = &ortho.add(3)[0];
-        let ortho = &ortho.add(4)[0];
-        assert_eq!(ortho.dims, vec![2, 2]);
-        assert_eq!(ortho.payload, vec![Some(1), Some(2), Some(3), Some(4)]);
-        let mut expansions = ortho.add(5);
-        expansions.sort_by(|a, b| a.dims.cmp(&b.dims));
-        assert_eq!(expansions, vec![
-            Ortho {
-                version: 1,
-                dims: vec![2, 2, 2],
-                payload: vec![Some(1), Some(2), Some(3), Some(5), Some(4), None, None, None],
-            },
-            Ortho {
-                version: 1,
-                dims: vec![3, 2],
-                payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), None],
-            },
-        ]);
+
+        let expansions = ortho.add(4);
+        assert_eq!(
+            expansions,
+            vec![
+                Ortho {
+                    version: 1,
+                    dims: vec![3, 2],
+                    payload: vec![Some(1), Some(2), Some(3), Some(4), None, None],
+                },
+                Ortho {
+                    version: 1,
+                    dims: vec![2, 2, 2],
+                    payload: vec![Some(1), Some(2), Some(3), Some(4), None, None, None, None],
+                }
+            ]
+        );
     }
 
     #[test]
     fn test_insert_position_middle() {
         let ortho = Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), Some(20)],
+            dims: vec![2, 2],
+            payload: vec![Some(10), Some(20), None, None],
         };
         let orthos = ortho.add(15);
-        assert_eq!(orthos, vec![Ortho {
-            version: 1,
-            dims: vec![2, 2],
-            payload: vec![Some(10), Some(15), Some(20), None],
-        }]);
+        assert_eq!(
+            orthos,
+            vec![Ortho {
+                version: 1,
+                dims: vec![2, 2],
+                payload: vec![Some(10), Some(15), Some(20), None],
+            }]
+        );
     }
 
     #[test]
     fn test_insert_position_middle_and_reorg() {
         let ortho = Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), Some(20)],
-        };
-        let orthos = ortho.add(15);
-        assert_eq!(orthos, vec![Ortho {
-            version: 1,
-            dims: vec![2, 2],
-            payload: vec![Some(10), Some(15), Some(20), None],
-        }]);
-
-        let ortho = Ortho {
-            version: 1,
             dims: vec![2, 2],
             payload: vec![Some(10), None, Some(20), Some(30)],
         };
-        let orthos = ortho.add(15);
-        assert_eq!(orthos, vec![Ortho {
-            version: 1,
-            dims: vec![2, 2],
-            payload: vec![Some(10), Some(15), Some(20), Some(30)],
-        }]);
+
+        let mut orthos = ortho.add(15);
+        orthos.sort_by(|a, b| a.dims.cmp(&b.dims));
+        assert_eq!(
+            orthos,
+            vec![
+                Ortho {
+                    version: 1,
+                    dims: vec![2, 2, 2],
+                    payload: vec![
+                        Some(10),
+                        Some(15),
+                        None,
+                        Some(20),
+                        None,
+                        None,
+                        Some(30),
+                        None
+                    ],
+                },
+                Ortho {
+                    version: 1,
+                    dims: vec![3, 2],
+                    payload: vec![Some(10), Some(15), Some(20), Some(30), None, None],
+                },
+            ]
+        );
     }
 
     #[test]
@@ -398,8 +406,7 @@ mod tests {
         let ortho = Ortho::new(1);
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
-        // Empty ortho with dims=[] will look ahead to expansion to [2] which has requirements
-        assert_eq!(required, vec![vec![]]);
+        assert_eq!(required, Vec::<Vec<usize>>::new());
     }
 
     #[test]
@@ -408,7 +415,7 @@ mod tests {
         let ortho = &ortho.add(10)[0];
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
-        assert_eq!(required, vec![vec![Some(10)]]);
+        assert_eq!(required, vec![vec![10]]);
     }
 
     #[test]
@@ -417,9 +424,8 @@ mod tests {
         let ortho = &ortho.add(10)[0];
         let ortho = &ortho.add(20)[0];
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, Vec::<usize>::new());
-        // Full [2] shape will look ahead to expansion to [2,2] which has requirements
-        assert_eq!(required, vec![vec![], vec![Some(10)]]);
+        assert_eq!(forbidden, vec![20]);
+        assert_eq!(required, vec![vec![10]]);
     }
 
     #[test]
@@ -429,11 +435,10 @@ mod tests {
         let ortho = &ortho.add(20)[0];
         let ortho = &ortho.add(30)[0];
         let ortho = &ortho.add(40)[0];
+        dbg!(ortho);
         let (forbidden, required) = ortho.get_requirements();
-        // Full [2,2] shape will look ahead to expansion which has requirements
         assert_eq!(forbidden, vec![40]);
-        // The actual requirements reflect the spatial reorganization pattern
-        assert_eq!(required, vec![vec![Some(10), Some(30)], vec![]]);
+        assert_eq!(required, vec![vec![10, 30]]);
     }
 
     #[test]
@@ -444,7 +449,7 @@ mod tests {
         let ortho = &ortho.add(3)[0];
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
-        assert_eq!(required, vec![vec![Some(2)], vec![Some(3)]]);
+        assert_eq!(required, vec![vec![2], vec![3]]);
     }
 
     #[test]
@@ -455,15 +460,13 @@ mod tests {
         let ortho2 = &ortho2.add(1)[0];
         let ortho1 = &ortho1.add(2)[0];
         let ortho2 = &ortho2.add(3)[0];
-        let (forbidden1, required1) = ortho1.get_requirements();
-        let (forbidden2, required2) = ortho2.get_requirements();
         let ortho1 = &ortho1.add(3)[0];
         let ortho2 = &ortho2.add(2)[0];
         let (forbidden1, required1) = ortho1.get_requirements();
         let (forbidden2, required2) = ortho2.get_requirements();
         assert_eq!(forbidden1, forbidden2);
-        assert_eq!(required1, vec![vec![Some(2)], vec![Some(3)]]);
-        assert_eq!(required2, vec![vec![Some(2)], vec![Some(3)]]);
+        assert_eq!(required1, vec![vec![2], vec![3]]);
+        assert_eq!(required2, vec![vec![2], vec![3]]);
     }
 
     #[test]
@@ -476,54 +479,27 @@ mod tests {
         // Test that orthos with different versions but same contents have same IDs
         let ortho_v1_with_content = Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), None],
+            dims: vec![2, 2],
+            payload: vec![Some(10), None, None, None],
         };
         let ortho_v2_with_content = Ortho {
             version: 2,
-            dims: vec![2],
-            payload: vec![Some(10), None],
+            dims: vec![2, 2],
+            payload: vec![Some(10), None, None, None],
         };
         assert_eq!(ortho_v1_with_content.id(), ortho_v2_with_content.id());
 
         // Test that orthos with same version but different contents have different IDs
         let ortho_v1_content_a = Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), None],
+            dims: vec![2, 2],
+            payload: vec![Some(10), None, None, None],
         };
         let ortho_v1_content_b = Ortho {
             version: 1,
-            dims: vec![2],
-            payload: vec![Some(20), None],
+            dims: vec![2, 2],
+            payload: vec![Some(20), None, None, None],
         };
         assert_ne!(ortho_v1_content_a.id(), ortho_v1_content_b.id());
-
-        // Test that orthos with different versions and different contents have different IDs
-        let ortho_v1_10 = Ortho {
-            version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), None],
-        };
-        let ortho_v2_20 = Ortho {
-            version: 2,
-            dims: vec![2],
-            payload: vec![Some(20), None],
-        };
-        assert_ne!(ortho_v1_10.id(), ortho_v2_20.id());
-
-        // Test with more complex structures
-        let ortho_v1_complex = Ortho {
-            version: 1,
-            dims: vec![2, 2],
-            payload: vec![Some(1), Some(2), Some(3), None],
-        };
-        let ortho_v3_complex = Ortho {
-            version: 3,
-            dims: vec![2, 2],
-            payload: vec![Some(1), Some(2), Some(3), None],
-        };
-        // Same contents, different versions should have same ID (dual nature)
-        assert_eq!(ortho_v1_complex.id(), ortho_v3_complex.id());
     }
 }

@@ -2,7 +2,6 @@ use std::{cell::RefCell, cmp::Ordering, collections::HashMap};
 
 use itertools::Itertools;
 
-// Thread-local caching for spatial functions
 thread_local! {
     static REQUIREMENTS_CACHE: RefCell<HashMap<(usize, Vec<usize>), (Vec<Vec<usize>>, Vec<usize>)>> = RefCell::new(HashMap::new());
     static BASE_CACHE: RefCell<HashMap<Vec<usize>, bool>> = RefCell::new(HashMap::new());
@@ -11,7 +10,6 @@ thread_local! {
     static AXIS_POSITIONS_CACHE: RefCell<HashMap<Vec<usize>, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
-// Public cached functions
 pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
     let key = (loc, dims.to_vec());
     REQUIREMENTS_CACHE.with(|cache| {
@@ -54,7 +52,6 @@ pub fn is_base(dims: &[usize]) -> bool {
     })
 }
 
-// Change expand_up and expand_over to return dims and capacity
 pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     let key = (old_dims.to_vec(), position);
     EXPAND_UP_CACHE.with(|cache| {
@@ -132,10 +129,6 @@ fn base(dims: &[usize]) -> bool {
 }
 
 fn next_dims_over(dims: &[usize]) -> Vec<Vec<usize>> {
-    if dims.len() < 2 {
-        return Vec::new();
-    }
-
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, &val) in dims.iter().enumerate() {
@@ -214,7 +207,6 @@ fn impacted_locations(
 ) -> Vec<Vec<usize>> {
     let mut res = vec![];
     let index = &location_to_index[&location];
-
     let indices = 0..index.len();
     for focus in indices {
         let cur = index[focus];
@@ -222,13 +214,11 @@ fn impacted_locations(
         for i in 0..cur {
             let mut location = index.clone();
             location[focus] = i;
-
             let fin = index_to_location[&location];
             subres.push(fin);
         }
         res.push(subres)
     }
-
     res
 }
 
@@ -440,8 +430,6 @@ mod tests {
 
     #[test]
     fn it_determines_if_dims_are_base() {
-        assert_eq!(is_base(&vec![]), true);
-        assert_eq!(is_base(&vec![2]), true);
         assert_eq!(is_base(&vec![2, 2]), true);
         assert_eq!(is_base(&vec![2, 2, 2]), true);
         assert_eq!(is_base(&vec![3, 2]), false);
@@ -501,15 +489,6 @@ mod tests {
     }
 
     #[test]
-    fn it_expands_for_over_edge_cases() {
-        let result = expand_over(&vec![2]);
-        assert_eq!(result, vec![]);
-
-        let result = expand_over(&vec![]);
-        assert_eq!(result, vec![]);
-    }
-
-    #[test]
     fn it_expands_for_up() {
         assert_eq!(
             expand_up(&vec![2, 2], 0),
@@ -562,21 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn it_expands_for_up_edge_cases() {
-        let result = expand_up(&vec![2], 0);
-        assert_eq!(result, vec![(vec![2, 2], 4, vec![0, 2])]);
-
-        let result = expand_up(&vec![2], 1);
-        assert_eq!(result, vec![(vec![2, 2], 4, vec![0, 1])]);
-
-        let result = expand_up(&vec![], 0);
-        assert_eq!(result, vec![(vec![2], 2, vec![])]);
-    }
-
-    #[test]
     fn it_gets_axis_positions() {
-        assert_eq!(get_axis_positions(&[]), vec![]);
-        assert_eq!(get_axis_positions(&[2]), vec![1]);
         assert_eq!(get_axis_positions(&[2, 2]), vec![1, 2]);
         assert_eq!(get_axis_positions(&[3, 2, 4]), vec![1, 2, 3]);
     }
