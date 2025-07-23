@@ -12,3 +12,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "spatial_bench"
 harness = false
+
+[[bench]]
+name = "ortho_bench"
+harness = false

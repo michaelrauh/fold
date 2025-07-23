@@ -1,14 +1,14 @@
-use std::{cmp::Ordering, collections::HashMap, cell::RefCell};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap};
 
 use itertools::Itertools;
 
 // Thread-local caching for spatial functions
 thread_local! {
     static REQUIREMENTS_CACHE: RefCell<HashMap<(usize, Vec<usize>), (Vec<Vec<usize>>, Vec<usize>)>> = RefCell::new(HashMap::new());
-    static CAPACITY_CACHE: RefCell<HashMap<Vec<usize>, usize>> = RefCell::new(HashMap::new());
     static BASE_CACHE: RefCell<HashMap<Vec<usize>, bool>> = RefCell::new(HashMap::new());
-    static EXPAND_UP_CACHE: RefCell<HashMap<(Vec<usize>, usize), Vec<(Vec<usize>, Vec<usize>)>>> = RefCell::new(HashMap::new());
-    static EXPAND_OVER_CACHE: RefCell<HashMap<Vec<usize>, Vec<(Vec<usize>, Vec<usize>)>>> = RefCell::new(HashMap::new());
+    static EXPAND_UP_CACHE: RefCell<HashMap<(Vec<usize>, usize), Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(HashMap::new());
+    static EXPAND_OVER_CACHE: RefCell<HashMap<Vec<usize>, Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(HashMap::new());
+    static AXIS_POSITIONS_CACHE: RefCell<HashMap<Vec<usize>, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
 // Public cached functions
@@ -26,15 +26,15 @@ pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usi
     })
 }
 
-pub fn get_capacity(dims: &[usize]) -> usize {
+pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> {
     let key = dims.to_vec();
-    CAPACITY_CACHE.with(|cache| {
+    AXIS_POSITIONS_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(&result) = cache.get(&key) {
-            result
+        if let Some(result) = cache.get(&key) {
+            result.clone()
         } else {
-            let result = capacity(dims);
-            cache.insert(key, result);
+            let result = axis_positions(dims);
+            cache.insert(key, result.clone());
             result
         }
     })
@@ -54,7 +54,8 @@ pub fn is_base(dims: &[usize]) -> bool {
     })
 }
 
-pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+// Change expand_up and expand_over to return dims and capacity
+pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     let key = (old_dims.to_vec(), position);
     EXPAND_UP_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -68,7 +69,7 @@ pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<us
     })
 }
 
-pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
+pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     let key = old_dims.to_vec();
     EXPAND_OVER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -82,11 +83,18 @@ pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
     })
 }
 
+pub fn capacity(dims: &[usize]) -> usize {
+    dims.iter().product()
+}
 
 fn apply_mapping(positions: &[Vec<usize>], mapping: &HashMap<Vec<usize>, usize>) -> Vec<usize> {
     positions
         .iter()
-        .map(|pos| *mapping.get(pos).expect("Position not found in new dimensions"))
+        .map(|pos| {
+            *mapping
+                .get(pos)
+                .expect("Position not found in new dimensions")
+        })
         .collect()
 }
 
@@ -99,7 +107,11 @@ fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
 
 fn remap_for_up(old_dims: &[usize], position: usize) -> Vec<usize> {
     let padded_positions = pad(old_dims, position);
-    let new_dims = old_dims.iter().chain(std::iter::once(&2)).cloned().collect::<Vec<usize>>();
+    let new_dims = old_dims
+        .iter()
+        .chain(std::iter::once(&2))
+        .cloned()
+        .collect::<Vec<usize>>();
     let mapping = location_to_index_mapping(&new_dims);
 
     apply_mapping(&padded_positions, &mapping)
@@ -119,51 +131,48 @@ fn base(dims: &[usize]) -> bool {
     dims.iter().all(|&x| x == 2)
 }
 
-
-
-fn next_shapes_over(dims: &[usize]) -> Vec<Vec<usize>> {
+fn next_dims_over(dims: &[usize]) -> Vec<Vec<usize>> {
     if dims.len() < 2 {
         return Vec::new();
     }
-    
+
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, &val) in dims.iter().enumerate() {
         if seen.insert(val) {
-            let mut new_shape = dims.to_vec();
-            new_shape[i] += 1;
-            results.push(new_shape);
+            let mut new_dims = dims.to_vec();
+            new_dims[i] += 1;
+            results.push(new_dims);
         }
     }
     results
 }
 
+fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
+    let over_dims = next_dims_over(old_dims);
 
-
-
-fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
-    let over_shapes = next_shapes_over(old_dims);
-    
-    over_shapes
+    over_dims
         .into_iter()
-        .map(|new_shape| {
-            let reorganization_pattern = remap(old_dims, &new_shape);
-            (new_shape, reorganization_pattern)
+        .map(|new_dims| {
+            let reorganization_pattern = remap(old_dims, &new_dims);
+            let cap = capacity(&new_dims);
+            (new_dims, cap, reorganization_pattern)
         })
         .collect()
 }
 
-fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
-    let over_results = expand_for_over(old_dims);
-    
-    let up_shape = old_dims.iter().chain(std::iter::once(&2)).cloned().collect();
+fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
+    let mut over_results = expand_for_over(old_dims);
+
+    let mut up_dims = old_dims.to_vec();
+    up_dims.insert(position, 2);
     let up_reorganization = remap_for_up(old_dims, position);
-    let up_result = (up_shape, up_reorganization);
-    
-    over_results.into_iter().chain(std::iter::once(up_result)).collect()
+    let up_cap = capacity(&up_dims);
+    let up_result = (up_dims, up_cap, up_reorganization);
+
+    over_results.push(up_result);
+    over_results
 }
-
-
 
 fn requirement_locations_at(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
     (
@@ -224,11 +233,10 @@ fn impacted_locations(
 }
 
 fn get_impacted_phrase_locations(dims: &[usize]) -> Vec<Vec<Vec<usize>>> {
-    let location_to_index = location_to_index_mapping(dims);
     let index_to_location = index_to_location_mapping(dims);
+    let location_to_index = location_to_index_mapping(dims);
 
     (0..dims.iter().product::<usize>())
-        .into_iter()
         .map(|location| impacted_locations(location, &index_to_location, &location_to_index))
         .collect()
 }
@@ -239,14 +247,13 @@ fn get_diagonals(dims: &[usize]) -> Vec<Vec<usize>> {
     let indices = indices_in_order(dims);
 
     (0..dims.iter().product::<usize>())
-        .into_iter()
         .map(|location| {
             let current_index = &index_to_location[&location];
             let current_distance: usize = current_index.iter().sum();
             indices
                 .iter()
                 .filter(|index| {
-                    *index < current_index && index.iter().sum::<usize>() == current_distance
+                    index < &current_index && index.iter().sum::<usize>() == current_distance
                 })
                 .map(|x| location_to_index[x])
                 .collect_vec()
@@ -312,8 +319,8 @@ fn cartesian_product<T: Clone>(lists: Vec<Vec<T>>) -> Vec<Vec<T>> {
     }
 }
 
-fn capacity(dims: &[usize]) -> usize {
-    dims.iter().product()
+fn axis_positions(dims: &[usize]) -> Vec<usize> {
+    (1..=dims.len()).collect()
 }
 
 #[cfg(test)]
@@ -422,15 +429,13 @@ mod tests {
         assert_eq!(diagonal, vec![3, 4])
     }
 
-
-
     #[test]
-    fn it_provides_capacity_information_by_shape() {
-        assert_eq!(get_capacity(&vec![2, 2]), 4);
-        assert_eq!(get_capacity(&vec![2, 2, 2]), 8);
-        assert_eq!(get_capacity(&vec![3, 2]), 6);
-        assert_eq!(get_capacity(&vec![4, 2]), 8);
-        assert_eq!(get_capacity(&vec![3, 3]), 9);
+    fn it_provides_capacity_information_by_dims() {
+        assert_eq!(capacity(&vec![2, 2]), 4);
+        assert_eq!(capacity(&vec![2, 2, 2]), 8);
+        assert_eq!(capacity(&vec![3, 2]), 6);
+        assert_eq!(capacity(&vec![4, 2]), 8);
+        assert_eq!(capacity(&vec![3, 3]), 9);
     }
 
     #[test]
@@ -449,14 +454,22 @@ mod tests {
         assert_eq!(remap(&vec![2, 2], &vec![3, 2]), vec![0, 1, 2, 3]);
         assert_eq!(remap(&vec![3, 2], &vec![4, 2]), vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(remap(&vec![3, 2], &vec![3, 3]), vec![0, 1, 2, 4, 5, 7]);
-
     }
 
     #[test]
     fn it_pads_at_a_position_for_up() {
-        assert_eq!(pad(&vec![2, 2], 0), vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]);
-        assert_eq!(pad(&vec![2, 2], 1), vec![vec![0, 0, 0], vec![0, 0, 1], vec![1, 0, 0], vec![1, 0, 1]]);
-        assert_eq!(pad(&vec![2, 2], 2), vec![vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1]]);
+        assert_eq!(
+            pad(&vec![2, 2], 0),
+            vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]
+        );
+        assert_eq!(
+            pad(&vec![2, 2], 1),
+            vec![vec![0, 0, 0], vec![0, 0, 1], vec![1, 0, 0], vec![1, 0, 1]]
+        );
+        assert_eq!(
+            pad(&vec![2, 2], 2),
+            vec![vec![0, 0, 0], vec![0, 0, 1], vec![0, 1, 0], vec![0, 1, 1]]
+        );
     }
 
     #[test]
@@ -470,20 +483,20 @@ mod tests {
     fn it_expands_for_over() {
         assert_eq!(
             expand_over(&vec![2, 2]),
-            vec![(vec![3, 2], vec![0, 1, 2, 3])]
+            vec![(vec![3, 2], 6, vec![0, 1, 2, 3])]
         );
 
         assert_eq!(
             expand_over(&vec![3, 2]),
             vec![
-                (vec![4, 2], vec![0, 1, 2, 3, 4, 5]),
-                (vec![3, 3], vec![0, 1, 2, 4, 5, 7])
+                (vec![4, 2], 8, vec![0, 1, 2, 3, 4, 5]),
+                (vec![3, 3], 9, vec![0, 1, 2, 4, 5, 7])
             ]
         );
 
         assert_eq!(
             expand_over(&vec![3, 3]),
-            vec![(vec![4, 3], vec![0, 1, 2, 3, 4, 5, 6, 7, 9])]
+            vec![(vec![4, 3], 12, vec![0, 1, 2, 3, 4, 5, 6, 7, 9])]
         );
     }
 
@@ -491,7 +504,7 @@ mod tests {
     fn it_expands_for_over_edge_cases() {
         let result = expand_over(&vec![2]);
         assert_eq!(result, vec![]);
-        
+
         let result = expand_over(&vec![]);
         assert_eq!(result, vec![]);
     }
@@ -500,25 +513,34 @@ mod tests {
     fn it_expands_for_up() {
         assert_eq!(
             expand_up(&vec![2, 2], 0),
-            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 2, 3, 6])]
+            vec![
+                (vec![3, 2], 6, vec![0, 1, 2, 3]),
+                (vec![2, 2, 2], 8, vec![0, 2, 3, 6])
+            ]
         );
-        
+
         assert_eq!(
             expand_up(&vec![2, 2], 1),
-            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 1, 3, 5])]
+            vec![
+                (vec![3, 2], 6, vec![0, 1, 2, 3]),
+                (vec![2, 2, 2], 8, vec![0, 1, 3, 5])
+            ]
         );
-        
+
         assert_eq!(
             expand_up(&vec![2, 2], 2),
-            vec![(vec![3, 2], vec![0, 1, 2, 3]), (vec![2, 2, 2], vec![0, 1, 2, 4])]
+            vec![
+                (vec![3, 2], 6, vec![0, 1, 2, 3]),
+                (vec![2, 2, 2], 8, vec![0, 1, 2, 4])
+            ]
         );
     }
 
     #[test]
     fn it_caches_results_correctly() {
         // Test that calling the same function multiple times returns the same result
-        let result1 = get_capacity(&vec![3, 3]);
-        let result2 = get_capacity(&vec![3, 3]);
+        let result1 = capacity(&vec![3, 3]);
+        let result2 = capacity(&vec![3, 3]);
         assert_eq!(result1, result2);
         assert_eq!(result1, 9);
 
@@ -542,16 +564,20 @@ mod tests {
     #[test]
     fn it_expands_for_up_edge_cases() {
         let result = expand_up(&vec![2], 0);
-        assert_eq!(result, vec![(vec![2, 2], vec![0, 2])]);
-        
+        assert_eq!(result, vec![(vec![2, 2], 4, vec![0, 2])]);
+
+        let result = expand_up(&vec![2], 1);
+        assert_eq!(result, vec![(vec![2, 2], 4, vec![0, 1])]);
+
         let result = expand_up(&vec![], 0);
-        assert_eq!(result, vec![(vec![2], vec![])]);
+        assert_eq!(result, vec![(vec![2], 2, vec![])]);
     }
 
-
-
-    // define expand for over - return new shape paired with the reorganization pattern for the payload. Take in the old shape
-    // define expand for up - return new shape paired with the reorganization pattern for the payload. Take in the old shape and the position to pad.
-    // special case of over on [2] - don't produce [3].
-    // cache all functions called by ortho and nothing else 
+    #[test]
+    fn it_gets_axis_positions() {
+        assert_eq!(get_axis_positions(&[]), vec![]);
+        assert_eq!(get_axis_positions(&[2]), vec![1]);
+        assert_eq!(get_axis_positions(&[2, 2]), vec![1, 2]);
+        assert_eq!(get_axis_positions(&[3, 2, 4]), vec![1, 2, 3]);
+    }
 }
