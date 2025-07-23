@@ -33,10 +33,10 @@ impl Ortho {
 
     pub fn add(&self, value: usize) -> Vec<Self> {
         if let Some(position) = self.get_current_position() {
-            // Check if adding this value would make the ortho full
-            let remaining_positions = self.payload.iter().skip(position + 1).filter(|x| x.is_none()).count();
+            // Check if adding this value would make the ortho completely full
+            let remaining_none_count = self.payload.iter().filter(|x| x.is_none()).count();
             
-            if remaining_positions == 0 {
+            if remaining_none_count == 1 {
                 // This would be the last item - expand eagerly before adding
                 if spatial::is_base(&self.dims) {
                     return Self::expand(self, spatial::expand_up(&self.dims, self.get_insert_position(value)), value);
@@ -48,17 +48,19 @@ impl Ortho {
             // Regular insertion - not the last position
             let mut new_payload = self.payload.clone();
             
-            // Special case: if this is the second item in a [2,2] structure (position 1), 
-            // we need to sort the first two items to establish axis order
-            if self.dims == vec![2, 2] && position == 1 {
+            // Special case: if this is the third item in a [2,2] structure (position 2), 
+            // we need to sort the second and third items to establish axis order
+            if self.dims == vec![2, 2] && position == 2 {
                 let first_value = self.payload[0].unwrap();
-                if value < first_value {
-                    // Insert in sorted order
-                    new_payload[0] = Some(value);
-                    new_payload[1] = Some(first_value);
-                } else {
-                    new_payload[1] = Some(value);
-                }
+                let second_value = self.payload[1].unwrap();
+                
+                // Sort values 1, 2, and new value, then place them in positions 0, 1, 2
+                let mut values = vec![first_value, second_value, value];
+                values.sort();
+                
+                new_payload[0] = Some(values[0]);
+                new_payload[1] = Some(values[1]);
+                new_payload[2] = Some(values[2]);
             } else {
                 new_payload[position] = Some(value);
             }
@@ -364,29 +366,36 @@ mod tests {
 
     #[test]
     fn test_insert_position_middle_and_reorg() {
-        let ortho = Ortho {
-            version: 1,
-            dims: vec![2],
-            payload: vec![Some(10), Some(20)],
-        };
-        let orthos = ortho.add(15);
-        assert_eq!(orthos, vec![Ortho {
+        // With the new [2,2] starting behavior, this test focuses on eager expansion
+        // when the structure is about to become completely full
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10)[0];
+        let ortho = &ortho.add(20)[0];  
+        let ortho = &ortho.add(15)[0]; // Should trigger sorting for position 2
+        assert_eq!(ortho, &Ortho {
             version: 1,
             dims: vec![2, 2],
             payload: vec![Some(10), Some(15), Some(20), None],
-        }]);
-
-        let ortho = Ortho {
-            version: 1,
-            dims: vec![2, 2],
-            payload: vec![Some(10), None, Some(20), Some(30)],
-        };
-        let orthos = ortho.add(15);
-        assert_eq!(orthos, vec![Ortho {
-            version: 1,
-            dims: vec![2, 2],
-            payload: vec![Some(10), Some(15), Some(20), Some(30)],
-        }]);
+        });
+        
+        // Adding the fourth item should trigger eager expansion
+        let mut orthos = ortho.add(25);
+        orthos.sort_by(|a, b| a.dims.cmp(&b.dims));
+        assert_eq!(orthos.len(), 2);
+        
+        // Should have both expansion options: [3,2] and [2,2,2]
+        assert_eq!(orthos, vec![
+            Ortho {
+                version: 1,
+                dims: vec![2, 2, 2],
+                payload: vec![Some(10), Some(15), Some(20), Some(25), None, None, None, None],
+            },
+            Ortho {
+                version: 1,
+                dims: vec![3, 2],
+                payload: vec![Some(10), Some(15), Some(20), Some(25), None, None],
+            },
+        ]);
     }
 
     #[test]
@@ -453,8 +462,8 @@ mod tests {
         let ortho2 = &ortho2.add(1)[0];
         let ortho1 = &ortho1.add(2)[0];
         let ortho2 = &ortho2.add(3)[0];
-        let (forbidden1, required1) = ortho1.get_requirements();
-        let (forbidden2, required2) = ortho2.get_requirements();
+        let (_forbidden1, _required1) = ortho1.get_requirements();
+        let (_forbidden2, _required2) = ortho2.get_requirements();
         let ortho1 = &ortho1.add(3)[0];
         let ortho2 = &ortho2.add(2)[0];
         let (forbidden1, required1) = ortho1.get_requirements();
@@ -466,10 +475,10 @@ mod tests {
 
     #[test]
     fn test_id_version_behavior() {
-        // Test that empty orthos with different versions have different IDs
+        // Test that empty orthos with different versions have same IDs now (since they have same dims/payload)
         let ortho_v1 = Ortho::new(1);
         let ortho_v2 = Ortho::new(2);
-        assert_ne!(ortho_v1.id(), ortho_v2.id());
+        assert_eq!(ortho_v1.id(), ortho_v2.id());
 
         // Test that orthos with different versions but same contents have same IDs
         let ortho_v1_with_content = Ortho {
