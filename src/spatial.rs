@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn it_takes_a_position_and_returns_impacted_diagonal() {
         let (_phrases, diagonal) = get_requirements(5, &[3, 3]);
-        assert_eq!(diagonal, vec![3, 4])
+        assert_eq!(diagonal, vec![3, 4]);
     }
 
     #[test]
