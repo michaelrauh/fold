@@ -31,7 +31,7 @@ impl Ortho {
         }
     }
 
-    pub fn add(&self, value: usize) -> Vec<Self> {
+    pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
         let position = self.get_current_position();
 
         let remaining_empty = self
@@ -47,9 +47,10 @@ impl Ortho {
                     self,
                     spatial::expand_up(&self.dims, self.get_insert_position(value)),
                     value,
+                    version,
                 );
             } else {
-                return Self::expand(self, spatial::expand_over(&self.dims), value);
+                return Self::expand(self, spatial::expand_over(&self.dims), value, version);
             }
         }
 
@@ -67,7 +68,7 @@ impl Ortho {
             }
 
             return vec![Ortho {
-                version: self.version,
+                version,
                 dims: self.dims.clone(),
                 payload: new_payload,
             }];
@@ -77,7 +78,7 @@ impl Ortho {
         let mut new_payload = self.payload.clone();
         new_payload[position] = Some(value);
         return vec![Ortho {
-            version: self.version,
+            version,
             dims: self.dims.clone(),
             payload: new_payload,
         }];
@@ -87,6 +88,7 @@ impl Ortho {
         ortho: &Ortho,
         expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
         value: usize,
+        version: usize,
     ) -> Vec<Ortho> {
         expansions
             .into_iter()
@@ -98,7 +100,7 @@ impl Ortho {
                 let new_insert_position = new_payload.iter().position(|x| x.is_none()).unwrap();
                 new_payload[new_insert_position] = Some(value);
                 Ortho {
-                    version: ortho.version,
+                    version,
                     dims: new_dims,
                     payload: new_payload,
                 }
@@ -142,6 +144,22 @@ impl Ortho {
             })
             .collect();
         (forbidden, required)
+    }
+
+    pub fn version(&self) -> usize {
+        todo!("stub: version getter for follower test")
+    }
+
+    pub fn set_version(&mut self, _v: usize) {
+        todo!("stub: set_version for follower test")
+    }
+
+    pub fn prefixes(&self) -> Vec<usize> {
+        todo!("stub: prefixes for follower test")
+    }
+
+    pub fn dims(&self) -> &Vec<usize> {
+        &self.dims
     }
 }
 
@@ -262,7 +280,7 @@ mod tests {
     #[test]
     fn test_add_simple() {
         let ortho = Ortho::new(1);
-        let orthos = ortho.add(10);
+        let orthos = ortho.add(10, 1);
         assert_eq!(
             orthos,
             vec![Ortho {
@@ -276,9 +294,9 @@ mod tests {
     #[test]
     fn test_add_multiple() {
         let ortho = Ortho::new(1);
-        let orthos1 = ortho.add(1);
+        let orthos1 = ortho.add(1, 1);
         let ortho = &orthos1[0];
-        let orthos2 = ortho.add(2);
+        let orthos2 = ortho.add(2, 1);
         assert_eq!(
             orthos2,
             vec![Ortho {
@@ -293,30 +311,30 @@ mod tests {
     fn test_add_order_independent_ids() {
         let ortho1 = Ortho::new(1);
         let ortho2 = Ortho::new(1);
-        let ortho1 = &ortho1.add(1)[0];
-        let ortho2 = &ortho2.add(1)[0];
+        let ortho1 = &ortho1.add(1, 1)[0];
+        let ortho2 = &ortho2.add(1, 1)[0];
         assert_eq!(ortho1.id(), ortho2.id());
-        let ortho1 = &ortho1.add(2)[0];
-        let ortho2 = &ortho2.add(3)[0];
+        let ortho1 = &ortho1.add(2, 1)[0];
+        let ortho2 = &ortho2.add(3, 1)[0];
         assert_ne!(ortho1.id(), ortho2.id());
-        let ortho1 = &ortho1.add(3)[0];
-        let ortho2 = &ortho2.add(2)[0];
+        let ortho1 = &ortho1.add(3, 1)[0];
+        let ortho2 = &ortho2.add(2, 1)[0];
         assert_eq!(ortho1.id(), ortho2.id());
-        let ortho1 = &ortho1.add(4)[0];
-        let ortho2 = &ortho2.add(4)[0];
+        let ortho1 = &ortho1.add(4, 1)[0];
+        let ortho2 = &ortho2.add(4, 1)[0];
         assert_eq!(ortho1.id(), ortho2.id());
     }
 
     #[test]
     fn test_add_shape_expansion() {
         let ortho = Ortho::new(1);
-        let orthos = ortho.add(1);
+        let orthos = ortho.add(1, 1);
         let ortho = &orthos[0];
-        let orthos2 = ortho.add(2);
+        let orthos2 = ortho.add(2, 1);
         let ortho = &orthos2[0];
         assert_eq!(ortho.dims, vec![2, 2]);
         assert_eq!(ortho.payload, vec![Some(1), Some(2), None, None]);
-        let orthos3 = ortho.add(3);
+        let orthos3 = ortho.add(3, 1);
         let ortho = &orthos3[0];
         assert_eq!(ortho.dims, vec![2, 2]);
         assert_eq!(ortho.payload, vec![Some(1), Some(2), Some(3), None]);
@@ -325,11 +343,11 @@ mod tests {
     #[test]
     fn test_up_and_over_expansions_full_coverage() {
         let ortho = Ortho::new(1);
-        let ortho = &ortho.add(1)[0];
-        let ortho = &ortho.add(2)[0];
-        let ortho = &ortho.add(3)[0];
+        let ortho = &ortho.add(1, 1)[0];
+        let ortho = &ortho.add(2, 1)[0];
+        let ortho = &ortho.add(3, 1)[0];
 
-        let expansions = ortho.add(4);
+        let expansions = ortho.add(4, 1);
         assert_eq!(
             expansions,
             vec![
@@ -354,7 +372,7 @@ mod tests {
             dims: vec![2, 2],
             payload: vec![Some(10), Some(20), None, None],
         };
-        let orthos = ortho.add(15);
+        let orthos = ortho.add(15, 1);
         assert_eq!(
             orthos,
             vec![Ortho {
@@ -373,7 +391,7 @@ mod tests {
             payload: vec![Some(10), None, Some(20), Some(30)],
         };
 
-        let mut orthos = ortho.add(15);
+        let mut orthos = ortho.add(15, 1);
         orthos.sort_by(|a, b| a.dims.cmp(&b.dims));
         assert_eq!(
             orthos,
@@ -412,7 +430,7 @@ mod tests {
     #[test]
     fn test_get_requirements_simple() {
         let ortho = Ortho::new(1);
-        let ortho = &ortho.add(10)[0];
+        let ortho = &ortho.add(10, 1)[0];
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
         assert_eq!(required, vec![vec![10]]);
@@ -421,8 +439,8 @@ mod tests {
     #[test]
     fn test_get_requirements_multiple() {
         let ortho = Ortho::new(1);
-        let ortho = &ortho.add(10)[0];
-        let ortho = &ortho.add(20)[0];
+        let ortho = &ortho.add(10, 1)[0];
+        let ortho = &ortho.add(20, 1)[0];
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, vec![20]);
         assert_eq!(required, vec![vec![10]]);
@@ -431,10 +449,10 @@ mod tests {
     #[test]
     fn test_get_requirements_full() {
         let ortho = Ortho::new(1);
-        let ortho = &ortho.add(10)[0];
-        let ortho = &ortho.add(20)[0];
-        let ortho = &ortho.add(30)[0];
-        let ortho = &ortho.add(40)[0];
+        let ortho = &ortho.add(10, 1)[0];
+        let ortho = &ortho.add(20, 1)[0];
+        let ortho = &ortho.add(30, 1)[0];
+        let ortho = &ortho.add(40, 1)[0];
         dbg!(ortho);
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, vec![40]);
@@ -444,9 +462,9 @@ mod tests {
     #[test]
     fn test_get_requirements_expansion() {
         let ortho = Ortho::new(1);
-        let ortho = &ortho.add(1)[0];
-        let ortho = &ortho.add(2)[0];
-        let ortho = &ortho.add(3)[0];
+        let ortho = &ortho.add(1, 1)[0];
+        let ortho = &ortho.add(2, 1)[0];
+        let ortho = &ortho.add(3, 1)[0];
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, Vec::<usize>::new());
         assert_eq!(required, vec![vec![2], vec![3]]);
@@ -456,12 +474,12 @@ mod tests {
     fn test_get_requirements_order_independent() {
         let ortho1 = Ortho::new(1);
         let ortho2 = Ortho::new(1);
-        let ortho1 = &ortho1.add(1)[0];
-        let ortho2 = &ortho2.add(1)[0];
-        let ortho1 = &ortho1.add(2)[0];
-        let ortho2 = &ortho2.add(3)[0];
-        let ortho1 = &ortho1.add(3)[0];
-        let ortho2 = &ortho2.add(2)[0];
+        let ortho1 = &ortho1.add(1, 1)[0];
+        let ortho2 = &ortho2.add(1, 1)[0];
+        let ortho1 = &ortho1.add(2, 1)[0];
+        let ortho2 = &ortho2.add(3, 1)[0];
+        let ortho1 = &ortho1.add(3, 1)[0];
+        let ortho2 = &ortho2.add(2, 1)[0];
         let (forbidden1, required1) = ortho1.get_requirements();
         let (forbidden2, required2) = ortho2.get_requirements();
         assert_eq!(forbidden1, forbidden2);

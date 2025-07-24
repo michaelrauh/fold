@@ -57,12 +57,6 @@ impl Splitter {
             })
             .collect()
     }
-    
-    fn clean_text(&self, text: &str) -> String {
-        text.chars()
-            .map(|c| self.filter_char(c))
-            .collect()
-    }
 
     fn filter_char(&self, c: char) -> char {
         // Keep 's as part of words, remove other punctuation

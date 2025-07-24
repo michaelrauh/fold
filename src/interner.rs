@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use fixedbitset::FixedBitSet;
 use crate::splitter::Splitter;
+use std::sync::Arc;
+use crate::work_queue::WorkQueue;
 
+#[derive(Clone)]
 pub struct Interner {
     version: u64,
     vocabulary: Vec<String>,
@@ -141,6 +144,79 @@ impl Interner {
     }
 }
 
+#[derive(Clone)]
+pub struct InternerContainer {
+    pub interners: std::collections::HashMap<u64, Interner>,
+}
+
+impl InternerContainer {
+    pub fn from_text(text: &str) -> Self {
+        let interner = Interner::from_text(text);
+        let mut interners = HashMap::new();
+        interners.insert(interner.version(), interner);
+        InternerContainer { interners }
+    }
+
+    pub async fn add_with_seed(&self, interner: Interner, workq: Arc<WorkQueue>) -> Self {
+        let mut interners = self.interners.clone();
+        let version = interner.version();
+        interners.insert(version, interner.clone());
+        // When a new interner is added, create a new ortho and send to workq
+        let ortho_seed = crate::ortho::Ortho::new(version as usize);
+        let _ = workq.sender.send(ortho_seed).await;
+        InternerContainer { interners }
+    }
+
+    pub fn get(&self, version: usize) -> &Interner {
+        self.interners.get(&(version as u64)).expect("Version not found in InternerContainer")
+    }
+
+    pub fn latest_version(&self) -> usize {
+        *self.interners.keys().max().expect("No interners in container") as usize
+    }
+
+    pub fn compare_prefix_bitsets(&self, prefix: usize, v1: usize, v2: usize) -> bool {
+        let interner1 = self.interners.get(&(v1 as u64)).unwrap();
+        let interner2 = self.interners.get(&(v2 as u64)).unwrap();
+        let bitset1 = interner1.prefix_to_completions.get(&vec![prefix]);
+        let bitset2 = interner2.prefix_to_completions.get(&vec![prefix]);
+
+        match (bitset1, bitset2) {
+            (Some(b1), Some(b2)) => b1 == b2,
+            _ => false,
+        }
+    }
+}
+
+pub struct InternerHolder {
+    pub container: InternerContainer,
+    pub workq: Arc<WorkQueue>,
+}
+
+impl InternerHolder {
+    pub fn new(workq: Arc<WorkQueue>) -> Self {
+        InternerHolder {
+            container: InternerContainer::from_text(""), 
+            workq,
+        }
+    }
+    pub async fn add_text_with_seed(&mut self, text: &str) {
+        let interner = if self.container.interners.is_empty() {
+            Interner::from_text(text)
+        } else {
+            let latest = self.container.interners.values().max_by_key(|i| i.version()).unwrap();
+            latest.add_text(text)
+        };
+        self.container = self.container.add_with_seed(interner, self.workq.clone()).await;
+    }
+    pub fn latest_version(&self) -> usize {
+        self.container.latest_version() as usize
+    }
+    pub fn compare_prefix_bitsets(&self, prefix: usize, v1: usize, v2: usize) -> bool {
+        self.container.compare_prefix_bitsets(prefix, v1, v2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,7 +224,8 @@ mod tests {
 
     #[test]
     fn test_from_text_creates_interner() {
-        let interner = Interner::from_text("hello world");
+        let container = InternerContainer::from_text("hello world");
+        let interner = container.get(container.latest_version());
         assert_eq!(interner.version(), 1);
         assert_eq!(interner.vocabulary.len(), 2);
         assert_eq!(interner.prefix_to_completions.len(), 1);
@@ -156,15 +233,16 @@ mod tests {
 
     #[test]
     fn test_add_increments_version() {
-        let interner = Interner::from_text("hello world");
-        assert_eq!(interner.version(), 1);
+        let container = InternerContainer::from_text("hello world");
+        let interner = container.get(container.latest_version());
         let interner2 = interner.add_text("test");
         assert_eq!(interner2.version(), 2);
     }
 
     #[test]
     fn test_add_extends_vocabulary() {
-        let interner = Interner::from_text("hello world");
+        let container = InternerContainer::from_text("hello world");
+        let interner = container.get(container.latest_version());
         assert_eq!(interner.vocabulary, vec!["hello", "world"]);
         let interner2 = interner.add_text("test hello");
         assert_eq!(interner2.vocabulary, vec!["hello", "world", "test"]);
@@ -172,7 +250,8 @@ mod tests {
 
     #[test]
     fn test_add_builds_prefix_mapping() {
-        let interner = Interner::from_text("a b c");
+        let container = InternerContainer::from_text("a b c");
+        let interner = container.get(container.latest_version());
         let vocab_len = interner.vocabulary.len();
         // prefix [0] should map to {1}
         let bitset_0 = interner.prefix_to_completions.get(&vec![0]).unwrap();
@@ -196,7 +275,8 @@ mod tests {
 
     #[test]
     fn test_add_handles_longer_phrases() {
-        let interner = Interner::from_text("a b c");
+        let container = InternerContainer::from_text("a b c");
+        let interner = container.get(container.latest_version());
         // Should have prefix [0] -> bit 1 set (for "b")
         let prefix_0 = vec![0];
         let bitset_0 = interner.prefix_to_completions.get(&prefix_0).unwrap();
@@ -214,7 +294,8 @@ mod tests {
     #[test]
     fn test_add_extends_existing_bitsets() {
         // First add with 2 words
-        let interner = Interner::from_text("a b");
+        let container = InternerContainer::from_text("a b");
+        let interner = container.get(container.latest_version());
         // Second add with 1 more word
         let interner2 = interner.add_text("a c");
         let prefix = vec![0];
@@ -228,7 +309,8 @@ mod tests {
 
     #[test]
     fn test_get_required_bits() {
-        let interner = Interner::from_text("a b c");
+        let container = InternerContainer::from_text("a b c");
+        let interner = container.get(container.latest_version());
         // prefix [0] should map to {1}
         let required = vec![vec![0]];
         let bits = interner.get_required_bits(&required);
@@ -239,7 +321,8 @@ mod tests {
 
     #[test]
     fn test_string_for_index() {
-        let interner = Interner::from_text("foo bar baz");
+        let container = InternerContainer::from_text("foo bar baz");
+        let interner = container.get(container.latest_version());
         let vocab = interner.vocabulary();
         assert_eq!(interner.string_for_index(0), vocab[0]);
         assert_eq!(interner.string_for_index(1), vocab[1]);
@@ -249,7 +332,53 @@ mod tests {
     #[test]
     #[should_panic(expected = "Index out of bounds in Interner::string_for_index")]
     fn test_string_for_index_out_of_bounds_panics() {
-        let interner = Interner::from_text("foo bar baz");
+        let container = InternerContainer::from_text("foo bar baz");
+        let interner = container.get(container.latest_version());
         interner.string_for_index(3);
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    #[test]
+    fn test_insert_and_get() {
+        let container = InternerContainer::from_text("a b");
+        let latest_version = container.latest_version();
+        let interner = container.get(latest_version);
+        assert_eq!(interner.version(), latest_version as u64);
+    }
+    #[test]
+    fn test_compare_prefix_bitsets_equal() {
+        let mut container = InternerContainer::from_text("a b");
+        let interner1 = container.get(container.latest_version());
+        let interner2 = interner1.add_text("");
+        container.interners.insert(interner2.version(), interner2.clone());
+        let prefix = 0;
+        let v1 = 1;
+        let v2 = 2;
+        assert!(container.compare_prefix_bitsets(prefix, v1, v2));
+    }
+    #[test]
+    fn test_compare_prefix_bitsets_different() {
+        let mut container = InternerContainer::from_text("a b");
+        let interner1 = container.get(container.latest_version());
+        let interner2 = interner1.add_text("c");
+        container.interners.insert(interner2.version(), interner2.clone());
+        let prefix = 0;
+        let v1 = 1;
+        let v2 = 2;
+        assert!(!container.compare_prefix_bitsets(prefix, v1, v2));
+    }
+    #[test]
+    fn test_compare_prefix_bitsets_missing() {
+        let mut container = InternerContainer::from_text("a b");
+        let interner1 = container.get(container.latest_version());
+        let interner2 = interner1.add_text("c");
+        container.interners.insert(interner2.version(), interner2.clone());
+        let prefix = 99; // non-existent prefix
+        let v1 = 1;
+        let v2 = 2;
+        assert!(!container.compare_prefix_bitsets(prefix, v1, v2));
     }
 }
