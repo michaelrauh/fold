@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use crate::queue::Queue;
 use crate::ortho_database::OrthoDatabase;
+use crate::queue::Queue;
+use std::sync::Arc;
 use tokio::time;
 
 pub struct OrthoFeeder;

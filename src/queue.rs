@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 use crate::ortho::Ortho;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 
 pub struct Queue {
     pub name: String,
@@ -38,8 +38,8 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::runtime::Runtime;
     use crate::ortho::Ortho;
+    use tokio::runtime::Runtime;
 
     #[test]
     fn test_push_many_and_pop_one() {
@@ -59,7 +59,6 @@ mod tests {
             let popped2 = dbq.pop_one().await;
             assert!(popped2.is_some());
             assert_eq!(popped2.unwrap(), orthos[1]);
-            
 
             // Pop empty
             let popped3 = dbq.pop_one().await;

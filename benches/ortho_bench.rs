@@ -7,7 +7,9 @@ fn bench_ortho_new(c: &mut Criterion) {
 
 fn bench_ortho_add_simple(c: &mut Criterion) {
     let ortho = Ortho::new(1);
-    c.bench_function("ortho_add_simple", |b| b.iter(|| ortho.add(black_box(10), 1)));
+    c.bench_function("ortho_add_simple", |b| {
+        b.iter(|| ortho.add(black_box(10), 1))
+    });
 }
 
 fn bench_ortho_add_multiple(c: &mut Criterion) {

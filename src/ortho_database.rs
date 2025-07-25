@@ -1,7 +1,7 @@
-use std::collections::{HashSet, HashMap};
+use crate::ortho::Ortho;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::ortho::Ortho;
 
 pub struct OrthoDatabase {
     pub map: Arc<Mutex<HashMap<usize, Ortho>>>,

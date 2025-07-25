@@ -11,7 +11,11 @@ impl Worker {
     pub fn new(interner: Interner) -> Self {
         Worker { interner }
     }
-    pub async fn run(workq: Arc<crate::queue::Queue>, dbq: Arc<crate::queue::Queue>, interner: Interner) {
+    pub async fn run(
+        workq: Arc<crate::queue::Queue>,
+        dbq: Arc<crate::queue::Queue>,
+        interner: Interner,
+    ) {
         loop {
             let ortho = {
                 let mut receiver = workq.receiver.lock().await;
@@ -38,7 +42,11 @@ impl Worker {
     pub fn get_requirements(&self, _ortho: &Ortho) -> (Vec<usize>, Vec<Vec<usize>>) {
         todo!("Stub: get requirements from ortho")
     }
-    pub fn solve_requirements(&self, _required: &Vec<Vec<usize>>, _forbidden: &Vec<usize>) -> Vec<usize> {
+    pub fn solve_requirements(
+        &self,
+        _required: &Vec<Vec<usize>>,
+        _forbidden: &Vec<usize>,
+    ) -> Vec<usize> {
         todo!("Stub: call interner.intersect")
     }
     pub fn add_to_ortho_and_dbq(&self, _ortho: &Ortho, _completions: Vec<usize>) {

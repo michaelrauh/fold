@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use crate::interner::InternerContainer;
 use crate::ortho_database::OrthoDatabase;
 use crate::queue::Queue;
+use std::sync::Arc;
 use tokio::time;
 
 pub struct Follower;
@@ -16,7 +16,10 @@ impl Follower {
             drop(map);
             while let Some(&lowest_version) = versions.first() {
                 let map = db.map.lock().await;
-                let ortho_opt = map.values().find(|o| o.version() == lowest_version).cloned();
+                let ortho_opt = map
+                    .values()
+                    .find(|o| o.version() == lowest_version)
+                    .cloned();
                 drop(map);
                 if let Some(mut ortho) = ortho_opt {
                     let latest_version = container.latest_version();
@@ -27,7 +30,11 @@ impl Follower {
                     let prefixes = ortho.prefixes();
                     let mut all_same = true;
                     for &prefix in &prefixes {
-                        if !container.compare_prefix_bitsets(prefix, ortho.version(), latest_version) {
+                        if !container.compare_prefix_bitsets(
+                            prefix,
+                            ortho.version(),
+                            latest_version,
+                        ) {
                             all_same = false;
                             break;
                         }

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use fixedbitset::FixedBitSet;
-use crate::splitter::Splitter;
-use std::sync::Arc;
 use crate::queue::Queue;
+use crate::splitter::Splitter;
+use fixedbitset::FixedBitSet;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Interner {
@@ -28,9 +28,15 @@ impl Interner {
             if phrase.len() < 2 {
                 continue;
             }
-            let indices: Vec<usize> = phrase.iter().map(|word| {
-                vocabulary.iter().position(|v| v == word).expect("Word should be in vocabulary")
-            }).collect();
+            let indices: Vec<usize> = phrase
+                .iter()
+                .map(|word| {
+                    vocabulary
+                        .iter()
+                        .position(|v| v == word)
+                        .expect("Word should be in vocabulary")
+                })
+                .collect();
             let prefix = indices[..indices.len() - 1].to_vec();
             let completion_word_index = indices[indices.len() - 1];
             if completion_word_index < new_vocab_len {
@@ -71,9 +77,15 @@ impl Interner {
             if phrase.len() < 2 {
                 continue;
             }
-            let indices: Vec<usize> = phrase.iter().map(|word| {
-                vocabulary.iter().position(|v| v == word).expect("Word should be in vocabulary")
-            }).collect();
+            let indices: Vec<usize> = phrase
+                .iter()
+                .map(|word| {
+                    vocabulary
+                        .iter()
+                        .position(|v| v == word)
+                        .expect("Word should be in vocabulary")
+                })
+                .collect();
             let prefix = indices[..indices.len() - 1].to_vec();
             let completion_word_index = indices[indices.len() - 1];
             if completion_word_index < new_vocab_len {
@@ -101,7 +113,8 @@ impl Interner {
     }
 
     pub fn string_for_index(&self, index: usize) -> &str {
-        self.vocabulary.get(index)
+        self.vocabulary
+            .get(index)
             .map(|s| s.as_str())
             .expect("Index out of bounds in Interner::string_for_index")
     }
@@ -150,7 +163,7 @@ pub struct InternerContainer {
 }
 
 impl InternerContainer {
-    pub fn from_text(text: &str) -> Self {
+    fn from_text(text: &str) -> Self {
         let interner = Interner::from_text(text);
         let mut interners = HashMap::new();
         interners.insert(interner.version(), interner);
@@ -161,18 +174,24 @@ impl InternerContainer {
         let mut interners = self.interners.clone();
         let version = interner.version();
         interners.insert(version, interner.clone());
-        // When a new interner is added, create a new ortho and send to workq
+
         let ortho_seed = crate::ortho::Ortho::new(version as usize);
         let _ = workq.sender.as_ref().unwrap().send(ortho_seed).await;
         InternerContainer { interners }
     }
 
     pub fn get(&self, version: usize) -> &Interner {
-        self.interners.get(&(version as u64)).expect("Version not found in InternerContainer")
+        self.interners
+            .get(&(version as u64))
+            .expect("Version not found in InternerContainer")
     }
 
     pub fn latest_version(&self) -> usize {
-        *self.interners.keys().max().expect("No interners in container") as usize
+        *self
+            .interners
+            .keys()
+            .max()
+            .expect("No interners in container") as usize
     }
 
     pub fn compare_prefix_bitsets(&self, prefix: usize, v1: usize, v2: usize) -> bool {
@@ -196,7 +215,7 @@ pub struct InternerHolder {
 impl InternerHolder {
     pub fn new(workq: Arc<Queue>) -> Self {
         InternerHolder {
-            container: InternerContainer::from_text(""), 
+            container: InternerContainer::from_text(""),
             workq,
         }
     }
@@ -204,10 +223,18 @@ impl InternerHolder {
         let interner = if self.container.interners.is_empty() {
             Interner::from_text(text)
         } else {
-            let latest = self.container.interners.values().max_by_key(|i| i.version()).unwrap();
+            let latest = self
+                .container
+                .interners
+                .values()
+                .max_by_key(|i| i.version())
+                .unwrap();
             latest.add_text(text)
         };
-        self.container = self.container.add_with_seed(interner, self.workq.clone()).await;
+        self.container = self
+            .container
+            .add_with_seed(interner, self.workq.clone())
+            .await;
     }
     pub fn latest_version(&self) -> usize {
         self.container.latest_version() as usize
@@ -353,7 +380,9 @@ mod container_tests {
         let mut container = InternerContainer::from_text("a b");
         let interner1 = container.get(container.latest_version());
         let interner2 = interner1.add_text("");
-        container.interners.insert(interner2.version(), interner2.clone());
+        container
+            .interners
+            .insert(interner2.version(), interner2.clone());
         let prefix = 0;
         let v1 = 1;
         let v2 = 2;
@@ -364,7 +393,9 @@ mod container_tests {
         let mut container = InternerContainer::from_text("a b");
         let interner1 = container.get(container.latest_version());
         let interner2 = interner1.add_text("c");
-        container.interners.insert(interner2.version(), interner2.clone());
+        container
+            .interners
+            .insert(interner2.version(), interner2.clone());
         let prefix = 0;
         let v1 = 1;
         let v2 = 2;
@@ -375,10 +406,87 @@ mod container_tests {
         let mut container = InternerContainer::from_text("a b");
         let interner1 = container.get(container.latest_version());
         let interner2 = interner1.add_text("c");
-        container.interners.insert(interner2.version(), interner2.clone());
+        container
+            .interners
+            .insert(interner2.version(), interner2.clone());
         let prefix = 99; // non-existent prefix
         let v1 = 1;
         let v2 = 2;
         assert!(!container.compare_prefix_bitsets(prefix, v1, v2));
+    }
+}
+
+#[cfg(test)]
+mod holder_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // Minimal mock for Queue
+    struct DummySender;
+    impl DummySender {
+        async fn send<T>(&self, _msg: T) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+    struct DummyQueue {
+        pub sender: Option<Arc<DummySender>>,
+    }
+    impl DummyQueue {
+        fn new() -> Self {
+            DummyQueue {
+                sender: Some(Arc::new(DummySender)),
+            }
+        }
+    }
+    impl Queue {
+        pub fn dummy() -> Arc<Queue> {
+            // SAFETY: This is only for tests, and we never use sender
+            unsafe {
+                std::mem::transmute::<Arc<DummyQueue>, Arc<Queue>>(Arc::new(DummyQueue::new()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_holder_new_initializes_empty() {
+        let workq = Queue::dummy();
+        let holder = InternerHolder::new(workq);
+        assert_eq!(holder.container.interners.len(), 1);
+        assert_eq!(holder.latest_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_holder_add_text_with_seed_increments_version() {
+        let workq = Queue::dummy();
+        let mut holder = InternerHolder::new(workq);
+        holder.add_text_with_seed("foo bar").await;
+        assert_eq!(holder.latest_version(), 2);
+        holder.add_text_with_seed("baz").await;
+        assert_eq!(holder.latest_version(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_holder_latest_version_returns_correct_value() {
+        let workq = Queue::dummy();
+        let mut holder = InternerHolder::new(workq);
+        holder.add_text_with_seed("a b").await;
+        holder.add_text_with_seed("c").await;
+        assert_eq!(holder.latest_version(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_holder_compare_prefix_bitsets() {
+        let workq = Queue::dummy();
+        let mut holder = InternerHolder::new(workq);
+        holder.add_text_with_seed("a b").await;
+        holder.add_text_with_seed("").await;
+        let prefix = 0;
+        let v1 = 1;
+        let v2 = 2;
+        assert!(holder.compare_prefix_bitsets(prefix, v1, v2));
+        holder.add_text_with_seed("c").await;
+        let v3 = 3;
+        assert!(!holder.compare_prefix_bitsets(prefix, v1, v3));
     }
 }
