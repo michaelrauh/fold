@@ -23,14 +23,14 @@ impl Follower {
                 }
                 _ = async {
                     let guard = container.lock().await;
-                    eprintln!("[Follower] main loop: interner_versions in container before removal: {:?}", guard.interners.keys().copied().collect::<Vec<_>>());
+                    
                     drop(guard);
                     if let Some(&lowest_version) = db.all_versions().await.first() {
                         Self::process_lowest_version(&db, &workq, &container, lowest_version).await;
                     }
                     Self::remove_unused_interners(&db, &container).await;
                     let guard = container.lock().await;
-                    eprintln!("[Follower] main loop: interner_versions in container after removal: {:?}", guard.interners.keys().copied().collect::<Vec<_>>());
+                    
                     drop(guard);
                     time::sleep(std::time::Duration::from_millis(10)).await;
                 } => {}
@@ -98,21 +98,17 @@ impl Follower {
         let interner_versions: HashSet<usize> =
             container_guard.interners.keys().copied().collect();
         let latest_version = container_guard.latest_version();
-        eprintln!("[Follower] remove_unused_interners: ortho_versions in db: {:?}", ortho_versions);
-        eprintln!("[Follower] remove_unused_interners: interner_versions in container: {:?}", interner_versions);
-        eprintln!("[Follower] remove_unused_interners: latest_version in container: {}", latest_version);
+        
         let to_remove = interner_versions
             .difference(&ortho_versions)
             .cloned()
             .filter(|v| *v != latest_version)
             .collect::<Vec<_>>();
-        for version in &to_remove {
-            eprintln!("[Follower] removing unused interner version: {}", version);
-        }
+        
         for version in to_remove {
             let _ = container_guard.remove_by_version(version);
         }
-        eprintln!("[Follower] after removal, interner_versions in container: {:?}", container_guard.interners.keys().copied().collect::<Vec<_>>());
+        
     }
 
     async fn all_prefixes_same(

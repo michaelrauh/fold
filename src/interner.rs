@@ -242,7 +242,7 @@ impl InternerHolder {
         let container = Arc::new(Mutex::new(InternerContainer::from_text(text)));
         let version = container.lock().await.latest_version();
         let ortho_seed = crate::ortho::Ortho::new(version);
-        eprintln!("[InternerHolder] created seed ortho: {:?}", ortho_seed);
+        
         workq.push_many(vec![ortho_seed.clone()]).await;
         InternerHolder { container, workq }
     }

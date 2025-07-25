@@ -12,7 +12,6 @@ use tokio::sync::Mutex;
 #[tokio::test]
 async fn test_e2e_full_flow() {
     let dbq = Arc::new(Queue::new("dbq", 10));
-    // Ensure all collaborators share the same Arc<OrthoDatabase>
     let db = Arc::new(OrthoDatabase::new());
     let workq = Arc::new(Queue::new("e2e", 8));
     let container = Arc::new(Mutex::new(InternerContainer::from_text("a b. c d. a c. b d.")));
@@ -53,7 +52,7 @@ async fn test_e2e_full_flow() {
 
     holder.add_text_with_seed("a c e. b d f. c d. e f.").await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    // Wait for follower to remove version 1
+
     let mut waited = 0;
     let max_wait = 2000; // ms
 
@@ -62,9 +61,8 @@ async fn test_e2e_full_flow() {
         waited += 50;
     }
     let ortho_opt = db.get_optimal().await;
-    // After upsert, print the map and seen set contents
-    eprintln!("[e2e_full_flow] db map keys: {:?}", db.map.lock().await.keys().collect::<Vec<_>>());
-    shutdown.notify_waiters(); // signal all tasks to exit
+    
+    shutdown.notify_waiters(); 
 
     feeder_handle.await.expect("feeder task panicked");
     follower_handle.await.expect("follower task panicked");

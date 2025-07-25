@@ -49,7 +49,7 @@ impl OrthoDatabase {
     pub async fn all_versions(&self) -> Vec<usize> {
         let map = self.map.lock().await;
         let versions: Vec<usize> = map.values().map(|o| o.version()).sorted().collect();
-        eprintln!("[OrthoDatabase] all_versions: {:?}", versions);
+        
         versions
     }
 
@@ -60,16 +60,16 @@ impl OrthoDatabase {
 
     pub async fn insert_or_update(&self, ortho: Ortho) {
         let mut map = self.map.lock().await;
-        eprintln!("[OrthoDatabase] insert_or_update: inserting id={} version={}", ortho.id(), ortho.version());
+        
         map.insert(ortho.id(), ortho);
-        eprintln!("[OrthoDatabase] after insert_or_update, map keys: {:?}", map.keys().collect::<Vec<_>>());
+        
     }
 
     pub async fn remove_by_id(&self, id: &usize) {
         let mut map = self.map.lock().await;
-        eprintln!("[OrthoDatabase] remove_by_id: removing id={}", id);
+        
         map.remove(id);
-        eprintln!("[OrthoDatabase] after remove_by_id, map keys: {:?}", map.keys().collect::<Vec<_>>());
+        
     }
 }
 
