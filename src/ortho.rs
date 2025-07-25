@@ -11,6 +11,7 @@ pub struct Ortho {
 
 impl Ortho {
     pub fn new(version: usize) -> Self {
+        
         Ortho {
             version,
             dims: vec![2, 2],
@@ -32,6 +33,7 @@ impl Ortho {
     }
 
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
+        
         let position = self.get_current_position();
 
         let remaining_empty = self
@@ -108,7 +110,7 @@ impl Ortho {
             .collect()
     }
 
-    fn get_current_position(&self) -> usize {
+    pub fn get_current_position(&self) -> usize {
         self.payload.iter().position(|x| x.is_none()).unwrap()
     }
 
@@ -127,6 +129,7 @@ impl Ortho {
     }
 
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        
         let pos = self.get_current_position();
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
         let forbidden: Vec<usize> = diagonals
@@ -147,19 +150,47 @@ impl Ortho {
     }
 
     pub fn version(&self) -> usize {
-        todo!("stub: version getter for follower test")
+        
+        self.version
     }
 
-    pub fn set_version(&mut self, _v: usize) {
-        todo!("stub: set_version for follower test")
-    }
-
-    pub fn prefixes(&self) -> Vec<usize> {
-        todo!("stub: prefixes for follower test")
+    pub fn prefixes(&self) -> Vec<Vec<usize>> {
+        
+        // For each position in the payload, get the prefix indices from spatial::get_requirements
+        let mut result = Vec::new();
+        for pos in 0..self.payload.len() {
+            let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims);
+            for prefix in prefixes {
+                if !prefix.is_empty() {
+                    // Map indices to payload values, skipping None
+                    let values: Vec<usize> = prefix
+                        .iter()
+                        .filter_map(|&i| self.payload.get(i).cloned().flatten())
+                        .collect();
+                    if !values.is_empty() {
+                        result.push(values);
+                    }
+                }
+            }
+        }
+        result
     }
 
     pub fn dims(&self) -> &Vec<usize> {
         &self.dims
+    }
+
+    pub(crate) fn set_version(&self, version: usize) -> Ortho {
+        
+        Ortho {
+            version,
+            dims: self.dims.clone(),
+            payload: self.payload.clone(),
+        }
+    }
+
+    pub fn payload(&self) -> &Vec<Option<usize>> {
+        &self.payload
     }
 }
 
@@ -453,7 +484,7 @@ mod tests {
         let ortho = &ortho.add(20, 1)[0];
         let ortho = &ortho.add(30, 1)[0];
         let ortho = &ortho.add(40, 1)[0];
-        dbg!(ortho);
+        
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, vec![40]);
         assert_eq!(required, vec![vec![10, 30]]);
@@ -519,5 +550,52 @@ mod tests {
             payload: vec![Some(20), None, None, None],
         };
         assert_ne!(ortho_v1_content_a.id(), ortho_v1_content_b.id());
+    }
+
+    #[test]
+    fn test_id_collision_for_different_payloads() {
+        use super::*;
+        // These are the payloads seen in the logs
+        let ortho0 = Ortho {
+            version: 2,
+            dims: vec![2, 2],
+            payload: vec![Some(0), None, None, None],
+        };
+        let ortho1 = Ortho {
+            version: 2,
+            dims: vec![2, 2],
+            payload: vec![Some(1), None, None, None],
+        };
+        let ortho2 = Ortho {
+            version: 2,
+            dims: vec![2, 2],
+            payload: vec![Some(2), None, None, None],
+        };
+        let ortho3 = Ortho {
+            version: 2,
+            dims: vec![2, 2],
+            payload: vec![Some(3), None, None, None],
+        };
+        let ortho4 = Ortho {
+            version: 2,
+            dims: vec![2, 2],
+            payload: vec![Some(4), None, None, None],
+        };
+        let ortho5 = Ortho {
+            version: 2,
+            dims: vec![2, 2],
+            payload: vec![Some(5), None, None, None],
+        };
+        let ids = vec![
+            ortho0.id(),
+            ortho1.id(),
+            ortho2.id(),
+            ortho3.id(),
+            ortho4.id(),
+            ortho5.id(),
+        ];
+        // If there are collisions, there will be fewer unique IDs than payloads
+        let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique_ids.len(), ids.len(), "Ortho::id() should be unique for different payloads, but got collisions: {:?}", ids);
     }
 }
