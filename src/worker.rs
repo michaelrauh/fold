@@ -23,7 +23,7 @@ impl Worker {
                 for completion in completions {
                     let new_orthos = ortho.add(completion, ortho.version());
                     for new_ortho in new_orthos {
-                        let _ = dbq.sender.send(new_ortho).await;
+                        dbq.push_many(vec![new_ortho]).await;
                     }
                 }
             }
