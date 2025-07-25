@@ -13,6 +13,7 @@ pub struct Interner {
 
 impl Interner {
     pub fn from_text(text: &str) -> Self {
+        println!("Interner::from_text called with text: {}", text);
         let splitter = Splitter::new();
         let vocab = splitter.vocabulary(text);
         let phrases = splitter.phrases(text);
@@ -56,6 +57,14 @@ impl Interner {
     }
 
     pub fn add_text(&self, text: &str) -> Self {
+        println!("Interner::add_text called with text: {}", text);
+        if text.trim().is_empty() {
+            return Interner {
+                version: self.version + 1,
+                vocabulary: self.vocabulary.clone(),
+                prefix_to_completions: self.prefix_to_completions.clone(),
+            };
+        }
         let splitter = Splitter::new();
         let vocab = splitter.vocabulary(text);
         let phrases = splitter.phrases(text);
@@ -213,11 +222,9 @@ pub struct InternerHolder {
 }
 
 impl InternerHolder {
-    pub fn new(workq: Arc<Queue>) -> Self {
-        InternerHolder {
-            container: InternerContainer::from_text(""),
-            workq,
-        }
+    pub async fn with_seed(text: &str, workq: Arc<Queue>) -> Self {
+        let container = InternerContainer::from_text(text);
+        InternerHolder { container, workq }
     }
     pub async fn add_text_with_seed(&mut self, text: &str) {
         let interner = if self.container.interners.is_empty() {
@@ -419,47 +426,21 @@ mod container_tests {
 #[cfg(test)]
 mod holder_tests {
     use super::*;
+    use crate::queue::Queue;
     use std::sync::Arc;
-    use std::sync::Mutex;
-
-    // Minimal mock for Queue
-    struct DummySender;
-    impl DummySender {
-        async fn send<T>(&self, _msg: T) -> Result<(), ()> {
-            Ok(())
-        }
-    }
-    struct DummyQueue {
-        pub sender: Option<Arc<DummySender>>,
-    }
-    impl DummyQueue {
-        fn new() -> Self {
-            DummyQueue {
-                sender: Some(Arc::new(DummySender)),
-            }
-        }
-    }
-    impl Queue {
-        pub fn dummy() -> Arc<Queue> {
-            // SAFETY: This is only for tests, and we never use sender
-            unsafe {
-                std::mem::transmute::<Arc<DummyQueue>, Arc<Queue>>(Arc::new(DummyQueue::new()))
-            }
-        }
-    }
 
     #[tokio::test]
     async fn test_holder_new_initializes_empty() {
-        let workq = Queue::dummy();
-        let holder = InternerHolder::new(workq);
+        let workq = Arc::new(Queue::new("test", 8));
+        let holder = InternerHolder::with_seed("", workq.clone()).await;
         assert_eq!(holder.container.interners.len(), 1);
         assert_eq!(holder.latest_version(), 1);
     }
 
     #[tokio::test]
     async fn test_holder_add_text_with_seed_increments_version() {
-        let workq = Queue::dummy();
-        let mut holder = InternerHolder::new(workq);
+        let workq = Arc::new(Queue::new("test", 8));
+        let mut holder = InternerHolder::with_seed("", workq.clone()).await;
         holder.add_text_with_seed("foo bar").await;
         assert_eq!(holder.latest_version(), 2);
         holder.add_text_with_seed("baz").await;
@@ -468,8 +449,8 @@ mod holder_tests {
 
     #[tokio::test]
     async fn test_holder_latest_version_returns_correct_value() {
-        let workq = Queue::dummy();
-        let mut holder = InternerHolder::new(workq);
+        let workq = Arc::new(Queue::new("test", 8));
+        let mut holder = InternerHolder::with_seed("", workq.clone()).await;
         holder.add_text_with_seed("a b").await;
         holder.add_text_with_seed("c").await;
         assert_eq!(holder.latest_version(), 3);
@@ -477,13 +458,28 @@ mod holder_tests {
 
     #[tokio::test]
     async fn test_holder_compare_prefix_bitsets() {
-        let workq = Queue::dummy();
-        let mut holder = InternerHolder::new(workq);
-        holder.add_text_with_seed("a b").await;
+        let workq = Arc::new(Queue::new("test", 8));
+        let mut holder = InternerHolder::with_seed("a b", workq.clone()).await;
         holder.add_text_with_seed("").await;
         let prefix = 0;
         let v1 = 1;
         let v2 = 2;
+        let b1 = holder
+            .container
+            .interners
+            .get(&(v1 as u64))
+            .unwrap()
+            .prefix_to_completions
+            .get(&vec![prefix]);
+        let b2 = holder
+            .container
+            .interners
+            .get(&(v2 as u64))
+            .unwrap()
+            .prefix_to_completions
+            .get(&vec![prefix]);
+        println!("bitset v1: {:?}", b1);
+        println!("bitset v2: {:?}", b2);
         assert!(holder.compare_prefix_bitsets(prefix, v1, v2));
         holder.add_text_with_seed("c").await;
         let v3 = 3;

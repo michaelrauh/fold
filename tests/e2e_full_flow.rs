@@ -1,6 +1,7 @@
 // Integration test for e2e full flow
 use fold::feeder::OrthoFeeder;
 use fold::follower::Follower;
+use fold::interner::InternerContainer;
 use fold::interner::InternerHolder;
 use fold::ortho_database::OrthoDatabase;
 use fold::queue::Queue;
@@ -11,8 +12,11 @@ use std::sync::Arc;
 async fn test_e2e_full_flow() {
     let dbq = Arc::new(Queue::new("dbq", 10));
     let db = Arc::new(OrthoDatabase::new());
-    let workq = Arc::new(Queue::new("workq", 10));
-    let mut holder = InternerHolder::new(workq.clone());
+    let workq = Arc::new(Queue::new("e2e", 8));
+    let mut holder = InternerHolder::with_seed("a b. c d. a c. b d.", workq.clone()).await;
+    holder
+        .add_text_with_seed("e f. g h. e g. f h. a e. b f. c g. d h.")
+        .await;
     let feeder_handle = {
         let dbq = dbq.clone();
         let db = db.clone();
@@ -43,8 +47,6 @@ async fn test_e2e_full_flow() {
             Worker::run(workq, dbq, interner).await;
         })
     };
-    // Add first batch of text
-    holder.add_text_with_seed("a b. c d. a c. b d.").await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     // Add second batch of text
     holder
