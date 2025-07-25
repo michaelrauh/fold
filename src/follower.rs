@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use crate::interner::InternerContainer;
 use crate::ortho_database::OrthoDatabase;
-use crate::work_queue::WorkQueue;
+use crate::queue::Queue;
 use tokio::time;
 
 pub struct Follower;
 
 impl Follower {
-    pub async fn run(db: Arc<OrthoDatabase>, workq: Arc<WorkQueue>, container: Arc<InternerContainer>) {
+    pub async fn run(db: Arc<OrthoDatabase>, workq: Arc<Queue>, container: Arc<InternerContainer>) {
         loop {
             let map = db.map.lock().await;
             let mut versions: Vec<usize> = map.values().map(|o| o.version()).collect();
@@ -40,7 +40,7 @@ impl Follower {
                         ortho.set_version(latest_version);
                         let mut map = db.map.lock().await;
                         map.remove(&ortho.id());
-                        let _ = workq.sender.send(ortho).await;
+                        let _ = workq.sender.as_ref().unwrap().send(ortho).await;
                     }
                 }
                 let map = db.map.lock().await;

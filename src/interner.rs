@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use fixedbitset::FixedBitSet;
 use crate::splitter::Splitter;
 use std::sync::Arc;
-use crate::work_queue::WorkQueue;
+use crate::queue::Queue;
 
 #[derive(Clone)]
 pub struct Interner {
@@ -157,13 +157,13 @@ impl InternerContainer {
         InternerContainer { interners }
     }
 
-    pub async fn add_with_seed(&self, interner: Interner, workq: Arc<WorkQueue>) -> Self {
+    pub async fn add_with_seed(&self, interner: Interner, workq: Arc<Queue>) -> Self {
         let mut interners = self.interners.clone();
         let version = interner.version();
         interners.insert(version, interner.clone());
         // When a new interner is added, create a new ortho and send to workq
         let ortho_seed = crate::ortho::Ortho::new(version as usize);
-        let _ = workq.sender.send(ortho_seed).await;
+        let _ = workq.sender.as_ref().unwrap().send(ortho_seed).await;
         InternerContainer { interners }
     }
 
@@ -190,11 +190,11 @@ impl InternerContainer {
 
 pub struct InternerHolder {
     pub container: InternerContainer,
-    pub workq: Arc<WorkQueue>,
+    pub workq: Arc<Queue>,
 }
 
 impl InternerHolder {
-    pub fn new(workq: Arc<WorkQueue>) -> Self {
+    pub fn new(workq: Arc<Queue>) -> Self {
         InternerHolder {
             container: InternerContainer::from_text(""), 
             workq,

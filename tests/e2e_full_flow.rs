@@ -1,7 +1,6 @@
 // Integration test for e2e full flow
 use fold::ortho_database::OrthoDatabase;
-use fold::ortho_dbq::OrthoDbQueue;
-use fold::work_queue::WorkQueue;
+use fold::queue::Queue;
 use fold::feeder::OrthoFeeder;
 use fold::follower::Follower;
 use fold::worker::Worker;
@@ -10,9 +9,9 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn test_e2e_full_flow() {
-    let dbq = Arc::new(OrthoDbQueue::new(10));
+    let dbq = Arc::new(Queue::new("dbq", 10));
     let db = Arc::new(OrthoDatabase::new());
-    let workq = Arc::new(WorkQueue::new(10));
+    let workq = Arc::new(Queue::new("workq", 10));
     let mut holder = InternerHolder::new(workq.clone());
     let feeder_handle = {
         let dbq = dbq.clone();

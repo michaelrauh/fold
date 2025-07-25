@@ -11,7 +11,7 @@ impl Worker {
     pub fn new(interner: Interner) -> Self {
         Worker { interner }
     }
-    pub async fn run(workq: Arc<crate::work_queue::WorkQueue>, dbq: Arc<crate::ortho_dbq::OrthoDbQueue>, interner: Interner) {
+    pub async fn run(workq: Arc<crate::queue::Queue>, dbq: Arc<crate::queue::Queue>, interner: Interner) {
         loop {
             let ortho = {
                 let mut receiver = workq.receiver.lock().await;
