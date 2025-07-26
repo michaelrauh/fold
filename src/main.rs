@@ -33,7 +33,9 @@ async fn main() {
     ));
     println!("[main] InternerHolder created");
 
-    // Spawn a task to add new seeds from 2.txt to 28.txt every 30 seconds
+    // Clone workq and dbq for feeding task to avoid move errors
+    let feeding_workq = workq.clone();
+    let feeding_dbq = dbq.clone();
     let holder_clone = holder.clone();
     tokio::spawn(async move {
         for i in 2..=28 {
@@ -41,11 +43,22 @@ async fn main() {
                 let holder_guard = holder_clone.lock().await;
                 let num_interners = holder_guard.num_interners();
                 drop(holder_guard);
-                if num_interners <= 2 {
-                    println!("[main] Feeding {}.txt ({} interners in play)", i, num_interners);
+                // Only feed if exactly one interner and workq+dbq depths < 10_000
+                let workq_depth = if let Ok(workq_guard) = feeding_workq.receiver.try_lock() {
+                    workq_guard.len()
+                } else {
+                    10_000
+                };
+                let dbq_depth = if let Ok(dbq_guard) = feeding_dbq.receiver.try_lock() {
+                    dbq_guard.len()
+                } else {
+                    10_000
+                };
+                if num_interners == 1 && (workq_depth + dbq_depth) < 10_000 {
+                    println!("[main] Feeding {}.txt ({} interners in play, workq+dbq={})", i, num_interners, workq_depth + dbq_depth);
                     break;
                 } else {
-                    println!("[main] Waiting to feed {}.txt: {} interners in play", i, num_interners);
+                    println!("[main] Waiting to feed {}.txt: {} interners in play, workq+dbq={}", i, num_interners, workq_depth + dbq_depth);
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
             }
