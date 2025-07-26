@@ -67,6 +67,46 @@ async fn main() {
     let follower_shutdown = shutdown.clone();
     let worker_shutdown = shutdown.clone();
 
+    // Periodic Follower work log task
+    {
+        let db = db.clone();
+        let holder = holder.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                // Log how much more "work" Follower has to do
+                let ortho_count = if let Ok(db_guard) = db.map.try_lock() {
+                    db_guard.len()
+                } else {
+                    0
+                };
+                let (latest_version, num_interners, all_versions, lowest_version, lowest_count) = {
+                    let holder_guard = holder.lock().await;
+                    let all_versions = db.all_versions().await;
+                    let lowest_version = all_versions.iter().min().cloned();
+                    let all_orthos = db.all_orthos().await;
+                    let lowest_count = if let Some(lv) = lowest_version {
+                        all_orthos.iter().filter(|o| o.version() == lv).count()
+                    } else { 0 };
+                    (holder_guard.latest_version(), holder_guard.num_interners(), all_versions, lowest_version, lowest_count)
+                };
+                println!(
+                    "[follower-info] Ortho count: {}, Interners: {}, Latest interner version: {}",
+                    ortho_count, num_interners, latest_version
+                );
+                println!(
+                    "[follower-info] All interner versions: {:?}", all_versions
+                );
+                if let Some(lv) = lowest_version {
+                    println!(
+                        "[follower-info] Number of orthos present in the lowest version ({}): {}",
+                        lv, lowest_count
+                    );
+                }
+            }
+        });
+    }
+
     let feeder_handle = {
         let dbq = dbq.clone();
         let db = db.clone();

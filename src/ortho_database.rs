@@ -48,9 +48,11 @@ impl OrthoDatabase {
 
     pub async fn all_versions(&self) -> Vec<usize> {
         let map = self.map.lock().await;
-        let versions: Vec<usize> = map.values().map(|o| o.version()).sorted().collect();
-
-        versions
+        use std::collections::HashSet;
+        let mut versions: HashSet<usize> = map.values().map(|o| o.version()).collect();
+        let mut versions_vec: Vec<usize> = versions.into_iter().collect();
+        versions_vec.sort_unstable();
+        versions_vec
     }
 
     pub fn log_map_length_periodically(self: Arc<Self>) {
