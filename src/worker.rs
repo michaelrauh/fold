@@ -33,6 +33,10 @@ impl Worker {
                 _ = async {
                     if let Some(ortho) = workq.pop_one().await {
                         if ortho.version() > self.interner.version() {
+                            println!("[worker] Updating interner from version {} to {} (ortho version {})", self.interner.version(), {
+                                let guard = self.container.lock().await;
+                                guard.latest_version()
+                            }, ortho.version());
                             self.interner = {
                                 let guard = self.container.lock().await;
                                 guard.get_latest().clone()

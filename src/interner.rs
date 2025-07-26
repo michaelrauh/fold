@@ -235,10 +235,10 @@ impl InternerHolder {
     }
 
     pub async fn with_seed(text: &str, workq: Arc<Queue>) -> Self {
-        let holder = InternerHolder::from_text(text, workq);
+        let holder = InternerHolder::from_text(text, workq.clone());
         let version = holder.latest_version();
         let ortho_seed = crate::ortho::Ortho::new(version);
-        holder.workq.push_many(vec![ortho_seed.clone()]).await;
+        workq.push_front(vec![ortho_seed.clone()]).await;
         holder
     }
 
@@ -256,11 +256,15 @@ impl InternerHolder {
 
         let ortho_seed = crate::ortho::Ortho::new(version);
 
-        self.workq.push_many(vec![ortho_seed]).await;
+        self.workq.push_front(vec![ortho_seed]).await;
     }
 
     pub async fn has_version(&self, version: usize) -> bool {
         self.interners.contains_key(&version)
+    }
+
+    pub fn num_interners(&self) -> usize {
+        self.interners.len()
     }
 }
 

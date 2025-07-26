@@ -37,10 +37,21 @@ async fn main() {
     let holder_clone = holder.clone();
     tokio::spawn(async move {
         for i in 2..=28 {
+            loop {
+                let holder_guard = holder_clone.lock().await;
+                let num_interners = holder_guard.num_interners();
+                drop(holder_guard);
+                if num_interners <= 2 {
+                    println!("[main] Feeding {}.txt ({} interners in play)", i, num_interners);
+                    break;
+                } else {
+                    println!("[main] Waiting to feed {}.txt: {} interners in play", i, num_interners);
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }
             let filename = format!("{}.txt", i);
             match fs::read_to_string(&filename) {
                 Ok(text) => {
-                    println!("[main] Adding seed from {}", filename);
                     let mut holder_guard = holder_clone.lock().await;
                     holder_guard.add_text_with_seed(text.trim()).await;
                 },
@@ -48,7 +59,6 @@ async fn main() {
                     println!("[main] Failed to read {}: {}", filename, e);
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
 
@@ -77,45 +87,53 @@ async fn main() {
             Follower::run(db, workq, container, shutdown).await;
         })
     };
-    let mut worker = Worker::new(holder.clone()).await;
-    let worker_version = worker.interner.version();
+    // Change worker to Arc<Mutex<Worker>> so we can read its version live
+    let worker = Arc::new(Mutex::new(Worker::new(holder.clone()).await));
     let worker_handle = {
+        let worker = worker.clone();
         let workq = workq.clone();
         let dbq = dbq.clone();
         let shutdown = worker_shutdown.clone();
         println!("[main] Spawning worker");
         tokio::spawn(async move {
-            worker.run(workq, dbq, shutdown).await;
+            let mut w = worker.lock().await;
+            w.run(workq, dbq, shutdown).await;
         })
     };
     println!("[main] Entering main loop");
 
     let mut loop_count = 0;
+    let mut last_db_len = 0;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         loop_count += 1;
         let workq_depth = if let Ok(workq_guard) = workq.receiver.try_lock() {
             workq_guard.len()
         } else {
+            println!("[main] Could not lock workq");
             continue;
         };
         let dbq_depth = if let Ok(dbq_guard) = dbq.receiver.try_lock() {
             dbq_guard.len()
         } else {
+            println!("[main] Could not lock dbq");
             continue;
         };
         let db_len = if let Ok(db_guard) = db.map.try_lock() {
-            db_guard.len()
+            let len = db_guard.len();
+            last_db_len = len;
+            len
         } else {
-            continue;
+            // Don't print error, just use last known value
+            last_db_len
         };
         let latest_version = {
             let holder_guard = holder.lock().await;
             holder_guard.latest_version()
         };
         println!(
-            "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}, worker version: {}",
-            workq_depth, dbq_depth, db_len, latest_version, worker_version
+            "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}",
+            workq_depth, dbq_depth, db_len, latest_version
         );
         if loop_count % 6 == 0 {
             let ortho_opt = db.get_optimal().await;
@@ -133,7 +151,12 @@ async fn main() {
                 println!("[main] No optimal Ortho found.");
             }
         }
-        if workq_depth == 0 && dbq_depth == 0 {
+        // Stop if worker version is less than latest interner version
+        let num_interners = {
+            let holder_guard = holder.lock().await;
+            holder_guard.num_interners()
+        };
+        if workq_depth == 0 && dbq_depth == 0 && latest_version > 25 && num_interners == 1 {
             break;
         }
     }

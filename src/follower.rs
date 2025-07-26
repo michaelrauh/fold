@@ -106,6 +106,7 @@ impl Follower {
             .collect::<Vec<_>>();
 
         for version in to_remove {
+            println!("[follower] Deleting interner version {}", version);
             let _ = container_guard.remove_by_version(version);
         }
     }
@@ -188,5 +189,4 @@ mod tests {
     }
 }
 
-// TODO panic on prefix not found in interner intersect 
-// TODO follower doesn't need to go through all phrases. It only needs to look at the position most recently filled.
+// TODO panic on prefix not found in interner intersect - actually don't - prefixes may be missing. Just return replay.

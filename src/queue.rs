@@ -6,6 +6,7 @@ pub struct Queue {
     pub name: String,
     sender: Arc<Mutex<Option<mpsc::Sender<Ortho>>>>,
     pub receiver: Arc<Mutex<mpsc::Receiver<Ortho>>>,
+    front_buffer: Arc<Mutex<Vec<Ortho>>>,
 }
 
 impl Queue {
@@ -15,6 +16,7 @@ impl Queue {
             name: name.to_string(),
             sender: Arc::new(Mutex::new(Some(sender))),
             receiver: Arc::new(Mutex::new(receiver)),
+            front_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -27,19 +29,38 @@ impl Queue {
         }
     }
 
+    pub async fn push_front(&self, orthos: Vec<Ortho>) {
+        let mut front = self.front_buffer.lock().await;
+        for ortho in orthos.into_iter().rev() {
+            front.insert(0, ortho);
+        }
+    }
+
     pub async fn pop_one(&self) -> Option<Ortho> {
+        let mut front = self.front_buffer.lock().await;
+        if !front.is_empty() {
+            return Some(front.remove(0));
+        }
+        drop(front);
         let mut receiver = self.receiver.lock().await;
         receiver.try_recv().ok()
     }
 
     /// Tries to pop up to `max` items from the queue without blocking. Returns as many as are available (may be empty).
     pub async fn pop_many(&self, max: usize) -> Vec<Ortho> {
-        let mut receiver = self.receiver.lock().await;
         let mut items = Vec::with_capacity(max);
-        for _ in 0..max {
-            match receiver.try_recv() {
-                Ok(item) => items.push(item),
-                Err(_) => break,
+        let mut front = self.front_buffer.lock().await;
+        while !front.is_empty() && items.len() < max {
+            items.push(front.remove(0));
+        }
+        drop(front);
+        if items.len() < max {
+            let mut receiver = self.receiver.lock().await;
+            for _ in items.len()..max {
+                match receiver.try_recv() {
+                    Ok(item) => items.push(item),
+                    Err(_) => break,
+                }
             }
         }
         items
