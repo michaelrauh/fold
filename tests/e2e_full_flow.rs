@@ -2,7 +2,6 @@
 use fold::feeder::OrthoFeeder;
 use fold::follower::Follower;
 use fold::interner::InternerHolder;
-use fold::interner::InternerContainer;
 use fold::ortho_database::OrthoDatabase;
 use fold::queue::Queue;
 use fold::worker::Worker;
@@ -14,8 +13,10 @@ async fn test_e2e_full_flow() {
     let dbq = Arc::new(Queue::new("dbq", 10));
     let db = Arc::new(OrthoDatabase::new());
     let workq = Arc::new(Queue::new("e2e", 8));
-    let container = Arc::new(Mutex::new(InternerContainer::from_text("a b. c d. a c. b d.")));
-    let mut holder = InternerHolder { container: container.clone(), workq: workq.clone() };
+    let holder = Arc::new(Mutex::new(InternerHolder::from_text(
+        "a b. c d. a c. b d.",
+        workq.clone(),
+    )));
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let feeder_shutdown = shutdown.clone();
     let follower_shutdown = shutdown.clone();
@@ -33,13 +34,13 @@ async fn test_e2e_full_flow() {
     let follower_handle = {
         let db = db.clone();
         let workq = workq.clone();
-        let container = container.clone();
+        let container = holder.clone();
         let shutdown = follower_shutdown.clone();
         tokio::spawn(async move {
             Follower::run(db, workq, container, shutdown).await;
         })
     };
-    let mut worker = Worker::new(container.clone()).await;
+    let mut worker = Worker::new(holder.clone()).await;
     let worker_handle = {
         let workq = workq.clone();
         let dbq = dbq.clone();
@@ -50,19 +51,23 @@ async fn test_e2e_full_flow() {
     };
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    holder.add_text_with_seed("a c e. b d f. c d. e f.").await;
+    holder
+        .lock()
+        .await
+        .add_text_with_seed("a c e. b d f. c d. e f.")
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let mut waited = 0;
     let max_wait = 2000; // ms
 
-    while holder.has_version(1).await && waited < max_wait {
+    while holder.lock().await.has_version(1).await && waited < max_wait {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         waited += 50;
     }
     let ortho_opt = db.get_optimal().await;
-    
-    shutdown.notify_waiters(); 
+
+    shutdown.notify_waiters();
 
     feeder_handle.await.expect("feeder task panicked");
     follower_handle.await.expect("follower task panicked");
@@ -73,7 +78,11 @@ async fn test_e2e_full_flow() {
     );
 
     assert!(
-        !holder.has_version(1).await,
+        !holder.lock().await.has_version(1).await,
         "Version 1 should be removed from the interner container"
+    );
+    println!(
+        "Test completed successfully with optimal ortho: {:?}",
+        ortho_opt
     );
 }

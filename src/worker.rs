@@ -1,14 +1,14 @@
-use crate::interner::{Interner, InternerContainer};
+use crate::interner::{Interner, InternerHolder};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
 pub struct Worker {
     pub interner: Interner,
-    pub container: Arc<Mutex<InternerContainer>>,
+    pub container: Arc<Mutex<InternerHolder>>,
 }
 
 impl Worker {
-    pub async fn new(container: Arc<Mutex<InternerContainer>>) -> Self {
+    pub async fn new(container: Arc<Mutex<InternerHolder>>) -> Self {
         let interner = {
             let guard = container.lock().await;
             guard.get_latest().clone()
@@ -28,12 +28,16 @@ impl Worker {
         loop {
             tokio::select! {
                 _ = shutdown.notified() => {
+
                     break;
                 }
                 _ = async {
+
                     let ortho = workq.pop_one().await;
+
                     if let Some(ortho) = ortho {
                         if ortho.version() > self.interner.version() {
+
                             self.interner = {
                                 let guard = self.container.lock().await;
                                 guard.get_latest().clone()
@@ -43,11 +47,15 @@ impl Worker {
                         let completions = self.interner.intersect(&required, &forbidden);
                         let version = self.interner.version();
                         for completion in completions {
+
                             let new_orthos = ortho.add(completion, version);
+
                             dbq.push_many(new_orthos).await;
+
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                    // tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 } => {}
             }
         }
@@ -57,15 +65,18 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interner::InternerContainer;
-    use crate::queue::Queue;
+    use crate::interner::InternerHolder;
     use crate::ortho::Ortho;
+    use crate::queue::Queue;
     use std::sync::Arc;
     use tokio::sync::{Mutex, Notify};
 
     #[tokio::test]
     async fn test_worker_new_gets_latest_interner() {
-        let container = Arc::new(Mutex::new(InternerContainer::from_text("a b c")));
+        let container = Arc::new(Mutex::new(InternerHolder::from_text(
+            "a b c",
+            Arc::new(Queue::new("test", 8)),
+        )));
         let worker = Worker::new(container.clone()).await;
         let guard = container.lock().await;
         let latest = guard.get_latest();
@@ -75,11 +86,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_updates_interner_if_out_of_date() {
-        let mut container = InternerContainer::from_text("a b");
-        let interner1 = container.get_latest().clone();
+        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
+        let interner1 = holder.get_latest().clone();
         let interner2 = interner1.add_text("c");
-        container.interners.insert(interner2.version(), interner2.clone());
-        let container = Arc::new(Mutex::new(container));
+        holder
+            .interners
+            .insert(interner2.version(), interner2.clone());
+        let container = Arc::new(Mutex::new(holder));
         let worker = Arc::new(Mutex::new(Worker::new(container.clone()).await));
         // Simulate out-of-date interner
         {
@@ -112,7 +125,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_creates_orthos() {
-        let container = Arc::new(Mutex::new(InternerContainer::from_text("a b c")));
+        let container = Arc::new(Mutex::new(InternerHolder::from_text(
+            "a b c",
+            Arc::new(Queue::new("test", 8)),
+        )));
         let worker = Arc::new(Mutex::new(Worker::new(container.clone()).await));
         let workq = Arc::new(Queue::new("workq", 8));
         let dbq = Arc::new(Queue::new("dbq", 8));

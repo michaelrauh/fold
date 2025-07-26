@@ -1,4 +1,4 @@
-use crate::interner::InternerContainer;
+use crate::interner::InternerHolder;
 use crate::ortho_database::OrthoDatabase;
 use crate::queue::Queue;
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ impl Follower {
     pub async fn run(
         db: Arc<OrthoDatabase>,
         workq: Arc<Queue>,
-        container: Arc<Mutex<InternerContainer>>,
+        container: Arc<Mutex<InternerHolder>>,
         shutdown: Arc<Notify>,
     ) {
         loop {
@@ -23,14 +23,14 @@ impl Follower {
                 }
                 _ = async {
                     let guard = container.lock().await;
-                    
+
                     drop(guard);
                     if let Some(&lowest_version) = db.all_versions().await.first() {
                         Self::process_lowest_version(&db, &workq, &container, lowest_version).await;
                     }
                     Self::remove_unused_interners(&db, &container).await;
                     let guard = container.lock().await;
-                    
+
                     drop(guard);
                     time::sleep(std::time::Duration::from_millis(10)).await;
                 } => {}
@@ -41,7 +41,7 @@ impl Follower {
     async fn process_lowest_version(
         db: &Arc<OrthoDatabase>,
         workq: &Arc<Queue>,
-        container: &Arc<Mutex<InternerContainer>>,
+        container: &Arc<Mutex<InternerHolder>>,
         lowest_version: usize,
     ) {
         if let Some(ortho) = Self::get_ortho_for_version(db, lowest_version).await {
@@ -91,28 +91,26 @@ impl Follower {
 
     async fn remove_unused_interners(
         db: &Arc<OrthoDatabase>,
-        container: &Arc<Mutex<InternerContainer>>,
+        container: &Arc<Mutex<InternerHolder>>,
     ) {
         let ortho_versions: HashSet<usize> = db.all_versions().await.into_iter().collect();
         let mut container_guard = container.lock().await;
-        let interner_versions: HashSet<usize> =
-            container_guard.interners.keys().copied().collect();
+        let interner_versions: HashSet<usize> = container_guard.interners.keys().copied().collect();
         let latest_version = container_guard.latest_version();
-        
+
         let to_remove = interner_versions
             .difference(&ortho_versions)
             .cloned()
             .filter(|v| *v != latest_version)
             .collect::<Vec<_>>();
-        
+
         for version in to_remove {
             let _ = container_guard.remove_by_version(version);
         }
-        
     }
 
     async fn all_prefixes_same(
-        container: &Arc<Mutex<InternerContainer>>,
+        container: &Arc<Mutex<InternerHolder>>,
         prefixes: &[Vec<usize>],
         ortho_version: usize,
         latest_version: usize,
@@ -127,19 +125,20 @@ impl Follower {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interner::InternerContainer;
+    use crate::interner::InternerHolder;
     use crate::ortho::Ortho;
-    // Removed unused imports: Queue, Notify, Runtime
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn test_remove_unused_interners_removes_versions_not_in_db() {
         let db = Arc::new(OrthoDatabase::new());
-        let mut container = InternerContainer::from_text("a b");
+        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
         // Add a fake version not in db
         let fake_version = 99;
-        let interner = container.get(container.latest_version()).add_text("c");
-        container.interners.insert(fake_version, interner);
-        let container = Arc::new(Mutex::new(container));
+        let interner = holder.get(holder.latest_version()).add_text("c");
+        holder.interners.insert(fake_version, interner);
+        let container = Arc::new(Mutex::new(holder));
         // No orthos in db, so only the latest interner should remain
         Follower::remove_unused_interners(&db, &container).await;
         let guard = container.lock().await;
@@ -152,12 +151,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_prefixes_same_true_and_false() {
-        let mut container = InternerContainer::from_text("a b");
-        let v1 = container.latest_version();
-        let interner2 = container.get(v1).add_text("");
+        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
+        let v1 = holder.latest_version();
+        let interner2 = holder.get(v1).add_text("");
         let v2 = interner2.version();
-        container.interners.insert(v2, interner2.clone());
-        let container = Arc::new(Mutex::new(container));
+        holder.interners.insert(v2, interner2.clone());
+        let container = Arc::new(Mutex::new(holder));
         let prefixes = vec![vec![0]];
         // Should be true for identical bitsets
         let same = Follower::all_prefixes_same(&container, &prefixes, v1, v2).await;

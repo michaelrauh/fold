@@ -49,8 +49,20 @@ impl OrthoDatabase {
     pub async fn all_versions(&self) -> Vec<usize> {
         let map = self.map.lock().await;
         let versions: Vec<usize> = map.values().map(|o| o.version()).sorted().collect();
-        
+
         versions
+    }
+
+    pub fn log_map_length_periodically(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                let map = self.map.lock().await;
+                let length = map.len();
+                drop(map);
+                println!("[map length: {}", length);
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            }
+        });
     }
 
     pub async fn all_orthos(&self) -> Vec<Ortho> {
@@ -60,16 +72,14 @@ impl OrthoDatabase {
 
     pub async fn insert_or_update(&self, ortho: Ortho) {
         let mut map = self.map.lock().await;
-        
+
         map.insert(ortho.id(), ortho);
-        
     }
 
     pub async fn remove_by_id(&self, id: &usize) {
         let mut map = self.map.lock().await;
-        
+
         map.remove(id);
-        
     }
 }
 

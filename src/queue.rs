@@ -10,7 +10,7 @@ pub struct Queue {
 
 impl Queue {
     pub fn new(name: &str, buffer: usize) -> Self {
-        let (sender, receiver) = mpsc::channel(buffer);
+        let (sender, receiver) = mpsc::channel(2305843009213693951);
         Self {
             name: name.to_string(),
             sender: Arc::new(Mutex::new(Some(sender))),
@@ -20,21 +20,46 @@ impl Queue {
 
     pub async fn push_many(&self, orthos: Vec<Ortho>) {
         let sender_guard = self.sender.lock().await;
+
         if let Some(sender) = sender_guard.as_ref() {
             for ortho in orthos {
-                let _ = sender.send(ortho).await;
+                let res = sender.send(ortho).await;
             }
+        } else {
+            println!("[Queue::push_many] Sender is None (queue closed)");
         }
     }
 
     pub async fn pop_one(&self) -> Option<Ortho> {
         let mut receiver = self.receiver.lock().await;
-        receiver.recv().await
+
+        let res = receiver.recv().await;
+
+        res
     }
 
     pub async fn close(&self) {
         let mut sender_guard = self.sender.lock().await;
         *sender_guard = None;
+    }
+
+    /// Returns true if the queue is empty.
+    pub async fn is_empty(&self) -> bool {
+        let receiver = self.receiver.lock().await;
+        receiver.len() == 0
+    }
+
+    /// Spawns a background task that logs the queue depth every second.
+    pub fn log_depth_periodically(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                let receiver = self.receiver.lock().await;
+                let depth = receiver.len();
+                drop(receiver);
+                println!("[queue: {}] depth: {}", self.name, depth);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
     }
 }
 

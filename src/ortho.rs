@@ -11,7 +11,6 @@ pub struct Ortho {
 
 impl Ortho {
     pub fn new(version: usize) -> Self {
-        
         Ortho {
             version,
             dims: vec![2, 2],
@@ -33,7 +32,6 @@ impl Ortho {
     }
 
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
-        
         let position = self.get_current_position();
 
         let remaining_empty = self
@@ -129,7 +127,6 @@ impl Ortho {
     }
 
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
-        
         let pos = self.get_current_position();
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
         let forbidden: Vec<usize> = diagonals
@@ -150,12 +147,10 @@ impl Ortho {
     }
 
     pub fn version(&self) -> usize {
-        
         self.version
     }
 
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
-        
         // For each position in the payload, get the prefix indices from spatial::get_requirements
         let mut result = Vec::new();
         for pos in 0..self.payload.len() {
@@ -181,7 +176,6 @@ impl Ortho {
     }
 
     pub(crate) fn set_version(&self, version: usize) -> Ortho {
-        
         Ortho {
             version,
             dims: self.dims.clone(),
@@ -484,7 +478,7 @@ mod tests {
         let ortho = &ortho.add(20, 1)[0];
         let ortho = &ortho.add(30, 1)[0];
         let ortho = &ortho.add(40, 1)[0];
-        
+
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, vec![40]);
         assert_eq!(required, vec![vec![10, 30]]);
@@ -596,6 +590,11 @@ mod tests {
         ];
         // If there are collisions, there will be fewer unique IDs than payloads
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique_ids.len(), ids.len(), "Ortho::id() should be unique for different payloads, but got collisions: {:?}", ids);
+        assert_eq!(
+            unique_ids.len(),
+            ids.len(),
+            "Ortho::id() should be unique for different payloads, but got collisions: {:?}",
+            ids
+        );
     }
 }
