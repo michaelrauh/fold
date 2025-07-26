@@ -35,7 +35,6 @@ async fn main() {
 
     // Spawn a task to add new seeds from 2.txt to 28.txt every 30 seconds
     let holder_clone = holder.clone();
-    let workq_clone = workq.clone();
     tokio::spawn(async move {
         for i in 2..=28 {
             let filename = format!("{}.txt", i);
@@ -79,6 +78,7 @@ async fn main() {
         })
     };
     let mut worker = Worker::new(holder.clone()).await;
+    let worker_version = worker.interner.version();
     let worker_handle = {
         let workq = workq.clone();
         let dbq = dbq.clone();
@@ -90,9 +90,10 @@ async fn main() {
     };
     println!("[main] Entering main loop");
 
-    let mut last_print = std::time::Instant::now();
+    let mut loop_count = 0;
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        loop_count += 1;
         let workq_depth = if let Ok(workq_guard) = workq.receiver.try_lock() {
             workq_guard.len()
         } else {
@@ -112,12 +113,25 @@ async fn main() {
             let holder_guard = holder.lock().await;
             holder_guard.latest_version()
         };
-        if last_print.elapsed().as_secs_f32() >= 5.0 {
-            println!(
-                "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}",
-                workq_depth, dbq_depth, db_len, latest_version
-            );
-            last_print = std::time::Instant::now();
+        println!(
+            "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}, worker version: {}",
+            workq_depth, dbq_depth, db_len, latest_version, worker_version
+        );
+        if loop_count % 6 == 0 {
+            let ortho_opt = db.get_optimal().await;
+            if let Some(ortho) = ortho_opt {
+                println!("[main] Optimal Ortho: {:?}", ortho);
+                let payload_strings = {
+                    let holder_guard = holder.lock().await;
+                    let interner = holder_guard.get_latest();
+                    ortho.payload().iter().map(|opt_idx| {
+                        opt_idx.map(|idx| interner.string_for_index(idx).to_string())
+                    }).collect::<Vec<_>>()
+                };
+                println!("[main] Optimal Ortho (strings): {:?}", payload_strings);
+            } else {
+                println!("[main] No optimal Ortho found.");
+            }
         }
         if workq_depth == 0 && dbq_depth == 0 {
             break;

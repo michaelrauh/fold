@@ -49,21 +49,14 @@ impl Follower {
             if ortho.version() == latest_version {
                 return;
             }
-            let prefixes = ortho.prefixes();
+            // Use requirements for the current (upcoming) position only
+            let (_forbidden, prefixes) = ortho.get_requirements();
             let all_same =
                 Self::all_prefixes_same(&container, &prefixes, ortho.version(), latest_version)
                     .await;
             if all_same {
                 Self::bump_ortho_version(db, ortho.clone(), latest_version).await;
             } else {
-                // println!(
-                //     "[Follower] requeuing ortho (total requeued: {})",
-                //     {
-                //         static REQUEUED_COUNT: std::sync::atomic::AtomicUsize =
-                //             std::sync::atomic::AtomicUsize::new(0);
-                //         REQUEUED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
-                //     }
-                // );
                 Self::remove_ortho_and_enqueue(db, workq, ortho.clone(), latest_version).await;
             }
         }

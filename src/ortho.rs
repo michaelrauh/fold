@@ -171,6 +171,25 @@ impl Ortho {
         result
     }
 
+    pub fn prefixes_for_last_filled(&self) -> Vec<Vec<usize>> {
+        let pos = if let Some(p) = self.payload.iter().position(|x| x.is_none()) {
+            if p == 0 { return vec![]; }
+            p - 1
+        } else {
+            self.payload.len() - 1
+        };
+        let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims);
+        prefixes.into_iter()
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| {
+                prefix.iter()
+                    .filter_map(|&i| self.payload.get(i).cloned().flatten())
+                    .collect::<Vec<usize>>()
+            })
+            .filter(|v| !v.is_empty())
+            .collect()
+    }
+
     pub fn dims(&self) -> &Vec<usize> {
         &self.dims
     }
