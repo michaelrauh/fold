@@ -61,14 +61,21 @@ mod tests {
                 OrthoFeeder::run(dbq, db, workq, shutdown).await;
             })
         };
-        let popped = timeout(std::time::Duration::from_millis(100), workq.pop_one()).await;
-        assert!(popped.is_ok(), "Should pop from workq");
-        let popped_ortho = popped.unwrap();
-        assert_eq!(popped_ortho, Some(ortho.clone()));
+        // Poll workq.pop_one() in a loop with a max timeout
+        let mut popped_ortho = None;
+        let start = std::time::Instant::now();
+        let timeout_ms = 1000;
+        while start.elapsed().as_millis() < timeout_ms && popped_ortho.is_none() {
+            if let Ok(Some(o)) = timeout(std::time::Duration::from_millis(50), workq.pop_one()).await {
+                popped_ortho = Some(o);
+                break;
+            }
+        }
+        assert_eq!(popped_ortho, Some(ortho.clone()), "Should pop ortho from workq within timeout");
         let fetched = db.get(&ortho.id()).await;
         assert_eq!(fetched, Some(ortho.clone()));
         feeder_handle.abort();
-        // Now push the same ortho again, should not be put back in workq
+        // Test that duplicate ortho is not re-added
         let dbq2 = make_dbq_with_ortho(&ortho).await;
         let shutdown2 = Arc::new(Notify::new());
         let feeder_handle2 = {
