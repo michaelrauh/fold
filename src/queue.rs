@@ -32,6 +32,19 @@ impl Queue {
         receiver.try_recv().ok()
     }
 
+    /// Tries to pop up to `max` items from the queue without blocking. Returns as many as are available (may be empty).
+    pub async fn pop_many(&self, max: usize) -> Vec<Ortho> {
+        let mut receiver = self.receiver.lock().await;
+        let mut items = Vec::with_capacity(max);
+        for _ in 0..max {
+            match receiver.try_recv() {
+                Ok(item) => items.push(item),
+                Err(_) => break,
+            }
+        }
+        items
+    }
+
     pub async fn close(&self) {
         let mut sender_guard = self.sender.lock().await;
         *sender_guard = None;

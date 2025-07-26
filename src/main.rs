@@ -5,16 +5,13 @@ use fold::ortho_database::OrthoDatabase;
 use fold::queue::Queue;
 use fold::worker::Worker;
 use std::fs;
-use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() {
-    // Prompt for initial filename
-    print!("Enter filename for initial text for InternerHolder: ");
-    std::io::stdout().flush().unwrap();
-    let filename = "e.txt";
+    // Initialize with 1.txt instead of e.txt
+    let filename = "1.txt";
     println!("[main] Using filename: {}", filename);
     let initial_text = match fs::read_to_string(filename) {
         Ok(s) => s,
@@ -25,7 +22,6 @@ async fn main() {
     };
     let input = initial_text.trim();
     println!("[main] Read input from file");
-    // println!("Using input: {}", input);
 
     let dbq = Arc::new(Queue::new("dbq", 1000000));
     let db = Arc::new(OrthoDatabase::new());
@@ -36,6 +32,26 @@ async fn main() {
         InternerHolder::with_seed(input, workq.clone()).await,
     ));
     println!("[main] InternerHolder created");
+
+    // Spawn a task to add new seeds from 2.txt to 28.txt every 30 seconds
+    let holder_clone = holder.clone();
+    let workq_clone = workq.clone();
+    tokio::spawn(async move {
+        for i in 2..=28 {
+            let filename = format!("{}.txt", i);
+            match fs::read_to_string(&filename) {
+                Ok(text) => {
+                    println!("[main] Adding seed from {}", filename);
+                    let mut holder_guard = holder_clone.lock().await;
+                    holder_guard.add_text_with_seed(text.trim()).await;
+                },
+                Err(e) => {
+                    println!("[main] Failed to read {}: {}", filename, e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let feeder_shutdown = shutdown.clone();
@@ -74,7 +90,7 @@ async fn main() {
     };
     println!("[main] Entering main loop");
 
-    // Wait until both workq and dbq are empty
+    let mut last_print = std::time::Instant::now();
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let workq_depth = if let Ok(workq_guard) = workq.receiver.try_lock() {
@@ -92,10 +108,17 @@ async fn main() {
         } else {
             continue;
         };
-        println!(
-            "[main] workq depth: {}, dbq depth: {}, db len: {}",
-            workq_depth, dbq_depth, db_len
-        );
+        let latest_version = {
+            let holder_guard = holder.lock().await;
+            holder_guard.latest_version()
+        };
+        if last_print.elapsed().as_secs_f32() >= 5.0 {
+            println!(
+                "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}",
+                workq_depth, dbq_depth, db_len, latest_version
+            );
+            last_print = std::time::Instant::now();
+        }
         if workq_depth == 0 && dbq_depth == 0 {
             break;
         }

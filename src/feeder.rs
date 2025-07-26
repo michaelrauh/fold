@@ -13,14 +13,16 @@ impl OrthoFeeder {
         workq: Arc<Queue>,
         shutdown: Arc<Notify>,
     ) {
+        const BATCH_SIZE: usize = 1000;
         loop {
             tokio::select! {
                 _ = shutdown.notified() => {
                     break;
                 }
                 _ = async {
-                    if let Some(item) = dbq.pop_one().await {
-                        let new_orthos = db.upsert(vec![item]).await;
+                    let items = dbq.pop_many(BATCH_SIZE).await;
+                    if !items.is_empty() {
+                        let new_orthos = db.upsert(items).await;
                         let _ = workq.push_many(new_orthos).await;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;

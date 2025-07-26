@@ -1,6 +1,6 @@
 /target
 e.txt
-
+*.txt
 
 # Added by cargo
 #
