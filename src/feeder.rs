@@ -19,18 +19,11 @@ impl OrthoFeeder {
                     break;
                 }
                 _ = async {
-                    let mut batch = Vec::new();
-                    // Drain dbq as much as possible, but yield if no item is available quickly
-                    loop {
-                        match tokio::time::timeout(std::time::Duration::from_millis(1), dbq.pop_one()).await {
-                            Ok(Some(item)) => batch.push(item),
-                            Ok(None) | Err(_) => break,
-                        }
-                    }
-                    if !batch.is_empty() {
-                        let new_orthos = db.upsert(batch).await;
+                    if let Some(item) = dbq.pop_one().await {
+                        let new_orthos = db.upsert(vec![item]).await;
                         let _ = workq.push_many(new_orthos).await;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 } => {}
             }
         }

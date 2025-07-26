@@ -128,14 +128,24 @@ impl Interner {
 
     fn get_required_bits(&self, required: &[Vec<usize>]) -> FixedBitSet {
         let mut result = FixedBitSet::with_capacity(self.vocabulary.len());
+        result.grow(self.vocabulary.len());
         if required.is_empty() {
-            result.grow(self.vocabulary.len());
             result.set_range(.., true);
             return result;
         }
+        let mut first = true;
         for prefix in required {
             if let Some(bitset) = self.prefix_to_completions.get(prefix) {
-                result.union_with(bitset);
+                if first {
+                    result.clone_from(bitset);
+                    first = false;
+                } else {
+                    result.intersect_with(bitset);
+                }
+            } else {
+                // If any required prefix is missing, intersection is empty
+                result.clear();
+                break;
             }
         }
         result
@@ -229,8 +239,6 @@ impl InternerHolder {
         let version = holder.latest_version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         holder.workq.push_many(vec![ortho_seed.clone()]).await;
-        println!("completion_map_size: {}", holder.completion_map_size());
-        println!("vocabulary_size: {}", holder.get_latest().vocabulary().len());
         holder
     }
 
@@ -490,5 +498,108 @@ mod holder_tests {
         assert!(holder.interners.contains_key(&v2));
         // Removing again should return false
         assert!(!holder.remove_by_version(v1));
+    }
+}
+
+#[cfg(test)]
+mod intersect_logic_tests {
+    use super::*;
+    use fixedbitset::FixedBitSet;
+
+    fn make_interner_with_vocab(vocab: Vec<&str>, prefix_map: Vec<(Vec<usize>, Vec<usize>)>) -> Interner {
+        let vocabulary = vocab.into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut prefix_to_completions = std::collections::HashMap::new();
+        let vocab_len = vocabulary.len();
+        for (prefix, completions) in prefix_map {
+            let mut fbs = FixedBitSet::with_capacity(vocab_len);
+            fbs.grow(vocab_len);
+            for idx in completions {
+                fbs.insert(idx);
+            }
+            prefix_to_completions.insert(prefix, fbs);
+        }
+        Interner {
+            version: 1,
+            vocabulary,
+            prefix_to_completions,
+        }
+    }
+
+    #[test]
+    fn test_intersect_all_empty_returns_all_indexes() {
+        let interner = make_interner_with_vocab(vec!["a", "b", "c"], vec![]);
+        let result = interner.intersect(&[], &[]);
+        assert_eq!(result, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_intersect_required_and_forbidden() {
+        // required: [00110, 00010] (as bitsets)
+        // forbidden: [1]
+        // expected: 00010 (index 3)
+        let interner = make_interner_with_vocab(
+            vec!["a", "b", "c", "d", "e"],
+            vec![
+                (vec![0], vec![2, 3]), // 00110
+                (vec![1], vec![3]),    // 00010
+            ],
+        );
+        let required = vec![vec![0], vec![1]];
+        let forbidden = vec![1];
+        let result = interner.intersect(&required, &forbidden);
+        // Only index 3 should be present
+        assert_eq!(result, vec![3]);
+    }
+
+    #[test]
+    fn test_intersect_required_anded() {
+        // required: [101, 110] => AND = 100
+        let interner = make_interner_with_vocab(
+            vec!["a", "b", "c"],
+            vec![
+                (vec![0], vec![0, 2]), // 101
+                (vec![1], vec![0, 1]), // 110
+            ],
+        );
+        let required = vec![vec![0], vec![1]];
+        let forbidden = vec![];
+        let result = interner.intersect(&required, &forbidden);
+        // Only index 0 should be present
+        assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn test_intersect_forbidden_zeroes_out() {
+        // required: [111]
+        // forbidden: [1]
+        let interner = make_interner_with_vocab(
+            vec!["a", "b", "c"],
+            vec![(vec![0], vec![0, 1, 2])], // 111
+        );
+        let required = vec![vec![0]];
+        let forbidden = vec![1];
+        let result = interner.intersect(&required, &forbidden);
+        // Should be [0, 2]
+        assert_eq!(result, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_intersect_bug_case() {
+        // This test is expected to fail with the current implementation
+        // required: [00110, 00010] (as bitsets)
+        // forbidden: []
+        // expected: 00010 (index 3)
+        let interner = make_interner_with_vocab(
+            vec!["a", "b", "c", "d", "e"],
+            vec![
+                (vec![0], vec![2, 3]), // 00110
+                (vec![1], vec![3]),    // 00010
+            ],
+        );
+        let required = vec![vec![0], vec![1]];
+        let forbidden = vec![];
+        let result = interner.intersect(&required, &forbidden);
+        // Only index 3 should be present
+        assert_eq!(result, vec![3]); // This will fail with the current code
     }
 }

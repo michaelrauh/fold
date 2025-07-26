@@ -32,7 +32,7 @@ impl Follower {
                     let guard = container.lock().await;
 
                     drop(guard);
-                    time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 } => {}
             }
         }

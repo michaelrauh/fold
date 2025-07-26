@@ -20,22 +20,16 @@ impl Queue {
 
     pub async fn push_many(&self, orthos: Vec<Ortho>) {
         let sender_guard = self.sender.lock().await;
-
         if let Some(sender) = sender_guard.as_ref() {
             for ortho in orthos {
-                let res = sender.send(ortho).await;
+                let _ = sender.try_send(ortho);
             }
-        } else {
-            println!("[Queue::push_many] Sender is None (queue closed)");
         }
     }
 
     pub async fn pop_one(&self) -> Option<Ortho> {
         let mut receiver = self.receiver.lock().await;
-
-        let res = receiver.recv().await;
-
-        res
+        receiver.try_recv().ok()
     }
 
     pub async fn close(&self) {
@@ -47,19 +41,6 @@ impl Queue {
     pub async fn is_empty(&self) -> bool {
         let receiver = self.receiver.lock().await;
         receiver.len() == 0
-    }
-
-    /// Spawns a background task that logs the queue depth every second.
-    pub fn log_depth_periodically(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                let receiver = self.receiver.lock().await;
-                let depth = receiver.len();
-                drop(receiver);
-                println!("[queue: {}] depth: {}", self.name, depth);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        });
     }
 }
 

@@ -28,16 +28,11 @@ impl Worker {
         loop {
             tokio::select! {
                 _ = shutdown.notified() => {
-
                     break;
                 }
                 _ = async {
-
-                    let ortho = workq.pop_one().await;
-
-                    if let Some(ortho) = ortho {
+                    if let Some(ortho) = workq.pop_one().await {
                         if ortho.version() > self.interner.version() {
-
                             self.interner = {
                                 let guard = self.container.lock().await;
                                 guard.get_latest().clone()
@@ -47,15 +42,11 @@ impl Worker {
                         let completions = self.interner.intersect(&required, &forbidden);
                         let version = self.interner.version();
                         for completion in completions {
-
                             let new_orthos = ortho.add(completion, version);
-
-                            dbq.push_many(new_orthos).await;
-
+                            let _ = dbq.push_many(new_orthos).await;
                         }
                     }
-
-                    // tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 } => {}
             }
         }
