@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  fold:
+    build: .
+    image: fold-app:latest
+    container_name: fold
+    working_dir: /app
+    command: ["/app/fold"]
