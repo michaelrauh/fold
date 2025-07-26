@@ -27,17 +27,18 @@ impl Splitter {
             .into_iter()
             .collect()
     }
-    
+
     fn split_into_sentences(&self, text: &str) -> Vec<String> {
         text.split("\n\n")
             .flat_map(|paragraph| {
-                paragraph.split(|c| matches!(c, '.' | '?' | ';' | '!'))
+                paragraph
+                    .split(|c| matches!(c, '.' | '?' | ';' | '!'))
                     .map(|sentence| sentence.trim().to_string())
                     .filter(|sentence| !sentence.is_empty())
             })
             .collect()
     }
-    
+
     fn clean_sentence(&self, sentence: &str) -> Vec<String> {
         sentence
             .chars()
@@ -48,19 +49,12 @@ impl Splitter {
             .filter(|word| !word.is_empty())
             .collect()
     }
-    
+
     fn generate_substrings(&self, words: &[String]) -> Vec<Vec<String>> {
         (0..words.len())
             .flat_map(|start| {
-                ((start + 2)..=words.len())
-                    .map(move |end| words[start..end].to_vec())
+                ((start + 2)..=words.len()).map(move |end| words[start..end].to_vec())
             })
-            .collect()
-    }
-    
-    fn clean_text(&self, text: &str) -> String {
-        text.chars()
-            .map(|c| self.filter_char(c))
             .collect()
     }
 
@@ -83,7 +77,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "hello world hello rust world";
         let vocab = splitter.vocabulary(text);
-        
+
         // Should have exactly 3 unique words in alphabetical order
         assert_eq!(vocab, vec!["hello", "rust", "world"]);
     }
@@ -93,7 +87,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "Hello WORLD Rust MiXeD CaSe";
         let vocab = splitter.vocabulary(text);
-        
+
         // Should have all words in lowercase and sorted alphabetically
         assert_eq!(vocab, vec!["case", "hello", "mixed", "rust", "world"]);
     }
@@ -102,7 +96,10 @@ mod tests {
     fn test_vocabulary_empty_input() {
         let splitter = Splitter::new();
         let vocab = splitter.vocabulary("");
-        assert!(vocab.is_empty(), "Empty input should produce empty vocabulary");
+        assert!(
+            vocab.is_empty(),
+            "Empty input should produce empty vocabulary"
+        );
     }
 
     #[test]
@@ -110,8 +107,11 @@ mod tests {
         let splitter = Splitter::new();
         let text = "hello world";
         let phrases = splitter.phrases(text);
-        
-        assert_eq!(phrases, vec![vec!["hello".to_string(), "world".to_string()]]);
+
+        assert_eq!(
+            phrases,
+            vec![vec!["hello".to_string(), "world".to_string()]]
+        );
     }
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "word";
         let phrases = splitter.phrases(text);
-        
+
         assert_eq!(phrases, Vec::<Vec<String>>::new());
     }
 
@@ -128,11 +128,16 @@ mod tests {
         let splitter = Splitter::new();
         let text = "one two three four";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["one".to_string(), "two".to_string()],
             vec!["one".to_string(), "two".to_string(), "three".to_string()],
-            vec!["one".to_string(), "two".to_string(), "three".to_string(), "four".to_string()],
+            vec![
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+                "four".to_string(),
+            ],
             vec!["three".to_string(), "four".to_string()],
             vec!["two".to_string(), "three".to_string()],
             vec!["two".to_string(), "three".to_string(), "four".to_string()],
@@ -145,7 +150,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "hello world. foo bar?";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["foo".to_string(), "bar".to_string()],
             vec!["hello".to_string(), "world".to_string()],
@@ -158,7 +163,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "hello, world! it's working.";
         let phrases = splitter.phrases(text);
-        
+
         // This creates two sentences since sentences are split by . ? ; ! \n\n
         // "hello, world" and "it's working" become two separate sentences
         let expected = vec![
@@ -168,13 +173,12 @@ mod tests {
         assert_eq!(phrases, expected);
     }
 
-
-    #[test] 
+    #[test]
     fn test_phrases_no_duplicates() {
         let splitter = Splitter::new();
         let text = "hello world. hello world? world hello";
         let phrases = splitter.phrases(text);
-        
+
         // Should deduplicate across and within sentences
         let expected = vec![
             vec!["hello".to_string(), "world".to_string()],
@@ -188,10 +192,14 @@ mod tests {
         let splitter = Splitter::new();
         let text = "it's working here";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["it's".to_string(), "working".to_string()],
-            vec!["it's".to_string(), "working".to_string(), "here".to_string()],
+            vec![
+                "it's".to_string(),
+                "working".to_string(),
+                "here".to_string(),
+            ],
             vec!["working".to_string(), "here".to_string()],
         ];
         assert_eq!(phrases, expected);
@@ -202,7 +210,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "The cat sat. The dog ran?";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["cat".to_string(), "sat".to_string()],
             vec!["dog".to_string(), "ran".to_string()],
@@ -219,7 +227,7 @@ mod tests {
         let splitter = Splitter::new();
         let text = "hello world\n\nfoo bar";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["foo".to_string(), "bar".to_string()],
             vec!["hello".to_string(), "world".to_string()],
@@ -232,12 +240,17 @@ mod tests {
         let splitter = Splitter::new();
         let text = "these words are test";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["are".to_string(), "test".to_string()],
             vec!["these".to_string(), "words".to_string()],
             vec!["these".to_string(), "words".to_string(), "are".to_string()],
-            vec!["these".to_string(), "words".to_string(), "are".to_string(), "test".to_string()],
+            vec![
+                "these".to_string(),
+                "words".to_string(),
+                "are".to_string(),
+                "test".to_string(),
+            ],
             vec!["words".to_string(), "are".to_string()],
             vec!["words".to_string(), "are".to_string(), "test".to_string()],
         ];
@@ -249,12 +262,17 @@ mod tests {
         let splitter = Splitter::new();
         let text = "these words are test";
         let phrases = splitter.phrases(text);
-        
+
         let expected = vec![
             vec!["are".to_string(), "test".to_string()],
             vec!["these".to_string(), "words".to_string()],
             vec!["these".to_string(), "words".to_string(), "are".to_string()],
-            vec!["these".to_string(), "words".to_string(), "are".to_string(), "test".to_string()],
+            vec![
+                "these".to_string(),
+                "words".to_string(),
+                "are".to_string(),
+                "test".to_string(),
+            ],
             vec!["words".to_string(), "are".to_string()],
             vec!["words".to_string(), "are".to_string(), "test".to_string()],
         ];
