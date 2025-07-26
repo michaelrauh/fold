@@ -39,14 +39,27 @@ fn bench_add_text(c: &mut Criterion) {
     });
 }
 
-fn bench_intersect(c: &mut Criterion) {
-    let interner = Interner::from_text("a b c d e f g h");
-    let required = vec![vec![0], vec![1, 2]];
-    let forbidden = vec![3, 4];
-    c.bench_function("interner_intersect", |b| {
-        b.iter(|| interner.intersect(black_box(&required), black_box(&forbidden)))
+use fold::interner::InternerHolder;
+use std::sync::Arc;
+use fold::queue::Queue;
+
+fn bench_interner_intersect(c: &mut Criterion) {
+    // Create a realistic interner with a moderate vocabulary
+    let holder = InternerHolder::from_text(
+        "the quick brown fox jumps over the lazy dog and then runs away",
+        Arc::new(Queue::new("test", 32)),
+    );
+    let interner = holder.get_latest().clone();
+    // Use the vocabulary indices for required and forbidden
+    let vocab: Vec<_> = (0..interner.vocabulary().len()).collect();
+    let required: Vec<Vec<usize>> = vec![vocab.iter().cloned().take(3).collect()];
+    let forbidden: Vec<usize> = vocab.iter().cloned().skip(3).take(2).collect();
+    c.bench_function("interner_intersect_realistic", |b| {
+        b.iter(|| {
+            let _ = interner.intersect(black_box(required.as_slice()), black_box(forbidden.as_slice()));
+        })
     });
 }
 
-criterion_group!(benches, bench_from_text, bench_add_text, bench_intersect);
+criterion_group!(benches, bench_from_text, bench_add_text, bench_interner_intersect);
 criterion_main!(benches);

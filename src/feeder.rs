@@ -2,7 +2,6 @@ use crate::ortho_database::OrthoDatabase;
 use crate::queue::Queue;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::time;
 
 pub struct OrthoFeeder;
 
