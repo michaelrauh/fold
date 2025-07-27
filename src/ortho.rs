@@ -1,8 +1,10 @@
 use crate::spatial;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use bincode::Encode;
+use bincode::Decode;
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, Encode, Decode)]
 pub struct Ortho {
     version: usize,
     dims: Vec<usize>,

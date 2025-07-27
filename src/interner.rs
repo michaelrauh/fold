@@ -1,8 +1,6 @@
-use crate::queue::Queue;
 use crate::splitter::Splitter;
 use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Interner {
@@ -176,22 +174,22 @@ impl Interner {
 
 pub struct InternerHolder {
     pub interners: std::collections::HashMap<usize, Interner>,
-    pub workq: Arc<Queue>,
 }
 
 impl InternerHolder {
-    pub fn from_text(text: &str, workq: Arc<Queue>) -> Self {
+    pub fn from_text(text: &str) -> Self {
         let interner = Interner::from_text(text);
         let mut interners = HashMap::new();
         interners.insert(interner.version(), interner);
-        InternerHolder { interners, workq }
+        InternerHolder { interners }
     }
 
-    pub async fn add_with_seed(&mut self, interner: Interner) {
+    pub fn add_with_seed<Q: crate::queue::QueueLike>(&mut self, interner: Interner, workq: &mut Q) {
         let version = interner.version();
         self.interners.insert(version, interner.clone());
         let ortho_seed = crate::ortho::Ortho::new(version);
-        self.workq.push_many(vec![ortho_seed]).await;
+        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
+        workq.push_many(vec![ortho_seed]);
     }
 
     pub fn get(&self, version: usize) -> &Interner {
@@ -234,15 +232,16 @@ impl InternerHolder {
         self.get_latest().prefix_to_completions.len()
     }
 
-    pub async fn with_seed(text: &str, workq: Arc<Queue>) -> Self {
-        let holder = InternerHolder::from_text(text, workq.clone());
+    pub fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self {
+        let holder = InternerHolder::from_text(text);
         let version = holder.latest_version();
         let ortho_seed = crate::ortho::Ortho::new(version);
-        workq.push_front(vec![ortho_seed.clone()]).await;
+        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
+        workq.push_many(vec![ortho_seed]);
         holder
     }
 
-    pub async fn add_text_with_seed(&mut self, text: &str) {
+    pub fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
         let interner = if self.interners.is_empty() {
             Interner::from_text(text)
         } else {
@@ -256,10 +255,11 @@ impl InternerHolder {
 
         let ortho_seed = crate::ortho::Ortho::new(version);
 
-        self.workq.push_front(vec![ortho_seed]).await;
+        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
+        workq.push_many(vec![ortho_seed]);
     }
 
-    pub async fn has_version(&self, version: usize) -> bool {
+    pub fn has_version(&self, version: usize) -> bool {
         self.interners.contains_key(&version)
     }
 
@@ -271,17 +271,11 @@ impl InternerHolder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::Queue;
     use fixedbitset::FixedBitSet;
-    use std::sync::Arc;
-
-    fn holder_from_text(text: &str) -> InternerHolder {
-        InternerHolder::from_text(text, Arc::new(Queue::new("test", 8)))
-    }
 
     #[test]
     fn test_from_text_creates_interner() {
-        let holder = holder_from_text("hello world");
+        let holder = InternerHolder::from_text("hello world");
         let interner = holder.get(holder.latest_version());
         assert_eq!(interner.version(), 1);
         assert_eq!(interner.vocabulary.len(), 2);
@@ -289,14 +283,14 @@ mod tests {
     }
     #[test]
     fn test_add_increments_version() {
-        let holder = holder_from_text("hello world");
+        let holder = InternerHolder::from_text("hello world");
         let interner = holder.get(holder.latest_version());
         let interner2 = interner.add_text("test");
         assert_eq!(interner2.version(), 2);
     }
     #[test]
     fn test_add_extends_vocabulary() {
-        let holder = holder_from_text("hello world");
+        let holder = InternerHolder::from_text("hello world");
         let interner = holder.get(holder.latest_version());
         assert_eq!(interner.vocabulary, vec!["hello", "world"]);
         let interner2 = interner.add_text("test hello");
@@ -304,7 +298,7 @@ mod tests {
     }
     #[test]
     fn test_add_builds_prefix_mapping() {
-        let holder = holder_from_text("a b c");
+        let holder = InternerHolder::from_text("a b c");
         let interner = holder.get(holder.latest_version());
         let vocab_len = interner.vocabulary.len();
         // prefix [0] should map to {1}
@@ -328,7 +322,7 @@ mod tests {
     }
     #[test]
     fn test_add_handles_longer_phrases() {
-        let holder = holder_from_text("a b c");
+        let holder = InternerHolder::from_text("a b c");
         let interner = holder.get(holder.latest_version());
         // Should have prefix [0] -> bit 1 set (for "b")
         let prefix_0 = vec![0];
@@ -346,7 +340,7 @@ mod tests {
     #[test]
     fn test_add_extends_existing_bitsets() {
         // First add with 2 words
-        let holder = holder_from_text("a b");
+        let holder = InternerHolder::from_text("a b");
         let interner = holder.get(holder.latest_version());
         // Second add with 1 more word
         let interner2 = interner.add_text("a c");
@@ -360,7 +354,7 @@ mod tests {
     }
     #[test]
     fn test_get_required_bits() {
-        let holder = holder_from_text("a b c");
+        let holder = InternerHolder::from_text("a b c");
         let interner = holder.get(holder.latest_version());
         // prefix [0] should map to {1}
         let required = vec![vec![0]];
@@ -371,7 +365,7 @@ mod tests {
     }
     #[test]
     fn test_string_for_index() {
-        let holder = holder_from_text("foo bar baz");
+        let holder = InternerHolder::from_text("foo bar baz");
         let interner = holder.get(holder.latest_version());
         let vocab = interner.vocabulary();
         assert_eq!(interner.string_for_index(0), vocab[0]);
@@ -381,7 +375,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Index out of bounds in Interner::string_for_index")]
     fn test_string_for_index_out_of_bounds_panics() {
-        let holder = holder_from_text("foo bar baz");
+        let holder = InternerHolder::from_text("foo bar baz");
         let interner = holder.get(holder.latest_version());
         interner.string_for_index(3);
     }
@@ -392,14 +386,14 @@ mod container_tests {
     use super::*;
     #[test]
     fn test_insert_and_get() {
-        let holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
+        let holder = InternerHolder::from_text("a b");
         let latest_version = holder.latest_version();
         let interner = holder.get(latest_version);
         assert_eq!(interner.version(), latest_version);
     }
     #[test]
     fn test_compare_prefix_bitsets_equal() {
-        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
+        let mut holder = InternerHolder::from_text("a b");
         let interner1 = holder.get(holder.latest_version());
         let interner2 = interner1.add_text("");
         holder
@@ -412,7 +406,7 @@ mod container_tests {
     }
     #[test]
     fn test_compare_prefix_bitsets_different() {
-        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
+        let mut holder = InternerHolder::from_text("a b");
         let interner1 = holder.get(holder.latest_version());
         let interner2 = interner1.add_text("c");
         holder
@@ -425,7 +419,7 @@ mod container_tests {
     }
     #[test]
     fn test_compare_prefix_bitsets_missing() {
-        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
+        let mut holder = InternerHolder::from_text("a b");
         let interner1 = holder.get(holder.latest_version());
         let interner2 = interner1.add_text("c");
         holder
@@ -441,43 +435,45 @@ mod container_tests {
 #[cfg(test)]
 mod holder_tests {
     use super::*;
-    use crate::queue::Queue;
-    use std::sync::Arc;
-    #[tokio::test]
-    async fn test_holder_new_initializes_empty() {
-        let holder = InternerHolder::from_text("", Arc::new(Queue::new("test", 8)));
+    use crate::queue::MockQueue;
+    #[test]
+    fn test_holder_new_initializes_empty() {
+        let holder = InternerHolder::from_text("");
         assert_eq!(holder.interners.len(), 1);
         assert_eq!(holder.latest_version(), 1);
     }
-    #[tokio::test]
-    async fn test_holder_add_text_with_seed_increments_version() {
-        let mut holder = InternerHolder::from_text("", Arc::new(Queue::new("test", 8)));
-        holder.add_text_with_seed("foo bar").await;
+    #[test]
+    fn test_holder_add_text_with_seed_increments_version() {
+        let mut queue = MockQueue::new();
+        let mut holder = InternerHolder::from_text("");
+        holder.add_text_with_seed("foo bar", &mut queue);
         assert_eq!(holder.latest_version(), 2);
-        holder.add_text_with_seed("baz").await;
+        holder.add_text_with_seed("baz", &mut queue);
         assert_eq!(holder.latest_version(), 3);
     }
-    #[tokio::test]
-    async fn test_holder_latest_version_returns_correct_value() {
-        let mut holder = InternerHolder::from_text("", Arc::new(Queue::new("test", 8)));
-        holder.add_text_with_seed("a b").await;
-        holder.add_text_with_seed("c").await;
+    #[test]
+    fn test_holder_latest_version_returns_correct_value() {
+        let mut queue = MockQueue::new();
+        let mut holder = InternerHolder::from_text("");
+        holder.add_text_with_seed("a b", &mut queue);
+        holder.add_text_with_seed("c", &mut queue);
         assert_eq!(holder.latest_version(), 3);
     }
-    #[tokio::test]
-    async fn test_holder_compare_prefix_bitsets() {
-        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
-        holder.add_text_with_seed("").await;
+    #[test]
+    fn test_holder_compare_prefix_bitsets() {
+        let mut queue = MockQueue::new();
+        let mut holder = InternerHolder::from_text("a b");
+        holder.add_text_with_seed("", &mut queue);
         let prefix = vec![0];
         let v1 = 1;
         let v2 = 2;
-        let b1 = holder
+        let _b1 = holder
             .interners
             .get(&v1)
             .unwrap()
             .prefix_to_completions
             .get(&prefix);
-        let b2 = holder
+        let _b2 = holder
             .interners
             .get(&v2)
             .unwrap()
@@ -485,14 +481,15 @@ mod holder_tests {
             .get(&prefix);
 
         assert!(holder.compare_prefix_bitsets(prefix.clone(), v1, v2));
-        holder.add_text_with_seed("c").await;
+        holder.add_text_with_seed("c", &mut queue);
         let v3 = 3;
         assert!(!holder.compare_prefix_bitsets(vec![0], v1, v3));
     }
-    #[tokio::test]
-    async fn test_holder_remove_by_version() {
-        let mut holder = InternerHolder::from_text("a b", Arc::new(Queue::new("test", 8)));
-        holder.add_text_with_seed("c").await;
+    #[test]
+    fn test_holder_remove_by_version() {
+        let mut queue = MockQueue::new();
+        let mut holder = InternerHolder::from_text("a b");
+        holder.add_text_with_seed("c", &mut queue);
         let v1 = 1;
         let v2 = 2;
         assert!(holder.interners.contains_key(&v1));

@@ -40,14 +40,11 @@ fn bench_add_text(c: &mut Criterion) {
 }
 
 use fold::interner::InternerHolder;
-use std::sync::Arc;
-use fold::queue::Queue;
 
 fn bench_interner_intersect(c: &mut Criterion) {
     // Create a realistic interner with a moderate vocabulary
     let holder = InternerHolder::from_text(
-        "the quick brown fox jumps over the lazy dog and then runs away",
-        Arc::new(Queue::new("test", 32)),
+        "the quick brown fox jumps over the lazy dog and then runs away"
     );
     let interner = holder.get_latest().clone();
     // Use the vocabulary indices for required and forbidden

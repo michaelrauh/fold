@@ -1,11 +1,14 @@
-version: '3.8'
 services:
   fold:
     build: .
     image: fold-app:latest
     container_name: fold
     working_dir: /app
-    command: ["/app/fold"]
+    command: /bin/sh -c "until curl -u guest:guest -s http://rabbitmq:15672/api/healthchecks/node | grep ok; do echo 'Waiting for RabbitMQ management API...'; sleep 2; done; curl -u guest:guest -XDELETE http://rabbitmq:15672/api/queues/%2F/dbq/contents; curl -u guest:guest -XDELETE http://rabbitmq:15672/api/queues/%2F/main/contents; /app/wait-for-it.sh rabbitmq:5672 -- /app/fold"
+    environment:
+      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      - rabbitmq
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
