@@ -6,12 +6,3 @@ services:
     container_name: fold
     working_dir: /app
     command: ["/app/fold"]
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    container_name: jaeger
-    ports:
-      - "16686:16686" # Jaeger UI
-      - "6831:6831/udp" # Jaeger agent UDP
-      - "14268:14268" # Jaeger collector HTTP
-    environment:
-      - COLLECTOR_ZIPKIN_HOST_PORT=9411
