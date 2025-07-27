@@ -31,7 +31,7 @@ impl Queue {
         Self {
             name: name.to_string(),
             url,
-            last_len: Mutex::new(0),
+            last_len: Mutex::new(usize::MAX), // Set initial value to max int
         }
     }
 
@@ -80,7 +80,7 @@ impl Queue {
                     return *self.last_len.lock().unwrap();
                 }
             }
-            Err(e) => {
+            Err(_e) => {
                 return *self.last_len.lock().unwrap();
             }
         }
