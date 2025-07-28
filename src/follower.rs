@@ -1,13 +1,13 @@
 use crate::interner::InternerHolder;
-use crate::ortho_database::OrthoDatabase;
+use crate::ortho_database::OrthoDatabaseLike;
 use std::collections::HashSet;
 use crate::queue::QueueLike;
 
 pub struct Follower;
 
 impl Follower {
-    pub fn run<Q: QueueLike>(
-        db: &mut OrthoDatabase,
+    pub fn run<Q: QueueLike, D: OrthoDatabaseLike>(
+        db: &mut D,
         workq: &mut Q,
         container: &mut InternerHolder,
     ) {
@@ -17,8 +17,8 @@ impl Follower {
         Self::remove_unused_interners(db, container);
     }
 
-    fn process_lowest_version<Q: QueueLike>(
-        db: &mut OrthoDatabase,
+    fn process_lowest_version<Q: QueueLike, D: OrthoDatabaseLike>(
+        db: &mut D,
         workq: &mut Q,
         container: &mut InternerHolder,
         lowest_version: usize,
@@ -38,16 +38,16 @@ impl Follower {
         }
     }
 
-    fn get_ortho_for_version(
-        db: &mut OrthoDatabase,
+    fn get_ortho_for_version<D: OrthoDatabaseLike>(
+        db: &mut D,
         version: usize,
     ) -> Option<crate::ortho::Ortho> {
         let orthos = db.all_orthos();
         orthos.into_iter().find(|o| o.version() == version)
     }
 
-    fn bump_ortho_version(
-        db: &mut OrthoDatabase,
+    fn bump_ortho_version<D: OrthoDatabaseLike>(
+        db: &mut D,
         ortho: crate::ortho::Ortho,
         latest_version: usize,
     ) {
@@ -55,8 +55,8 @@ impl Follower {
         db.insert_or_update(new_ortho);
     }
 
-    fn remove_ortho_and_enqueue<Q: QueueLike>(
-        db: &mut OrthoDatabase,
+    fn remove_ortho_and_enqueue<Q: QueueLike, D: OrthoDatabaseLike>(
+        db: &mut D,
         workq: &mut Q,
         ortho: crate::ortho::Ortho,
         latest_version: usize,
@@ -66,8 +66,8 @@ impl Follower {
         workq.push_many(vec![new_ortho]);
     }
 
-    fn remove_unused_interners(
-        db: &mut OrthoDatabase,
+    fn remove_unused_interners<D: OrthoDatabaseLike>(
+        db: &mut D,
         container: &mut InternerHolder,
     ) {
         let ortho_versions: HashSet<usize> = db.all_versions().into_iter().collect();
@@ -101,10 +101,11 @@ mod tests {
     use super::*;
     use crate::interner::InternerHolder;
     use crate::ortho::Ortho;
+    use crate::InMemoryOrthoDatabase;
 
     #[test]
     fn test_remove_unused_interners_removes_versions_not_in_db() {
-        let mut db = OrthoDatabase::new();
+        let mut db = InMemoryOrthoDatabase::new();
         let mut holder = InternerHolder::from_text("a b");
         // Add a fake version not in db
         let fake_version = 99;
@@ -138,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_get_ortho_for_version_returns_correct_ortho() {
-        let mut db = OrthoDatabase::new();
+        let mut db = InMemoryOrthoDatabase::new();
         let ortho = Ortho::new(42);
         db.insert_or_update(ortho.clone());
         let found = Follower::get_ortho_for_version(&mut db, 42);
@@ -147,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_bump_ortho_version_inserts_updated_ortho() {
-        let mut db = OrthoDatabase::new();
+        let mut db = InMemoryOrthoDatabase::new();
         let ortho = Ortho::new(1);
         db.insert_or_update(ortho.clone());
         Follower::bump_ortho_version(&mut db, ortho.clone(), 2);
