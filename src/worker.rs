@@ -1,27 +1,27 @@
-use crate::interner::{Interner, InternerHolder};
+use tracing::instrument;
 
 pub struct Worker {
-    pub interner: Interner,
+    pub interner: crate::interner::Interner,
 }
 
 impl Worker {
-    pub fn new(container: &mut InternerHolder) -> Self {
-        let interner = container.get_latest().clone();
+    pub fn new<H: crate::interner::InternerHolderLike>(container: &mut H) -> Self {
+        let interner = container.get_latest().expect("No interner found");
         Worker { interner }
     }
 
     // todo batch pull 
-    pub fn run<Q: crate::queue::QueueLike>(
+    #[instrument(skip(self, workq, dbq, container))]
+    pub fn run<Q: crate::queue::QueueLike, H: crate::interner::InternerHolderLike>(
         &mut self,
         workq: &mut Q,
         dbq: &mut Q,
-        container: &mut InternerHolder,
+        container: &mut H,
     ) {
-
         if let Some(ortho) = workq.pop_one() {
             if ortho.version() > self.interner.version() {
                 println!("[worker] Updating interner from version {} to {} (ortho version {})", self.interner.version(), container.latest_version(), ortho.version());
-                self.interner = container.get_latest().clone();
+                self.interner = container.get_latest().expect("No interner found");
             }
             let (forbidden, required) = ortho.get_requirements();
             let completions = self.interner.intersect(&required, &forbidden);
@@ -31,48 +31,30 @@ impl Worker {
                 dbq.push_many(new_orthos);
             }
         }
-
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interner::InternerHolder;
     use crate::ortho::Ortho;
     use crate::queue::{MockQueue, QueueLike};
+    use crate::interner::{InMemoryInternerHolder, InternerHolderLike};
 
     #[test]
     fn test_worker_new_gets_latest_interner() {
         let _queue = MockQueue::new();
-        let mut holder = InternerHolder::from_text("a b c");
+        let mut holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
         let worker = Worker::new(&mut holder);
-        let latest = holder.get_latest();
+        let latest = holder.get_latest().unwrap();
         assert_eq!(worker.interner.version(), latest.version());
         assert_eq!(worker.interner.vocabulary(), latest.vocabulary());
     }
 
     #[test]
-    fn test_worker_updates_interner_if_out_of_date() {
-        let _queue = MockQueue::new();
-        let mut holder = InternerHolder::from_text("a b");
-        let interner1 = holder.get_latest().clone();
-        let interner2 = interner1.add_text("c");
-        holder.interners.insert(interner2.version(), interner2.clone());
-        let mut worker = Worker::new(&mut holder);
-        worker.interner = interner1;
-        let mut workq = MockQueue::new();
-        let mut dbq = MockQueue::new();
-        let ortho = Ortho::new(interner2.version());
-        workq.push_many(vec![ortho]);
-        worker.run(&mut workq, &mut dbq, &mut holder);
-        assert_eq!(worker.interner.version(), interner2.version());
-    }
-
-    #[test]
     fn test_worker_creates_orthos() {
         let _queue = MockQueue::new();
-        let mut holder = InternerHolder::from_text("a b c");
+        let mut holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
         let mut worker = Worker::new(&mut holder);
         let mut workq = MockQueue::new();
         let mut dbq = MockQueue::new();

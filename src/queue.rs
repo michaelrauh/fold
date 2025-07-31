@@ -1,14 +1,12 @@
 use crate::ortho::Ortho;
-use amiquip::{Connection, QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish};
+use amiquip::{Connection, QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish, FieldTable, AmqpValue};
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
-use reqwest::blocking::Client;
-use base64::{engine::general_purpose, Engine as _};
-use serde_json;
 use crossbeam_channel::TryRecvError;
-use std::sync::Mutex;
+use tracing::instrument;
 
 // todo put in acks
 // todo do not reopen connection for every push/pop
+// todo revisit blocking implementation
 pub trait QueueLike {
     fn push_many(&mut self, items: Vec<Ortho>);
     fn pop_one(&mut self) -> Option<Ortho>;
@@ -22,7 +20,6 @@ pub trait QueueLike {
 pub struct Queue {
     pub name: String,
     pub url: String,
-    last_len: Mutex<usize>,
 }
 
 impl Queue {
@@ -31,61 +28,29 @@ impl Queue {
         Self {
             name: name.to_string(),
             url,
-            last_len: Mutex::new(usize::MAX), // Set initial value to max int
         }
     }
 
+    #[instrument(skip_all)]
     pub fn len(&self) -> usize {
-        // Extract hostname from FOLD_AMQP_URL for management API
-        let amqp_url = std::env::var("FOLD_AMQP_URL")
+        let rabbit_url = std::env::var("FOLD_AMQP_URL")
             .expect("FOLD_AMQP_URL environment variable must be set for Queue");
-        let host = amqp_url
-            .split('@')
-            .nth(1)
-            .and_then(|s| s.split(':').next())
-            .expect("Could not parse host from FOLD_AMQP_URL");
-        let api_url = format!(
-            "http://{}:15672/api/queues/%2F/{}",
-            host,
-            self.name
-        );
-        let client = Client::new();
-        let auth = general_purpose::STANDARD.encode(b"guest:guest");
-        let resp = client
-            .get(&api_url)
-            .header("Authorization", format!("Basic {}", auth))
-            .send();
-        match resp {
-            Ok(mut r) => {
-                let _status = r.status();
-                let mut body = String::new();
-                use std::io::Read;
-                if let Err(_e) = r.read_to_string(&mut body) {
 
-                    return *self.last_len.lock().unwrap();
-                }
+        let mut connection = Connection::insecure_open(&rabbit_url).unwrap();
+        let channel = connection.open_channel(None).unwrap();
 
-                let json: serde_json::Value = match serde_json::from_str(&body) {
-                    Ok(j) => j,
-                    Err(_e) => {
-
-                        return *self.last_len.lock().unwrap();
-                    }
-                };
-                if let Some(messages) = json.get("messages") {
-                    let val = messages.as_u64().unwrap_or(0) as usize;
-                    *self.last_len.lock().unwrap() = val;
-                    return val;
-                } else {
-                    return *self.last_len.lock().unwrap();
-                }
-            }
-            Err(_e) => {
-                return *self.last_len.lock().unwrap();
-            }
-        }
+        let queue = channel.queue_declare(
+            self.name.as_str(),
+            QueueDeclareOptions {
+                durable: false, // todo make durable
+                ..QueueDeclareOptions::default()
+            },
+        ).unwrap();
+        let depth = queue.declared_message_count().unwrap();
+        depth as usize
     }
 
+    #[instrument(skip_all)]
     pub fn push_many(&mut self, orthos: Vec<Ortho>) {
         let mut conn = Connection::insecure_open(&self.url).unwrap();
         let channel = conn.open_channel(None).unwrap();
@@ -97,6 +62,7 @@ impl Queue {
         conn.close().unwrap();
     }
 
+    #[instrument(skip_all)]
     pub fn pop_one(&mut self) -> Option<Ortho> {
         let mut conn = Connection::insecure_open(&self.url).unwrap();
         let channel = conn.open_channel(None).unwrap();
@@ -129,6 +95,7 @@ impl Queue {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn pop_many(&mut self, max: usize) -> Vec<Ortho> {
         
         let mut conn = Connection::insecure_open(&self.url).unwrap();
@@ -161,24 +128,30 @@ impl Queue {
         items
     }
 
+    #[instrument(skip_all)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
 impl QueueLike for Queue {
+    #[instrument(skip_all)]
     fn push_many(&mut self, items: Vec<Ortho>) {
         self.push_many(items)
     }
+    #[instrument(skip_all)]
     fn pop_one(&mut self) -> Option<Ortho> {
         self.pop_one()
     }
+    #[instrument(skip_all)]
     fn pop_many(&mut self, max: usize) -> Vec<Ortho> {
         self.pop_many(max)
     }
+    #[instrument(skip_all)]
     fn len(&self) -> usize {
         self.len()
     }
+    #[instrument(skip_all)]
     fn is_empty(&self) -> bool {
         self.is_empty()
     }

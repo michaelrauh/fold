@@ -1,8 +1,9 @@
 use crate::ortho::Ortho;
 use std::collections::HashMap;
 use postgres::{Client, NoTls};
-use std::env;
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
+use std::env;
+use tracing::instrument;
 
 pub trait OrthoDatabaseLike {
     fn upsert(&mut self, orthos: Vec<Ortho>) -> Vec<Ortho>;
@@ -14,6 +15,7 @@ pub trait OrthoDatabaseLike {
     fn insert_or_update(&mut self, ortho: Ortho);
     fn remove_by_id(&mut self, id: &usize);
     fn len(&mut self) -> usize;
+    fn sample_version(&mut self, version: usize) -> Option<Ortho>;
 }
 
 pub struct InMemoryOrthoDatabase {
@@ -44,6 +46,7 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
     fn get_by_dims(&mut self, dims: &[usize]) -> Option<Ortho> {
         self.map.values().find(|o| o.dims() == dims).cloned()
     }
+
     fn get_optimal(&mut self) -> Option<Ortho> {
         self.map.values()
             .max_by_key(|o| o.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>())
@@ -59,6 +62,7 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
     fn all_orthos(&mut self) -> Vec<Ortho> {
         self.map.values().cloned().collect()
     }
+
     fn insert_or_update(&mut self, ortho: Ortho) {
         self.map.insert(ortho.id(), ortho);
     }
@@ -67,6 +71,9 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
     }
     fn len(&mut self) -> usize {
         self.map.len()
+    }
+    fn sample_version(&mut self, version: usize) -> Option<Ortho> {
+        self.map.values().find(|o| o.version() == version).cloned()
     }
 }
 
@@ -91,6 +98,7 @@ impl PostgresOrthoDatabase {
 }
 
 impl OrthoDatabaseLike for PostgresOrthoDatabase {
+    #[instrument(skip_all)]
     fn upsert(&mut self, orthos: Vec<Ortho>) -> Vec<Ortho> {
         if orthos.is_empty() {
             return Vec::new();
@@ -117,6 +125,7 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             })
             .collect()
     }
+    #[instrument(skip_all)]
     fn get(&mut self, key: &usize) -> Option<Ortho> {
         let id = *key as i64;
         let row = self.client.query_opt("SELECT data FROM orthos WHERE id = $1", &[&id]).unwrap();
@@ -125,6 +134,7 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
         })
     }
+    #[instrument(skip_all)]
     fn get_by_dims(&mut self, dims: &[usize]) -> Option<Ortho> {
         let dims_bin = encode_to_vec(dims, standard()).unwrap();
         let row = self.client.query_opt("SELECT data FROM orthos WHERE dims = $1", &[&dims_bin]).unwrap();
@@ -133,6 +143,7 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
         })
     }
+    #[instrument(skip(self))]
     fn get_optimal(&mut self) -> Option<Ortho> {
         // Step 1: Get all dims
         let rows = self.client.query("SELECT DISTINCT dims FROM orthos", &[]).unwrap();
@@ -156,12 +167,17 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             None
         }
     }
+    #[instrument(skip_all)]
     fn all_versions(&mut self) -> Vec<usize> {
         let rows = self.client.query("SELECT DISTINCT version FROM orthos", &[]).unwrap();
-        let mut versions: Vec<usize> = rows.into_iter().map(|r| r.get::<_, i64>(0) as usize).collect();
+        let mut versions: Vec<usize> = rows.into_iter().map(|r| {
+            let version: i64 = r.get(0);
+            version as usize
+        }).collect();
         versions.sort_unstable();
         versions
     }
+    #[instrument(skip_all)]
     fn all_orthos(&mut self) -> Vec<Ortho> {
         let rows = self.client.query("SELECT data FROM orthos", &[]).unwrap();
         rows.into_iter().filter_map(|r| {
@@ -169,6 +185,7 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             decode_from_slice(&data, standard()).ok().map(|(o, _)| o)
         }).collect()
     }
+    #[instrument(skip(self, ortho))]
     fn insert_or_update(&mut self, ortho: Ortho) {
         let id = ortho.id() as i64;
         let version = ortho.version() as i64;
@@ -180,13 +197,26 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             &[&id, &version, &dims, &data],
         ).unwrap();
     }
+    #[instrument(skip_all)]
     fn remove_by_id(&mut self, id: &usize) {
         let id = *id as i64;
         self.client.execute("DELETE FROM orthos WHERE id = $1", &[&id]).unwrap();
     }
+    #[instrument(skip_all)]
     fn len(&mut self) -> usize {
         let row = self.client.query_one("SELECT COUNT(*) FROM orthos", &[]).unwrap();
-        row.get::<_, i64>(0) as usize
+        let count: i64 = row.get(0);
+        count as usize
+    }
+    #[instrument(skip_all)]
+    fn sample_version(&mut self, _version: usize) -> Option<Ortho> {
+        // Return the first Ortho with the given version, or None
+        let version = _version as i64;
+        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 LIMIT 1", &[&version]).unwrap();
+        row.and_then(|r| {
+            let data: Vec<u8> = r.get(0);
+            decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
+        })
     }
 }
 

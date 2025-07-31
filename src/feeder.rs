@@ -1,6 +1,9 @@
 pub struct OrthoFeeder;
 
+use tracing::instrument;
+
 impl OrthoFeeder {
+    #[instrument(skip_all)]
     pub fn run<Q: crate::queue::QueueLike, D: crate::ortho_database::OrthoDatabaseLike>(
         dbq: &mut Q,
         db: &mut D,

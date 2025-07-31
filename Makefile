@@ -4,6 +4,7 @@ up:
 
 down:
 	docker-compose down -v
+	docker volume rm fold_miniostorage || true
 
 reset:
 	docker-compose down -v

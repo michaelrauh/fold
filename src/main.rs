@@ -1,113 +1,202 @@
 use fold::feeder::OrthoFeeder;
 use fold::follower::Follower;
-use fold::interner::InternerHolder;
+use fold::interner::{FileInternerHolder, BlobInternerHolder};
+use fold::interner::InternerHolderLike;
 use fold::ortho_database::{InMemoryOrthoDatabase, PostgresOrthoDatabase, OrthoDatabaseLike};
 use fold::queue::{Queue, MockQueue, QueueLike};
 use fold::worker::Worker;
 use std::fs;
 use dotenv::dotenv;
 use std::time::Instant;
+use opentelemetry::{KeyValue};
+use opentelemetry_sdk::{Resource, trace as sdktrace};
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use opentelemetry::trace::TracerProvider;
+use tracing::instrument;
 
-fn run<Q: QueueLike, D: OrthoDatabaseLike>(mut dbq: Q, mut workq: Q, mut db: D) {
-    // Prepare list of files 0.txt to 28.txt
-    let files: Vec<String> = (0..=28).map(|i| format!("{}.txt", i)).collect();
-    let mut current_file_idx = 0;
-    // Read the first file (0.txt)
-    let initial_text = match fs::read_to_string(&files[0]) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("[main] Failed to read file {}: {}", files[0], e);
-            return;
-        }
-    };
-    let mut holder = InternerHolder::with_seed(initial_text.trim(), &mut workq);
-    println!("[main] Queues and InternerHolder created");
-    let mut loop_count = 0;
-    let mut files_processed = 1; // 0.txt is already processed
-    let start_time = Instant::now(); // Start grace period timer
+fn run<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::InternerHolderLike>(
+    mut dbq: Q,
+    mut workq: Q,
+    mut db: D,
+    mut holder: H,
+    _initial_file: &str,
+) {
+    use std::time::{Duration, Instant};
+    let mut loop_count: usize = 0;
+    let mut files_fed = 1; // 0.txt is already seeded
+    let total_files = 29; // 0.txt to 28.txt
+    let mut last_feed = Instant::now();
+    let mut all_files_fed = false;
+    let mut next_file_idx = 1;
+    let mut printed_final_optimal = false;
+    // Main processing loop
     loop {
-        OrthoFeeder::run(&mut dbq, &mut db, &mut workq);
-        Follower::run(&mut db, &mut workq, &mut holder);
-        Worker::run(&mut Worker::new(&mut holder), &mut workq, &mut dbq, &mut holder);
-        loop_count += 1;
+        // Always process queues
+        process_with_grace(&mut dbq, &mut workq, &mut db, &mut holder, files_fed, 0, &mut loop_count);
+        // Feed logic
+        if !all_files_fed {
+            let queue_depth = workq.len() + dbq.len();
+            let interner_count = holder.versions().len();
+            let enough_time = last_feed.elapsed() >= Duration::from_secs(60);
+            if queue_depth < 1000 && interner_count < 2 && enough_time && next_file_idx < total_files {
+                let file = format!("{}.txt", next_file_idx);
+                let s = fs::read_to_string(&file).expect(&format!("[main] Failed to read file {}", file));
+                println!("[main] Feeding {}...", file);
+                holder.add_text_with_seed(&s, &mut workq);
+                println!("[main] Queues and InternerHolder updated");
+                last_feed = Instant::now();
+                files_fed += 1;
+                next_file_idx += 1;
+                if next_file_idx == total_files {
+                    all_files_fed = true;
+                }
+            }
+        } else {
+            // After all files are fed, wait for all queues to empty, then print optimal and exit
+            if workq.len() == 0 && dbq.len() == 0 {
+                if !printed_final_optimal {
+                    let ortho_opt = db.get_optimal();
+                    if let Some(ortho) = ortho_opt {
+                        println!("[main] Final Optimal Ortho: {:?}", ortho);
+                        if let Some(interner) = holder.get_latest() {
+                            let payload_strings = ortho.payload().iter().map(|opt_idx| {
+                                opt_idx.map(|idx| interner.string_for_index(idx).to_string())
+                            }).collect::<Vec<_>>();
+                            println!("[main] Final Optimal Ortho (strings): {:?}", payload_strings);
+                        } else {
+                            println!("[main] No interner found for final optimal ortho.");
+                        }
+                    } else {
+                        println!("[main] No final optimal Ortho found.");
+                    }
+                    println!("[main] Exiting.");
+                    printed_final_optimal = true;
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::InternerHolderLike>(
+    dbq: &mut Q,
+    workq: &mut Q,
+    db: &mut D,
+    holder: &mut H,
+    files_processed: usize,
+    grace_period_secs: u64,
+    loop_count: &mut usize,
+) {
+    let mut follower = Follower::new();
+    let grace_start = Instant::now();
+    loop {
+        OrthoFeeder::run(dbq, db, workq);
+        follower.run(db, workq, holder);
+        Worker::run(&mut Worker::new(holder), workq, dbq, holder);
+        *loop_count += 1;
         let workq_depth = workq.len();
         let dbq_depth = dbq.len();
         let db_len = db.len();
         let latest_version = holder.latest_version();
-        let num_interners = holder.num_interners();
+        println!("[main] LOOP_COUNT: {}", *loop_count);
         println!(
             "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}, files processed: {}",
             workq_depth, dbq_depth, db_len, latest_version, files_processed
         );
         // Periodically print optimal ortho
-        if loop_count % 1000 == 0 {
+        if *loop_count % 1000 == 0 {
             let ortho_opt = db.get_optimal();
             if let Some(ortho) = ortho_opt {
-                println!("[main] Optimal Ortho: {:?}", ortho);
-                let interner = holder.get_latest();
-                let payload_strings = ortho.payload().iter().map(|opt_idx| {
-                    opt_idx.map(|idx| interner.string_for_index(idx).to_string())
-                }).collect::<Vec<_>>();
-                println!("[main] Optimal Ortho (strings): {:?}", payload_strings);
+                println!("[main] (file idx: {}) Optimal Ortho: {:?}", files_processed, ortho);
+                if let Some(interner) = holder.get_latest() {
+                    let payload_strings = ortho.payload().iter().map(|opt_idx| {
+                        opt_idx.map(|idx| interner.string_for_index(idx).to_string())
+                    }).collect::<Vec<_>>();
+                    println!("[main] Optimal Ortho (strings): {:?}", payload_strings);
+                } else {
+                    println!("[main] No interner found for optimal ortho.");
+                }
             } else {
                 println!("[main] No optimal Ortho found.");
             }
         }
-        let GRACE_PERIOD_SECS: u64 = 60;
-        // Feed next file if queues are small and only one interner, but only after 30s grace period
-        if start_time.elapsed().as_secs() >= GRACE_PERIOD_SECS {
-            if (workq_depth + dbq_depth) < 1000 && num_interners == 1 && files_processed < files.len() {
-                current_file_idx += 1;
-                let next_file = &files[current_file_idx];
-                match fs::read_to_string(next_file) {
-                    Ok(s) => {
-                        println!("[main] Feeding {}...", next_file);
-                        holder.add_text_with_seed(s.trim(), &mut workq);
-                        files_processed += 1;
-                    },
-                    Err(e) => {
-                        println!("[main] Failed to read file {}: {}", next_file, e);
-                    }
-                }
-            }
+        let elapsed = grace_start.elapsed().as_secs();
+        if elapsed >= grace_period_secs {
+            break;
         } else {
-            if files_processed < files.len() {
-                let remaining = GRACE_PERIOD_SECS - start_time.elapsed().as_secs();
-                println!("[main] Grace period active ({}s remaining), not feeding new files.", remaining);
-            }
+            let remaining = grace_period_secs - elapsed;
+            println!("[main] Grace period active ({}s remaining) before next feed.", remaining);
         }
-        // Only exit when all files are processed and queues are empty
-        if files_processed == files.len() && workq_depth == 0 && dbq_depth == 0 {
+        // If all queues are empty, exit early
+        if workq.len() == 0 && dbq.len() == 0 {
             break;
         }
     }
-    println!("[main] Main loop exited");
-    let ortho_opt = db.get_optimal();
-    if let Some(ortho) = ortho_opt {
-        println!("Optimal Ortho: {:?}", ortho);
-        let interner = holder.get_latest();
-        let payload_strings = ortho.payload().iter().map(|opt_idx| {
-            opt_idx.map(|idx| interner.string_for_index(idx).to_string())
-        }).collect::<Vec<_>>();
-        println!("Optimal Ortho (strings): {:?}", payload_strings);
-    } else {
-        println!("No optimal Ortho found.");
-    }
-    println!("[main] Exiting.");
 }
 
 fn main() {
+    // todo make tracing jaeger for distributed mode and stdout for monolith
+    // todo consider a mixed mode with monolith + jaeger
+    // --- Jaeger/Tracing Initialization (opentelemetry-otlp 0.29, OTLP/HTTP, Jaeger, Compose) ---
+    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint("http://jaeger:4318/v1/traces") // todo manage in env vars
+        .build()
+        .expect("Failed to build OTLP exporter");
+
+    let resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "fold-app"),
+        ])
+        .build();
+
+    let tracer_provider = sdktrace::SdkTracerProvider::builder()
+        .with_simple_exporter(otlp_exporter)
+        .with_resource(resource)
+        .build();
+
+    let tracer = tracer_provider.tracer("fold-app");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    // --- End Jaeger/Tracing Initialization ---
+
     dotenv().ok();
-    let amqp_url = std::env::var("FOLD_AMQP_URL")
-        .expect("FOLD_AMQP_URL environment variable must be set");
-    let pg_url = std::env::var("FOLD_PG_URL")
-        .expect("FOLD_PG_URL environment variable must be set");
-    println!("[main] FOLD_AMQP_URL: {}", amqp_url);
-    println!("[main] FOLD_PG_URL: {}", pg_url);
-    let use_local = amqp_url == "local" || pg_url == "local";
-    if use_local {
-        run(MockQueue::new(), MockQueue::new(), InMemoryOrthoDatabase::new());
+    let mode = std::env::var("FOLD_MODE").unwrap_or_else(|_| "monolith".to_string());
+    println!("[main] FOLD_MODE: {}", mode);
+    let endpoint = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap_or_else(|_| "(unset)".to_string());
+    println!("[main][debug] FOLD_INTERNER_BLOB_ENDPOINT: {}", endpoint);
+    if mode == "monolith" {
+        // Clean interner directory if in monolith mode
+        if let Ok(dir) = std::env::var("INTERNER_FILE_LOCATION") {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    let file = "0.txt";
+    let initial_text = std::fs::read_to_string(&file).unwrap();
+    if mode == "monolith" {
+        // Monolith: always use FileInternerHolder, MockQueue, InMemoryOrthoDatabase
+        let dbq = MockQueue::new();
+        let mut workq = MockQueue::new();
+        let db = InMemoryOrthoDatabase::new();
+        let holder = FileInternerHolder::with_seed(&initial_text, &mut workq);
+        run(dbq, workq, db, holder, file);
     } else {
-        run(Queue::new("dbq"), Queue::new("main"), PostgresOrthoDatabase::new());
+        // Distributed: use Queue, PostgresOrthoDatabase, and BlobInternerHolder only
+        // Print endpoint again before BlobInternerHolder
+        println!("[main][debug] Using endpoint for BlobInternerHolder: {}", endpoint);
+        let dbq = Queue::new("dbq");
+        let mut workq = Queue::new("main");
+        let db = PostgresOrthoDatabase::new();
+        let holder = BlobInternerHolder::with_seed(&initial_text, &mut workq);
+        run(dbq, workq, db, holder, file);
     }
 }
