@@ -1,6 +1,7 @@
 up:
-	docker-compose up --build -d
-	docker-compose logs -f fold
+	RUST_LOG=info,fold=trace docker-compose up --build -d
+	# Print only your logs to stdout, but all logs (including dependencies) are exported to Jaeger via the tracing config in your app
+	docker-compose logs -f fold | grep -E '\[main|\[worker|\[follower|\[feeder|\[queue|\[ortho|\[interner' || true
 
 down:
 	docker-compose down -v
@@ -12,4 +13,4 @@ reset:
 	docker-compose logs -f fold
 
 local:
-	cargo run --release
+	RUST_LOG=info,fold=trace cargo run --release

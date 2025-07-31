@@ -5,6 +5,7 @@ use fold::interner::InternerHolderLike;
 use fold::ortho_database::{InMemoryOrthoDatabase, PostgresOrthoDatabase, OrthoDatabaseLike};
 use fold::queue::{Queue, MockQueue, QueueLike};
 use fold::worker::Worker;
+use tracing_subscriber::EnvFilter;
 use std::fs;
 use dotenv::dotenv;
 use std::time::Instant;
@@ -136,37 +137,42 @@ fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::Int
 }
 
 fn main() {
-    // todo make tracing jaeger for distributed mode and stdout for monolith
-    // todo consider a mixed mode with monolith + jaeger
-    // --- Jaeger/Tracing Initialization (opentelemetry-otlp 0.29, OTLP/HTTP, Jaeger, Compose) ---
-    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint("http://jaeger:4318/v1/traces") // todo manage in env vars
-        .build()
-        .expect("Failed to build OTLP exporter");
-
-    let resource = Resource::builder_empty()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "fold-app"),
-        ])
-        .build();
-
-    let tracer_provider = sdktrace::SdkTracerProvider::builder()
-        .with_simple_exporter(otlp_exporter)
-        .with_resource(resource)
-        .build();
-
-    let tracer = tracer_provider.tracer("fold-app");
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    tracing_subscriber::registry()
-        .with(otel_layer)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-    // --- End Jaeger/Tracing Initialization ---
-
     dotenv().ok();
     let mode = std::env::var("FOLD_MODE").unwrap_or_else(|_| "monolith".to_string());
+    if mode == "distributed" {
+        // Jaeger/OTLP tracing setup
+        let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .with_endpoint("http://jaeger:4318/v1/traces")
+            .build()
+            .expect("Failed to build OTLP exporter");
+        let resource = Resource::builder_empty()
+            .with_attributes(vec![KeyValue::new("service.name", "fold-app")])
+            .build();
+        let tracer_provider = sdktrace::SdkTracerProvider::builder()
+            .with_simple_exporter(otlp_exporter)
+            .with_resource(resource)
+            .build();
+        let tracer = tracer_provider.tracer("fold-app");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    } else {
+        // Stdout tracing setup with full span events and env filter
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            )
+            .with(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("info,fold=trace"))
+            )
+            .init();
+    }
     println!("[main] FOLD_MODE: {}", mode);
     let endpoint = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap_or_else(|_| "(unset)".to_string());
     println!("[main][debug] FOLD_INTERNER_BLOB_ENDPOINT: {}", endpoint);
