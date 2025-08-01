@@ -6,8 +6,6 @@ use std::path::PathBuf;
 
 use aws_sdk_s3::{Client, primitives::ByteStream};
 use aws_config;
-use std::net::TcpStream;
-use std::io::{Read, Write};
 
 #[derive(Clone)]
 pub struct Interner {
@@ -188,10 +186,6 @@ impl Interner {
         }
         let mut first = true;
         for prefix in required {
-            if !self.prefix_to_completions.contains_key(prefix) {
-                println!("[interner] Prefixes in interner: {:?}", self.prefix_to_completions.keys().collect::<Vec<_>>());
-                println!("[interner] Missing required prefix: {:?}", prefix);
-            }
             let bitset = self
                 .prefix_to_completions
                 .get(prefix)
@@ -443,7 +437,7 @@ impl BlobInternerHolder {
                     let bytes = data.into_bytes();
                     Some(bytes.to_vec())
                 },
-                Err(e) => {
+                Err(_e) => {
                     None
                 },
             }
@@ -458,7 +452,7 @@ impl BlobInternerHolder {
                     let keys: Vec<String> = resp.contents().iter().filter_map(|obj| obj.key().map(|k| k.to_string())).collect();
                     keys
                 },
-                Err(e) => {
+                Err(_e) => {
                     vec![]
                 },
             }

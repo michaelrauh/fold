@@ -70,7 +70,8 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
         self.map.remove(id);
     }
     fn len(&mut self) -> usize {
-        self.map.len()
+        let l = self.map.len();
+        l
     }
     fn sample_version(&mut self, version: usize) -> Option<Ortho> {
         self.map.values().find(|o| o.version() == version).cloned()
@@ -206,7 +207,8 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
     fn len(&mut self) -> usize {
         let row = self.client.query_one("SELECT COUNT(*) FROM orthos", &[]).unwrap();
         let count: i64 = row.get(0);
-        count as usize
+        let l = count as usize;
+        l
     }
     #[instrument(skip_all)]
     fn sample_version(&mut self, _version: usize) -> Option<Ortho> {

@@ -1,5 +1,5 @@
 use crate::ortho::Ortho;
-use amiquip::{Connection, QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish, FieldTable, AmqpValue};
+use amiquip::{Connection, QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish};
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
 use crossbeam_channel::TryRecvError;
 use tracing::instrument;
@@ -47,7 +47,8 @@ impl Queue {
             },
         ).unwrap();
         let depth = queue.declared_message_count().unwrap();
-        depth as usize
+        let l = depth as usize;
+        l
     }
 
     #[instrument(skip_all)]
@@ -190,7 +191,8 @@ impl QueueLike for MockQueue {
         out
     }
     fn len(&self) -> usize {
-        self.items.len()
+        let l = self.items.len();
+        l
     }
     fn is_empty(&self) -> bool {
         self.items.is_empty()
