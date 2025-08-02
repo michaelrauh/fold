@@ -356,7 +356,7 @@ impl InternerHolderLike for FileInternerHolder {
         workq.push_many(vec![ortho_seed]);
     }
     
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self {
+    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo deprecate with seed and just use add_text_with_seed
         let dir = std::env::var("INTERNER_FILE_LOCATION")
             .expect("INTERNER_FILE_LOCATION not set in environment. Please set it in your .env file.");
         let mut holder = FileInternerHolder::new_internal(dir);
@@ -491,17 +491,30 @@ impl InternerHolderLike for BlobInternerHolder {
         self.delete_blocking(&key);
     }
     fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
-        let latest = self.get_latest().unwrap();    
-        let interner = latest.add_text(text);
-        let key = interner.version().to_string();
-        let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
-        self.put_blocking(&key, &data);
-        let version = interner.version();
-        let ortho_seed = crate::ortho::Ortho::new(version);
-        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        if self.get_latest().is_none() {
+            // Holder is empty, create new with seed
+            let interner = Interner::from_text(text);
+            let key = interner.version().to_string();
+            let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
+            self.put_blocking(&key, &data);
+            let version = interner.version();
+            let ortho_seed = crate::ortho::Ortho::new(version);
+            println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
+            workq.push_many(vec![ortho_seed]);
+        } else {
+            // Holder is nonempty, add text to latest
+            let latest = self.get_latest().unwrap();
+            let interner = latest.add_text(text);
+            let key = interner.version().to_string();
+            let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
+            self.put_blocking(&key, &data);
+            let version = interner.version();
+            let ortho_seed = crate::ortho::Ortho::new(version);
+            println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
+            workq.push_many(vec![ortho_seed]);
+        }
     }
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self {
+    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo be careful around creations.
         let holder = BlobInternerHolder::new_internal();
         let interner = Interner::from_text(text);
         let key = interner.version().to_string();

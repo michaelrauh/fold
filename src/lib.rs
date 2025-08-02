@@ -1,4 +1,4 @@
-pub mod feeder;
+
 pub mod interner;
 pub mod ortho;
 pub mod ortho_database;
