@@ -1,4 +1,7 @@
-up:
+build:
+	docker build -t fold-services:latest -f Dockerfile .
+
+up: build
 	RUST_LOG=info,fold=trace,aws_sdk_s3=warn,aws_smithy_runtime=warn,hyper=warn,opentelemetry=warn docker-compose up --build -d
 	docker-compose logs -f ingestor fold_worker feeder follower | grep -E '\[main|\[worker|\[follower|\[feeder|\[queue|\[ortho|\[interner' || true
 

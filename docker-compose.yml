@@ -1,12 +1,12 @@
 services:
   fold_worker:
+    image: fold-services:latest
+    container_name: fold_worker
     build:
       context: .
-      dockerfile: Dockerfile.fold_worker
-    image: fold-worker-app:latest
-    container_name: fold_worker
+      dockerfile: Dockerfile
     working_dir: /app
-    command: sh -c "/app/wait-for-it.sh postgres:5432 --timeout=30 -- /app/wait-for-it.sh rabbitmq:5672 --timeout=30 -- /app/wait-for-it.sh minio:9000 --timeout=30 -- /app/fold_worker"
+    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "./wait-for-it.sh", "postgres:5432", "--timeout=30", "--", "./wait-for-it.sh", "minio:9000", "--timeout=30", "--", "/app/fold_worker"]
     environment:
       - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
       - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
@@ -19,6 +19,56 @@ services:
       - rabbitmq
       - postgres
       - minio
+  follower:
+    image: fold-services:latest
+    container_name: follower
+    working_dir: /app
+    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "/app/follower"]
+    environment:
+      - FOLD_MODE=distributed
+      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
+      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
+      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_BUCKET=internerdata
+    depends_on:
+      - rabbitmq
+  feeder:
+    image: fold-services:latest
+    container_name: feeder
+    working_dir: /app
+    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "/app/feeder"]
+    environment:
+      - FOLD_MODE=distributed
+      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
+      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
+      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_BUCKET=internerdata
+    depends_on:
+      - rabbitmq
+      - postgres
+      - minio
+  ingestor:
+    image: fold-services:latest
+    container_name: ingestor
+    working_dir: /app
+    environment:
+      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
+      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
+      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
+      - FOLD_MODE=distributed
+      - FOLD_INTERNER_BLOB_BUCKET=internerdata
+    depends_on:
+      - rabbitmq
+      - postgres
+      - minio
+    profiles:
+      - manual
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
@@ -54,71 +104,11 @@ services:
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     ports:
-      - "16686:16686"   # Jaeger UI
-      - "4317:4317"     # OTLP gRPC ingest
-      - "4318:4318"     # OTLP HTTP ingest
-      - "6831:6831/udp" # Jaeger agent UDP (optional)
-      - "14268:14268"   # Jaeger collector HTTP (optional)
-  follower:
-    build:
-      context: .
-      dockerfile: Dockerfile.follower
-    image: fold_follower:latest
-    depends_on:
-      - rabbitmq
-    environment:
-      - FOLD_MODE=distributed
-      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
-      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
-      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
-      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_BUCKET=internerdata
-    command: ["/app/wait-for-it.sh", "rabbitmq:5672", "--", "/app/follower"]
-  feeder:
-    build:
-      context: .
-      dockerfile: Dockerfile.feeder
-    image: fold_feeder:latest
-    container_name: feeder
-    working_dir: /app
-    command: sh -c "/app/wait-for-it.sh rabbitmq:5672 --timeout=30 -- /app/feeder"
-    environment:
-      - FOLD_MODE=distributed
-      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
-      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
-      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
-      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_BUCKET=internerdata
-    depends_on:
-      - rabbitmq
-      - postgres
-      - minio
-  ingestor:
-    build:
-      context: .
-      dockerfile: Dockerfile.ingestor
-    image: fold-ingestor:latest
-    container_name: ingestor
-    working_dir: /app
-    entrypoint: ""
-    command: ""
-    environment:
-      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
-      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
-      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
-      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
-      - FOLD_MODE=distributed
-      - FOLD_INTERNER_BLOB_BUCKET=internerdata
-    depends_on:
-      - rabbitmq
-      - postgres
-      - minio
-    profiles:
-      - manual
-
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+      - "6831:6831/udp"
+      - "14268:14268"
 volumes:
   pgdata:
   internerdata:

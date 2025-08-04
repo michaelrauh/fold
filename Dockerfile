@@ -1,16 +1,22 @@
 # syntax=docker/dockerfile:1
-FROM rustlang/rust:nightly AS builder
+FROM rustlang/rust:nightly-bookworm AS builder
 WORKDIR /app
-# Copy manifests, benches, then source, then build
+# 1. Cache dependencies
 COPY Cargo.toml Cargo.lock ./
-COPY benches/ benches/
-COPY src/ src/
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release || true
+# 2. Copy actual source and build all binaries
+RUN rm src/main.rs
+COPY src ./src
+COPY benches ./benches
 RUN cargo build --release
 
-FROM alpine:latest
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y libssl3 curl postgresql-client bash && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN apk update && apk add libssl3 curl postgresql-client && rm -rf /var/cache/apk/*
-COPY --from=builder /app/target/release/fold /app/fold
-COPY wait-for-it.sh /app/wait-for-it.sh
-RUN chmod +x /app/wait-for-it.sh /app/fold
-CMD ["/app/wait-for-it.sh", "rabbitmq:5672", "--", "/app/fold"]
+COPY --from=builder /app/target/release/fold_worker .
+COPY --from=builder /app/target/release/follower .
+COPY --from=builder /app/target/release/feeder .
+COPY --from=builder /app/target/release/ingestor .
+COPY wait-for-it.sh .
+RUN chmod +x ./wait-for-it.sh
