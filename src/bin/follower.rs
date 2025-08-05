@@ -32,8 +32,8 @@ fn main() {
         .with(otel_layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let mut workq = Queue::new("workq");
-    let mut holder = BlobInternerHolder::new_internal();
+    let mut workq = Queue::new("workq").expect("Failed to create workq");
+    let mut holder = BlobInternerHolder::new_internal().expect("Failed to create BlobInternerHolder");
     let mut db = PostgresOrthoDatabase::new();
     let mut follower = Follower::new();
     loop {

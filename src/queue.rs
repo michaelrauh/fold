@@ -106,10 +106,13 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub fn new(name: &str) -> Self {
-        let url = std::env::var("FOLD_AMQP_URL").expect("FOLD_AMQP_URL environment variable must be set for Queue");
-        let mut connection = Connection::insecure_open(&url).expect("Failed to open RabbitMQ connection");
-        let channel = connection.open_channel(None).expect("Failed to open RabbitMQ channel");
+    pub fn new(name: &str) -> Result<Self, FoldError> {
+        let url = std::env::var("FOLD_AMQP_URL")
+            .map_err(|_| FoldError::Other("FOLD_AMQP_URL environment variable must be set for Queue".into()))?;
+        let mut connection = Connection::insecure_open(&url)
+            .map_err(|e| FoldError::Queue(format!("Failed to open RabbitMQ connection: {}", e)))?;
+        let channel = connection.open_channel(None)
+            .map_err(|e| FoldError::Queue(format!("Failed to open RabbitMQ channel: {}", e)))?;
         
         // Declare the queue as durable to persist messages (this is idempotent)
         let _queue = channel.queue_declare(
@@ -118,13 +121,13 @@ impl Queue {
                 durable: true,
                 ..QueueDeclareOptions::default()
             },
-        ).expect("Failed to declare queue");
+        ).map_err(|e| FoldError::Queue(format!("Failed to declare queue: {}", e)))?;
         
-        Self {
+        Ok(Self {
             name: name.to_string(),
             connection: Some(connection),
             channel,
-        }
+        })
     }
 
     pub fn ack_handle(&self, handle: QueueHandle) -> Result<(), FoldError> {
@@ -199,7 +202,9 @@ impl Queue {
             },
         )?;
         
-        Ok(queue.declared_message_count().unwrap_or(0) as usize)
+        queue.declared_message_count()
+            .map(|count| count as usize)
+            .map_err(|e| FoldError::Queue(format!("Failed to get queue message count: {}", e)))
     }
 
     #[instrument(skip_all)]
@@ -350,7 +355,7 @@ mod tests {
         
         // Create a queue and push one item
         {
-            let mut queue = Queue::new(test_queue_name);
+            let mut queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
             let test_ortho = Ortho::new(42);
             queue.push_many(vec![test_ortho.clone()]).expect("push_many should succeed");
             
@@ -369,7 +374,7 @@ mod tests {
         
         // Create a new queue with the same name and verify it's empty (since we acked)
         {
-            let queue = Queue::new(test_queue_name);
+            let queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
             assert_eq!(queue.len().expect("len should succeed"), 0);
         }
     }
@@ -387,7 +392,7 @@ mod tests {
         
         // Create a queue and push items without acking
         {
-            let mut queue = Queue::new(test_queue_name);
+            let mut queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
             let test_ortho = Ortho::new(123);
             queue.push_many(vec![test_ortho.clone()]).expect("push_many should succeed");
             
@@ -398,13 +403,13 @@ mod tests {
         
         // Create a new queue and verify the message is still there
         {
-            let queue = Queue::new(test_queue_name);
+            let queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
             assert_eq!(queue.len().expect("len should succeed"), 1, "Message should still be in durable queue after connection drop without ack");
         }
         
         // Clean up: pop and ack the message
         {
-            let mut queue = Queue::new(test_queue_name);
+            let mut queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
             let handle = queue.pop_one();
             if let Some(handle) = handle {
                 queue.ack_handle(handle).expect("Failed to ack message");

@@ -30,8 +30,8 @@ fn main() {
         .with(otel_layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let mut dbq = Queue::new("dbq");
-    let mut workq = Queue::new("workq");
+    let mut dbq = Queue::new("dbq").expect("Failed to create dbq");
+    let mut workq = Queue::new("workq").expect("Failed to create workq");
     let mut db = PostgresOrthoDatabase::new();
     loop {
         OrthoFeeder::run_feeder_once(&mut dbq, &mut db, &mut workq);

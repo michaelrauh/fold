@@ -102,9 +102,9 @@ impl S3Client {
 
 fn main() {
     let cli = Cli::parse();
-    let dbq = Queue::new("dbq");
-    let mut workq = Queue::new("workq");
-    let mut holder = BlobInternerHolder::new_internal();
+    let dbq = Queue::new("dbq").expect("Failed to create dbq");
+    let mut workq = Queue::new("workq").expect("Failed to create workq");
+    let mut holder = BlobInternerHolder::new_internal().expect("Failed to create BlobInternerHolder");
     let mut db = PostgresOrthoDatabase::new();
     let s3_client = S3Client::new();
     match cli.command {
