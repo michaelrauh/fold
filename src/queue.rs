@@ -322,7 +322,7 @@ mod tests {
     fn test_push_many_and_pop_one() {
         let mut dbq = MockQueue::new();
         let orthos = vec![Ortho::new(1), Ortho::new(2)];
-        dbq.push_many(orthos.clone());
+        dbq.push_many(orthos.clone()).expect("push_many should succeed");
         // Pop first
         let handle1 = dbq.pop_one();
         assert!(handle1.is_some());
@@ -352,10 +352,10 @@ mod tests {
         {
             let mut queue = Queue::new(test_queue_name);
             let test_ortho = Ortho::new(42);
-            queue.push_many(vec![test_ortho.clone()]);
+            queue.push_many(vec![test_ortho.clone()]).expect("push_many should succeed");
             
             // Verify the queue has the item
-            assert_eq!(queue.len(), 1);
+            assert_eq!(queue.len().expect("len should succeed"), 1);
             
             // Pop the item and verify it's correct
             let handle = queue.pop_one();
@@ -370,7 +370,7 @@ mod tests {
         // Create a new queue with the same name and verify it's empty (since we acked)
         {
             let queue = Queue::new(test_queue_name);
-            assert_eq!(queue.len(), 0);
+            assert_eq!(queue.len().expect("len should succeed"), 0);
         }
     }
 
@@ -389,7 +389,7 @@ mod tests {
         {
             let mut queue = Queue::new(test_queue_name);
             let test_ortho = Ortho::new(123);
-            queue.push_many(vec![test_ortho.clone()]);
+            queue.push_many(vec![test_ortho.clone()]).expect("push_many should succeed");
             
             // Pop the item but don't ack (it should stay in queue)
             let _handle = queue.pop_one();
@@ -399,7 +399,7 @@ mod tests {
         // Create a new queue and verify the message is still there
         {
             let queue = Queue::new(test_queue_name);
-            assert_eq!(queue.len(), 1, "Message should still be in durable queue after connection drop without ack");
+            assert_eq!(queue.len().expect("len should succeed"), 1, "Message should still be in durable queue after connection drop without ack");
         }
         
         // Clean up: pop and ack the message

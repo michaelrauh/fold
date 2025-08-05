@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_from_text_creates_interner() {
-        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         assert_eq!(interner.version(), 1);
         assert_eq!(interner.vocabulary.len(), 2);
@@ -547,14 +547,14 @@ mod tests {
     }
     #[test]
     fn test_add_increments_version() {
-        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let interner2 = interner.add_text("test");
         assert_eq!(interner2.version(), 2);
     }
     #[test]
     fn test_add_extends_vocabulary() {
-        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         assert_eq!(interner.vocabulary, vec!["hello", "world"]);
         let interner2 = interner.add_text("test hello");
@@ -562,7 +562,7 @@ mod tests {
     }
     #[test]
     fn test_add_builds_prefix_mapping() {
-        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let vocab_len = interner.vocabulary.len();
         // prefix [0] should map to {1}
@@ -586,7 +586,7 @@ mod tests {
     }
     #[test]
     fn test_add_handles_longer_phrases() {
-        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         // Should have prefix [0] -> bit 1 set (for "b")
         let prefix_0 = vec![0];
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn test_add_extends_existing_bitsets() {
         // First add with 2 words
-        let holder = InMemoryInternerHolder::with_seed("a b", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("a b", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         // Second add with 1 more word
         let interner2 = interner.add_text("a c");
@@ -618,7 +618,7 @@ mod tests {
     }
     #[test]
     fn test_get_required_bits() {
-        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         // prefix [0] should map to {1}
         let required = vec![vec![0]];
@@ -629,7 +629,7 @@ mod tests {
     }
     #[test]
     fn test_string_for_index() {
-        let holder = InMemoryInternerHolder::with_seed("foo bar baz", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("foo bar baz", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let vocab = interner.vocabulary();
         assert_eq!(interner.string_for_index(0), vocab[0]);
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Index out of bounds in Interner::string_for_index")]
     fn test_string_for_index_out_of_bounds_panics() {
-        let holder = InMemoryInternerHolder::with_seed("foo bar baz", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("foo bar baz", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         interner.string_for_index(3);
     }
@@ -650,7 +650,7 @@ mod container_tests {
     use super::*;
     #[test]
     fn test_insert_and_get() {
-        let holder = InMemoryInternerHolder::with_seed("a b", &mut crate::queue::MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("a b", &mut crate::queue::MockQueue::new()).expect("with_seed should succeed");
         let latest_version = holder.latest_version();
         let interner = holder.get(latest_version).unwrap();
         assert_eq!(interner.version(), latest_version);
@@ -663,25 +663,25 @@ mod holder_tests {
     use crate::queue::MockQueue;
     #[test]
     fn test_holder_new_initializes_empty() {
-        let holder = InMemoryInternerHolder::with_seed("", &mut MockQueue::new());
+        let holder = InMemoryInternerHolder::with_seed("", &mut MockQueue::new()).expect("with_seed should succeed");
         assert_eq!(holder.interners.len(), 1);
         assert_eq!(holder.latest_version(), 1);
     }
     #[test]
     fn test_holder_add_text_with_seed_increments_version() {
         let mut queue = MockQueue::new();
-        let mut holder = InMemoryInternerHolder::with_seed("", &mut queue);
-        holder.add_text_with_seed("foo bar", &mut queue);
+        let mut holder = InMemoryInternerHolder::with_seed("", &mut queue).expect("with_seed should succeed");
+        holder.add_text_with_seed("foo bar", &mut queue).expect("add_text_with_seed should succeed");
         assert_eq!(holder.latest_version(), 2);
-        holder.add_text_with_seed("baz", &mut queue);
+        holder.add_text_with_seed("baz", &mut queue).expect("add_text_with_seed should succeed");
         assert_eq!(holder.latest_version(), 3);
     }
     #[test]
     fn test_holder_latest_version_returns_correct_value() {
         let mut queue = MockQueue::new();
-        let mut holder = InMemoryInternerHolder::with_seed("", &mut queue);
-        holder.add_text_with_seed("a b", &mut queue);
-        holder.add_text_with_seed("c", &mut queue);
+        let mut holder = InMemoryInternerHolder::with_seed("", &mut queue).expect("with_seed should succeed");
+        holder.add_text_with_seed("a b", &mut queue).expect("add_text_with_seed should succeed");
+        holder.add_text_with_seed("c", &mut queue).expect("add_text_with_seed should succeed");
         assert_eq!(holder.latest_version(), 3);
     }
 }
