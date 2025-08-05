@@ -1,4 +1,5 @@
 use crate::ortho::Ortho;
+use crate::error::FoldError;
 use amiquip::{Connection, QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish, Channel, Delivery};
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
 use crossbeam_channel::TryRecvError;
@@ -6,8 +7,8 @@ use tracing::instrument;
 
 // Trait for acknowledgment handles
 pub trait AckHandle {
-    fn ack(self) -> Result<(), Box<dyn std::error::Error>>;
-    fn nack(self) -> Result<(), Box<dyn std::error::Error>>;
+    fn ack(self) -> Result<(), FoldError>;
+    fn nack(self) -> Result<(), FoldError>;
     fn ortho(&self) -> &Ortho;
 }
 
@@ -24,7 +25,7 @@ impl QueueHandle {
     }
     
     // Ack method that takes the channel - to be called by queue
-    pub fn ack_with_channel(mut self, channel: &Channel) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn ack_with_channel(mut self, channel: &Channel) -> Result<(), FoldError> {
         if let Some(delivery) = self.delivery.take() {
             delivery.ack(channel)?;
         }
@@ -32,7 +33,7 @@ impl QueueHandle {
     }
     
     // Nack method that takes the channel - to be called by queue
-    pub fn nack_with_channel(mut self, channel: &Channel, requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn nack_with_channel(mut self, channel: &Channel, requeue: bool) -> Result<(), FoldError> {
         if let Some(delivery) = self.delivery.take() {
             delivery.nack(channel, requeue)?;
         }
@@ -41,14 +42,14 @@ impl QueueHandle {
 }
 
 impl AckHandle for QueueHandle {
-    fn ack(self) -> Result<(), Box<dyn std::error::Error>> {
+    fn ack(self) -> Result<(), FoldError> {
         // This can't work without the channel, so we'll make this an error
-        Err("QueueHandle requires channel for ack - use queue.ack_handle() instead".into())
+        Err(FoldError::Other("QueueHandle requires channel for ack - use queue.ack_handle() instead".into()))
     }
     
-    fn nack(self) -> Result<(), Box<dyn std::error::Error>> {
+    fn nack(self) -> Result<(), FoldError> {
         // This can't work without the channel, so we'll make this an error
-        Err("QueueHandle requires channel for nack - use queue.nack_handle() instead".into())
+        Err(FoldError::Other("QueueHandle requires channel for nack - use queue.nack_handle() instead".into()))
     }
     
     fn ortho(&self) -> &Ortho {
@@ -68,12 +69,12 @@ impl MockHandle {
 }
 
 impl AckHandle for MockHandle {
-    fn ack(self) -> Result<(), Box<dyn std::error::Error>> {
+    fn ack(self) -> Result<(), FoldError> {
         // No-op for mock queues
         Ok(())
     }
     
-    fn nack(self) -> Result<(), Box<dyn std::error::Error>> {
+    fn nack(self) -> Result<(), FoldError> {
         // No-op for mock queues
         Ok(())
     }
@@ -86,16 +87,16 @@ impl AckHandle for MockHandle {
 pub trait QueueLike: std::any::Any {
     type Handle: AckHandle;
     
-    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>>;
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), FoldError>;
     fn pop_one(&mut self) -> Option<Self::Handle>;
     fn pop_many(&mut self, max: usize) -> Vec<Self::Handle>;
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    fn len(&self) -> Result<usize, FoldError>;
+    fn is_empty(&self) -> Result<bool, FoldError> {
+        Ok(self.len()? == 0)
     }
     // Add ack method to the trait
-    fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>>;
-    fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), Box<dyn std::error::Error>>;
+    fn ack_handle(&self, handle: Self::Handle) -> Result<(), FoldError>;
+    fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), FoldError>;
 }
 
 pub struct Queue {
@@ -110,11 +111,11 @@ impl Queue {
         let mut connection = Connection::insecure_open(&url).expect("Failed to open RabbitMQ connection");
         let channel = connection.open_channel(None).expect("Failed to open RabbitMQ channel");
         
-        // Declare the queue as durable to persist messages
+        // Declare the queue as durable to persist messages (this is idempotent)
         let _queue = channel.queue_declare(
             name,
             QueueDeclareOptions {
-                durable: true, // Made durable for persistence
+                durable: true,
                 ..QueueDeclareOptions::default()
             },
         ).expect("Failed to declare queue");
@@ -126,16 +127,17 @@ impl Queue {
         }
     }
 
-    pub fn ack_handle(&self, handle: QueueHandle) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn ack_handle(&self, handle: QueueHandle) -> Result<(), FoldError> {
         handle.ack_with_channel(&self.channel)
     }
 
-    pub fn nack_handle(&self, handle: QueueHandle, requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn nack_handle(&self, handle: QueueHandle, requeue: bool) -> Result<(), FoldError> {
         handle.nack_with_channel(&self.channel, requeue)
     }
 
     #[instrument(skip_all)]
     pub fn pop_one(&mut self) -> Option<QueueHandle> {
+        // Use existing declared queue - queue_declare is idempotent
         let queue = self.channel.queue_declare(&self.name, QueueDeclareOptions {
             durable: true,
             ..QueueDeclareOptions::default()
@@ -188,23 +190,20 @@ impl Queue {
     }
 
     #[instrument(skip_all)]
-    pub fn len(&self) -> usize {
-        let queue = match self.channel.queue_declare(
-            self.name.as_str(),
+    pub fn len(&self) -> Result<usize, FoldError> {
+        let queue = self.channel.queue_declare(
+            &self.name,
             QueueDeclareOptions {
-                durable: true, // Made durable for persistence
+                durable: true,
                 ..QueueDeclareOptions::default()
             },
-        ) {
-            Ok(q) => q,
-            Err(_) => return 0,
-        };
+        )?;
         
-        queue.declared_message_count().unwrap_or(0) as usize
+        Ok(queue.declared_message_count().unwrap_or(0) as usize)
     }
 
     #[instrument(skip_all)]
-    pub fn push_many(&mut self, orthos: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn push_many(&mut self, orthos: Vec<Ortho>) -> Result<(), FoldError> {
         let exchange = Exchange::direct(&self.channel);
         for ortho in orthos {
             let payload = encode_to_vec(&ortho, standard())?;
@@ -214,8 +213,8 @@ impl Queue {
     }
 
     #[instrument(skip_all)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty(&self) -> Result<bool, FoldError> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -234,7 +233,7 @@ impl QueueLike for Queue {
     type Handle = QueueHandle;
     
     #[instrument(skip_all)]
-    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>> {
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), FoldError> {
         self.push_many(items)
     }
     #[instrument(skip_all)]
@@ -246,18 +245,18 @@ impl QueueLike for Queue {
         self.pop_many(max)
     }
     #[instrument(skip_all)]
-    fn len(&self) -> usize {
+    fn len(&self) -> Result<usize, FoldError> {
         self.len()
     }
     #[instrument(skip_all)]
-    fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> Result<bool, FoldError> {
         self.is_empty()
     }
     #[instrument(skip_all)]
-    fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>> {
+    fn ack_handle(&self, handle: Self::Handle) -> Result<(), FoldError> {
         self.ack_handle(handle)
     }
-    fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+    fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), FoldError> {
         self.nack_handle(handle, requeue)
     }
 }
@@ -275,7 +274,7 @@ impl MockQueue {
 impl QueueLike for MockQueue {
     type Handle = MockHandle;
     
-    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>> {
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), FoldError> {
         self.items.extend(items);
         Ok(())
     }
@@ -298,18 +297,17 @@ impl QueueLike for MockQueue {
         }
         out
     }
-    fn len(&self) -> usize {
-        let l = self.items.len();
-        l
+    fn len(&self) -> Result<usize, FoldError> {
+        Ok(self.items.len())
     }
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    fn is_empty(&self) -> Result<bool, FoldError> {
+        Ok(self.items.is_empty())
     }
-    fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>> {
+    fn ack_handle(&self, handle: Self::Handle) -> Result<(), FoldError> {
         // No-op for mock queue - handle.ack() would do the same
         handle.ack()
     }
-    fn nack_handle(&self, handle: Self::Handle, _requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+    fn nack_handle(&self, handle: Self::Handle, _requeue: bool) -> Result<(), FoldError> {
         // No-op for mock queue - handle.nack() would do the same
         handle.nack()
     }

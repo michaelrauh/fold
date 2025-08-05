@@ -1,4 +1,5 @@
 use crate::ortho::Ortho;
+use crate::error::FoldError;
 use std::collections::HashMap;
 use postgres::{Client, NoTls};
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
@@ -6,16 +7,16 @@ use std::env;
 use tracing::instrument;
 
 pub trait OrthoDatabaseLike {
-    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, Box<dyn std::error::Error>>;
-    fn get(&mut self, key: &usize) -> Option<Ortho>;
-    fn get_by_dims(&mut self, dims: &[usize]) -> Option<Ortho>;
-    fn get_optimal(&mut self) -> Option<Ortho>;
-    fn all_versions(&mut self) -> Vec<usize>;
-    fn all_orthos(&mut self) -> Vec<Ortho>;
-    fn insert_or_update(&mut self, ortho: Ortho);
-    fn remove_by_id(&mut self, id: &usize);
-    fn len(&mut self) -> usize;
-    fn sample_version(&mut self, version: usize) -> Option<Ortho>;
+    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, FoldError>;
+    fn get(&mut self, key: &usize) -> Result<Option<Ortho>, FoldError>;
+    fn get_by_dims(&mut self, dims: &[usize]) -> Result<Option<Ortho>, FoldError>;
+    fn get_optimal(&mut self) -> Result<Option<Ortho>, FoldError>;
+    fn all_versions(&mut self) -> Result<Vec<usize>, FoldError>;
+    fn all_orthos(&mut self) -> Result<Vec<Ortho>, FoldError>;
+    fn insert_or_update(&mut self, ortho: Ortho) -> Result<(), FoldError>;
+    fn remove_by_id(&mut self, id: &usize) -> Result<(), FoldError>;
+    fn len(&mut self) -> Result<usize, FoldError>;
+    fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError>;
 }
 
 pub struct InMemoryOrthoDatabase {
@@ -29,7 +30,7 @@ impl InMemoryOrthoDatabase {
 }
 
 impl OrthoDatabaseLike for InMemoryOrthoDatabase {
-    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, Box<dyn std::error::Error>> {
+    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, FoldError> {
         let mut new_orthos = Vec::new();
         for ortho in orthos {
             let key = ortho.id();
@@ -40,41 +41,42 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
         }
         Ok(new_orthos)
     }
-    fn get(&mut self, key: &usize) -> Option<Ortho> {
-        self.map.get(key).cloned()
+    fn get(&mut self, key: &usize) -> Result<Option<Ortho>, FoldError> {
+        Ok(self.map.get(key).cloned())
     }
-    fn get_by_dims(&mut self, dims: &[usize]) -> Option<Ortho> {
-        self.map.values().find(|o| o.dims() == dims).cloned()
+    fn get_by_dims(&mut self, dims: &[usize]) -> Result<Option<Ortho>, FoldError> {
+        Ok(self.map.values().find(|o| o.dims() == dims).cloned())
     }
 
-    fn get_optimal(&mut self) -> Option<Ortho> {
-        self.map.values()
+    fn get_optimal(&mut self) -> Result<Option<Ortho>, FoldError> {
+        Ok(self.map.values()
             .max_by_key(|o| o.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>())
-            .cloned()
+            .cloned())
     }
-    fn all_versions(&mut self) -> Vec<usize> {
+    fn all_versions(&mut self) -> Result<Vec<usize>, FoldError> {
         use std::collections::HashSet;
         let versions: HashSet<usize> = self.map.values().map(|o| o.version()).collect();
         let mut versions_vec: Vec<usize> = versions.into_iter().collect();
         versions_vec.sort_unstable();
-        versions_vec
+        Ok(versions_vec)
     }
-    fn all_orthos(&mut self) -> Vec<Ortho> {
-        self.map.values().cloned().collect()
+    fn all_orthos(&mut self) -> Result<Vec<Ortho>, FoldError> {
+        Ok(self.map.values().cloned().collect())
     }
 
-    fn insert_or_update(&mut self, ortho: Ortho) {
+    fn insert_or_update(&mut self, ortho: Ortho) -> Result<(), FoldError> {
         self.map.insert(ortho.id(), ortho);
+        Ok(())
     }
-    fn remove_by_id(&mut self, id: &usize) {
+    fn remove_by_id(&mut self, id: &usize) -> Result<(), FoldError> {
         self.map.remove(id);
+        Ok(())
     }
-    fn len(&mut self) -> usize {
-        let l = self.map.len();
-        l
+    fn len(&mut self) -> Result<usize, FoldError> {
+        Ok(self.map.len())
     }
-    fn sample_version(&mut self, version: usize) -> Option<Ortho> {
-        self.map.values().find(|o| o.version() == version).cloned()
+    fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError> {
+        Ok(self.map.values().find(|o| o.version() == version).cloned())
     }
 }
 
@@ -100,7 +102,7 @@ impl PostgresOrthoDatabase {
 
 impl OrthoDatabaseLike for PostgresOrthoDatabase {
     #[instrument(skip_all)]
-    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, Box<dyn std::error::Error>> {
+    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, FoldError> {
         if orthos.is_empty() {
             return Ok(Vec::new());
         }
@@ -129,27 +131,27 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
         Ok(result)
     }
     #[instrument(skip_all)]
-    fn get(&mut self, key: &usize) -> Option<Ortho> {
+    fn get(&mut self, key: &usize) -> Result<Option<Ortho>, FoldError> {
         let id = *key as i64;
-        let row = self.client.query_opt("SELECT data FROM orthos WHERE id = $1", &[&id]).unwrap();
-        row.and_then(|r| {
+        let row = self.client.query_opt("SELECT data FROM orthos WHERE id = $1", &[&id])?;
+        Ok(row.and_then(|r| {
             let data: Vec<u8> = r.get(0);
             decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-        })
+        }))
     }
     #[instrument(skip_all)]
-    fn get_by_dims(&mut self, dims: &[usize]) -> Option<Ortho> {
-        let dims_bin = encode_to_vec(dims, standard()).unwrap();
-        let row = self.client.query_opt("SELECT data FROM orthos WHERE dims = $1", &[&dims_bin]).unwrap();
-        row.and_then(|r| {
+    fn get_by_dims(&mut self, dims: &[usize]) -> Result<Option<Ortho>, FoldError> {
+        let dims_bin = encode_to_vec(dims, standard())?;
+        let row = self.client.query_opt("SELECT data FROM orthos WHERE dims = $1", &[&dims_bin])?;
+        Ok(row.and_then(|r| {
             let data: Vec<u8> = r.get(0);
             decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-        })
+        }))
     }
     #[instrument(skip(self))]
-    fn get_optimal(&mut self) -> Option<Ortho> {
+    fn get_optimal(&mut self) -> Result<Option<Ortho>, FoldError> {
         // Step 1: Get all dims
-        let rows = self.client.query("SELECT DISTINCT dims FROM orthos", &[]).unwrap();
+        let rows = self.client.query("SELECT DISTINCT dims FROM orthos", &[])?;
         let dims_list: Vec<Vec<usize>> = rows.into_iter().filter_map(|r| {
             let dims_bin: Vec<u8> = r.get(0);
             decode_from_slice::<Vec<usize>, _>(&dims_bin, standard()).ok().map(|(d, _)| d)
@@ -160,67 +162,68 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
         });
         // Step 3: Query for one ortho with those dims
         if let Some(dims) = optimal_dims {
-            let dims_bin = encode_to_vec(&dims, standard()).unwrap();
-            let row = self.client.query_opt("SELECT data FROM orthos WHERE dims = $1 LIMIT 1", &[&dims_bin]).unwrap();
-            row.and_then(|r| {
+            let dims_bin = encode_to_vec(&dims, standard())?;
+            let row = self.client.query_opt("SELECT data FROM orthos WHERE dims = $1 LIMIT 1", &[&dims_bin])?;
+            Ok(row.and_then(|r| {
                 let data: Vec<u8> = r.get(0);
                 decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-            })
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
     #[instrument(skip_all)]
-    fn all_versions(&mut self) -> Vec<usize> {
-        let rows = self.client.query("SELECT DISTINCT version FROM orthos", &[]).unwrap();
+    fn all_versions(&mut self) -> Result<Vec<usize>, FoldError> {
+        let rows = self.client.query("SELECT DISTINCT version FROM orthos", &[])?;
         let mut versions: Vec<usize> = rows.into_iter().map(|r| {
             let version: i64 = r.get(0);
             version as usize
         }).collect();
         versions.sort_unstable();
-        versions
+        Ok(versions)
     }
     #[instrument(skip_all)]
-    fn all_orthos(&mut self) -> Vec<Ortho> {
-        let rows = self.client.query("SELECT data FROM orthos", &[]).unwrap();
-        rows.into_iter().filter_map(|r| {
+    fn all_orthos(&mut self) -> Result<Vec<Ortho>, FoldError> {
+        let rows = self.client.query("SELECT data FROM orthos", &[])?;
+        Ok(rows.into_iter().filter_map(|r| {
             let data: Vec<u8> = r.get(0);
             decode_from_slice(&data, standard()).ok().map(|(o, _)| o)
-        }).collect()
+        }).collect())
     }
     #[instrument(skip(self, ortho))]
-    fn insert_or_update(&mut self, ortho: Ortho) {
+    fn insert_or_update(&mut self, ortho: Ortho) -> Result<(), FoldError> {
         let id = ortho.id() as i64;
         let version = ortho.version() as i64;
-        let dims = encode_to_vec(&ortho.dims(), standard()).unwrap();
-        let data = encode_to_vec(&ortho, standard()).unwrap();
+        let dims = encode_to_vec(&ortho.dims(), standard())?;
+        let data = encode_to_vec(&ortho, standard())?;
         self.client.execute(
             "INSERT INTO orthos (id, version, dims, data) VALUES ($1, $2, $3, $4)
              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version",
             &[&id, &version, &dims, &data],
-        ).unwrap();
+        )?;
+        Ok(())
     }
     #[instrument(skip_all)]
-    fn remove_by_id(&mut self, id: &usize) {
+    fn remove_by_id(&mut self, id: &usize) -> Result<(), FoldError> {
         let id = *id as i64;
-        self.client.execute("DELETE FROM orthos WHERE id = $1", &[&id]).unwrap();
+        self.client.execute("DELETE FROM orthos WHERE id = $1", &[&id])?;
+        Ok(())
     }
     #[instrument(skip_all)]
-    fn len(&mut self) -> usize {
-        let row = self.client.query_one("SELECT COUNT(*) FROM orthos", &[]).unwrap();
+    fn len(&mut self) -> Result<usize, FoldError> {
+        let row = self.client.query_one("SELECT COUNT(*) FROM orthos", &[])?;
         let count: i64 = row.get(0);
-        let l = count as usize;
-        l
+        Ok(count as usize)
     }
     #[instrument(skip_all)]
-    fn sample_version(&mut self, _version: usize) -> Option<Ortho> {
+    fn sample_version(&mut self, _version: usize) -> Result<Option<Ortho>, FoldError> {
         // Return the first Ortho with the given version, or None
         let version = _version as i64;
-        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 LIMIT 1", &[&version]).unwrap();
-        row.and_then(|r| {
+        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 LIMIT 1", &[&version])?;
+        Ok(row.and_then(|r| {
             let data: Vec<u8> = r.get(0);
             decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-        })
+        }))
     }
 }
 
@@ -242,7 +245,7 @@ mod tests {
         let key = ortho.id();
         let new_orthos = db.upsert(vec![ortho.clone()]).expect("upsert should succeed");
         assert_eq!(new_orthos.len(), 1);
-        let fetched = db.get(&key);
+        let fetched = db.get(&key).expect("get should succeed");
         assert_eq!(fetched, Some(ortho));
     }
 
@@ -261,8 +264,8 @@ mod tests {
         let mut db = InMemoryOrthoDatabase::new();
         let ortho = Ortho::new(1);
         let dims = ortho.dims().clone();
-        db.upsert(vec![ortho.clone()]);
-        let found = db.get_by_dims(&dims);
+        db.upsert(vec![ortho.clone()]).expect("upsert should succeed");
+        let found = db.get_by_dims(&dims).expect("get_by_dims should succeed");
         assert_eq!(found, Some(ortho));
     }
 
@@ -285,8 +288,8 @@ mod tests {
             .find(|o| o.dims() == &vec![2, 2, 2])
             .unwrap()
             .clone();
-        db.upsert(vec![ortho.clone(), ortho_3_2.clone(), ortho_2_2_2.clone()]);
-        let optimal = db.get_optimal();
+        db.upsert(vec![ortho.clone(), ortho_3_2.clone(), ortho_2_2_2.clone()]).expect("upsert should succeed");
+        let optimal = db.get_optimal().expect("get_optimal should succeed");
         // [2,2] -> 1, [3,2] -> 2, [2,2,2] -> 1
         assert_eq!(optimal, Some(ortho_3_2));
     }
@@ -296,11 +299,11 @@ mod tests {
         let mut db = InMemoryOrthoDatabase::new();
         let ortho1 = Ortho::new(1);
         let ortho2 = Ortho::new(2);
-        db.upsert(vec![ortho1.clone(), ortho2.clone()]);
-        let mut versions = db.all_versions();
+        db.upsert(vec![ortho1.clone(), ortho2.clone()]).expect("upsert should succeed");
+        let mut versions = db.all_versions().expect("all_versions should succeed");
         versions.sort();
         assert_eq!(versions, vec![1, 2]);
-        let mut orthos = db.all_orthos();
+        let mut orthos = db.all_orthos().expect("all_orthos should succeed");
         orthos.sort_by_key(|o| o.version());
         assert_eq!(orthos, vec![ortho1, ortho2]);
     }
@@ -309,15 +312,15 @@ mod tests {
     fn test_insert_or_update_and_remove_by_id() {
         let mut db = InMemoryOrthoDatabase::new();
         let ortho = Ortho::new(5);
-        db.insert_or_update(ortho.clone());
-        let fetched = db.get(&ortho.id());
+        db.insert_or_update(ortho.clone()).expect("insert_or_update should succeed");
+        let fetched = db.get(&ortho.id()).expect("get should succeed");
         assert_eq!(fetched, Some(ortho.clone()));
         let ortho2 = ortho.add(0, 10)[0].clone();
-        db.insert_or_update(ortho2.clone());
-        let fetched2 = db.get(&ortho2.id());
+        db.insert_or_update(ortho2.clone()).expect("insert_or_update should succeed");
+        let fetched2 = db.get(&ortho2.id()).expect("get should succeed");
         assert_eq!(fetched2, Some(ortho2.clone()));
-        db.remove_by_id(&ortho2.id());
-        let fetched3 = db.get(&ortho2.id());
+        db.remove_by_id(&ortho2.id()).expect("remove_by_id should succeed");
+        let fetched3 = db.get(&ortho2.id()).expect("get should succeed");
         assert_eq!(fetched3, None);
     }
 
@@ -326,13 +329,13 @@ mod tests {
         let mut db = InMemoryOrthoDatabase::new();
         let ortho_v1 = Ortho::new(1);
         let ortho_v2 = Ortho::new(2);
-        db.upsert(vec![ortho_v1.clone()]);
-        db.upsert(vec![ortho_v2.clone()]);
-        let mut versions = db.all_versions();
+        db.upsert(vec![ortho_v1.clone()]).expect("upsert should succeed");
+        db.upsert(vec![ortho_v2.clone()]).expect("upsert should succeed");
+        let mut versions = db.all_versions().expect("all_versions should succeed");
         versions.sort();
         assert_eq!(versions, vec![1, 2]);
-        let fetched_v1 = db.get(&ortho_v1.id());
-        let fetched_v2 = db.get(&ortho_v2.id());
+        let fetched_v1 = db.get(&ortho_v1.id()).expect("get should succeed");
+        let fetched_v2 = db.get(&ortho_v2.id()).expect("get should succeed");
         assert_eq!(fetched_v1, Some(ortho_v1));
         assert_eq!(fetched_v2, Some(ortho_v2));
     }

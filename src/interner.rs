@@ -1,4 +1,5 @@
 use crate::splitter::Splitter;
+use crate::error::FoldError;
 use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
 use std::fs;
@@ -229,8 +230,8 @@ pub trait InternerHolderLike {
     fn get_latest(&self) -> Option<Interner>;
     fn versions(&self) -> Vec<usize>;
     fn delete(&mut self, version: usize);
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q);
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self where Self: Sized;
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError>;
+    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Result<Self, FoldError> where Self: Sized;
 }
 
 pub struct InMemoryInternerHolder {
@@ -266,27 +267,24 @@ impl InternerHolderLike for InMemoryInternerHolder {
     fn delete(&mut self, version: usize) {
         self.interners.remove(&version);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
         let latest = self.interners.values().max_by_key(|i| i.version()).unwrap();
         let interner = latest.add_text(text);
         self.interners.insert(interner.version(), interner.clone());
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        if let Err(e) = workq.push_many(vec![ortho_seed]) {
-            eprintln!("Failed to seed work queue with new ortho: {}", e);
-        }
+        workq.push_many(vec![ortho_seed])?;
+        Ok(())
     }
     
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self {
+    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Result<Self, FoldError> {
         let holder = InMemoryInternerHolder::from_text_internal(text);
         let version = holder.latest_version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        if let Err(e) = workq.push_many(vec![ortho_seed]) {
-            eprintln!("Failed to seed work queue with new ortho: {}", e);
-        }
-        holder
+        workq.push_many(vec![ortho_seed])?;
+        Ok(holder)
     }
 }
 
@@ -350,19 +348,18 @@ impl InternerHolderLike for FileInternerHolder {
         let path = self.file_path(version);
         let _ = fs::remove_file(path);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
         let latest = self.get_latest().unwrap();
         let interner = latest.add_text(text);
         self.put(interner.clone());
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        if let Err(e) = workq.push_many(vec![ortho_seed]) {
-            eprintln!("Failed to seed work queue with new ortho: {}", e);
-        }
+        workq.push_many(vec![ortho_seed])?;
+        Ok(())
     }
     
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo deprecate with seed and just use add_text_with_seed
+    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Result<Self, FoldError> { // todo deprecate with seed and just use add_text_with_seed
         let dir = std::env::var("INTERNER_FILE_LOCATION")
             .expect("INTERNER_FILE_LOCATION not set in environment. Please set it in your .env file.");
         let mut holder = FileInternerHolder::new_internal(dir);
@@ -371,10 +368,8 @@ impl InternerHolderLike for FileInternerHolder {
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        if let Err(e) = workq.push_many(vec![ortho_seed]) {
-            eprintln!("Failed to seed work queue with new ortho: {}", e);
-        }
-        holder
+        workq.push_many(vec![ortho_seed])?;
+        Ok(holder)
     }
 }
 
@@ -498,7 +493,7 @@ impl InternerHolderLike for BlobInternerHolder {
         let key = version.to_string();
         self.delete_blocking(&key);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
         if self.get_latest().is_none() {
             // Holder is empty, create new with seed
             let interner = Interner::from_text(text);
@@ -508,9 +503,7 @@ impl InternerHolderLike for BlobInternerHolder {
             let version = interner.version();
             let ortho_seed = crate::ortho::Ortho::new(version);
             println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-            if let Err(e) = workq.push_many(vec![ortho_seed]) {
-                eprintln!("Failed to seed work queue with new ortho: {}", e);
-            }
+            workq.push_many(vec![ortho_seed])?;
         } else {
             // Holder is nonempty, add text to latest
             let latest = self.get_latest().unwrap();
@@ -521,12 +514,11 @@ impl InternerHolderLike for BlobInternerHolder {
             let version = interner.version();
             let ortho_seed = crate::ortho::Ortho::new(version);
             println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-            if let Err(e) = workq.push_many(vec![ortho_seed]) {
-                eprintln!("Failed to seed work queue with new ortho: {}", e);
-            }
+            workq.push_many(vec![ortho_seed])?;
         }
+        Ok(())
     }
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo be careful around creations.
+    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Result<Self, FoldError> { // todo be careful around creations.
         let holder = BlobInternerHolder::new_internal();
         let interner = Interner::from_text(text);
         let key = interner.version().to_string();
@@ -535,10 +527,8 @@ impl InternerHolderLike for BlobInternerHolder {
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        if let Err(e) = workq.push_many(vec![ortho_seed]) {
-            eprintln!("Failed to seed work queue with new ortho: {}", e);
-        }
-        holder
+        workq.push_many(vec![ortho_seed])?;
+        Ok(holder)
     }
 }
 
