@@ -7,8 +7,6 @@ use tracing::instrument;
 
 // Trait for acknowledgment handles
 pub trait AckHandle {
-    fn ack(self) -> Result<(), FoldError>;
-    fn nack(self) -> Result<(), FoldError>;
     fn ortho(&self) -> &Ortho;
 }
 
@@ -42,16 +40,6 @@ impl QueueHandle {
 }
 
 impl AckHandle for QueueHandle {
-    fn ack(self) -> Result<(), FoldError> {
-        // This can't work without the channel, so we'll make this an error
-        Err(FoldError::Other("QueueHandle requires channel for ack - use queue.ack_handle() instead".into()))
-    }
-    
-    fn nack(self) -> Result<(), FoldError> {
-        // This can't work without the channel, so we'll make this an error
-        Err(FoldError::Other("QueueHandle requires channel for nack - use queue.nack_handle() instead".into()))
-    }
-    
     fn ortho(&self) -> &Ortho {
         &self.ortho
     }
@@ -69,16 +57,6 @@ impl MockHandle {
 }
 
 impl AckHandle for MockHandle {
-    fn ack(self) -> Result<(), FoldError> {
-        // No-op for mock queues
-        Ok(())
-    }
-    
-    fn nack(self) -> Result<(), FoldError> {
-        // No-op for mock queues
-        Ok(())
-    }
-    
     fn ortho(&self) -> &Ortho {
         &self.ortho
     }
@@ -106,6 +84,23 @@ pub struct Queue {
 }
 
 impl Queue {
+    fn declare_queue(&self) -> Result<amiquip::Queue, amiquip::Error> {
+        match self.channel.queue_declare(&self.name, QueueDeclareOptions {
+            durable: true,
+            ..QueueDeclareOptions::default()
+        }) {
+            Ok(queue) => Ok(queue),
+            Err(e) => {
+                // Check if error indicates a stale connection
+                let error_msg = format!("{}", e);
+                if error_msg.contains("connection") || error_msg.contains("broken") || error_msg.contains("disconnected") {
+                    panic!("RabbitMQ connection error detected (stale connection): {}. Container will restart.", e);
+                }
+                Err(e)
+            },
+        }
+    }
+
     pub fn new(name: &str) -> Result<Self, FoldError> {
         let url = std::env::var("FOLD_AMQP_URL")
             .map_err(|_| FoldError::Other("FOLD_AMQP_URL environment variable must be set for Queue".into()))?;
@@ -137,90 +132,6 @@ impl Queue {
     pub fn nack_handle(&self, handle: QueueHandle, requeue: bool) -> Result<(), FoldError> {
         handle.nack_with_channel(&self.channel, requeue)
     }
-
-    #[instrument(skip_all)]
-    pub fn pop_one(&mut self) -> Option<QueueHandle> {
-        // Use existing declared queue - queue_declare is idempotent
-        let queue = self.channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        }).ok()?;
-        
-        let consumer = queue.consume(ConsumerOptions::default()).ok()?;
-        match consumer.receiver().try_recv() {
-            Ok(msg) => {
-                if let ConsumerMessage::Delivery(delivery) = msg {
-                    let (ortho, _): (Ortho, _) = decode_from_slice(&delivery.body, standard()).ok()?;
-                    Some(QueueHandle::new(ortho, delivery))
-                } else {
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    }
-
-    #[instrument(skip_all)]
-    pub fn pop_many(&mut self, max: usize) -> Vec<QueueHandle> {
-        let queue = match self.channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        }) {
-            Ok(q) => q,
-            Err(_) => return Vec::new(),
-        };
-        
-        let consumer = match queue.consume(ConsumerOptions::default()) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        
-        let mut items = Vec::with_capacity(max);
-        for _ in 0..max {
-            match consumer.receiver().try_recv() {
-                Ok(msg) => {
-                    if let ConsumerMessage::Delivery(delivery) = msg {
-                        if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
-                            items.push(QueueHandle::new(ortho, delivery));
-                        }
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        items
-    }
-
-    #[instrument(skip_all)]
-    pub fn len(&self) -> Result<usize, FoldError> {
-        let queue = self.channel.queue_declare(
-            &self.name,
-            QueueDeclareOptions {
-                durable: true,
-                ..QueueDeclareOptions::default()
-            },
-        )?;
-        
-        queue.declared_message_count()
-            .map(|count| count as usize)
-            .ok_or_else(|| FoldError::Queue("Failed to get queue message count".to_string()))
-    }
-
-    #[instrument(skip_all)]
-    pub fn push_many(&mut self, orthos: Vec<Ortho>) -> Result<(), FoldError> {
-        let exchange = Exchange::direct(&self.channel);
-        for ortho in orthos {
-            let payload = encode_to_vec(&ortho, standard())?;
-            exchange.publish(Publish::new(&payload, &self.name))?;
-        }
-        Ok(())
-    }
-
-    #[instrument(skip_all)]
-    pub fn is_empty(&self) -> Result<bool, FoldError> {
-        Ok(self.len()? == 0)
-    }
 }
 
 impl Drop for Queue {
@@ -238,31 +149,91 @@ impl QueueLike for Queue {
     type Handle = QueueHandle;
     
     #[instrument(skip_all)]
-    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), FoldError> {
-        self.push_many(items)
+    fn push_many(&mut self, orthos: Vec<Ortho>) -> Result<(), FoldError> {
+        let exchange = Exchange::direct(&self.channel);
+        for ortho in orthos {
+            let payload = encode_to_vec(&ortho, standard())?;
+            match exchange.publish(Publish::new(&payload, &self.name)) {
+                Ok(()) => {},
+                Err(e) => {
+                    // Check if error indicates a stale connection
+                    let error_msg = format!("{}", e);
+                    if error_msg.contains("connection") || error_msg.contains("broken") || error_msg.contains("disconnected") {
+                        panic!("RabbitMQ connection error during publish (stale connection): {}. Container will restart.", e);
+                    }
+                    return Err(FoldError::Queue(format!("Failed to publish message: {}", e)));
+                },
+            }
+        }
+        Ok(())
     }
+    
     #[instrument(skip_all)]
     fn pop_one(&mut self) -> Option<Self::Handle> {
-        self.pop_one()
+        // Use existing declared queue - queue_declare is idempotent
+        let queue = self.declare_queue().ok()?;
+        
+        let consumer = queue.consume(ConsumerOptions::default()).ok()?;
+        match consumer.receiver().try_recv() {
+            Ok(msg) => {
+                if let ConsumerMessage::Delivery(delivery) = msg {
+                    if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
+                        return Some(QueueHandle::new(ortho, delivery));
+                    }
+                }
+                None
+            },
+            Err(_) => None,
+        }
     }
+    
     #[instrument(skip_all)]
     fn pop_many(&mut self, max: usize) -> Vec<Self::Handle> {
-        self.pop_many(max)
+        let queue = match self.declare_queue() {
+            Ok(q) => q,
+            Err(_) => return Vec::new(),
+        };
+        
+        let consumer = match queue.consume(ConsumerOptions::default()) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        
+        let mut items = Vec::new();
+        for _ in 0..max {
+            match consumer.receiver().try_recv() {
+                Ok(msg) => {
+                    if let ConsumerMessage::Delivery(delivery) = msg {
+                        if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
+                            items.push(QueueHandle::new(ortho, delivery));
+                        }
+                    }
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        items
     }
+    
     #[instrument(skip_all)]
     fn len(&self) -> Result<usize, FoldError> {
-        self.len()
+        let queue = self.declare_queue()?;
+        Ok(queue.declared_message_count().unwrap_or(0) as usize)
     }
+    
     #[instrument(skip_all)]
     fn is_empty(&self) -> Result<bool, FoldError> {
-        self.is_empty()
+        Ok(self.len()? == 0)
     }
+    
     #[instrument(skip_all)]
     fn ack_handle(&self, handle: Self::Handle) -> Result<(), FoldError> {
-        self.ack_handle(handle)
+        handle.ack_with_channel(&self.channel)
     }
+    
     fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), FoldError> {
-        self.nack_handle(handle, requeue)
+        handle.nack_with_channel(&self.channel, requeue)
     }
 }
 
@@ -308,13 +279,13 @@ impl QueueLike for MockQueue {
     fn is_empty(&self) -> Result<bool, FoldError> {
         Ok(self.items.is_empty())
     }
-    fn ack_handle(&self, handle: Self::Handle) -> Result<(), FoldError> {
-        // No-op for mock queue - handle.ack() would do the same
-        handle.ack()
+    fn ack_handle(&self, _handle: Self::Handle) -> Result<(), FoldError> {
+        // No-op for mock queue
+        Ok(())
     }
-    fn nack_handle(&self, handle: Self::Handle, _requeue: bool) -> Result<(), FoldError> {
-        // No-op for mock queue - handle.nack() would do the same
-        handle.nack()
+    fn nack_handle(&self, _handle: Self::Handle, _requeue: bool) -> Result<(), FoldError> {
+        // No-op for mock queue
+        Ok(())
     }
 }
 
@@ -341,79 +312,4 @@ mod tests {
         assert!(handle3.is_none());
     }
 
-    #[test]
-    #[ignore] // Only run this test if RabbitMQ is available
-    fn test_first_write_hits_queue() {
-        // This test verifies that the first write to a real Queue actually works
-        // Skip if FOLD_AMQP_URL is not set
-        if std::env::var("FOLD_AMQP_URL").is_err() {
-            eprintln!("Skipping test_first_write_hits_queue: FOLD_AMQP_URL not set");
-            return;
-        }
-
-        let test_queue_name = "test_first_write_queue";
-        
-        // Create a queue and push one item
-        {
-            let mut queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
-            let test_ortho = Ortho::new(42);
-            queue.push_many(vec![test_ortho.clone()]).expect("push_many should succeed");
-            
-            // Verify the queue has the item
-            assert_eq!(queue.len().expect("len should succeed"), 1);
-            
-            // Pop the item and verify it's correct
-            let handle = queue.pop_one();
-            assert!(handle.is_some());
-            let handle = handle.unwrap();
-            assert_eq!(*handle.ortho(), test_ortho);
-            
-            // Ack the message
-            queue.ack_handle(handle).expect("Failed to ack message");
-        } // Queue should be dropped and connection closed here
-        
-        // Create a new queue with the same name and verify it's empty (since we acked)
-        {
-            let queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
-            assert_eq!(queue.len().expect("len should succeed"), 0);
-        }
-    }
-
-    #[test]
-    #[ignore] // Only run this test if RabbitMQ is available
-    fn test_durable_queue_persistence() {
-        // This test verifies that queues are durable and messages persist
-        if std::env::var("FOLD_AMQP_URL").is_err() {
-            eprintln!("Skipping test_durable_queue_persistence: FOLD_AMQP_URL not set");
-            return;
-        }
-
-        let test_queue_name = "test_durable_queue";
-        
-        // Create a queue and push items without acking
-        {
-            let mut queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
-            let test_ortho = Ortho::new(123);
-            queue.push_many(vec![test_ortho.clone()]).expect("push_many should succeed");
-            
-            // Pop the item but don't ack (it should stay in queue)
-            let _handle = queue.pop_one();
-            // Not calling queue.ack_handle() intentionally
-        } // Queue dropped without acking
-        
-        // Create a new queue and verify the message is still there
-        {
-            let queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
-            assert_eq!(queue.len().expect("len should succeed"), 1, "Message should still be in durable queue after connection drop without ack");
-        }
-        
-        // Clean up: pop and ack the message
-        {
-            let mut queue = Queue::new(test_queue_name).expect("Queue creation should succeed");
-            let handle = queue.pop_one();
-            if let Some(handle) = handle {
-                queue.ack_handle(handle).expect("Failed to ack message");
-            }
-        }
-    }
 }

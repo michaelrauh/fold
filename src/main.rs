@@ -23,10 +23,10 @@ fn run<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::InternerHolderLike
         loop {
             fold::OrthoFeeder::run_feeder_once(dbq, db, workq);
             process_with_grace(dbq, workq, db, holder, files_fed, 0, &mut loop_count);
-            if workq.len() == 0 && dbq.len() == 0 {
+            if workq.len().unwrap_or(0) == 0 && dbq.len().unwrap_or(0) == 0 {
                 if !printed_final_optimal {
                     let ortho_opt = db.get_optimal();
-                    if let Some(ortho) = ortho_opt {
+                    if let Ok(Some(ortho)) = ortho_opt {
                         println!("[main] Final Optimal Ortho: {:?}", ortho);
                         if let Some(interner) = holder.get_latest() {
                             let payload_strings = ortho.payload().iter().map(|opt_idx| {
@@ -63,9 +63,9 @@ fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::Int
         follower.run_follower_once(db, workq, holder);
         fold::run_worker_once(workq, dbq, holder);
         *loop_count += 1;
-        let workq_depth = workq.len();
-        let dbq_depth = dbq.len();
-        let db_len = db.len();
+        let workq_depth = workq.len().unwrap_or(0);
+        let dbq_depth = dbq.len().unwrap_or(0);
+        let db_len = db.len().unwrap_or(0);
         println!("[main] raw lens: workq_depth={}, dbq_depth={}, db_len={}", workq_depth, dbq_depth, db_len);
         let latest_version = holder.latest_version();
         println!("[main] LOOP_COUNT: {}", *loop_count);
@@ -75,7 +75,7 @@ fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::Int
         );
         if *loop_count % 1000 == 0 {
             let ortho_opt = db.get_optimal();
-            if let Some(ortho) = ortho_opt {
+            if let Ok(Some(ortho)) = ortho_opt {
                 println!("[main] (file idx: {}) Optimal Ortho: {:?}", files_processed, ortho);
                 if let Some(interner) = holder.get_latest() {
                     let payload_strings = ortho.payload().iter().map(|opt_idx| {
@@ -96,7 +96,7 @@ fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::Int
             let remaining = grace_period_secs - elapsed;
             println!("[main] Grace period active ({}s remaining) before next feed.", remaining);
         }
-        if workq.len() == 0 && dbq.len() == 0 {
+        if workq.len().unwrap_or(0) == 0 && dbq.len().unwrap_or(0) == 0 {
             break;
         }
     }
@@ -118,6 +118,13 @@ fn main() {
     let mut dbq = MockQueue::new();
     let mut workq = MockQueue::new();
     let mut db = InMemoryOrthoDatabase::new();
-    let mut holder = FileInternerHolder::with_seed("", &mut workq);
+    let mut holder = FileInternerHolder::new().unwrap_or_else(|e| {
+        eprintln!("Failed to create holder: {:?}", e);
+        std::process::exit(1);
+    });
+    // Initialize the holder if needed 
+    if let Err(e) = holder.add_text_with_seed("", &mut workq) {
+        eprintln!("Failed to initialize holder: {:?}", e);
+    }
     run(&mut dbq, &mut workq, &mut db, &mut holder, chapters);
 }

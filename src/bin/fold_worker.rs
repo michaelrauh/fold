@@ -33,14 +33,14 @@ fn main() {
         .init();
     let mut workq = Queue::new("workq").expect("Failed to create workq");
     let mut dbq = Queue::new("dbq").expect("Failed to create dbq");
-    let mut holder = BlobInternerHolder::new_internal().expect("Failed to create BlobInternerHolder");
+    let mut holder = BlobInternerHolder::new().expect("Failed to create BlobInternerHolder");
     // Wait until there is at least one interner in the holder
     while holder.versions().len() == 0 {
         println!("[worker] Waiting for interner to be seeded...");
         thread::sleep(Duration::from_secs(1));
     }
     loop {
-        run_worker_once(&mut workq, &mut dbq, &mut holder);
+        let _ = run_worker_once(&mut workq, &mut dbq, &mut holder);
         // Optionally add sleep or exit condition if needed
     }
 }
