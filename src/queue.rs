@@ -6,6 +6,7 @@ use tracing::instrument;
 use std::collections::VecDeque;
 
 // Wrapper for deliveries that need to be acknowledged
+#[allow(dead_code)] // delivery field is used for future manual acking
 pub struct AckableOrtho {
     pub ortho: Ortho,
     delivery: Option<Delivery>,
