@@ -86,17 +86,22 @@ impl OrthoFeeder {
         dbq: &mut Q,
         db: &mut D,
         workq: &mut Q,
-    ) {
+    ) where 
+        Q::Handle: crate::queue::AckHandle,
+    {
         const BATCH_SIZE: usize = 1000;
-        let items = dbq.pop_many(BATCH_SIZE);
-        if !items.is_empty() {
+        let handles = dbq.pop_many(BATCH_SIZE);
+        if !handles.is_empty() {
+            // Extract Orthos from handles for processing
+            let items: Vec<crate::ortho::Ortho> = handles.iter().map(|h| h.ortho().clone()).collect();
             let new_orthos = db.upsert(items);
             workq.push_many(new_orthos);
             
-            // If this is a real Queue (not MockQueue), ack the processed messages
-            let any_ref: &mut dyn std::any::Any = dbq;
-            if let Some(queue) = any_ref.downcast_mut::<crate::queue::Queue>() {
-                queue.ack_pending();
+            // Ack all the processed handles after successful processing
+            for handle in handles {
+                if let Err(e) = dbq.ack_handle(handle) {
+                    eprintln!("Failed to ack message: {}", e);
+                }
             }
         }
     }
@@ -107,9 +112,12 @@ pub fn run_worker_once<Q: queue::QueueLike, H: interner::InternerHolderLike>(
     workq: &mut Q,
     dbq: &mut Q,
     container: &mut H,
-) {
+) where 
+    Q::Handle: queue::AckHandle,
+{
     // println!("[worker] run_worker_once: workq.len()={}, dbq.len()={}", workq.len(), dbq.len());
-    if let Some(ortho) = workq.pop_one() {
+    if let Some(handle) = workq.pop_one() {
+        let ortho = handle.ortho().clone();
         // println!("[worker] Popped ortho from workq: id={}, version={}", ortho.id(), ortho.version());
         let mut interner = container.get_latest().expect("No interner found");
         if ortho.version() > interner.version() {
@@ -125,10 +133,9 @@ pub fn run_worker_once<Q: queue::QueueLike, H: interner::InternerHolderLike>(
             dbq.push_many(new_orthos);
         }
         
-        // If this is a real Queue (not MockQueue), ack the processed messages
-        let any_ref: &mut dyn std::any::Any = workq;
-        if let Some(queue) = any_ref.downcast_mut::<queue::Queue>() {
-            queue.ack_pending();
+        // Ack the handle after successful processing
+        if let Err(e) = workq.ack_handle(handle) {
+            eprintln!("Failed to ack message: {}", e);
         }
     } else {
         // println!("[worker] No ortho popped from workq");

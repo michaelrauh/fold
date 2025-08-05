@@ -3,40 +3,85 @@ use amiquip::{Connection, QueueDeclareOptions, ConsumerMessage, ConsumerOptions,
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
 use crossbeam_channel::TryRecvError;
 use tracing::instrument;
-use std::collections::VecDeque;
 
-// Wrapper for deliveries that need to be acknowledged
-#[allow(dead_code)] // delivery field is used for future manual acking
-pub struct AckableOrtho {
-    pub ortho: Ortho,
-    delivery: Option<Delivery>,
+// Trait for acknowledgment handles
+pub trait AckHandle {
+    fn ack(self) -> Result<(), Box<dyn std::error::Error>>;
+    fn ortho(&self) -> &Ortho;
 }
 
-impl AckableOrtho {
-    pub fn new(ortho: Ortho, delivery: Option<Delivery>) -> Self {
-        Self { ortho, delivery }
+// Since Channel cannot be cloned, we need a different approach
+// Handle for real RabbitMQ deliveries that holds the delivery but not the channel
+pub struct QueueHandle {
+    ortho: Ortho,
+    delivery: Option<Delivery>, // Option to allow moving out for ack
+}
+
+impl QueueHandle {
+    pub fn new(ortho: Ortho, delivery: Delivery) -> Self {
+        Self { ortho, delivery: Some(delivery) }
     }
     
-    pub fn into_ortho(self) -> Ortho {
-        self.ortho
+    // Ack method that takes the channel - to be called by queue
+    pub fn ack_with_channel(mut self, channel: &Channel) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(delivery) = self.delivery.take() {
+            delivery.ack(channel)?;
+        }
+        Ok(())
+    }
+}
+
+impl AckHandle for QueueHandle {
+    fn ack(self) -> Result<(), Box<dyn std::error::Error>> {
+        // This can't work without the channel, so we'll make this an error
+        Err("QueueHandle requires channel for ack - use queue.ack_handle() instead".into())
+    }
+    
+    fn ortho(&self) -> &Ortho {
+        &self.ortho
+    }
+}
+
+// No-op handle for mock queues
+pub struct MockHandle {
+    ortho: Ortho,
+}
+
+impl MockHandle {
+    pub fn new(ortho: Ortho) -> Self {
+        Self { ortho }
+    }
+}
+
+impl AckHandle for MockHandle {
+    fn ack(self) -> Result<(), Box<dyn std::error::Error>> {
+        // No-op for mock queues
+        Ok(())
+    }
+    
+    fn ortho(&self) -> &Ortho {
+        &self.ortho
     }
 }
 
 pub trait QueueLike: std::any::Any {
+    type Handle: AckHandle;
+    
     fn push_many(&mut self, items: Vec<Ortho>);
-    fn pop_one(&mut self) -> Option<Ortho>;
-    fn pop_many(&mut self, max: usize) -> Vec<Ortho>;
+    fn pop_one(&mut self) -> Option<Self::Handle>;
+    fn pop_many(&mut self, max: usize) -> Vec<Self::Handle>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    // Add ack method to the trait
+    fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub struct Queue {
     pub name: String,
     connection: Option<Connection>,
     channel: Channel,
-    pending_acks: VecDeque<Delivery>,
 }
 
 impl Queue {
@@ -58,21 +103,15 @@ impl Queue {
             name: name.to_string(),
             connection: Some(connection),
             channel,
-            pending_acks: VecDeque::new(),
         }
     }
 
-    // Ack all pending deliveries - should be called after processing
-    pub fn ack_pending(&mut self) {
-        while let Some(delivery) = self.pending_acks.pop_front() {
-            if let Err(e) = delivery.ack(&self.channel) {
-                eprintln!("Failed to ack message: {}", e);
-            }
-        }
+    pub fn ack_handle(&self, handle: QueueHandle) -> Result<(), Box<dyn std::error::Error>> {
+        handle.ack_with_channel(&self.channel)
     }
 
-    // Pop one item with manual acking capability
-    pub fn pop_one_ackable(&mut self) -> Option<AckableOrtho> {
+    #[instrument(skip_all)]
+    pub fn pop_one(&mut self) -> Option<QueueHandle> {
         let queue = self.channel.queue_declare(&self.name, QueueDeclareOptions {
             durable: true,
             ..QueueDeclareOptions::default()
@@ -83,7 +122,7 @@ impl Queue {
             Ok(msg) => {
                 if let ConsumerMessage::Delivery(delivery) = msg {
                     let (ortho, _): (Ortho, _) = decode_from_slice(&delivery.body, standard()).ok()?;
-                    Some(AckableOrtho::new(ortho, Some(delivery)))
+                    Some(QueueHandle::new(ortho, delivery))
                 } else {
                     None
                 }
@@ -92,8 +131,8 @@ impl Queue {
         }
     }
 
-    // Pop many items with manual acking capability  
-    pub fn pop_many_ackable(&mut self, max: usize) -> Vec<AckableOrtho> {
+    #[instrument(skip_all)]
+    pub fn pop_many(&mut self, max: usize) -> Vec<QueueHandle> {
         let queue = match self.channel.queue_declare(&self.name, QueueDeclareOptions {
             durable: true,
             ..QueueDeclareOptions::default()
@@ -113,7 +152,7 @@ impl Queue {
                 Ok(msg) => {
                     if let ConsumerMessage::Delivery(delivery) = msg {
                         if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
-                            items.push(AckableOrtho::new(ortho, Some(delivery)));
+                            items.push(QueueHandle::new(ortho, delivery));
                         }
                     }
                 },
@@ -152,63 +191,6 @@ impl Queue {
     }
 
     #[instrument(skip_all)]
-    pub fn pop_one(&mut self) -> Option<Ortho> {
-        let queue = self.channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        }).ok()?;
-        
-        let consumer = queue.consume(ConsumerOptions::default()).ok()?;
-        match consumer.receiver().try_recv() {
-            Ok(msg) => {
-                if let ConsumerMessage::Delivery(delivery) = msg {
-                    let (ortho, _): (Ortho, _) = decode_from_slice(&delivery.body, standard()).ok()?;
-                    // Store delivery for manual acking later
-                    self.pending_acks.push_back(delivery);
-                    Some(ortho)
-                } else {
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    }
-
-    #[instrument(skip_all)]
-    pub fn pop_many(&mut self, max: usize) -> Vec<Ortho> {
-        let queue = match self.channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        }) {
-            Ok(q) => q,
-            Err(_) => return Vec::new(),
-        };
-        
-        let consumer = match queue.consume(ConsumerOptions::default()) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        
-        let mut items = Vec::with_capacity(max);
-        for _ in 0..max {
-            match consumer.receiver().try_recv() {
-                Ok(msg) => {
-                    if let ConsumerMessage::Delivery(delivery) = msg {
-                        if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
-                            items.push(ortho);
-                            // Store delivery for manual acking later
-                            self.pending_acks.push_back(delivery);
-                        }
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        items
-    }
-
-    #[instrument(skip_all)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -216,9 +198,6 @@ impl Queue {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        // Ack any remaining pending messages before closing
-        self.ack_pending();
-        
         // Close the connection gracefully
         if let Some(connection) = self.connection.take() {
             if let Err(e) = connection.close() {
@@ -229,16 +208,18 @@ impl Drop for Queue {
 }
 
 impl QueueLike for Queue {
+    type Handle = QueueHandle;
+    
     #[instrument(skip_all)]
     fn push_many(&mut self, items: Vec<Ortho>) {
         self.push_many(items)
     }
     #[instrument(skip_all)]
-    fn pop_one(&mut self) -> Option<Ortho> {
+    fn pop_one(&mut self) -> Option<Self::Handle> {
         self.pop_one()
     }
     #[instrument(skip_all)]
-    fn pop_many(&mut self, max: usize) -> Vec<Ortho> {
+    fn pop_many(&mut self, max: usize) -> Vec<Self::Handle> {
         self.pop_many(max)
     }
     #[instrument(skip_all)]
@@ -248,6 +229,10 @@ impl QueueLike for Queue {
     #[instrument(skip_all)]
     fn is_empty(&self) -> bool {
         self.is_empty()
+    }
+    #[instrument(skip_all)]
+    fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>> {
+        self.ack_handle(handle)
     }
 }
 
@@ -262,21 +247,24 @@ impl MockQueue {
 }
 
 impl QueueLike for MockQueue {
+    type Handle = MockHandle;
+    
     fn push_many(&mut self, items: Vec<Ortho>) {
         self.items.extend(items);
     }
-    fn pop_one(&mut self) -> Option<Ortho> {
+    fn pop_one(&mut self) -> Option<Self::Handle> {
         if self.items.is_empty() {
             None
         } else {
-            Some(self.items.remove(0))
+            let ortho = self.items.remove(0);
+            Some(MockHandle::new(ortho))
         }
     }
-    fn pop_many(&mut self, max: usize) -> Vec<Ortho> {
+    fn pop_many(&mut self, max: usize) -> Vec<Self::Handle> {
         let mut out = Vec::new();
         for _ in 0..max {
-            if let Some(item) = self.pop_one() {
-                out.push(item);
+            if let Some(handle) = self.pop_one() {
+                out.push(handle);
             } else {
                 break;
             }
@@ -289,6 +277,10 @@ impl QueueLike for MockQueue {
     }
     fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+    fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>> {
+        // No-op for mock queue - handle.ack() would do the same
+        handle.ack()
     }
 }
 
@@ -303,16 +295,16 @@ mod tests {
         let orthos = vec![Ortho::new(1), Ortho::new(2)];
         dbq.push_many(orthos.clone());
         // Pop first
-        let popped1 = dbq.pop_one();
-        assert!(popped1.is_some());
-        assert_eq!(popped1.unwrap(), orthos[0]);
+        let handle1 = dbq.pop_one();
+        assert!(handle1.is_some());
+        assert_eq!(*handle1.unwrap().ortho(), orthos[0]);
         // Pop second
-        let popped2 = dbq.pop_one();
-        assert!(popped2.is_some());
-        assert_eq!(popped2.unwrap(), orthos[1]);
+        let handle2 = dbq.pop_one();
+        assert!(handle2.is_some());
+        assert_eq!(*handle2.unwrap().ortho(), orthos[1]);
         // Pop empty
-        let popped3 = dbq.pop_one();
-        assert!(popped3.is_none());
+        let handle3 = dbq.pop_one();
+        assert!(handle3.is_none());
     }
 
     #[test]
@@ -337,12 +329,13 @@ mod tests {
             assert_eq!(queue.len(), 1);
             
             // Pop the item and verify it's correct
-            let popped = queue.pop_one();
-            assert!(popped.is_some());
-            assert_eq!(popped.unwrap(), test_ortho);
+            let handle = queue.pop_one();
+            assert!(handle.is_some());
+            let handle = handle.unwrap();
+            assert_eq!(*handle.ortho(), test_ortho);
             
-            // Ack pending messages
-            queue.ack_pending();
+            // Ack the message
+            queue.ack_handle(handle).expect("Failed to ack message");
         } // Queue should be dropped and connection closed here
         
         // Create a new queue with the same name and verify it's empty (since we acked)
@@ -370,8 +363,8 @@ mod tests {
             queue.push_many(vec![test_ortho.clone()]);
             
             // Pop the item but don't ack (it should stay in queue)
-            let _popped = queue.pop_one();
-            // Not calling queue.ack_pending() intentionally
+            let _handle = queue.pop_one();
+            // Not calling queue.ack_handle() intentionally
         } // Queue dropped without acking
         
         // Create a new queue and verify the message is still there
@@ -383,8 +376,10 @@ mod tests {
         // Clean up: pop and ack the message
         {
             let mut queue = Queue::new(test_queue_name);
-            let _popped = queue.pop_one();
-            queue.ack_pending();
+            let handle = queue.pop_one();
+            if let Some(handle) = handle {
+                queue.ack_handle(handle).expect("Failed to ack message");
+            }
         }
     }
 }
