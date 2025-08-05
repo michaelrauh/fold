@@ -314,7 +314,7 @@ impl FileInternerHolder {
     fn put(&mut self, interner: Interner) -> Result<(), FoldError> {
         let path = self.file_path(interner.version());
         let data = bincode::encode_to_vec(&interner, bincode::config::standard())
-            .map_err(|e| FoldError::Serialization(e.to_string()))?;
+            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
         fs::write(path, data).map_err(|e| FoldError::Io(e))?;
         Ok(())
     }
@@ -522,7 +522,7 @@ impl InternerHolderLike for BlobInternerHolder {
         };
         let key = interner.version().to_string();
         let data = bincode::encode_to_vec(&interner, bincode::config::standard())
-            .map_err(|e| FoldError::Serialization(e.to_string()))?;
+            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
         self.put_blocking(&key, &data)?;
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);

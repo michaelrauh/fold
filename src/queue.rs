@@ -204,7 +204,7 @@ impl Queue {
         
         queue.declared_message_count()
             .map(|count| count as usize)
-            .map_err(|e| FoldError::Queue(format!("Failed to get queue message count: {}", e)))
+            .ok_or_else(|| FoldError::Queue("Failed to get queue message count".to_string()))
     }
 
     #[instrument(skip_all)]

@@ -3,7 +3,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum FoldError {
     Database(postgres::Error),
-    Queue(amiquip::Error),
+    Queue(String),
     Serialization(Box<bincode::error::EncodeError>),
     Deserialization(Box<bincode::error::DecodeError>),
     Io(std::io::Error),
@@ -35,7 +35,7 @@ impl From<postgres::Error> for FoldError {
 
 impl From<amiquip::Error> for FoldError {
     fn from(err: amiquip::Error) -> Self {
-        FoldError::Queue(err)
+        FoldError::Queue(err.to_string())
     }
 }
 
