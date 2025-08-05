@@ -7,6 +7,7 @@ use tracing::instrument;
 // Trait for acknowledgment handles
 pub trait AckHandle {
     fn ack(self) -> Result<(), Box<dyn std::error::Error>>;
+    fn nack(self) -> Result<(), Box<dyn std::error::Error>>;
     fn ortho(&self) -> &Ortho;
 }
 
@@ -29,12 +30,25 @@ impl QueueHandle {
         }
         Ok(())
     }
+    
+    // Nack method that takes the channel - to be called by queue
+    pub fn nack_with_channel(mut self, channel: &Channel, requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(delivery) = self.delivery.take() {
+            delivery.nack(channel, requeue)?;
+        }
+        Ok(())
+    }
 }
 
 impl AckHandle for QueueHandle {
     fn ack(self) -> Result<(), Box<dyn std::error::Error>> {
         // This can't work without the channel, so we'll make this an error
         Err("QueueHandle requires channel for ack - use queue.ack_handle() instead".into())
+    }
+    
+    fn nack(self) -> Result<(), Box<dyn std::error::Error>> {
+        // This can't work without the channel, so we'll make this an error
+        Err("QueueHandle requires channel for nack - use queue.nack_handle() instead".into())
     }
     
     fn ortho(&self) -> &Ortho {
@@ -59,6 +73,11 @@ impl AckHandle for MockHandle {
         Ok(())
     }
     
+    fn nack(self) -> Result<(), Box<dyn std::error::Error>> {
+        // No-op for mock queues
+        Ok(())
+    }
+    
     fn ortho(&self) -> &Ortho {
         &self.ortho
     }
@@ -67,7 +86,7 @@ impl AckHandle for MockHandle {
 pub trait QueueLike: std::any::Any {
     type Handle: AckHandle;
     
-    fn push_many(&mut self, items: Vec<Ortho>);
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>>;
     fn pop_one(&mut self) -> Option<Self::Handle>;
     fn pop_many(&mut self, max: usize) -> Vec<Self::Handle>;
     fn len(&self) -> usize;
@@ -76,6 +95,7 @@ pub trait QueueLike: std::any::Any {
     }
     // Add ack method to the trait
     fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>>;
+    fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub struct Queue {
@@ -108,6 +128,10 @@ impl Queue {
 
     pub fn ack_handle(&self, handle: QueueHandle) -> Result<(), Box<dyn std::error::Error>> {
         handle.ack_with_channel(&self.channel)
+    }
+
+    pub fn nack_handle(&self, handle: QueueHandle, requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+        handle.nack_with_channel(&self.channel, requeue)
     }
 
     #[instrument(skip_all)]
@@ -180,14 +204,13 @@ impl Queue {
     }
 
     #[instrument(skip_all)]
-    pub fn push_many(&mut self, orthos: Vec<Ortho>) {
+    pub fn push_many(&mut self, orthos: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>> {
         let exchange = Exchange::direct(&self.channel);
         for ortho in orthos {
-            let payload = encode_to_vec(&ortho, standard()).unwrap();
-            if let Err(e) = exchange.publish(Publish::new(&payload, &self.name)) {
-                eprintln!("Failed to publish message: {}", e);
-            }
+            let payload = encode_to_vec(&ortho, standard())?;
+            exchange.publish(Publish::new(&payload, &self.name))?;
         }
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -211,7 +234,7 @@ impl QueueLike for Queue {
     type Handle = QueueHandle;
     
     #[instrument(skip_all)]
-    fn push_many(&mut self, items: Vec<Ortho>) {
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>> {
         self.push_many(items)
     }
     #[instrument(skip_all)]
@@ -234,6 +257,9 @@ impl QueueLike for Queue {
     fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>> {
         self.ack_handle(handle)
     }
+    fn nack_handle(&self, handle: Self::Handle, requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.nack_handle(handle, requeue)
+    }
 }
 
 pub struct MockQueue {
@@ -249,8 +275,9 @@ impl MockQueue {
 impl QueueLike for MockQueue {
     type Handle = MockHandle;
     
-    fn push_many(&mut self, items: Vec<Ortho>) {
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), Box<dyn std::error::Error>> {
         self.items.extend(items);
+        Ok(())
     }
     fn pop_one(&mut self) -> Option<Self::Handle> {
         if self.items.is_empty() {
@@ -281,6 +308,10 @@ impl QueueLike for MockQueue {
     fn ack_handle(&self, handle: Self::Handle) -> Result<(), Box<dyn std::error::Error>> {
         // No-op for mock queue - handle.ack() would do the same
         handle.ack()
+    }
+    fn nack_handle(&self, handle: Self::Handle, _requeue: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // No-op for mock queue - handle.nack() would do the same
+        handle.nack()
     }
 }
 

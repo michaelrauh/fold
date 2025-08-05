@@ -72,7 +72,10 @@ impl Follower {
             db.insert_or_update(new_ortho);
         } else {
             let new_ortho = ortho.set_version(high_version);
-            workq.push_many(vec![new_ortho.clone()]);
+            if let Err(e) = workq.push_many(vec![new_ortho.clone()]) {
+                eprintln!("Failed to push ortho to work queue in follower: {}", e);
+                return; // Exit early if we can't push to queue
+            }
             db.remove_by_id(&ortho.id());
         }
     }
@@ -94,13 +97,38 @@ impl OrthoFeeder {
         if !handles.is_empty() {
             // Extract Orthos from handles for processing
             let items: Vec<crate::ortho::Ortho> = handles.iter().map(|h| h.ortho().clone()).collect();
-            let new_orthos = db.upsert(items);
-            workq.push_many(new_orthos);
             
-            // Ack all the processed handles after successful processing
-            for handle in handles {
-                if let Err(e) = dbq.ack_handle(handle) {
-                    eprintln!("Failed to ack message: {}", e);
+            // Process the items and handle errors
+            match db.upsert(items) {
+                Ok(new_orthos) => {
+                    match workq.push_many(new_orthos) {
+                        Ok(()) => {
+                            // Both operations succeeded - ack all handles
+                            for handle in handles {
+                                if let Err(e) = dbq.ack_handle(handle) {
+                                    eprintln!("Failed to ack message: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to push to work queue: {}", e);
+                            // Push failed - nack and requeue all handles
+                            for handle in handles {
+                                if let Err(nack_err) = dbq.nack_handle(handle, true) {
+                                    eprintln!("Failed to nack message: {}", nack_err);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to upsert to database: {}", e);
+                    // Database operation failed - nack and requeue all handles
+                    for handle in handles {
+                        if let Err(nack_err) = dbq.nack_handle(handle, true) {
+                            eprintln!("Failed to nack message: {}", nack_err);
+                        }
+                    }
                 }
             }
         }
@@ -119,23 +147,58 @@ pub fn run_worker_once<Q: queue::QueueLike, H: interner::InternerHolderLike>(
     if let Some(handle) = workq.pop_one() {
         let ortho = handle.ortho().clone();
         // println!("[worker] Popped ortho from workq: id={}, version={}", ortho.id(), ortho.version());
-        let mut interner = container.get_latest().expect("No interner found");
+        
+        // Get interner and handle potential failure
+        let mut interner = match container.get_latest() {
+            Some(interner) => interner,
+            None => {
+                eprintln!("No interner found - nacking message");
+                if let Err(e) = workq.nack_handle(handle, true) {
+                    eprintln!("Failed to nack message: {}", e);
+                }
+                return;
+            }
+        };
+        
         if ortho.version() > interner.version() {
             println!("[worker] Updating interner from version {} to {} (ortho version {})", interner.version(), container.latest_version(), ortho.version());
-            interner = container.get_latest().expect("No interner found");
+            interner = match container.get_latest() {
+                Some(interner) => interner,
+                None => {
+                    eprintln!("No interner found after update - nacking message");
+                    if let Err(e) = workq.nack_handle(handle, true) {
+                        eprintln!("Failed to nack message: {}", e);
+                    }
+                    return;
+                }
+            };
         }
+        
         let (forbidden, required) = ortho.get_requirements();
         let completions = interner.intersect(&required, &forbidden);
         let version = interner.version();
+        
+        let mut new_orthos = Vec::new();
         for completion in completions {
-            let new_orthos = ortho.add(completion, version);
-            // println!("[worker] Pushing {} new orthos to dbq", new_orthos.len());
-            dbq.push_many(new_orthos);
+            let mut batch = ortho.add(completion, version);
+            new_orthos.append(&mut batch);
         }
         
-        // Ack the handle after successful processing
-        if let Err(e) = workq.ack_handle(handle) {
-            eprintln!("Failed to ack message: {}", e);
+        // Try to push to database queue
+        match dbq.push_many(new_orthos) {
+            Ok(()) => {
+                // Success - ack the handle
+                if let Err(e) = workq.ack_handle(handle) {
+                    eprintln!("Failed to ack message: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to push to database queue: {}", e);
+                // Failed to push - nack and requeue
+                if let Err(nack_err) = workq.nack_handle(handle, true) {
+                    eprintln!("Failed to nack message: {}", nack_err);
+                }
+            }
         }
     } else {
         // println!("[worker] No ortho popped from workq");

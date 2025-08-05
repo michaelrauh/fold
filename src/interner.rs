@@ -273,7 +273,9 @@ impl InternerHolderLike for InMemoryInternerHolder {
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        if let Err(e) = workq.push_many(vec![ortho_seed]) {
+            eprintln!("Failed to seed work queue with new ortho: {}", e);
+        }
     }
     
     fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self {
@@ -281,7 +283,9 @@ impl InternerHolderLike for InMemoryInternerHolder {
         let version = holder.latest_version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        if let Err(e) = workq.push_many(vec![ortho_seed]) {
+            eprintln!("Failed to seed work queue with new ortho: {}", e);
+        }
         holder
     }
 }
@@ -353,7 +357,9 @@ impl InternerHolderLike for FileInternerHolder {
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        if let Err(e) = workq.push_many(vec![ortho_seed]) {
+            eprintln!("Failed to seed work queue with new ortho: {}", e);
+        }
     }
     
     fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo deprecate with seed and just use add_text_with_seed
@@ -365,7 +371,9 @@ impl InternerHolderLike for FileInternerHolder {
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        if let Err(e) = workq.push_many(vec![ortho_seed]) {
+            eprintln!("Failed to seed work queue with new ortho: {}", e);
+        }
         holder
     }
 }
@@ -500,7 +508,9 @@ impl InternerHolderLike for BlobInternerHolder {
             let version = interner.version();
             let ortho_seed = crate::ortho::Ortho::new(version);
             println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-            workq.push_many(vec![ortho_seed]);
+            if let Err(e) = workq.push_many(vec![ortho_seed]) {
+                eprintln!("Failed to seed work queue with new ortho: {}", e);
+            }
         } else {
             // Holder is nonempty, add text to latest
             let latest = self.get_latest().unwrap();
@@ -511,7 +521,9 @@ impl InternerHolderLike for BlobInternerHolder {
             let version = interner.version();
             let ortho_seed = crate::ortho::Ortho::new(version);
             println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-            workq.push_many(vec![ortho_seed]);
+            if let Err(e) = workq.push_many(vec![ortho_seed]) {
+                eprintln!("Failed to seed work queue with new ortho: {}", e);
+            }
         }
     }
     fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo be careful around creations.
@@ -523,7 +535,9 @@ impl InternerHolderLike for BlobInternerHolder {
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        if let Err(e) = workq.push_many(vec![ortho_seed]) {
+            eprintln!("Failed to seed work queue with new ortho: {}", e);
+        }
         holder
     }
 }

@@ -6,7 +6,7 @@ use std::env;
 use tracing::instrument;
 
 pub trait OrthoDatabaseLike {
-    fn upsert(&mut self, orthos: Vec<Ortho>) -> Vec<Ortho>;
+    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, Box<dyn std::error::Error>>;
     fn get(&mut self, key: &usize) -> Option<Ortho>;
     fn get_by_dims(&mut self, dims: &[usize]) -> Option<Ortho>;
     fn get_optimal(&mut self) -> Option<Ortho>;
@@ -29,7 +29,7 @@ impl InMemoryOrthoDatabase {
 }
 
 impl OrthoDatabaseLike for InMemoryOrthoDatabase {
-    fn upsert(&mut self, orthos: Vec<Ortho>) -> Vec<Ortho> {
+    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, Box<dyn std::error::Error>> {
         let mut new_orthos = Vec::new();
         for ortho in orthos {
             let key = ortho.id();
@@ -38,7 +38,7 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
                 new_orthos.push(ortho);
             }
         }
-        new_orthos
+        Ok(new_orthos)
     }
     fn get(&mut self, key: &usize) -> Option<Ortho> {
         self.map.get(key).cloned()
@@ -100,9 +100,9 @@ impl PostgresOrthoDatabase {
 
 impl OrthoDatabaseLike for PostgresOrthoDatabase {
     #[instrument(skip_all)]
-    fn upsert(&mut self, orthos: Vec<Ortho>) -> Vec<Ortho> {
+    fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, Box<dyn std::error::Error>> {
         if orthos.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::new();
         let mut values = Vec::new();
@@ -110,21 +110,23 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             values.push(format!("(${}, ${}, ${}, ${})", i*4+1, i*4+2, i*4+3, i*4+4));
             params.push(Box::new(ortho.id() as i64));
             params.push(Box::new(ortho.version() as i64));
-            params.push(Box::new(encode_to_vec(&ortho.dims(), standard()).unwrap()));
-            params.push(Box::new(encode_to_vec(&ortho, standard()).unwrap()));
+            params.push(Box::new(encode_to_vec(&ortho.dims(), standard())?));
+            params.push(Box::new(encode_to_vec(&ortho, standard())?));
         }
         let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = params.iter().map(|b| &**b).collect();
         let sql = format!(
             "INSERT INTO orthos (id, version, dims, data) VALUES {} ON CONFLICT (id) DO NOTHING RETURNING data",
             values.join(", ")
         );
-        self.client.query(&sql, &param_refs).unwrap()
+        let rows = self.client.query(&sql, &param_refs)?;
+        let result = rows
             .into_iter()
             .filter_map(|row| {
                 let data: Vec<u8> = row.get(0);
                 decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
             })
-            .collect()
+            .collect();
+        Ok(result)
     }
     #[instrument(skip_all)]
     fn get(&mut self, key: &usize) -> Option<Ortho> {
@@ -238,7 +240,7 @@ mod tests {
         let mut db = InMemoryOrthoDatabase::new();
         let ortho = Ortho::new(1);
         let key = ortho.id();
-        let new_orthos = db.upsert(vec![ortho.clone()]);
+        let new_orthos = db.upsert(vec![ortho.clone()]).expect("upsert should succeed");
         assert_eq!(new_orthos.len(), 1);
         let fetched = db.get(&key);
         assert_eq!(fetched, Some(ortho));
@@ -248,9 +250,9 @@ mod tests {
     fn test_upsert_duplicates() {
         let mut db = InMemoryOrthoDatabase::new();
         let ortho = Ortho::new(1);
-        let first = db.upsert(vec![ortho.clone()]);
+        let first = db.upsert(vec![ortho.clone()]).expect("first upsert should succeed");
         assert_eq!(first.len(), 1);
-        let second = db.upsert(vec![ortho.clone()]);
+        let second = db.upsert(vec![ortho.clone()]).expect("second upsert should succeed");
         assert_eq!(second.len(), 0); // Already seen
     }
 
