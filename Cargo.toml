@@ -4,9 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+amiquip = "0.4.2"
+base64 = "0.22.1"
+bincode = "2.0.1"
 fixedbitset = "0.5.7"
 itertools = "0.12"
-tokio = { version = "1.46.1", features = ["full"] }
+reqwest = { version = "0.12.22", features = ["blocking"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+dotenv = "0.15"
+crossbeam-channel = "0.5.15"
+postgres = "0.19"
+aws-sdk-s3 = "1.100.0"
+aws-config = "1.8.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.30"
+opentelemetry = "0.29"
+opentelemetry_sdk = "0.29"
+opentelemetry-otlp = { version = "0.29", features = ["reqwest-blocking-client"] }
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -14,11 +32,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "spatial_bench"
 harness = false
+path = "benches/spatial_bench.rs"
 
 [[bench]]
 name = "ortho_bench"
 harness = false
-
-[[bench]]
-name = "interner_bench"
-harness = false
+path = "benches/ortho_bench.rs"

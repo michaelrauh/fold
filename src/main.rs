@@ -1,239 +1,123 @@
-use fold::feeder::OrthoFeeder;
-use fold::follower::Follower;
-use fold::interner::InternerHolder;
-use fold::ortho_database::OrthoDatabase;
-use fold::queue::Queue;
-use fold::worker::Worker;
-use std::fs;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use fold::Follower;
+use fold::interner::FileInternerHolder;
+use fold::interner::InternerHolderLike;
+use fold::ortho_database::{InMemoryOrthoDatabase, OrthoDatabaseLike};
+use fold::queue::{MockQueue, QueueLike};
+use dotenv::dotenv;
+use std::time::Instant;
 
-#[tokio::main]
-async fn main() {
-    // Initialize with 1.txt instead of e.txt
-    let filename = "1.txt";
-    println!("[main] Using filename: {}", filename);
-    let initial_text = match fs::read_to_string(filename) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("[main] Failed to read file: {}", e);
-            return;
+fn run<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::InternerHolderLike>(
+    dbq: &mut Q,
+    workq: &mut Q,
+    db: &mut D,
+    holder: &mut H,
+    chapters: Vec<&str>,
+) {
+    println!("[main] Found {} chapters in e.txt", chapters.len());
+    for (i, chapter) in chapters.iter().enumerate() {
+        println!("[main] Feeding chapter {}...", i);
+        holder.add_text_with_seed(chapter, workq);
+        let mut loop_count: usize = 0;
+        let files_fed = 1;
+        let printed_final_optimal = false;
+        loop {
+            fold::OrthoFeeder::run_feeder_once(dbq, db, workq);
+            process_with_grace(dbq, workq, db, holder, files_fed, 0, &mut loop_count);
+            if workq.len() == 0 && dbq.len() == 0 {
+                if !printed_final_optimal {
+                    let ortho_opt = db.get_optimal();
+                    if let Some(ortho) = ortho_opt {
+                        println!("[main] Final Optimal Ortho: {:?}", ortho);
+                        if let Some(interner) = holder.get_latest() {
+                            let payload_strings = ortho.payload().iter().map(|opt_idx| {
+                                opt_idx.map(|idx| interner.string_for_index(idx).to_string())
+                            }).collect::<Vec<_>>();
+                            println!("[main] Final Optimal Ortho (strings): {:?}", payload_strings);
+                        } else {
+                            println!("[main] No interner found for final optimal ortho.");
+                        }
+                    } else {
+                        println!("[main] No final optimal Ortho found.");
+                    }
+                    println!("[main] Exiting chapter loop.");
+                }
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-    };
-    let input = initial_text.trim();
-    println!("[main] Read input from file");
-
-    let dbq = Arc::new(Queue::new("dbq", 1000000));
-    let db = Arc::new(OrthoDatabase::new());
-    let workq = Arc::new(Queue::new("main", 800000));
-    println!("[main] Queues created");
-
-    let holder = Arc::new(Mutex::new(
-        InternerHolder::with_seed(input, workq.clone()).await,
-    ));
-    println!("[main] InternerHolder created");
-
-    // Clone workq and dbq for feeding task to avoid move errors
-    let feeding_workq = workq.clone();
-    let feeding_dbq = dbq.clone();
-    let holder_clone = holder.clone();
-    tokio::spawn(async move {
-        for i in 2..=28 {
-            loop {
-                let holder_guard = holder_clone.lock().await;
-                let num_interners = holder_guard.num_interners();
-                drop(holder_guard);
-                // Only feed if exactly one interner and workq+dbq depths < 10_000
-                let workq_depth = if let Ok(workq_guard) = feeding_workq.receiver.try_lock() {
-                    workq_guard.len()
-                } else {
-                    10_000
-                };
-                let dbq_depth = if let Ok(dbq_guard) = feeding_dbq.receiver.try_lock() {
-                    dbq_guard.len()
-                } else {
-                    10_000
-                };
-                if num_interners == 1 && (workq_depth + dbq_depth) < 10_000 {
-                    println!("[main] Feeding {}.txt ({} interners in play, workq+dbq={})", i, num_interners, workq_depth + dbq_depth);
-                    break;
-                } else {
-                    println!("[main] Waiting to feed {}.txt: {} interners in play, workq+dbq={}", i, num_interners, workq_depth + dbq_depth);
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                }
-            }
-            let filename = format!("{}.txt", i);
-            match fs::read_to_string(&filename) {
-                Ok(text) => {
-                    let mut holder_guard = holder_clone.lock().await;
-                    holder_guard.add_text_with_seed(text.trim()).await;
-                },
-                Err(e) => {
-                    println!("[main] Failed to read {}: {}", filename, e);
-                }
-            }
-        }
-    });
-
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let feeder_shutdown = shutdown.clone();
-    let follower_shutdown = shutdown.clone();
-    let worker_shutdown = shutdown.clone();
-
-    // Periodic Follower work log task
-    {
-        let db = db.clone();
-        let holder = holder.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                // Log how much more "work" Follower has to do
-                let ortho_count = if let Ok(db_guard) = db.map.try_lock() {
-                    db_guard.len()
-                } else {
-                    0
-                };
-                let (latest_version, num_interners, all_versions, lowest_version, lowest_count) = {
-                    let holder_guard = holder.lock().await;
-                    let all_versions = db.all_versions().await;
-                    let lowest_version = all_versions.iter().min().cloned();
-                    let all_orthos = db.all_orthos().await;
-                    let lowest_count = if let Some(lv) = lowest_version {
-                        all_orthos.iter().filter(|o| o.version() == lv).count()
-                    } else { 0 };
-                    (holder_guard.latest_version(), holder_guard.num_interners(), all_versions, lowest_version, lowest_count)
-                };
-                println!(
-                    "[follower-info] Ortho count: {}, Interners: {}, Latest interner version: {}",
-                    ortho_count, num_interners, latest_version
-                );
-                println!(
-                    "[follower-info] All interner versions: {:?}", all_versions
-                );
-                if let Some(lv) = lowest_version {
-                    println!(
-                        "[follower-info] Number of orthos present in the lowest version ({}): {}",
-                        lv, lowest_count
-                    );
-                }
-            }
-        });
     }
+}
 
-    let feeder_handle = {
-        let dbq = dbq.clone();
-        let db = db.clone();
-        let workq = workq.clone();
-        let shutdown = feeder_shutdown.clone();
-        println!("[main] Spawning feeder");
-        tokio::spawn(async move {
-            OrthoFeeder::run(dbq, db, workq, shutdown).await;
-        })
-    };
-    let follower_handle = {
-        let db = db.clone();
-        let workq = workq.clone();
-        let container = holder.clone();
-        let shutdown = follower_shutdown.clone();
-        println!("[main] Spawning follower");
-        tokio::spawn(async move {
-            Follower::run(db, workq, container, shutdown).await;
-        })
-    };
-    // Change worker to Arc<Mutex<Worker>> so we can read its version live
-    let worker = Arc::new(Mutex::new(Worker::new(holder.clone()).await));
-    let worker_handle = {
-        let worker = worker.clone();
-        let workq = workq.clone();
-        let dbq = dbq.clone();
-        let shutdown = worker_shutdown.clone();
-        println!("[main] Spawning worker");
-        tokio::spawn(async move {
-            let mut w = worker.lock().await;
-            w.run(workq, dbq, shutdown).await;
-        })
-    };
-    println!("[main] Entering main loop");
-
-    let mut loop_count = 0;
-    let mut last_db_len = 0;
+fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::InternerHolderLike>(
+    dbq: &mut Q,
+    workq: &mut Q,
+    db: &mut D,
+    holder: &mut H,
+    files_processed: usize,
+    grace_period_secs: u64,
+    loop_count: &mut usize,
+) {
+    let mut follower = Follower::new();
+    let grace_start = Instant::now();
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        loop_count += 1;
-        let workq_depth = if let Ok(workq_guard) = workq.receiver.try_lock() {
-            workq_guard.len()
-        } else {
-            println!("[main] Could not lock workq");
-            continue;
-        };
-        let dbq_depth = if let Ok(dbq_guard) = dbq.receiver.try_lock() {
-            dbq_guard.len()
-        } else {
-            println!("[main] Could not lock dbq");
-            continue;
-        };
-        let db_len = if let Ok(db_guard) = db.map.try_lock() {
-            let len = db_guard.len();
-            last_db_len = len;
-            len
-        } else {
-            // Don't print error, just use last known value
-            last_db_len
-        };
-        let latest_version = {
-            let holder_guard = holder.lock().await;
-            holder_guard.latest_version()
-        };
+        follower.run_follower_once(db, workq, holder);
+        fold::run_worker_once(workq, dbq, holder);
+        *loop_count += 1;
+        let workq_depth = workq.len();
+        let dbq_depth = dbq.len();
+        let db_len = db.len();
+        println!("[main] raw lens: workq_depth={}, dbq_depth={}, db_len={}", workq_depth, dbq_depth, db_len);
+        let latest_version = holder.latest_version();
+        println!("[main] LOOP_COUNT: {}", *loop_count);
         println!(
-            "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}",
-            workq_depth, dbq_depth, db_len, latest_version
+            "[main] workq depth: {}, dbq depth: {}, db len: {}, latest interner version: {}, files processed: {}",
+            workq_depth, dbq_depth, db_len, latest_version, files_processed
         );
-        if loop_count % 6 == 0 {
-            let ortho_opt = db.get_optimal().await;
+        if *loop_count % 1000 == 0 {
+            let ortho_opt = db.get_optimal();
             if let Some(ortho) = ortho_opt {
-                println!("[main] Optimal Ortho: {:?}", ortho);
-                let payload_strings = {
-                    let holder_guard = holder.lock().await;
-                    let interner = holder_guard.get_latest();
-                    ortho.payload().iter().map(|opt_idx| {
+                println!("[main] (file idx: {}) Optimal Ortho: {:?}", files_processed, ortho);
+                if let Some(interner) = holder.get_latest() {
+                    let payload_strings = ortho.payload().iter().map(|opt_idx| {
                         opt_idx.map(|idx| interner.string_for_index(idx).to_string())
-                    }).collect::<Vec<_>>()
-                };
-                println!("[main] Optimal Ortho (strings): {:?}", payload_strings);
+                    }).collect::<Vec<_>>();
+                    println!("[main] Optimal Ortho (strings): {:?}", payload_strings);
+                } else {
+                    println!("[main] No interner found for optimal ortho.");
+                }
             } else {
                 println!("[main] No optimal Ortho found.");
             }
         }
-        // Stop if worker version is less than latest interner version
-        let num_interners = {
-            let holder_guard = holder.lock().await;
-            holder_guard.num_interners()
-        };
-        if workq_depth == 0 && dbq_depth == 0 && latest_version > 25 && num_interners == 1 {
+        let elapsed = grace_start.elapsed().as_secs();
+        if elapsed >= grace_period_secs {
+            break;
+        } else {
+            let remaining = grace_period_secs - elapsed;
+            println!("[main] Grace period active ({}s remaining) before next feed.", remaining);
+        }
+        if workq.len() == 0 && dbq.len() == 0 {
             break;
         }
     }
-    println!("[main] Main loop exited");
+}
 
-    let ortho_opt = db.get_optimal().await;
-    if let Some(ortho) = ortho_opt {
-        println!("Optimal Ortho: {:?}", ortho);
-        // Print non-interned version of payload
-        let payload_strings = {
-            let holder_guard = holder.lock().await;
-            let interner = holder_guard.get_latest();
-            ortho.payload().iter().map(|opt_idx| {
-                opt_idx.map(|idx| interner.string_for_index(idx).to_string())
-            }).collect::<Vec<_>>()
-        };
-        println!("Optimal Ortho (strings): {:?}", payload_strings);
-    } else {
-        println!("No optimal Ortho found.");
+fn main() {
+    dotenv().ok();
+    let mode = std::env::var("FOLD_MODE").unwrap_or_else(|_| "monolith".to_string());
+    if mode != "monolith" {
+        println!("[main] Skipping main.rs: FOLD_MODE is not monolith (got '{}')", mode);
+        return;
     }
-    println!("[main] Notifying shutdown");
-    shutdown.notify_waiters();
-    feeder_handle.await.expect("feeder task panicked");
-    follower_handle.await.expect("follower task panicked");
-    worker_handle.await.expect("worker task panicked");
-    println!("[main] All background tasks joined. Exiting.");
+    println!("[main] FOLD_MODE: monolith");
+    let endpoint = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap_or_else(|_| "(unset)".to_string());
+    println!("[main][debug] FOLD_INTERNER_BLOB_ENDPOINT: {}", endpoint);
+    let file = "e.txt";
+    let initial_text = std::fs::read_to_string(&file).unwrap();
+    let chapters: Vec<&str> = initial_text.split("CHAPTER").collect();
+    let mut dbq = MockQueue::new();
+    let mut workq = MockQueue::new();
+    let mut db = InMemoryOrthoDatabase::new();
+    let mut holder = FileInternerHolder::with_seed("", &mut workq);
+    run(&mut dbq, &mut workq, &mut db, &mut holder, chapters);
 }

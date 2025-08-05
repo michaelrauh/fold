@@ -1,6 +1,7 @@
 /target
-e.txt
 *.txt
+.vscode/
+/interner_data
 
 # Added by cargo
 #
