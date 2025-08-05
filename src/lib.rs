@@ -92,6 +92,12 @@ impl OrthoFeeder {
         if !items.is_empty() {
             let new_orthos = db.upsert(items);
             workq.push_many(new_orthos);
+            
+            // If this is a real Queue (not MockQueue), ack the processed messages
+            let any_ref: &mut dyn std::any::Any = dbq;
+            if let Some(queue) = any_ref.downcast_mut::<crate::queue::Queue>() {
+                queue.ack_pending();
+            }
         }
     }
 }
@@ -117,6 +123,12 @@ pub fn run_worker_once<Q: queue::QueueLike, H: interner::InternerHolderLike>(
             let new_orthos = ortho.add(completion, version);
             // println!("[worker] Pushing {} new orthos to dbq", new_orthos.len());
             dbq.push_many(new_orthos);
+        }
+        
+        // If this is a real Queue (not MockQueue), ack the processed messages
+        let any_ref: &mut dyn std::any::Any = workq;
+        if let Some(queue) = any_ref.downcast_mut::<queue::Queue>() {
+            queue.ack_pending();
         }
     } else {
         // println!("[worker] No ortho popped from workq");
