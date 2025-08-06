@@ -34,7 +34,15 @@ fn main() {
     let mut workq = Queue::new("workq").expect("Failed to create workq");
     let mut db = PostgresOrthoDatabase::new();
     loop {
-        let _ = OrthoFeeder::run_feeder_once(&mut dbq, &mut db, &mut workq);
+        match OrthoFeeder::run_feeder_once(&mut dbq, &mut db, &mut workq) {
+            Ok(()) => {
+                // Success - continue processing
+            }
+            Err(e) => {
+                eprintln!("Feeder error: {}", e);
+                // Continue processing - errors are expected during service outages
+            }
+        }
         thread::sleep(Duration::from_millis(100));
     }
 }

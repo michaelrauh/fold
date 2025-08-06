@@ -161,14 +161,20 @@ fn main() {
             if let Some((bucket, key)) = parse_s3_path(&s3_path) {
                 if let Some(data) = s3_client.get_object_blocking(&key) {
                     let s = String::from_utf8_lossy(&data);
-                    let _ = holder.add_text_with_seed(&s, &mut workq);
-                    // After successful feed, delete the object
-                    s3_client.rt.block_on(s3_client.client.delete_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send())
-                        .expect("Failed to delete S3 object after feed");
-                    println!("Fed S3 object {} into interner and deleted original.", s3_path);
+                    match holder.add_text_with_seed(&s, &mut workq) {
+                        Ok(()) => {
+                            // Only delete the object after successful feed
+                            s3_client.rt.block_on(s3_client.client.delete_object()
+                                .bucket(&bucket)
+                                .key(&key)
+                                .send())
+                                .expect("Failed to delete S3 object after feed");
+                            println!("Fed S3 object {} into interner and deleted original.", s3_path);
+                        }
+                        Err(e) => {
+                            panic!("Failed to feed S3 object {} into interner: {}", s3_path, e);
+                        }
+                    }
                 } else {
                     panic!("Failed to feed from S3 path {}", s3_path);
                 }
