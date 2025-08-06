@@ -16,12 +16,16 @@ fn run<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::InternerHolderLike
     println!("[main] Found {} chapters in e.txt", chapters.len());
     for (i, chapter) in chapters.iter().enumerate() {
         println!("[main] Feeding chapter {}...", i);
-        holder.add_text_with_seed(chapter, workq);
+        if let Err(e) = holder.add_text_with_seed(chapter, workq) {
+            eprintln!("Failed to add text with seed: {:?}", e);
+        }
         let mut loop_count: usize = 0;
         let files_fed = 1;
         let printed_final_optimal = false;
         loop {
-            fold::OrthoFeeder::run_feeder_once(dbq, db, workq);
+            if let Err(e) = fold::OrthoFeeder::run_feeder_once(dbq, db, workq) {
+                eprintln!("Feeder error: {:?}", e);
+            }
             process_with_grace(dbq, workq, db, holder, files_fed, 0, &mut loop_count);
             if workq.len().unwrap_or(0) == 0 && dbq.len().unwrap_or(0) == 0 {
                 if !printed_final_optimal {
@@ -60,8 +64,12 @@ fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::Int
     let mut follower = Follower::new();
     let grace_start = Instant::now();
     loop {
-        follower.run_follower_once(db, workq, holder);
-        fold::run_worker_once(workq, dbq, holder);
+        if let Err(e) = follower.run_follower_once(db, workq, holder) {
+            eprintln!("Follower error: {:?}", e);
+        }
+        if let Err(e) = fold::run_worker_once(workq, dbq, holder) {
+            eprintln!("Worker error: {:?}", e);
+        }
         *loop_count += 1;
         let workq_depth = workq.len().unwrap_or(0);
         let dbq_depth = dbq.len().unwrap_or(0);

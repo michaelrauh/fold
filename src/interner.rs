@@ -238,14 +238,7 @@ pub struct InMemoryInternerHolder {
     pub interners: std::collections::HashMap<usize, Interner>,
 }
 
-impl InMemoryInternerHolder {
-    fn from_text_internal(text: &str) -> Self {
-        let interner = Interner::from_text(text);
-        let mut interners = std::collections::HashMap::new();
-        interners.insert(interner.version(), interner);
-        InMemoryInternerHolder { interners }
-    }
-}
+impl InMemoryInternerHolder {}
 
 impl InternerHolderLike for InMemoryInternerHolder {
     fn get(&self, version: usize) -> Option<Interner> {
@@ -294,11 +287,6 @@ pub struct FileInternerHolder {
 }
 
 impl FileInternerHolder {
-    fn new_internal(dir: impl Into<PathBuf>) -> Self {
-        let dir = dir.into();
-        fs::create_dir_all(&dir).ok();
-        Self { dir }
-    }
     fn file_path(&self, version: usize) -> PathBuf {
         self.dir.join(format!("interner_{}.bin", version))
     }
