@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use fold::queue::Queue;
+use fold::queue::{Queue, QueueLike};
 use fold::interner::{BlobInternerHolder, InternerHolderLike};
 use fold::ortho_database::PostgresOrthoDatabase;
 use fold::{OrthoDatabaseLike};
@@ -102,19 +102,19 @@ impl S3Client {
 
 fn main() {
     let cli = Cli::parse();
-    let dbq = Queue::new("dbq");
-    let mut workq = Queue::new("workq");
-    let mut holder = BlobInternerHolder::new_internal();
+    let dbq = Queue::new("dbq").expect("Failed to create dbq");
+    let mut workq = Queue::new("workq").expect("Failed to create workq");
+    let mut holder = BlobInternerHolder::new().expect("Failed to create BlobInternerHolder");
     let mut db = PostgresOrthoDatabase::new();
     let s3_client = S3Client::new();
     match cli.command {
         Commands::Queues => {
-            println!("workq depth: {}", workq.len());
-            println!("dbq depth: {}", dbq.len());
+            println!("workq depth: {}", workq.len().unwrap_or(0));
+            println!("dbq depth: {}", dbq.len().unwrap_or(0));
         }
         Commands::PrintOptimal => {
             let ortho_opt = db.get_optimal();
-            if let Some(ortho) = ortho_opt {
+            if let Ok(Some(ortho)) = ortho_opt {
                 println!("Optimal Ortho: {:?}", ortho);
                 if let Some(interner) = holder.get_latest() {
                     let payload_strings = ortho.payload().iter().map(|opt_idx| {
@@ -161,14 +161,20 @@ fn main() {
             if let Some((bucket, key)) = parse_s3_path(&s3_path) {
                 if let Some(data) = s3_client.get_object_blocking(&key) {
                     let s = String::from_utf8_lossy(&data);
-                    holder.add_text_with_seed(&s, &mut workq);
-                    // After successful feed, delete the object
-                    s3_client.rt.block_on(s3_client.client.delete_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send())
-                        .expect("Failed to delete S3 object after feed");
-                    println!("Fed S3 object {} into interner and deleted original.", s3_path);
+                    match holder.add_text_with_seed(&s, &mut workq) {
+                        Ok(()) => {
+                            // Only delete the object after successful feed
+                            s3_client.rt.block_on(s3_client.client.delete_object()
+                                .bucket(&bucket)
+                                .key(&key)
+                                .send())
+                                .expect("Failed to delete S3 object after feed");
+                            println!("Fed S3 object {} into interner and deleted original.", s3_path);
+                        }
+                        Err(e) => {
+                            panic!("Failed to feed S3 object {} into interner: {}", s3_path, e);
+                        }
+                    }
                 } else {
                     panic!("Failed to feed from S3 path {}", s3_path);
                 }
@@ -202,7 +208,7 @@ fn main() {
             }
         }
         Commands::Database => {
-            let db_len = db.len();
+            let db_len = db.len().unwrap_or(0);
             println!("Database length: {}", db_len);
         }
     }

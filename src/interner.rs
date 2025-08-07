@@ -1,4 +1,5 @@
 use crate::splitter::Splitter;
+use crate::error::FoldError;
 use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
 use std::fs;
@@ -229,22 +230,15 @@ pub trait InternerHolderLike {
     fn get_latest(&self) -> Option<Interner>;
     fn versions(&self) -> Vec<usize>;
     fn delete(&mut self, version: usize);
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q);
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self where Self: Sized;
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError>;
+    fn new() -> Result<Self, FoldError> where Self: Sized;
 }
 
 pub struct InMemoryInternerHolder {
     pub interners: std::collections::HashMap<usize, Interner>,
 }
 
-impl InMemoryInternerHolder {
-    fn from_text_internal(text: &str) -> Self {
-        let interner = Interner::from_text(text);
-        let mut interners = std::collections::HashMap::new();
-        interners.insert(interner.version(), interner);
-        InMemoryInternerHolder { interners }
-    }
-}
+impl InMemoryInternerHolder {}
 
 impl InternerHolderLike for InMemoryInternerHolder {
     fn get(&self, version: usize) -> Option<Interner> {
@@ -266,23 +260,25 @@ impl InternerHolderLike for InMemoryInternerHolder {
     fn delete(&mut self, version: usize) {
         self.interners.remove(&version);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
-        let latest = self.interners.values().max_by_key(|i| i.version()).unwrap();
-        let interner = latest.add_text(text);
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
+        let interner = if let Some(latest) = self.get_latest() {
+            latest.add_text(text)
+        } else {
+            // Make from scratch if empty
+            Interner::from_text(text)
+        };
         self.interners.insert(interner.version(), interner.clone());
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        workq.push_many(vec![ortho_seed])?;
+        Ok(())
     }
     
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self {
-        let holder = InMemoryInternerHolder::from_text_internal(text);
-        let version = holder.latest_version();
-        let ortho_seed = crate::ortho::Ortho::new(version);
-        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
-        holder
+    fn new() -> Result<Self, FoldError> {
+        Ok(InMemoryInternerHolder { 
+            interners: std::collections::HashMap::new() 
+        })
     }
 }
 
@@ -291,11 +287,6 @@ pub struct FileInternerHolder {
 }
 
 impl FileInternerHolder {
-    fn new_internal(dir: impl Into<PathBuf>) -> Self {
-        let dir = dir.into();
-        fs::create_dir_all(&dir).ok();
-        Self { dir }
-    }
     fn file_path(&self, version: usize) -> PathBuf {
         self.dir.join(format!("interner_{}.bin", version))
     }
@@ -307,10 +298,12 @@ impl FileInternerHolder {
             None
         }
     }
-    fn put(&mut self, interner: Interner) {
+    fn put(&mut self, interner: Interner) -> Result<(), FoldError> {
         let path = self.file_path(interner.version());
-        let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
-        fs::write(path, data).expect("Failed to write Interner file");
+        let data = bincode::encode_to_vec(&interner, bincode::config::standard())
+            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
+        fs::write(path, data).map_err(|e| FoldError::Io(e))?;
+        Ok(())
     }
 }
 
@@ -346,27 +339,28 @@ impl InternerHolderLike for FileInternerHolder {
         let path = self.file_path(version);
         let _ = fs::remove_file(path);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
-        let latest = self.get_latest().unwrap();
-        let interner = latest.add_text(text);
-        self.put(interner.clone());
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
+        let interner = if let Some(latest) = self.get_latest() {
+            // Add text to existing latest
+            latest.add_text(text)
+        } else {
+            // Make from scratch if empty
+            Interner::from_text(text)
+        };
+        self.put(interner.clone())?;
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
+        workq.push_many(vec![ortho_seed])?;
+        Ok(())
     }
     
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo deprecate with seed and just use add_text_with_seed
+    fn new() -> Result<Self, FoldError> {
         let dir = std::env::var("INTERNER_FILE_LOCATION")
-            .expect("INTERNER_FILE_LOCATION not set in environment. Please set it in your .env file.");
-        let mut holder = FileInternerHolder::new_internal(dir);
-        let interner = Interner::from_text(text);
-        holder.put(interner.clone());
-        let version = interner.version();
-        let ortho_seed = crate::ortho::Ortho::new(version);
-        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
-        holder
+            .map_err(|_| FoldError::Other("INTERNER_FILE_LOCATION not set in environment. Please set it in your .env file.".into()))?;
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).map_err(|e| FoldError::Io(e))?;
+        Ok(Self { dir })
     }
 }
 
@@ -377,14 +371,15 @@ pub struct BlobInternerHolder {
 }
 
 impl BlobInternerHolder {
-    pub fn new_internal() -> Self {
+    fn new_internal() -> Result<Self, FoldError> {
         let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap_or_else(|_| "internerdata".to_string());
         let endpoint_url = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".to_string());
         let access_key = std::env::var("FOLD_INTERNER_BLOB_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
         let secret_key = std::env::var("FOLD_INTERNER_BLOB_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
         let region = "us-east-1";
 
-        let rt = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let rt = std::sync::Arc::new(tokio::runtime::Runtime::new()
+            .map_err(|e| FoldError::Other(format!("Failed to create Tokio runtime: {}", e)))?);
         let config = rt.block_on(async {
             aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(region)
@@ -408,12 +403,14 @@ impl BlobInternerHolder {
         rt.block_on(async {
             let head_result = client.head_bucket().bucket(&bucket_clone).send().await;
             if head_result.is_err() {
-                let _ = client.create_bucket().bucket(&bucket_clone).send().await;
+                client.create_bucket().bucket(&bucket_clone).send().await
+                    .map_err(|e| FoldError::Other(format!("Failed to create S3 bucket: {}", e)))?;
             }
-        });
-        Self { client, bucket, rt }
+            Ok::<(), FoldError>(())
+        })?;
+        Ok(Self { client, bucket, rt })
     }
-    fn put_blocking(&self, key: &str, data: &[u8]) {
+    fn put_blocking(&self, key: &str, data: &[u8]) -> Result<(), FoldError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let data = data.to_vec();
@@ -424,59 +421,70 @@ impl BlobInternerHolder {
                 .body(ByteStream::from(data))
                 .send()
                 .await;
-            result.unwrap()
-        });
+            result.map(|_| ()).map_err(|e| FoldError::Other(format!("S3 put operation failed: {}", e)))
+        })
     }
-    fn get_blocking(&self, key: &str) -> Option<Vec<u8>> {
+    fn get_blocking(&self, key: &str) -> Result<Option<Vec<u8>>, FoldError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.rt.block_on(async move {
             match client.get_object().bucket(&bucket).key(key).send().await {
                 Ok(resp) => {
-                    let data = resp.body.collect().await.ok()?;
-                    let bytes = data.into_bytes();
-                    Some(bytes.to_vec())
+                    match resp.body.collect().await {
+                        Ok(data) => {
+                            let bytes = data.into_bytes();
+                            Ok(Some(bytes.to_vec()))
+                        }
+                        Err(e) => Err(FoldError::Other(format!("Failed to read S3 object body: {}", e)))
+                    }
                 },
-                Err(_e) => {
-                    None
+                Err(e) => {
+                    // Check if it's a "not found" error, which is expected
+                    if e.to_string().contains("NoSuchKey") {
+                        Ok(None)
+                    } else {
+                        Err(FoldError::Other(format!("S3 get operation failed: {}", e)))
+                    }
                 },
             }
         })
     }
-    fn list_blocking(&self) -> Vec<String> {
+    fn list_blocking(&self) -> Result<Vec<String>, FoldError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.rt.block_on(async move {
             match client.list_objects_v2().bucket(&bucket).send().await {
                 Ok(resp) => {
                     let keys: Vec<String> = resp.contents().iter().filter_map(|obj| obj.key().map(|k| k.to_string())).collect();
-                    keys
+                    Ok(keys)
                 },
-                Err(_e) => {
-                    vec![]
+                Err(e) => {
+                    Err(FoldError::Other(format!("S3 list operation failed: {}", e)))
                 },
             }
         })
     }
-    fn delete_blocking(&self, key: &str) {
+    fn delete_blocking(&self, key: &str) -> Result<(), FoldError> {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.rt.block_on(async move {
-            let _ = client.delete_object().bucket(&bucket).key(key).send().await;
-        });
+            client.delete_object().bucket(&bucket).key(key).send().await
+                .map(|_| ())
+                .map_err(|e| FoldError::Other(format!("S3 delete operation failed: {}", e)))
+        })
     }
 }
 
 impl InternerHolderLike for BlobInternerHolder {
     fn get(&self, version: usize) -> Option<Interner> {
         let key = version.to_string();
-        let result = self.get_blocking(&key).and_then(|data| {
+        let result = self.get_blocking(&key).ok()?.and_then(|data| {
             bincode::decode_from_slice::<Interner, _>(&data, bincode::config::standard()).ok().map(|(v, _)| v)
         });
         result
     }
     fn latest_version(&self) -> usize {
-        let versions = self.list_blocking().iter().filter_map(|key| key.parse::<usize>().ok()).collect::<Vec<_>>();
+        let versions = self.list_blocking().unwrap_or_default().iter().filter_map(|key| key.parse::<usize>().ok()).collect::<Vec<_>>();
         versions.into_iter().max().unwrap_or(0)
     }
     fn get_latest(&self) -> Option<Interner> {
@@ -484,47 +492,33 @@ impl InternerHolderLike for BlobInternerHolder {
         self.get(v)
     }
     fn versions(&self) -> Vec<usize> {
-        self.list_blocking().iter().filter_map(|key| key.parse::<usize>().ok()).collect()
+        self.list_blocking().unwrap_or_default().iter().filter_map(|key| key.parse::<usize>().ok()).collect()
     }
     fn delete(&mut self, version: usize) {
         let key = version.to_string();
-        self.delete_blocking(&key);
+        let _ = self.delete_blocking(&key);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) {
-        if self.get_latest().is_none() {
+    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
+        let interner = if self.get_latest().is_none() {
             // Holder is empty, create new with seed
-            let interner = Interner::from_text(text);
-            let key = interner.version().to_string();
-            let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
-            self.put_blocking(&key, &data);
-            let version = interner.version();
-            let ortho_seed = crate::ortho::Ortho::new(version);
-            println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-            workq.push_many(vec![ortho_seed]);
+            Interner::from_text(text)
         } else {
             // Holder is nonempty, add text to latest
             let latest = self.get_latest().unwrap();
-            let interner = latest.add_text(text);
-            let key = interner.version().to_string();
-            let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
-            self.put_blocking(&key, &data);
-            let version = interner.version();
-            let ortho_seed = crate::ortho::Ortho::new(version);
-            println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-            workq.push_many(vec![ortho_seed]);
-        }
-    }
-    fn with_seed<Q: crate::queue::QueueLike>(text: &str, workq: &mut Q) -> Self { // todo be careful around creations.
-        let holder = BlobInternerHolder::new_internal();
-        let interner = Interner::from_text(text);
+            latest.add_text(text)
+        };
         let key = interner.version().to_string();
-        let data = bincode::encode_to_vec(&interner, bincode::config::standard()).expect("Failed to serialize Interner");
-        holder.put_blocking(&key, &data);
+        let data = bincode::encode_to_vec(&interner, bincode::config::standard())
+            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
+        self.put_blocking(&key, &data)?;
         let version = interner.version();
         let ortho_seed = crate::ortho::Ortho::new(version);
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed]);
-        holder
+        workq.push_many(vec![ortho_seed])?;
+        Ok(())
+    }
+    fn new() -> Result<Self, FoldError> {
+        BlobInternerHolder::new_internal()
     }
 }
 
@@ -535,7 +529,8 @@ mod tests {
 
     #[test]
     fn test_from_text_creates_interner() {
-        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("hello world", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         assert_eq!(interner.version(), 1);
         assert_eq!(interner.vocabulary.len(), 2);
@@ -543,14 +538,17 @@ mod tests {
     }
     #[test]
     fn test_add_increments_version() {
-        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("hello world", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let interner2 = interner.add_text("test");
         assert_eq!(interner2.version(), 2);
     }
     #[test]
     fn test_add_extends_vocabulary() {
-        let holder = InMemoryInternerHolder::with_seed("hello world", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        let mut queue = crate::queue::MockQueue::new();
+        holder.add_text_with_seed("hello world", &mut queue).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         assert_eq!(interner.vocabulary, vec!["hello", "world"]);
         let interner2 = interner.add_text("test hello");
@@ -558,7 +556,9 @@ mod tests {
     }
     #[test]
     fn test_add_builds_prefix_mapping() {
-        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        let mut queue = crate::queue::MockQueue::new();
+        holder.add_text_with_seed("a b c", &mut queue).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let vocab_len = interner.vocabulary.len();
         // prefix [0] should map to {1}
@@ -582,7 +582,8 @@ mod tests {
     }
     #[test]
     fn test_add_handles_longer_phrases() {
-        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("a b c", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         // Should have prefix [0] -> bit 1 set (for "b")
         let prefix_0 = vec![0];
@@ -600,7 +601,8 @@ mod tests {
     #[test]
     fn test_add_extends_existing_bitsets() {
         // First add with 2 words
-        let holder = InMemoryInternerHolder::with_seed("a b", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("a b", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         // Second add with 1 more word
         let interner2 = interner.add_text("a c");
@@ -614,7 +616,8 @@ mod tests {
     }
     #[test]
     fn test_get_required_bits() {
-        let holder = InMemoryInternerHolder::with_seed("a b c", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("a b c", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         // prefix [0] should map to {1}
         let required = vec![vec![0]];
@@ -625,7 +628,8 @@ mod tests {
     }
     #[test]
     fn test_string_for_index() {
-        let holder = InMemoryInternerHolder::with_seed("foo bar baz", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("foo bar baz", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let vocab = interner.vocabulary();
         assert_eq!(interner.string_for_index(0), vocab[0]);
@@ -635,7 +639,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "Index out of bounds in Interner::string_for_index")]
     fn test_string_for_index_out_of_bounds_panics() {
-        let holder = InMemoryInternerHolder::with_seed("foo bar baz", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("foo bar baz", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         interner.string_for_index(3);
     }
@@ -646,7 +651,8 @@ mod container_tests {
     use super::*;
     #[test]
     fn test_insert_and_get() {
-        let holder = InMemoryInternerHolder::with_seed("a b", &mut crate::queue::MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("a b", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let latest_version = holder.latest_version();
         let interner = holder.get(latest_version).unwrap();
         assert_eq!(interner.version(), latest_version);
@@ -659,25 +665,28 @@ mod holder_tests {
     use crate::queue::MockQueue;
     #[test]
     fn test_holder_new_initializes_empty() {
-        let holder = InMemoryInternerHolder::with_seed("", &mut MockQueue::new());
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("", &mut MockQueue::new()).expect("add_text_with_seed should succeed");
         assert_eq!(holder.interners.len(), 1);
         assert_eq!(holder.latest_version(), 1);
     }
     #[test]
     fn test_holder_add_text_with_seed_increments_version() {
         let mut queue = MockQueue::new();
-        let mut holder = InMemoryInternerHolder::with_seed("", &mut queue);
-        holder.add_text_with_seed("foo bar", &mut queue);
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("", &mut queue).expect("add_text_with_seed should succeed");
+        holder.add_text_with_seed("foo bar", &mut queue).expect("add_text_with_seed should succeed");
         assert_eq!(holder.latest_version(), 2);
-        holder.add_text_with_seed("baz", &mut queue);
+        holder.add_text_with_seed("baz", &mut queue).expect("add_text_with_seed should succeed");
         assert_eq!(holder.latest_version(), 3);
     }
     #[test]
     fn test_holder_latest_version_returns_correct_value() {
         let mut queue = MockQueue::new();
-        let mut holder = InMemoryInternerHolder::with_seed("", &mut queue);
-        holder.add_text_with_seed("a b", &mut queue);
-        holder.add_text_with_seed("c", &mut queue);
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("", &mut queue).expect("add_text_with_seed should succeed");
+        holder.add_text_with_seed("a b", &mut queue).expect("add_text_with_seed should succeed");
+        holder.add_text_with_seed("c", &mut queue).expect("add_text_with_seed should succeed");
         assert_eq!(holder.latest_version(), 3);
     }
 }

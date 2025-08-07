@@ -1,6 +1,6 @@
 use fold::{Follower, PostgresOrthoDatabase};
 use fold::queue::Queue;
-use fold::interner::BlobInternerHolder;
+use fold::interner::{BlobInternerHolder, InternerHolderLike};
 use dotenv::dotenv;
 use opentelemetry::{KeyValue};
 use opentelemetry_sdk::{Resource, trace as sdktrace};
@@ -32,12 +32,14 @@ fn main() {
         .with(otel_layer)
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let mut workq = Queue::new("workq");
-    let mut holder = BlobInternerHolder::new_internal();
+    let mut workq = Queue::new("workq").expect("Failed to create workq");
+    let mut holder = BlobInternerHolder::new().expect("Failed to create BlobInternerHolder");
     let mut db = PostgresOrthoDatabase::new();
     let mut follower = Follower::new();
     loop {
-        follower.run_follower_once(&mut db, &mut workq, &mut holder);
+        if let Err(e) = follower.run_follower_once(&mut db, &mut workq, &mut holder) {
+            panic!("Follower error: {}", e);
+        }
     }
 }
 
