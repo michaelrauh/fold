@@ -40,14 +40,8 @@ fn main() {
         thread::sleep(Duration::from_secs(1));
     }
     loop {
-        match run_worker_once(&mut workq, &mut dbq, &mut holder) {
-            Ok(()) => {
-                // Success - continue processing
-            }
-            Err(e) => {
-                eprintln!("Worker error: {}", e);
-                // Continue processing - errors are expected during service outages
-            }
+        if let Err(e) = run_worker_once(&mut workq, &mut dbq, &mut holder) {
+            panic!("Worker error: {}", e);
         }
         // Optionally add sleep or exit condition if needed
     }

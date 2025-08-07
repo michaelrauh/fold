@@ -37,14 +37,8 @@ fn main() {
     let mut db = PostgresOrthoDatabase::new();
     let mut follower = Follower::new();
     loop {
-        match follower.run_follower_once(&mut db, &mut workq, &mut holder) {
-            Ok(()) => {
-                // Success - continue processing
-            }
-            Err(e) => {
-                eprintln!("Follower error: {}", e);
-                // Continue processing - errors are expected during service outages
-            }
+        if let Err(e) = follower.run_follower_once(&mut db, &mut workq, &mut holder) {
+            panic!("Follower error: {}", e);
         }
     }
 }

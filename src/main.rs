@@ -104,7 +104,9 @@ fn process_with_grace<Q: QueueLike, D: OrthoDatabaseLike, H: fold::interner::Int
             let remaining = grace_period_secs - elapsed;
             println!("[main] Grace period active ({}s remaining) before next feed.", remaining);
         }
-        if workq.len().unwrap_or(0) == 0 && dbq.len().unwrap_or(0) == 0 {
+        let workq_len = workq.len().expect("Failed to get workq length");
+        let dbq_len = dbq.len().expect("Failed to get dbq length");
+        if workq_len == 0 && dbq_len == 0 {
             break;
         }
     }
