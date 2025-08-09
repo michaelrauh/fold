@@ -10,4 +10,16 @@ make feed-s3 FILE=e.txt-part-56
 make db-count
 make queue-count
 make interner-versions
+sleep 10
+make feed-s3 FILE=e.txt-part-55
+make db-count
+make queue-count
+make scale REPLICAS=50
+sleep 10
+make db-count
+make queue-count
+make optimal
 make logs
+
+# todo make a flow that feeds periodically, ideally from a folder
+# todo check results by calling optimal periodically and ensuring all subphrases are in the source text.

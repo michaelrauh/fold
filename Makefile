@@ -1,3 +1,8 @@
+start:
+	${MAKE} reset
+	sleep 10
+	./feed.sh
+
 build:
 	docker build -t fold-services:latest -f Dockerfile .
 

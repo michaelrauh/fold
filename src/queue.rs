@@ -42,11 +42,6 @@ impl QueueProducer {
             connection,
         })
     }
-
-    pub fn is_broken(&mut self) -> bool {
-        // Deprecated: do not proactively check connection health
-        false
-    }
 }
 
 impl QueueLenLike for QueueProducer {
