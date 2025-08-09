@@ -149,8 +149,7 @@ impl QueueConsumerLike for QueueConsumer {
         let url = QueueConsumer::get_url();
         let mut connection = amiquip::Connection::insecure_open(&url)?;
         let channel = connection.open_channel(None)?;
-        // Set prefetch count to batch_size using Channel::qos
-        channel.qos(0, batch_size as u16, false)?;
+        channel.qos(0, batch_size as u16, false)?; // prefetch = batch_size
         let queue = channel.queue_declare(&self.name, QueueDeclareOptions {
             durable: true,
             ..QueueDeclareOptions::default()
@@ -159,55 +158,57 @@ impl QueueConsumerLike for QueueConsumer {
         let consumer = queue.consume(ConsumerOptions::default())?;
         let mut batch = Vec::with_capacity(batch_size);
         let mut deliveries = Vec::with_capacity(batch_size);
-        let mut last_flush = std::time::Instant::now();
-        let flush_interval = std::time::Duration::from_secs(1);
-        for msg in consumer.receiver().iter() {
-            if let ConsumerMessage::Delivery(delivery) = msg {
-                if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
-                    batch.push(ortho);
-                    deliveries.push(delivery);
-                    // Optional lightweight progress log
-                    if batch.len() % 250 == 0 || batch.len() == 1 { // first item & every 250 items
-                        println!("[queue][consumer] accumulating batch: size={} on {}", batch.len(), self.name);
-                    }
-                    if batch.len() >= batch_size {
-                        println!("[queue][consumer] flushing full batch size={} on {}", batch.len(), self.name);
-                        let result = callback(&batch);
-                        for delivery in deliveries.drain(..) {
-                            handle_delivery_result(&result, delivery, &channel)?;
+        use std::time::{Duration, Instant};
+        use crossbeam_channel::RecvTimeoutError;
+        let flush_interval = Duration::from_secs(1);
+        let mut last_flush = Instant::now();
+        loop {
+            // Try to receive with timeout to allow periodic flush
+            match consumer.receiver().recv_timeout(flush_interval) {
+                Ok(ConsumerMessage::Delivery(delivery)) => {
+                    if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
+                        batch.push(ortho);
+                        deliveries.push(delivery);
+                        if batch.len() % 250 == 0 || batch.len() == 1 {
+                            println!("[queue][consumer] accumulating batch: size={} on {}", batch.len(), self.name);
                         }
-                        batch.clear();
-                        last_flush = std::time::Instant::now();
+                        if batch.len() >= batch_size {
+                            println!("[queue][consumer] flushing full batch size={} on {}", batch.len(), self.name);
+                            let result = callback(&batch);
+                            for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
+                            batch.clear();
+                            last_flush = Instant::now();
+                        } else if !batch.is_empty() && last_flush.elapsed() >= flush_interval {
+                            println!("[queue][consumer] flushing timed partial batch size={} on {}", batch.len(), self.name);
+                            let result = callback(&batch);
+                            for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
+                            batch.clear();
+                            last_flush = Instant::now();
+                        }
+                    } else {
+                        // decoding failed; requeue
+                        handle_delivery_result(&Err(FoldError::Queue("decode failed".into())), delivery, &channel)?;
                     }
                 }
-            }
-            // Time-based flush: ensure progress even with constant inflow preventing empty-queue heuristic
-            if !batch.is_empty() && last_flush.elapsed() >= flush_interval {
-                println!("[queue][consumer] flushing timed partial batch size={} on {}", batch.len(), self.name);
-                let result = callback(&batch);
-                for delivery in deliveries.drain(..) {
-                    handle_delivery_result(&result, delivery, &channel)?;
+                Ok(_) => { // cancellation variants
+                    break;
                 }
-                batch.clear();
-                last_flush = std::time::Instant::now();
-            }
-            // Existing empty-queue flush heuristic
-            if batch.len() > 0 && batch.len() < batch_size && consumer.receiver().try_recv().is_err() {
-                println!("[queue][consumer] flushing partial batch size={} (queue idle) on {}", batch.len(), self.name);
-                let result = callback(&batch);
-                for delivery in deliveries.drain(..) {
-                    handle_delivery_result(&result, delivery, &channel)?;
+                Err(RecvTimeoutError::Timeout) => {
+                    if !batch.is_empty() {
+                        println!("[queue][consumer] flushing timed partial batch size={} on {}", batch.len(), self.name);
+                        let result = callback(&batch);
+                        for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
+                        batch.clear();
+                    }
+                    last_flush = Instant::now();
                 }
-                batch.clear();
-                last_flush = std::time::Instant::now();
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         if !batch.is_empty() {
             println!("[queue][consumer] final flush size={} on {}", batch.len(), self.name);
             let result = callback(&batch);
-            for delivery in deliveries.drain(..) {
-                handle_delivery_result(&result, delivery, &channel)?;
-            }
+            for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
         }
         consumer.cancel().ok();
         Ok(())

@@ -6,7 +6,7 @@ fn main() {
     let mut dbq = QueueConsumer::new("dbq");
     let mut workq = QueueProducer::new("workq").expect("Failed to create workq");
     let mut db = PostgresOrthoDatabase::new();
-    dbq.consume_one_at_a_time_forever( |ortho| {
-        OrthoFeeder::run_feeder_once(std::slice::from_ref(&ortho), &mut db, &mut workq)
+    dbq.consume_batch_forever(100, |batch| {
+        OrthoFeeder::run_feeder_once(batch, &mut db, &mut workq)
     }).expect("Failed to consume batch from dbq");
 }
