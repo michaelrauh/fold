@@ -1,7 +1,6 @@
 services:
   fold_worker:
     image: fold-services:latest
-    container_name: fold_worker
     build:
       context: .
       dockerfile: Dockerfile
@@ -12,35 +11,19 @@ services:
       - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
       - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
       - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
-      - FOLD_MODE=distributed
+      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin  
       - FOLD_INTERNER_BLOB_BUCKET=internerdata
     depends_on:
       - rabbitmq
       - postgres
       - minio
+    restart: unless-stopped
   follower:
     image: fold-services:latest
     container_name: follower
     working_dir: /app
-    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "/app/follower"]
-    environment:
-      - FOLD_MODE=distributed
-      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
-      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
-      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
-      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_BUCKET=internerdata
-    depends_on:
-      - rabbitmq
-  feeder:
-    image: fold-services:latest
-    container_name: feeder
-    working_dir: /app
-    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "/app/feeder"]
-    environment:
-      - FOLD_MODE=distributed
+    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "./wait-for-it.sh", "postgres:5432", "--timeout=30", "--", "./wait-for-it.sh", "minio:9000", "--timeout=30", "--", "/app/follower"]
+    environment:  
       - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
       - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
       - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
@@ -51,6 +34,24 @@ services:
       - rabbitmq
       - postgres
       - minio
+    restart: unless-stopped
+  feeder:
+    image: fold-services:latest
+    container_name: feeder
+    working_dir: /app
+    command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "./wait-for-it.sh", "postgres:5432", "--timeout=30", "--", "./wait-for-it.sh", "minio:9000", "--timeout=30", "--", "/app/feeder"]
+    environment:  
+      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
+      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
+      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
+      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
+      - FOLD_INTERNER_BLOB_BUCKET=internerdata
+    depends_on:
+      - rabbitmq
+      - postgres
+      - minio
+    restart: unless-stopped
   ingestor:
     image: fold-services:latest
     container_name: ingestor
@@ -60,8 +61,7 @@ services:
       - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
       - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
       - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin
-      - FOLD_MODE=distributed
+      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin  
       - FOLD_INTERNER_BLOB_BUCKET=internerdata
     depends_on:
       - rabbitmq
@@ -69,12 +69,14 @@ services:
       - minio
     profiles:
       - manual
+    restart: unless-stopped
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
     ports:
       - "5672:5672"
       - "15672:15672"
+    restart: unless-stopped
   postgres:
     image: postgres:15
     container_name: postgres
@@ -86,6 +88,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
   minio:
     image: minio/minio
     container_name: minio
@@ -98,6 +101,7 @@ services:
       - "9001:9001"
     volumes:
       - miniostorage:/data
+    restart: unless-stopped
   jaeger:
     image: jaegertracing/all-in-one:latest
     container_name: jaeger
@@ -109,6 +113,7 @@ services:
       - "4318:4318"
       - "6831:6831/udp"
       - "14268:14268"
+    restart: unless-stopped
 volumes:
   pgdata:
   internerdata:

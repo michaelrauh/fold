@@ -156,6 +156,25 @@ impl Interner {
                 prefix_to_completions.insert(prefix, fbs);
             }
         }
+        // NEW: Ensure every full phrase itself is represented as a (terminal) prefix
+        // with an empty completion set so lookups do not panic when a phrase has no extension.
+        for phrase in phrases {
+            if phrase.is_empty() { continue; }
+            let indices: Vec<usize> = phrase
+                .iter()
+                .map(|word| {
+                    vocabulary
+                        .iter()
+                        .position(|v| v == word)
+                        .expect("Word should be in vocabulary")
+                })
+                .collect();
+            if !prefix_to_completions.contains_key(&indices) {
+                let mut fbs = FixedBitSet::with_capacity(vocab_len);
+                fbs.grow(vocab_len); // remains empty
+                prefix_to_completions.insert(indices, fbs);
+            }
+        }
         prefix_to_completions
     }
 
@@ -230,7 +249,7 @@ pub trait InternerHolderLike {
     fn get_latest(&self) -> Option<Interner>;
     fn versions(&self) -> Vec<usize>;
     fn delete(&mut self, version: usize);
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError>;
+    fn add_text_with_seed<Q: crate::queue::QueueProducerLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError>;
     fn new() -> Result<Self, FoldError> where Self: Sized;
 }
 
@@ -260,7 +279,7 @@ impl InternerHolderLike for InMemoryInternerHolder {
     fn delete(&mut self, version: usize) {
         self.interners.remove(&version);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
+    fn add_text_with_seed<Q: crate::queue::QueueProducerLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
         let interner = if let Some(latest) = self.get_latest() {
             latest.add_text(text)
         } else {
@@ -339,7 +358,7 @@ impl InternerHolderLike for FileInternerHolder {
         let path = self.file_path(version);
         let _ = fs::remove_file(path);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
+    fn add_text_with_seed<Q: crate::queue::QueueProducerLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
         let interner = if let Some(latest) = self.get_latest() {
             // Add text to existing latest
             latest.add_text(text)
@@ -356,8 +375,7 @@ impl InternerHolderLike for FileInternerHolder {
     }
     
     fn new() -> Result<Self, FoldError> {
-        let dir = std::env::var("INTERNER_FILE_LOCATION")
-            .map_err(|_| FoldError::Other("INTERNER_FILE_LOCATION not set in environment. Please set it in your .env file.".into()))?;
+        let dir = std::env::var("INTERNER_FILE_LOCATION").unwrap();
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir).map_err(|e| FoldError::Io(e))?;
         Ok(Self { dir })
@@ -372,12 +390,13 @@ pub struct BlobInternerHolder {
 
 impl BlobInternerHolder {
     fn new_internal() -> Result<Self, FoldError> {
-        let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap_or_else(|_| "internerdata".to_string());
-        let endpoint_url = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".to_string());
-        let access_key = std::env::var("FOLD_INTERNER_BLOB_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
-        let secret_key = std::env::var("FOLD_INTERNER_BLOB_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string());
+        let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap();
+        let endpoint_url = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap();
+        let access_key = std::env::var("FOLD_INTERNER_BLOB_ACCESS_KEY").unwrap();
+        let secret_key = std::env::var("FOLD_INTERNER_BLOB_SECRET_KEY").unwrap();
         let region = "us-east-1";
-
+        // Redact secrets in logs
+        println!("[interner] init: bucket='{}' endpoint='{}' access_key='{}'", bucket, endpoint_url, access_key);
         let rt = std::sync::Arc::new(tokio::runtime::Runtime::new()
             .map_err(|e| FoldError::Other(format!("Failed to create Tokio runtime: {}", e)))?);
         let config = rt.block_on(async {
@@ -398,13 +417,17 @@ impl BlobInternerHolder {
             .force_path_style(true)
             .build();
         let client = Client::from_conf(s3_config);
-        // Create the bucket if it does not exist
+        // Create bucket if missing; ignore already-exists style errors
         let bucket_clone = bucket.clone();
         rt.block_on(async {
             let head_result = client.head_bucket().bucket(&bucket_clone).send().await;
             if head_result.is_err() {
-                client.create_bucket().bucket(&bucket_clone).send().await
-                    .map_err(|e| FoldError::Other(format!("Failed to create S3 bucket: {}", e)))?;
+                if let Err(e) = client.create_bucket().bucket(&bucket_clone).send().await {
+                    let msg = e.to_string();
+                    if !(msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists")) {
+                        return Err(FoldError::Other(format!("Failed to ensure S3 bucket exists: {}", e)));
+                    }
+                }
             }
             Ok::<(), FoldError>(())
         })?;
@@ -455,10 +478,13 @@ impl BlobInternerHolder {
         self.rt.block_on(async move {
             match client.list_objects_v2().bucket(&bucket).send().await {
                 Ok(resp) => {
-                    let keys: Vec<String> = resp.contents().iter().filter_map(|obj| obj.key().map(|k| k.to_string())).collect();
+                    let raw = resp.contents();
+                    // println!("[interner] raw keys: {:?}", raw);
+                    let keys: Vec<String> = raw.iter().filter_map(|obj| obj.key().map(|k| k.to_string())).collect();
                     Ok(keys)
                 },
                 Err(e) => {
+                    // println!("[interner] Error listing S3 objects: {}", e);
                     Err(FoldError::Other(format!("S3 list operation failed: {}", e)))
                 },
             }
@@ -492,13 +518,16 @@ impl InternerHolderLike for BlobInternerHolder {
         self.get(v)
     }
     fn versions(&self) -> Vec<usize> {
-        self.list_blocking().unwrap_or_default().iter().filter_map(|key| key.parse::<usize>().ok()).collect()
+        let list = self.list_blocking().unwrap();
+        // println!("[interner] S3 versions: {:?}", list);
+        // println!("[interner] S3 versions (parsed): {:?}", list.iter().filter_map(|key| key.parse::<usize>().ok()).collect::<Vec<_>>());
+        list.iter().filter_map(|key| key.parse::<usize>().ok()).collect()
     }
     fn delete(&mut self, version: usize) {
         let key = version.to_string();
         let _ = self.delete_blocking(&key);
     }
-    fn add_text_with_seed<Q: crate::queue::QueueLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
+    fn add_text_with_seed<Q: crate::queue::QueueProducerLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
         let interner = if self.get_latest().is_none() {
             // Holder is empty, create new with seed
             Interner::from_text(text)
@@ -522,6 +551,10 @@ impl InternerHolderLike for BlobInternerHolder {
     }
 }
 
+pub fn queue_push_many<Q: crate::queue::QueueProducerLike>(q: &mut Q, items: Vec<crate::ortho::Ortho>) {
+    q.push_many(items).expect("queue connection failed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,7 +567,8 @@ mod tests {
         let interner = holder.get(holder.latest_version()).unwrap();
         assert_eq!(interner.version(), 1);
         assert_eq!(interner.vocabulary.len(), 2);
-        assert_eq!(interner.prefix_to_completions.len(), 2);
+        // now includes terminal phrase prefix [0,1]
+        assert_eq!(interner.prefix_to_completions.len(), 3);
     }
     #[test]
     fn test_add_increments_version() {
@@ -557,8 +591,7 @@ mod tests {
     #[test]
     fn test_add_builds_prefix_mapping() {
         let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
-        let mut queue = crate::queue::MockQueue::new();
-        holder.add_text_with_seed("a b c", &mut queue).expect("add_text_with_seed should succeed");
+        holder.add_text_with_seed("a b c", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         let vocab_len = interner.vocabulary.len();
         // prefix [0] should map to {1}
@@ -643,6 +676,15 @@ mod tests {
         holder.add_text_with_seed("foo bar baz", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
         let interner = holder.get(holder.latest_version()).unwrap();
         interner.string_for_index(3);
+    }
+    #[test]
+    fn test_terminal_phrase_inserted_empty() {
+        let mut holder = InMemoryInternerHolder::new().expect("new should succeed");
+        holder.add_text_with_seed("a b", &mut crate::queue::MockQueue::new()).expect("add_text_with_seed should succeed");
+        let interner = holder.get(holder.latest_version()).unwrap();
+        // vocabulary: ["a", "b"], phrase: [a,b]
+        let terminal = interner.prefix_to_completions.get(&vec![0,1]).expect("terminal phrase prefix missing");
+        assert_eq!(terminal.count_ones(..), 0, "terminal phrase should have empty completion set");
     }
 }
 

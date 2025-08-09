@@ -2,8 +2,7 @@ build:
 	docker build -t fold-services:latest -f Dockerfile .
 
 up: build
-	RUST_LOG=info,fold=trace,aws_sdk_s3=warn,aws_smithy_runtime=warn,hyper=warn,opentelemetry=warn docker-compose up --build -d
-	docker-compose logs -f ingestor fold_worker feeder follower | grep -E '\[main|\[worker|\[follower|\[feeder|\[queue|\[ortho|\[interner' || true
+	docker-compose up --build -d
 
 down:
 	docker-compose down -v
@@ -11,9 +10,6 @@ down:
 reset:
 	$(MAKE) down
 	$(MAKE) up
-
-local:
-	RUST_LOG=info,fold=trace cargo run --release --bin fold
 
 test:
 	cargo test
@@ -42,8 +38,7 @@ optimal:
 	docker compose run --rm ingestor /app/ingestor print-optimal
 
 logs:
-	# Usage: make logs SERVICE=fold
-	docker compose logs -f $(SERVICE)
+	docker-compose logs -f 
 
 services:
 	docker compose config --services
@@ -69,3 +64,12 @@ feed-s3:
 
 help-ingestor:
 	docker compose run --rm ingestor /app/ingestor --help
+
+interner-versions:
+	docker compose run --rm ingestor /app/ingestor interner-versions
+
+make scale:
+	docker compose up --scale fold_worker=$(REPLICAS) -d
+
+make stats:
+	docker stats

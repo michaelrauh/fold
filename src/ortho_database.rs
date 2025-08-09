@@ -217,9 +217,9 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
     }
     #[instrument(skip_all)]
     fn sample_version(&mut self, _version: usize) -> Result<Option<Ortho>, FoldError> {
-        // Return the first Ortho with the given version, or None
+        // Return a random Ortho with the given version, or None
         let version = _version as i64;
-        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 LIMIT 1", &[&version])?;
+        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 ORDER BY RANDOM() LIMIT 1", &[&version])?;
         Ok(row.and_then(|r| {
             let data: Vec<u8> = r.get(0);
             decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
