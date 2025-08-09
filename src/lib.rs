@@ -179,21 +179,12 @@ impl OrthoFeeder {
 }
 
 #[instrument(skip_all)]
-pub fn process_worker_item<P: crate::queue::QueueProducerLike, H: crate::interner::InternerHolderLike>(
+pub fn process_worker_item_with_cached<P: crate::queue::QueueProducerLike>(
     ortho: &crate::ortho::Ortho,
     dbq: &mut P,
-    container: &mut H,
+    interner: &crate::interner::Interner,
 ) -> Result<(), FoldError> {
     println!("[worker] Popped ortho from workq: id={}, version={}", ortho.id(), ortho.version());
-    let mut interner = container.get_latest().ok_or_else(|| {
-        FoldError::Interner("No interner found".to_string())
-    })?;
-    if ortho.version() > interner.version() {
-        println!("[worker] Updating interner from version {} to {} (ortho version {})", interner.version(), container.latest_version(), ortho.version());
-        interner = container.get_latest().ok_or_else(|| {
-            FoldError::Interner("No interner found after update".to_string())
-        })?;
-    }
     let (forbidden, required) = ortho.get_requirements();
     let completions = interner.intersect(&required, &forbidden);
     let version = interner.version();
@@ -203,23 +194,5 @@ pub fn process_worker_item<P: crate::queue::QueueProducerLike, H: crate::interne
         new_orthos.append(&mut batch);
     }
     dbq.push_many(new_orthos)?;
-    Ok(())
-}
-
-#[instrument(skip_all)]
-pub fn run_worker_once<C: crate::queue::QueueConsumerLike, P: crate::queue::QueueProducerLike, H: crate::interner::InternerHolderLike>(
-    workq: &mut C,
-    dbq: &mut P,
-    container: &mut H,
-) -> Result<(), FoldError> {
-    println!("[worker] run_worker_once: workq.len()={:?}, dbq.len()={:?}", workq.len(), dbq.len());
-    let mut processed = false;
-    workq.consume_one_at_a_time_forever(|ortho| {
-        processed = true;
-        process_worker_item(ortho, dbq, container)
-    })?;
-    if !processed {
-        return Ok(());
-    }
     Ok(())
 }
