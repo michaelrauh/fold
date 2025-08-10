@@ -18,6 +18,9 @@ use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use opentelemetry::trace::TracerProvider;
 use tracing_subscriber::EnvFilter;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+use lru::LruCache;
 
 pub fn init_tracing(service_name: &str) {
     let mut builder = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -104,10 +107,10 @@ impl Follower {
         };
         
         let (_forbidden, prefixes) = ortho.get_requirements();
-        let all_same = prefixes.iter().all(|prefix| {
-                    self.low_interner.as_ref().and_then(|interner| interner.completions_for_prefix(prefix))
-                        == self.high_interner.as_ref().and_then(|interner| interner.completions_for_prefix(prefix))
-                });
+        let all_same = match (self.low_interner.as_ref(), self.high_interner.as_ref()) {
+            (Some(low), Some(high)) => low.all_completions_equal_up_to_vocab(high, &prefixes),
+            _ => false,
+        };
         if all_same {
             let new_ortho = ortho.set_version(high_version);
             db.insert_or_update(new_ortho).expect("queue connection failed");
@@ -145,10 +148,10 @@ impl Follower {
             self.high_version = Some(high_version);
         }
         let (_forbidden, prefixes) = ortho.get_requirements();
-        let all_same = prefixes.iter().all(|prefix| {
-            self.low_interner.as_ref().and_then(|interner| interner.completions_for_prefix(prefix))
-                == self.high_interner.as_ref().and_then(|interner| interner.completions_for_prefix(prefix))
-        });
+        let all_same = match (self.low_interner.as_ref(), self.high_interner.as_ref()) {
+            (Some(low), Some(high)) => low.all_completions_equal_up_to_vocab(high, &prefixes),
+            _ => false,
+        };
         if all_same {
             let new_ortho = ortho.set_version(high_version);
             db.insert_or_update(new_ortho).expect("queue connection failed");
@@ -171,9 +174,41 @@ impl OrthoFeeder {
         workq: &mut P,
     ) -> Result<(usize, usize), FoldError> { // (new, total)
         if batch.is_empty() { return Ok((0,0)); }
+        static FEEDER_LRU: Lazy<Mutex<LruCache<usize, ()>>> = Lazy::new(|| {
+            // Capacity chosen to balance memory (~16MB for 1M usize entries) vs hit rate; adjust via FOLD_FEEDER_LRU_CAP
+            let cap = std::env::var("FOLD_FEEDER_LRU_CAP").ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .and_then(|c| std::num::NonZeroUsize::new(c))
+                .unwrap_or_else(|| std::num::NonZeroUsize::new(1_000_000).unwrap());
+            Mutex::new(LruCache::new(cap))
+        });
         let total = batch.len();
-        let items: Vec<_> = batch.iter().cloned().collect();
-        let new_orthos = db.upsert(items)?; // only freshly inserted
+        let mut cache_hits = 0usize;
+        let mut candidates = Vec::with_capacity(total);
+        {
+            let mut lru = FEEDER_LRU.lock().unwrap();
+            for o in batch.iter() {
+                let id = o.id();
+                if lru.contains(&id) {
+                    cache_hits += 1;
+                    continue;
+                }
+                // Insert before DB attempt so concurrent duplicates in same batch won't duplicate
+                lru.put(id, ());
+                candidates.push(o.clone());
+            }
+        }
+        let skipped = cache_hits;
+        if skipped > 0 {
+            let pct_skipped = skipped as f64 / total as f64;
+            println!("[feeder][cache] batch_total={} cache_hits={} attempted_db={} pct_skipped={:.4}", total, skipped, candidates.len(), pct_skipped);
+        } else {
+            println!("[feeder][cache] batch_total={} cache_hits=0 attempted_db={} pct_skipped=0.0000", total, candidates.len());
+        }
+        if candidates.is_empty() {
+            return Ok((0, total));
+        }
+        let new_orthos = db.upsert(candidates)?; // only freshly inserted
         let new_count = new_orthos.len();
         workq.push_many(new_orthos)?;
         Ok((new_count, total))

@@ -98,6 +98,14 @@ feeder-stats-once:
 	# Show last 200 feeder stats lines
 	docker compose logs --tail=200 feeder 2>&1 | grep -F '[feeder][stats]'
 
+feeder-cache:
+	# Follow feeder container logs and show only cache lines
+	docker compose logs -f feeder 2>&1 | grep -F '[feeder][cache]'
+
+feeder-cache-once:
+	# Show last 200 feeder cache lines
+	docker compose logs --tail=200 feeder 2>&1 | grep -F '[feeder][cache]'
+
 follower-stats:
 	# Follow follower container logs and show only stats lines
 	docker compose logs -f follower 2>&1 | grep -F '[follower][stats]'

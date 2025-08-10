@@ -241,6 +241,47 @@ impl Interner {
         intersection.intersect_with(&forbidden_bits);
         intersection.ones().collect()
     }
+
+    pub fn differing_completions_indices_up_to_vocab(&self, other: &Interner, prefix: &Vec<usize>) -> Vec<usize> {
+        // Compare completion sets for a prefix restricted to the lower (self) vocabulary size.
+        // Return sorted indices (< self.vocabulary.len()) whose membership differs.
+        let low_vocab_len = self.vocabulary.len();
+        let word_bits = usize::BITS as usize;
+        let words_needed = (low_vocab_len + word_bits - 1) / word_bits;
+        let low_opt = self.prefix_to_completions.get(prefix);
+        let high_opt = other.prefix_to_completions.get(prefix);
+        // Fast path: both absent => no differences.
+        if low_opt.is_none() && high_opt.is_none() { return Vec::new(); }
+        // Represent missing bitset as zeroed slice.
+        let zero_words: Vec<usize> = vec![0; words_needed];
+        let low_slice: &[usize] = match low_opt { Some(bs) => bs.as_slice(), None => &zero_words }; // may be longer than needed
+        let high_slice: &[usize] = match high_opt { Some(bs) => bs.as_slice(), None => &zero_words };
+        let mut diffs = Vec::new();
+        for w in 0..words_needed {
+            let lw = *low_slice.get(w).unwrap_or(&0);
+            let hw = *high_slice.get(w).unwrap_or(&0);
+            let mut xor = lw ^ hw;
+            // Mask off bits beyond vocab_len in final word
+            if w == words_needed - 1 {
+                let rem = low_vocab_len % word_bits;
+                if rem != 0 { let mask = (1usize << rem) - 1; xor &= mask; }
+            }
+            while xor != 0 {
+                let tz = xor.trailing_zeros() as usize;
+                diffs.push(w * word_bits + tz);
+                xor &= xor - 1; // clear lowest set bit
+            }
+        }
+        diffs
+    }
+
+    pub fn completions_equal_up_to_vocab(&self, other: &Interner, prefix: &Vec<usize>) -> bool {
+        self.differing_completions_indices_up_to_vocab(other, prefix).is_empty()
+    }
+
+    pub fn all_completions_equal_up_to_vocab(&self, other: &Interner, prefixes: &[Vec<usize>]) -> bool {
+        prefixes.iter().all(|p| self.completions_equal_up_to_vocab(other, p))
+    }
 }
 
 pub trait InternerHolderLike {
@@ -833,5 +874,41 @@ mod intersect_logic_tests {
         let result = interner.intersect(&required, &forbidden);
         // Only index 3 should be present
         assert_eq!(result, vec![3]); // This will fail with the current code
+    }
+}
+
+#[cfg(test)]
+mod version_compare_tests {
+    use super::*;
+
+    #[test]
+    fn test_completions_equal_with_vocab_growth_tail_only() {
+        let low = Interner::from_text("a b c");
+        let high = low.add_text("x y"); // adds new vocab only
+        let prefixes = vec![vec![0], vec![1], vec![0,1]];
+        assert!(low.all_completions_equal_up_to_vocab(&high, &prefixes));
+        for p in prefixes { assert!(low.differing_completions_indices_up_to_vocab(&high, &p).is_empty()); }
+    }
+
+    #[test]
+    fn test_completions_difference_in_old_vocab_detected() {
+        let low = Interner::from_text("a b c");
+        let high = low.add_text("a c b"); // introduces prefix [a,c] -> b (all old vocab indices)
+        let diff_prefix = vec![0,2];
+        let diffs = low.differing_completions_indices_up_to_vocab(&high, &diff_prefix);
+        assert_eq!(diffs, vec![1], "Expected differing completion index 1 (word 'b')");
+        assert!(!low.completions_equal_up_to_vocab(&high, &diff_prefix));
+    }
+
+    #[test]
+    fn test_added_completion_on_existing_indices_detected() {
+        // low has phrase a b (prefix a -> b)
+        let low = Interner::from_text("a b");
+        // Add a phrase a a so prefix a now also completes to a (index 0) in addition to existing b (index 1)
+        let high = low.add_text("a a");
+        let prefix_a = vec![0];
+        let diffs = low.differing_completions_indices_up_to_vocab(&high, &prefix_a);
+        assert!(diffs.contains(&0), "Should detect newly added completion index 0");
+        assert!(!low.completions_equal_up_to_vocab(&high, &prefix_a));
     }
 }

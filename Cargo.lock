@@ -1273,6 +1273,8 @@ dependencies = [
  "dotenv",
  "fixedbitset",
  "itertools 0.12.1",
+ "lru",
+ "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
