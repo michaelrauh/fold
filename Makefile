@@ -73,6 +73,9 @@ help-ingestor:
 interner-versions:
 	docker compose run --rm ingestor /app/ingestor interner-versions
 
+version-counts:
+	docker compose run --rm ingestor /app/ingestor version-counts
+
 scale-worker:
 	docker compose up --scale fold_worker=$(REPLICAS) -d
 
@@ -86,3 +89,19 @@ scale-status:
 	@echo "fold_worker: $$(docker ps --filter 'name=fold_worker' --format '{{.Names}}' | wc -l)"
 	@echo "feeder: $$(docker ps --filter 'name=feeder' --format '{{.Names}}' | wc -l)"
 	@echo "follower: $$(docker ps --filter 'name=follower' --format '{{.Names}}' | wc -l)"
+
+feeder-stats:
+	# Follow feeder container logs and show only stats lines
+	docker compose logs -f feeder 2>&1 | grep -F '[feeder][stats]'
+
+feeder-stats-once:
+	# Show last 200 feeder stats lines
+	docker compose logs --tail=200 feeder 2>&1 | grep -F '[feeder][stats]'
+
+follower-stats:
+	# Follow follower container logs and show only stats lines
+	docker compose logs -f follower 2>&1 | grep -F '[follower][stats]'
+
+follower-stats-once:
+	# Show last 200 follower stats lines
+	docker compose logs --tail=200 follower 2>&1 | grep -F '[follower][stats]'

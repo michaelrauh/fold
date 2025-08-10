@@ -17,6 +17,7 @@ pub trait OrthoDatabaseLike {
     fn remove_by_id(&mut self, id: &usize) -> Result<(), FoldError>;
     fn len(&mut self) -> Result<usize, FoldError>;
     fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError>;
+    fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError>; // (version, count)
 }
 
 pub struct InMemoryOrthoDatabase {
@@ -77,6 +78,14 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
     }
     fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError> {
         Ok(self.map.values().find(|o| o.version() == version).cloned())
+    }
+    fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError> {
+        use std::collections::HashMap as StdHashMap;
+        let mut counts: StdHashMap<usize, usize> = StdHashMap::new();
+        for o in self.map.values() { *counts.entry(o.version()).or_insert(0) += 1; }
+        let mut v: Vec<(usize, usize)> = counts.into_iter().collect();
+        v.sort_by_key(|(ver, _)| *ver);
+        Ok(v)
     }
 }
 
@@ -295,6 +304,13 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
             if let Ok((o, _)) = decode_from_slice::<Ortho, _>(&data, standard()) { return Ok(Some(o)); }
         }
         Ok(None)
+    }
+    #[instrument(skip_all)]
+    fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError> {
+        let rows = self.client.query("SELECT version, COUNT(*) FROM orthos GROUP BY version ORDER BY version", &[])?;
+        Ok(rows.into_iter().map(|r| {
+            let v: i64 = r.get(0); let c: i64 = r.get(1); (v as usize, c as usize)
+        }).collect())
     }
 }
 

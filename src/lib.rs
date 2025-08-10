@@ -72,11 +72,11 @@ impl Follower {
         db: &mut D,
         workq: &mut P,
         holder: &mut H,
-    ) -> Result<(), FoldError> {
-        let versions = holder.versions(); // todo move this up into caller to avoid repeated calls
+    ) -> Result<(usize, usize), FoldError> { // (bumped, requeued)
+        let versions = holder.versions();
         if versions.len() < 2 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            return Ok(());
+            return Ok((0, 0));
         }
 
         let low_version = versions[0];
@@ -99,7 +99,7 @@ impl Follower {
                 holder.delete(low_version);
                 self.low_interner = None;
                 self.low_version = None;
-                return Ok(());
+                return Ok((0, 0));
             }
         };
         
@@ -111,13 +111,14 @@ impl Follower {
         if all_same {
             let new_ortho = ortho.set_version(high_version);
             db.insert_or_update(new_ortho).expect("queue connection failed");
+            Ok((1, 0))
         } else {
             let new_ortho = ortho.set_version(high_version);
             println!("[follower] Pushing ortho to workq: id={}, version={}", new_ortho.id(), new_ortho.version());
             workq.push_many(vec![new_ortho.clone()]).expect("queue connection failed");
             db.remove_by_id(&ortho.id())?;
+            Ok((0, 1))
         }
-        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -168,13 +169,14 @@ impl OrthoFeeder {
         batch: &[crate::ortho::Ortho],
         db: &mut D,
         workq: &mut P,
-    ) -> Result<(), FoldError> {
-        if batch.is_empty() {
-            return Ok(());
-        }
+    ) -> Result<(usize, usize), FoldError> { // (new, total)
+        if batch.is_empty() { return Ok((0,0)); }
+        let total = batch.len();
         let items: Vec<_> = batch.iter().cloned().collect();
-        db.upsert(items)
-            .and_then(|new_orthos| workq.push_many(new_orthos))
+        let new_orthos = db.upsert(items)?; // only freshly inserted
+        let new_count = new_orthos.len();
+        workq.push_many(new_orthos)?;
+        Ok((new_count, total))
     }
 }
 
