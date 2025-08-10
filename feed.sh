@@ -29,4 +29,3 @@ make logs
 # todo dedup in the follower and measure effectiveness
 # todo add more benchmarks 
 # todo k8s 
-# todo cache holder in caller to follower to avoid repeated calls
