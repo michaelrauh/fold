@@ -82,10 +82,12 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
 
 pub struct PostgresOrthoDatabase {
     pub client: Client,
+    follower_id: String,
 }
 
 impl PostgresOrthoDatabase {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::new_with_follower_id("default".to_string()) }
+    pub fn new_with_follower_id(follower_id: String) -> Self {
         let conn_str = env::var("FOLD_PG_URL").expect("FOLD_PG_URL environment variable must be set for PostgresOrthoDatabase");
         let mut client = Client::connect(&conn_str, NoTls).expect("Failed to connect to Postgres");
         client.batch_execute("
@@ -93,10 +95,24 @@ impl PostgresOrthoDatabase {
                 id BIGINT PRIMARY KEY,
                 version BIGINT NOT NULL,
                 dims BYTEA NOT NULL,
-                data BYTEA NOT NULL
+                data BYTEA NOT NULL,
+                claimed_at TIMESTAMPTZ,
+                claimed_by TEXT
             );
+            ALTER TABLE orthos ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+            ALTER TABLE orthos ADD COLUMN IF NOT EXISTS claimed_by TEXT;
         ").unwrap();
-        Self { client }
+        let _ = client.batch_execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_orthos_ready ON orthos (version, id) WHERE claimed_at IS NULL;");
+        Self { client, follower_id }
+    }
+
+    #[instrument(skip_all)]
+    pub fn reap_stale_claims(&mut self) {
+        // 45s timeout window
+        let _ = self.client.execute(
+            "UPDATE orthos SET claimed_at = NULL, claimed_by = NULL WHERE claimed_at < now() - interval '45 seconds'",
+            &[]
+        );
     }
 }
 
@@ -197,8 +213,8 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
         let dims = encode_to_vec(&ortho.dims(), standard())?;
         let data = encode_to_vec(&ortho, standard())?;
         self.client.execute(
-            "INSERT INTO orthos (id, version, dims, data) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version",
+            "INSERT INTO orthos (id, version, dims, data, claimed_at, claimed_by) VALUES ($1, $2, $3, $4, NULL, NULL)
+             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, dims = EXCLUDED.dims, data = EXCLUDED.data, claimed_at = NULL, claimed_by = NULL",
             &[&id, &version, &dims, &data],
         )?;
         Ok(())
@@ -217,13 +233,68 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
     }
     #[instrument(skip_all)]
     fn sample_version(&mut self, _version: usize) -> Result<Option<Ortho>, FoldError> {
-        // Return a random Ortho with the given version, or None
         let version = _version as i64;
-        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 ORDER BY RANDOM() LIMIT 1", &[&version])?;
-        Ok(row.and_then(|r| {
-            let data: Vec<u8> = r.get(0);
-            decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-        }))
+        let follower_id = &self.follower_id;
+
+        let q = r#"
+            WITH bounds AS (
+              SELECT min(id) AS lo, max(id) AS hi
+              FROM orthos
+              WHERE version = $1 AND claimed_at IS NULL
+            ), pick AS (
+              SELECT CASE WHEN (bounds.lo IS NULL OR bounds.hi IS NULL) THEN NULL
+                          ELSE floor(random() * (bounds.hi - bounds.lo + 1))::bigint + bounds.lo END AS start_id
+              FROM bounds
+            )
+            , c AS (
+              SELECT id
+              FROM orthos, pick
+              WHERE version = $1 AND claimed_at IS NULL AND pick.start_id IS NOT NULL AND id >= pick.start_id
+              ORDER BY id
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+            )
+            UPDATE orthos o
+            SET claimed_at = now(), claimed_by = $2
+            FROM c
+            WHERE o.id = c.id
+            RETURNING o.data;
+        "#;
+
+        let wrap = r#"
+            WITH bounds AS (
+              SELECT min(id) AS lo, max(id) AS hi
+              FROM orthos
+              WHERE version = $1 AND claimed_at IS NULL
+            ), pick AS (
+              SELECT CASE WHEN (bounds.lo IS NULL OR bounds.hi IS NULL) THEN NULL
+                          ELSE floor(random() * (bounds.hi - bounds.lo + 1))::bigint + bounds.lo END AS start_id
+              FROM bounds
+            )
+            , c AS (
+              SELECT id
+              FROM orthos, pick
+              WHERE version = $1 AND claimed_at IS NULL AND pick.start_id IS NOT NULL AND id < pick.start_id
+              ORDER BY id
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+            )
+            UPDATE orthos o
+            SET claimed_at = now(), claimed_by = $2
+            FROM c
+            WHERE o.id = c.id
+            RETURNING o.data;
+        "#;
+
+        let mut row_opt = self.client.query_opt(q, &[&version, &follower_id])?;
+        if row_opt.is_none() {
+            row_opt = self.client.query_opt(wrap, &[&version, &follower_id])?;
+        }
+        if let Some(row) = row_opt {
+            let data: Vec<u8> = row.get(0);
+            if let Ok((o, _)) = decode_from_slice::<Ortho, _>(&data, standard()) { return Ok(Some(o)); }
+        }
+        Ok(None)
     }
 }
 

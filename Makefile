@@ -73,8 +73,16 @@ help-ingestor:
 interner-versions:
 	docker compose run --rm ingestor /app/ingestor interner-versions
 
-make scale:
+scale-worker:
 	docker compose up --scale fold_worker=$(REPLICAS) -d
 
-make stats:
+scale-feeder:
+	docker compose up --scale feeder=$(REPLICAS) -d
+
+stats:
 	docker stats
+
+scale-status:
+	@echo "fold_worker: $$(docker ps --filter 'name=fold_worker' --format '{{.Names}}' | wc -l)"
+	@echo "feeder: $$(docker ps --filter 'name=feeder' --format '{{.Names}}' | wc -l)"
+	@echo "follower: $$(docker ps --filter 'name=follower' --format '{{.Names}}' | wc -l)"

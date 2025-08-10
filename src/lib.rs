@@ -73,7 +73,7 @@ impl Follower {
         workq: &mut P,
         holder: &mut H,
     ) -> Result<(), FoldError> {
-        let versions = holder.versions();
+        let versions = holder.versions(); // todo move this up into caller to avoid repeated calls
         if versions.len() < 2 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             return Ok(());

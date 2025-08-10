@@ -24,12 +24,12 @@ impl Ortho {
         if self.get_current_position() == 0 {
             let mut hasher = DefaultHasher::new();
             self.version.hash(&mut hasher);
-            hasher.finish() as usize
+            (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
         } else {
             let mut hasher = DefaultHasher::new();
             self.dims.hash(&mut hasher);
             self.payload.hash(&mut hasher);
-            hasher.finish() as usize
+            (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
         }
     }
 
