@@ -92,6 +92,7 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
 pub struct PostgresOrthoDatabase {
     pub client: Client,
     follower_id: String,
+    upsert_prepared: bool,
 }
 
 impl PostgresOrthoDatabase {
@@ -112,7 +113,13 @@ impl PostgresOrthoDatabase {
             ALTER TABLE orthos ADD COLUMN IF NOT EXISTS claimed_by TEXT;
         ").unwrap();
         let _ = client.batch_execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_orthos_ready ON orthos (version, id) WHERE claimed_at IS NULL;");
-        Self { client, follower_id }
+        Self { client, follower_id, upsert_prepared: false }
+    }
+
+    fn ensure_upsert_prepared(&mut self) {
+        if self.upsert_prepared { return; }
+        let _ = self.client.prepare("INSERT INTO orthos (id, version, dims, data) SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::bytea[], $4::bytea[]) ON CONFLICT (id) DO NOTHING RETURNING data");
+        self.upsert_prepared = true;
     }
 
     #[instrument(skip_all)]
@@ -128,33 +135,27 @@ impl PostgresOrthoDatabase {
 impl OrthoDatabaseLike for PostgresOrthoDatabase {
     #[instrument(skip_all)]
     fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, FoldError> {
-        if orthos.is_empty() {
-            return Ok(Vec::new());
+        if orthos.is_empty() { return Ok(Vec::new()); }
+        self.ensure_upsert_prepared();
+        let mut ids: Vec<i64> = Vec::with_capacity(orthos.len());
+        let mut versions: Vec<i64> = Vec::with_capacity(orthos.len());
+        let mut dims_arr: Vec<Vec<u8>> = Vec::with_capacity(orthos.len());
+        let mut data_arr: Vec<Vec<u8>> = Vec::with_capacity(orthos.len());
+        for o in &orthos {
+            ids.push(o.id() as i64);
+            versions.push(o.version() as i64);
+            dims_arr.push(encode_to_vec(&o.dims(), standard())?);
+            data_arr.push(encode_to_vec(o, standard())?);
         }
-        let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::new();
-        let mut values = Vec::new();
-        for (i, ortho) in orthos.iter().enumerate() {
-            values.push(format!("(${}, ${}, ${}, ${})", i*4+1, i*4+2, i*4+3, i*4+4));
-            params.push(Box::new(ortho.id() as i64));
-            params.push(Box::new(ortho.version() as i64));
-            params.push(Box::new(encode_to_vec(&ortho.dims(), standard())?));
-            params.push(Box::new(encode_to_vec(&ortho, standard())?));
-        }
-        let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = params.iter().map(|b| &**b).collect();
-        let sql = format!(
-            "INSERT INTO orthos (id, version, dims, data) VALUES {} ON CONFLICT (id) DO NOTHING RETURNING data",
-            values.join(", ")
-        );
-        let rows = self.client.query(&sql, &param_refs)?;
-        let result = rows
-            .into_iter()
-            .filter_map(|row| {
-                let data: Vec<u8> = row.get(0);
-                decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-            })
-            .collect();
-        Ok(result)
+        let rows = self.client.query(
+            "INSERT INTO orthos (id, version, dims, data) SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::bytea[], $4::bytea[]) ON CONFLICT (id) DO NOTHING RETURNING data",
+            &[&ids, &versions, &dims_arr, &data_arr],
+        )?;
+        let mut inserted = Vec::with_capacity(rows.len());
+        for row in rows { let data: Vec<u8> = row.get(0); if let Ok((o,_)) = decode_from_slice::<Ortho,_>(&data, standard()) { inserted.push(o); } }
+        Ok(inserted)
     }
+
     #[instrument(skip_all)]
     fn get(&mut self, key: &usize) -> Result<Option<Ortho>, FoldError> {
         let id = *key as i64;
@@ -244,61 +245,20 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
     fn sample_version(&mut self, _version: usize) -> Result<Option<Ortho>, FoldError> {
         let version = _version as i64;
         let follower_id = &self.follower_id;
-
+        // Deterministic claim: pick lowest unclaimed id for version using index (version,id)
         let q = r#"
-            WITH bounds AS (
-              SELECT min(id) AS lo, max(id) AS hi
-              FROM orthos
+            UPDATE orthos o
+            SET claimed_at = now(), claimed_by = $2
+            WHERE o.id = (
+              SELECT id FROM orthos
               WHERE version = $1 AND claimed_at IS NULL
-            ), pick AS (
-              SELECT CASE WHEN (bounds.lo IS NULL OR bounds.hi IS NULL) THEN NULL
-                          ELSE floor(random() * (bounds.hi - bounds.lo + 1))::bigint + bounds.lo END AS start_id
-              FROM bounds
-            )
-            , c AS (
-              SELECT id
-              FROM orthos, pick
-              WHERE version = $1 AND claimed_at IS NULL AND pick.start_id IS NOT NULL AND id >= pick.start_id
               ORDER BY id
               FOR UPDATE SKIP LOCKED
               LIMIT 1
             )
-            UPDATE orthos o
-            SET claimed_at = now(), claimed_by = $2
-            FROM c
-            WHERE o.id = c.id
             RETURNING o.data;
         "#;
-
-        let wrap = r#"
-            WITH bounds AS (
-              SELECT min(id) AS lo, max(id) AS hi
-              FROM orthos
-              WHERE version = $1 AND claimed_at IS NULL
-            ), pick AS (
-              SELECT CASE WHEN (bounds.lo IS NULL OR bounds.hi IS NULL) THEN NULL
-                          ELSE floor(random() * (bounds.hi - bounds.lo + 1))::bigint + bounds.lo END AS start_id
-              FROM bounds
-            )
-            , c AS (
-              SELECT id
-              FROM orthos, pick
-              WHERE version = $1 AND claimed_at IS NULL AND pick.start_id IS NOT NULL AND id < pick.start_id
-              ORDER BY id
-              FOR UPDATE SKIP LOCKED
-              LIMIT 1
-            )
-            UPDATE orthos o
-            SET claimed_at = now(), claimed_by = $2
-            FROM c
-            WHERE o.id = c.id
-            RETURNING o.data;
-        "#;
-
-        let mut row_opt = self.client.query_opt(q, &[&version, &follower_id])?;
-        if row_opt.is_none() {
-            row_opt = self.client.query_opt(wrap, &[&version, &follower_id])?;
-        }
+        let row_opt = self.client.query_opt(q, &[&version, &follower_id])?;
         if let Some(row) = row_opt {
             let data: Vec<u8> = row.get(0);
             if let Ok((o, _)) = decode_from_slice::<Ortho, _>(&data, standard()) { return Ok(Some(o)); }

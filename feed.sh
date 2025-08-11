@@ -21,8 +21,6 @@ make queue-count
 make optimal
 make logs
 
-# todo make a flow that feeds periodically, ideally from a folder
-# todo check results by calling optimal periodically and ensuring all subphrases are in the source text
 # todo add more benchmarks 
 # todo k8s 
 # todo results explorer:
