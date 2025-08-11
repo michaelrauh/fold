@@ -76,15 +76,30 @@ impl Follower {
         dbq: &mut Q,     // destination for generated child orthos
         holder: &mut H,
     ) -> Result<(usize, usize, Option<std::time::Duration>), FoldError> { // (bumped, produced_children, diff_duration)
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
         let versions = holder.versions();
-        if versions.len() < 2 { std::thread::sleep(std::time::Duration::from_millis(100)); return Ok((0,0,None)); }
+        if versions.len() < 2 { 
+            println!("[follower][iter] ts={} status=WAITING reason=INSUFFICIENT_VERSIONS versions={}", ts_ms, versions.len());
+            std::thread::sleep(std::time::Duration::from_millis(100)); 
+            return Ok((0,0,None)); 
+        }
         let low_version = versions[0];
         let high_version = *versions.last().unwrap();
         if self.low_version != Some(low_version) { self.low_interner = holder.get(low_version); self.low_version = Some(low_version); }
         if self.high_version != Some(high_version) { self.high_interner = holder.get(high_version); self.high_version = Some(high_version); }
-        if self.low_interner.is_none() || self.high_interner.is_none() { return Ok((0,0,None)); }
+        if self.low_interner.is_none() || self.high_interner.is_none() { 
+            println!("[follower][iter] ts={} status=WAITING reason=INTERNER_MISSING low_ok={} high_ok={}", ts_ms, self.low_interner.is_some(), self.high_interner.is_some());
+            return Ok((0,0,None)); 
+        }
         let candidate = db.sample_version(low_version).expect("queue connection failed");
-        let ortho = match candidate { Some(o) => o, None => { holder.delete(low_version); self.low_interner = None; self.low_version = None; return Ok((0,0,None)); } };
+        let ortho = match candidate { 
+            Some(o) => o, 
+            None => { 
+                println!("[follower][iter] ts={} status=EMPTY reason=NO_MORE_ORTHOS low_version={}", ts_ms, low_version); 
+                holder.delete(low_version); self.low_interner = None; self.low_version = None; return Ok((0,0,None)); 
+            } 
+        };
         let (forbidden, required) = ortho.get_requirements();
         let low = self.low_interner.as_ref().unwrap();
         let high = self.high_interner.as_ref().unwrap();
@@ -110,6 +125,7 @@ impl Follower {
             }
         }
         if additions.is_empty() {
+            println!("[follower][iter] ts={} status=BUMP reason=NO_ADDITIONS ortho_id={} low_version={} -> high_version={}", ts_ms, ortho.id(), low_version, high_version);
             let bumped = ortho.set_version(high_version); db.insert_or_update(bumped)?; return Ok((1,0,None));
         }
         let mut final_candidates: Vec<usize> = Vec::with_capacity(additions.len());
@@ -131,7 +147,7 @@ impl Follower {
         let time_us = elapsed.as_micros();
         let per_add_us = if additions_ct>0 { time_us as f64 / additions_ct as f64 } else { 0.0 };
         let per_child_us = if produced>0 { time_us as f64 / produced as f64 } else { 0.0 };
-        println!("[follower][perf] additions={} candidates={} children={} time_us={} per_addition_us={:.2} per_child_us={:.2}", additions_ct, candidates_ct, produced, time_us, per_add_us, per_child_us);
+        println!("[follower][iter] ts={} status=EXPAND additions={} candidates={} children={} time_us={} per_add_us={:.2} per_child_us={:.2} ortho_id={}", ts_ms, additions_ct, candidates_ct, produced, time_us, per_add_us, per_child_us, ortho.id());
         let bumped = ortho.set_version(high_version); db.insert_or_update(bumped)?;
         Ok((1, produced, Some(elapsed)))
     }
