@@ -65,20 +65,23 @@ impl Interner {
         }
         let new_vocab_len = vocabulary.len();
         let prefix_to_completions = Self::build_prefix_to_completions(&phrases, &vocabulary, new_vocab_len, None);
-        Interner {
+        let interner = Interner {
             version: 1,
             vocabulary,
             prefix_to_completions,
-        }
+        };
+        debug_assert!(interner.debug_verify_prefix_closure(&phrases), "Prefix closure verification failed after from_text");
+        interner
     }
 
     fn add_text(&self, text: &str) -> Self {
         if text.trim().is_empty() {
-            return Interner {
+            let mut interner = Interner {
                 version: self.version + 1,
                 vocabulary: self.vocabulary.clone(),
                 prefix_to_completions: self.prefix_to_completions.clone(),
             };
+            return interner;
         }
         let splitter = Splitter::new();
         let vocab = splitter.vocabulary(text);
@@ -99,11 +102,13 @@ impl Interner {
             Some(&self.prefix_to_completions),
         );
 
-        Interner {
+        let interner = Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
-        }
+        };
+        debug_assert!(interner.debug_verify_prefix_closure(&phrases), "Prefix closure verification failed after add_text");
+        interner
     }
 
     fn build_prefix_to_completions(
@@ -115,67 +120,62 @@ impl Interner {
         let mut prefix_to_completions = match existing {
             Some(map) => {
                 let mut new_map = map.clone();
-                for bitset in new_map.values_mut() {
-                    bitset.grow(vocab_len);
-                }
+                for bitset in new_map.values_mut() { bitset.grow(vocab_len); }
                 new_map
             }
             None => HashMap::new(),
         };
-
         for phrase in phrases {
-            if phrase.len() < 2 {
-                continue;
-            }
-            let indices: Vec<usize> = phrase
-                .iter()
-                .map(|word| {
-                    vocabulary
-                        .iter()
-                        .position(|v| v == word)
-                        .expect("Word should be in vocabulary")
-                })
-                .collect();
-            let prefix = indices[..indices.len() - 1].to_vec();
-            let completion_word_index = indices[indices.len() - 1];
-            if completion_word_index < vocab_len {
-                let bitset = prefix_to_completions.entry(prefix).or_insert_with(|| {
-                    let mut fbs = FixedBitSet::with_capacity(vocab_len);
-                    fbs.grow(vocab_len);
-                    fbs
-                });
-                bitset.insert(completion_word_index);
+            if phrase.len() < 2 { continue; }
+            let indices: Vec<usize> = phrase.iter().map(|word| {
+                vocabulary.iter().position(|v| v == word).expect("Word should be in vocabulary")
+            }).collect();
+            // Insert every incremental prefix chain edge: prefix[0..i] -> indices[i]
+            for i in 1..indices.len() { // i is completion index position
+                let prefix = indices[..i].to_vec();
+                let completion_word_index = indices[i];
+                if completion_word_index < vocab_len {
+                    let bitset = prefix_to_completions.entry(prefix).or_insert_with(|| {
+                        let mut fbs = FixedBitSet::with_capacity(vocab_len);
+                        fbs.grow(vocab_len);
+                        fbs
+                    });
+                    bitset.insert(completion_word_index);
+                }
             }
         }
-        // Ensure every vocabulary item is present as a prefix key
+        // Ensure every vocabulary item has a single-token prefix key
         for idx in 0..vocab_len {
-            let prefix = vec![idx];
-            if !prefix_to_completions.contains_key(&prefix) {
-                let mut fbs = FixedBitSet::with_capacity(vocab_len);
-                fbs.grow(vocab_len);
-                prefix_to_completions.insert(prefix, fbs);
-            }
+            prefix_to_completions.entry(vec![idx]).or_insert_with(|| {
+                let mut fbs = FixedBitSet::with_capacity(vocab_len); fbs.grow(vocab_len); fbs
+            });
         }
-        // NEW: Ensure every full phrase itself is represented as a (terminal) prefix
-        // with an empty completion set so lookups do not panic when a phrase has no extension.
+        // Ensure every full phrase itself as terminal prefix with empty completions
         for phrase in phrases {
             if phrase.is_empty() { continue; }
-            let indices: Vec<usize> = phrase
-                .iter()
-                .map(|word| {
-                    vocabulary
-                        .iter()
-                        .position(|v| v == word)
-                        .expect("Word should be in vocabulary")
-                })
-                .collect();
-            if !prefix_to_completions.contains_key(&indices) {
-                let mut fbs = FixedBitSet::with_capacity(vocab_len);
-                fbs.grow(vocab_len); // remains empty
-                prefix_to_completions.insert(indices, fbs);
-            }
+            let indices: Vec<usize> = phrase.iter().map(|word| {
+                vocabulary.iter().position(|v| v == word).expect("Word should be in vocabulary")
+            }).collect();
+            prefix_to_completions.entry(indices).or_insert_with(|| {
+                let mut fbs = FixedBitSet::with_capacity(vocab_len); fbs.grow(vocab_len); fbs
+            });
         }
         prefix_to_completions
+    }
+
+    fn debug_verify_prefix_closure(&self, new_phrases: &[Vec<String>]) -> bool {
+        // Only verify prefixes introduced by new_phrases (historical ones validated earlier).
+        for phrase in new_phrases {
+            if phrase.is_empty() { continue; }
+            let indices: Vec<usize> = phrase.iter().map(|w| self.vocabulary.iter().position(|v| v==w).unwrap()).collect();
+            for k in 1..=indices.len() {
+                if !self.prefix_to_completions.contains_key(&indices[..k].to_vec()) {
+                    eprintln!("[interner][verify] missing prefix {:?}", &indices[..k]);
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     pub fn version(&self) -> usize {
@@ -200,21 +200,25 @@ impl Interner {
     fn get_required_bits(&self, required: &[Vec<usize>]) -> FixedBitSet {
         let mut result = FixedBitSet::with_capacity(self.vocabulary.len());
         result.grow(self.vocabulary.len());
-        if required.is_empty() {
-            result.set_range(.., true);
-            return result;
-        }
+        if required.is_empty() { result.set_range(.., true); return result; }
         let mut first = true;
         for prefix in required {
-            let bitset = self
-                .prefix_to_completions
-                .get(prefix)
-                .unwrap_or_else(|| panic!("Required prefix {:?} not found in prefix_to_completions", prefix));
-            if first {
-                result.clone_from(bitset);
-                first = false;
-            } else {
-                result.intersect_with(bitset);
+            match self.prefix_to_completions.get(prefix) {
+                Some(bitset) => {
+                    if first { result.clone_from(bitset); first = false; } else { result.intersect_with(bitset); }
+                    if result.count_ones(..) == 0 { break; }
+                }
+                None => {
+                    // Prefix not present: this can happen because ortho spatial prefixes are not guaranteed
+                    // to correspond to linear phrase prefixes. Missing => zero completions.
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        eprintln!("[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)", prefix);
+                    });
+                    if first { /* intersection stays empty */ first = false; }
+                    else { result.set_range(.., false); }
+                    break;
+                }
             }
         }
         result

@@ -24,6 +24,8 @@ make logs
 # todo make a flow that feeds periodically, ideally from a folder
 # todo check results by calling optimal periodically and ensuring all subphrases are in the source text
 # todo add more benchmarks 
-# todo consider having follower write to DBQ instead of direct to DB
-# todo look at option for enriching data with follower requqeue reason to avoid re-intersect and duplicate results
 # todo k8s 
+# todo results explorer:
+# - start empty and show all possible fills for each possible direction
+# - indicate directions toward optimal
+# - allow for rotating and showing different points of view in single orthos

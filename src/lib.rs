@@ -70,97 +70,70 @@ impl Follower {
     }
 
     #[instrument(skip_all)]
-    pub fn run_follower_once<P: crate::queue::QueueProducerLike, D: crate::ortho_database::OrthoDatabaseLike, H: crate::interner::InternerHolderLike>(
+    pub fn run_follower_once<Q: crate::queue::QueueProducerLike, D: crate::ortho_database::OrthoDatabaseLike, H: crate::interner::InternerHolderLike>(
         &mut self,
         db: &mut D,
-        workq: &mut P,
+        dbq: &mut Q,     // destination for generated child orthos
         holder: &mut H,
-    ) -> Result<(usize, usize), FoldError> { // (bumped, requeued)
+    ) -> Result<(usize, usize, Option<std::time::Duration>), FoldError> { // (bumped, produced_children, diff_duration)
         let versions = holder.versions();
-        if versions.len() < 2 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            return Ok((0, 0));
-        }
-
+        if versions.len() < 2 { std::thread::sleep(std::time::Duration::from_millis(100)); return Ok((0,0,None)); }
         let low_version = versions[0];
         let high_version = *versions.last().unwrap();
-
-        if self.low_version != Some(low_version) {
-            self.low_interner = holder.get(low_version);
-            self.low_version = Some(low_version);
-        }
-
-        if self.high_version != Some(high_version) {
-            self.high_interner = holder.get(high_version);
-            self.high_version = Some(high_version);
-        }
-
+        if self.low_version != Some(low_version) { self.low_interner = holder.get(low_version); self.low_version = Some(low_version); }
+        if self.high_version != Some(high_version) { self.high_interner = holder.get(high_version); self.high_version = Some(high_version); }
+        if self.low_interner.is_none() || self.high_interner.is_none() { return Ok((0,0,None)); }
         let candidate = db.sample_version(low_version).expect("queue connection failed");
-        let ortho = match candidate {
-            Some(o) => o,
-            None => {
-                holder.delete(low_version);
-                self.low_interner = None;
-                self.low_version = None;
-                return Ok((0, 0));
+        let ortho = match candidate { Some(o) => o, None => { holder.delete(low_version); self.low_interner = None; self.low_version = None; return Ok((0,0,None)); } };
+        let (forbidden, required) = ortho.get_requirements();
+        let low = self.low_interner.as_ref().unwrap();
+        let high = self.high_interner.as_ref().unwrap();
+        let low_vocab_len = low.vocabulary().len();
+        let high_vocab_len = high.vocabulary().len();
+        let t_start = std::time::Instant::now();
+        // Sparse additions collection: gather all new candidate indices (no threshold)
+        use std::collections::HashSet;
+        let mut additions: HashSet<usize> = HashSet::new();
+        let forbidden_set: HashSet<usize> = forbidden.iter().copied().collect();
+        if required.is_empty() {
+            for i in low_vocab_len..high_vocab_len { if !forbidden_set.contains(&i) { additions.insert(i); } }
+        } else {
+            for prefix in &required {
+                let high_bs_opt = high.completions_for_prefix(prefix);
+                if high_bs_opt.is_none() { continue; }
+                let high_bs = high_bs_opt.unwrap();
+                let diffs = low.differing_completions_indices_up_to_vocab(high, prefix);
+                for idx in diffs { if idx < low_vocab_len && !forbidden_set.contains(&idx) { if high_bs.contains(idx) { additions.insert(idx); } } }
+                if high_vocab_len > low_vocab_len {
+                    for idx in low_vocab_len..high_vocab_len { if forbidden_set.contains(&idx) { continue; } if high_bs.contains(idx) { additions.insert(idx); } }
+                }
             }
-        };
-        
-        let (_forbidden, prefixes) = ortho.get_requirements();
-        let all_same = match (self.low_interner.as_ref(), self.high_interner.as_ref()) {
-            (Some(low), Some(high)) => low.all_completions_equal_up_to_vocab(high, &prefixes),
-            _ => false,
-        };
-        if all_same {
-            let new_ortho = ortho.set_version(high_version);
-            db.insert_or_update(new_ortho).expect("queue connection failed");
-            Ok((1, 0))
-        } else {
-            let new_ortho = ortho.set_version(high_version);
-            println!("[follower] Pushing ortho to workq: id={}, version={}", new_ortho.id(), new_ortho.version());
-            workq.push_many(vec![new_ortho.clone()]).expect("queue connection failed");
-            db.remove_by_id(&ortho.id())?;
-            Ok((0, 1))
         }
-    }
-
-    #[instrument(skip_all)]
-    pub fn process_ortho<P: crate::queue::QueueProducerLike, D: crate::ortho_database::OrthoDatabaseLike, H: crate::interner::InternerHolderLike>(
-        &mut self,
-        ortho: &crate::ortho::Ortho,
-        db: &mut D,
-        workq: &mut P,
-        holder: &mut H,
-    ) -> Result<(), FoldError> {
-        let versions = holder.versions();
-        if versions.len() < 2 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            return Ok(());
+        if additions.is_empty() {
+            let bumped = ortho.set_version(high_version); db.insert_or_update(bumped)?; return Ok((1,0,None));
         }
-        let low_version = versions[0];
-        let high_version = *versions.last().unwrap();
-        if self.low_version != Some(low_version) {
-            self.low_interner = holder.get(low_version);
-            self.low_version = Some(low_version);
+        let mut final_candidates: Vec<usize> = Vec::with_capacity(additions.len());
+        'cand: for &cand in additions.iter() {
+            if forbidden_set.contains(&cand) { continue; }
+            for prefix in &required { if let Some(bs) = high.completions_for_prefix(prefix) { if !bs.contains(cand) { continue 'cand; } } else { continue 'cand; } }
+            final_candidates.push(cand);
         }
-        if self.high_version != Some(high_version) {
-            self.high_interner = holder.get(high_version);
-            self.high_version = Some(high_version);
-        }
-        let (_forbidden, prefixes) = ortho.get_requirements();
-        let all_same = match (self.low_interner.as_ref(), self.high_interner.as_ref()) {
-            (Some(low), Some(high)) => low.all_completions_equal_up_to_vocab(high, &prefixes),
-            _ => false,
-        };
-        if all_same {
-            let new_ortho = ortho.set_version(high_version);
-            db.insert_or_update(new_ortho).expect("queue connection failed");
-        } else {
-            let new_ortho = ortho.set_version(high_version);
-            workq.push_many(vec![new_ortho.clone()]).expect("queue connection failed");
-            db.remove_by_id(&ortho.id())?;
-        }
-        Ok(())
+        final_candidates.sort_unstable();
+        let candidates_ct_for_log = final_candidates.len();
+        let mut children = Vec::new();
+        for completion in final_candidates { let mut batch = ortho.add(completion, high_version); children.append(&mut batch); }
+        let produced = children.len();
+        let elapsed = t_start.elapsed();
+        if produced > 0 { dbq.push_many(children)?; }
+        // Always log perf
+        let additions_ct = additions.len();
+        let candidates_ct = candidates_ct_for_log;
+        let time_us = elapsed.as_micros();
+        let per_add_us = if additions_ct>0 { time_us as f64 / additions_ct as f64 } else { 0.0 };
+        let per_child_us = if produced>0 { time_us as f64 / produced as f64 } else { 0.0 };
+        println!("[follower][perf] additions={} candidates={} children={} time_us={} per_addition_us={:.2} per_child_us={:.2}", additions_ct, candidates_ct, produced, time_us, per_add_us, per_child_us);
+        let bumped = ortho.set_version(high_version); db.insert_or_update(bumped)?;
+        Ok((1, produced, Some(elapsed)))
     }
 }
 
@@ -232,4 +205,55 @@ pub fn process_worker_item_with_cached<P: crate::queue::QueueProducerLike>(
     }
     dbq.push_many(new_orthos)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod follower_diff_tests {
+    use super::*;
+    use crate::interner::InMemoryInternerHolder;
+    use crate::queue::MockQueue;
+
+    fn build_low_high(low_text: &str, high_text: &str) -> (crate::interner::Interner, crate::interner::Interner) {
+        // low_text ingested first, then high_text appended to create new version
+        let mut holder = InMemoryInternerHolder::new().unwrap();
+        let mut q = MockQueue::new();
+        holder.add_text_with_seed(low_text, &mut q).unwrap(); // version 1
+        holder.add_text_with_seed(high_text, &mut q).unwrap(); // version 2
+        let low = holder.get(1).unwrap();
+        let high = holder.get(2).unwrap();
+        (low, high)
+    }
+
+    #[test]
+    fn test_delta_intersection_adds_only_new() {
+        let (low, high) = build_low_high("a b", "a c"); // low has a b; high adds a c
+        // Construct ortho with single token 'a' (index 0)
+        let mut o = crate::ortho::Ortho::new(low.version());
+        o = o.add(0, low.version()).pop().unwrap();
+        let (forbidden, required) = o.get_requirements();
+        assert!(forbidden.is_empty());
+        assert_eq!(required, vec![vec![0]]);
+        let low_set: std::collections::HashSet<usize> = low.intersect(&required, &forbidden).into_iter().collect();
+        let high_set: std::collections::HashSet<usize> = high.intersect(&required, &forbidden).into_iter().collect();
+        assert!(low_set.contains(&1)); // 'b'
+        assert!(!low_set.contains(&2)); // 'c' absent in low
+        assert!(high_set.contains(&1) && high_set.contains(&2));
+        let delta: Vec<usize> = high_set.difference(&low_set).copied().collect();
+        assert_eq!(delta, vec![2]);
+    }
+
+    #[test]
+    fn test_delta_union_intersection_logic() {
+        let (low, high) = build_low_high("a b", "a c");
+        let mut o = crate::ortho::Ortho::new(low.version());
+        o = o.add(0, low.version()).pop().unwrap();
+        let (forbidden, required) = o.get_requirements();
+        let low_set: std::collections::HashSet<usize> = low.intersect(&required, &forbidden).into_iter().collect();
+        let high_set: std::collections::HashSet<usize> = high.intersect(&required, &forbidden).into_iter().collect();
+        assert!(low_set.contains(&1));
+        assert!(!low_set.contains(&2));
+        assert!(high_set.contains(&2));
+        let diff: Vec<usize> = high_set.difference(&low_set).copied().collect();
+        assert_eq!(diff, vec![2]);
+    }
 }

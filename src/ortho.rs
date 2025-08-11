@@ -35,14 +35,12 @@ impl Ortho {
 
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
         let position = self.get_current_position();
-
         let remaining_empty = self
             .payload
             .iter()
             .skip(position)
             .filter(|x| x.is_none())
             .count();
-
         if remaining_empty == 1 {
             if spatial::is_base(&self.dims) {
                 return Self::expand(
@@ -55,7 +53,7 @@ impl Ortho {
                 return Self::expand(self, spatial::expand_over(&self.dims), value, version);
             }
         }
-
+        
         // Special case: third insert (position 2) needs axis sorting
         if position == 2 && self.dims == vec![2, 2] {
             let mut new_payload = self.payload.clone();
@@ -617,5 +615,35 @@ mod tests {
             "Ortho::id() should be unique for different payloads, but got collisions: {:?}",
             ids
         );
+    }
+
+    #[test]
+    fn test_canonicalization_invariant_axis_permutation() {
+        // This test is intended to expose the canonicalization issue: inserting the two axis tokens
+        // in different orders should yield (after inserting the 4th token that triggers expansion)
+        // an equivalent canonical set of children. Currently (with the swap removed) they differ.
+        // Axis tokens are the 2nd and 3rd overall inserts into base dims [2,2].
+        // Path 1: a < b < c
+        let mut o1 = Ortho::new(1);
+        o1 = o1.add(10, 1).pop().unwrap(); // a
+        o1 = o1.add(20, 1).pop().unwrap(); // b
+        o1 = o1.add(30, 1).pop().unwrap(); // c
+        // Path 2: a < c but b < c (second and third swapped relative to path 1)
+        let mut o2 = Ortho::new(1);
+        o2 = o2.add(10, 1).pop().unwrap(); // a
+        o2 = o2.add(30, 1).pop().unwrap(); // c
+        o2 = o2.add(20, 1).pop().unwrap(); // b (unsorted axis order)
+        // Insert 4th token to force expansion candidates
+        let children1 = o1.add(40, 1);
+        let children2 = o2.add(40, 1);
+        // Normalize each child to (dims, filled_values_in_order)
+        fn norm(o: &Ortho) -> (Vec<usize>, Vec<usize>) {
+            (o.dims.clone(), o.payload.iter().filter_map(|x| *x).collect())
+        }
+        let mut norms1: Vec<_> = children1.iter().map(norm).collect();
+        let mut norms2: Vec<_> = children2.iter().map(norm).collect();
+        norms1.sort();
+        norms2.sort();
+        assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
     }
 }

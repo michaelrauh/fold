@@ -1,6 +1,6 @@
 start:
 	${MAKE} reset
-	sleep 10
+	sleep 15
 	./feed.sh
 
 build:
@@ -113,3 +113,23 @@ follower-stats:
 follower-stats-once:
 	# Show last 200 follower stats lines
 	docker compose logs --tail=200 follower 2>&1 | grep -F '[follower][stats]'
+
+follower-diff:
+	# Follow follower logs and show only diff production lines
+	docker compose logs -f follower 2>&1 | grep -F 'delta-intersect'
+
+follower-perf:
+	# Follow follower perf iteration and window logs
+	docker compose logs -f follower 2>&1 | grep -E '\[follower\]\[perf-(iter|window)'
+
+worker-perf:
+	# Follow worker perf iteration and window logs
+	docker compose logs -f fold_worker 2>&1 | grep -E '\[worker\]\[perf-(iter|window)'
+
+perf-all:
+	# Follow both follower and worker perf logs
+	docker compose logs -f follower fold_worker 2>&1 | grep -E '\[(follower|worker)\]\[perf-(iter|window)'
+
+prod-stats:
+	# Show high-level production stats from feeder + follower
+	docker compose logs -f feeder follower 2>&1 | grep -E '\[feeder\]\[stats\]|\[follower\]\[stats\]'
