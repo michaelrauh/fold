@@ -17,6 +17,7 @@ pub trait OrthoDatabaseLike {
     fn remove_by_id(&mut self, id: &usize) -> Result<(), FoldError>;
     fn len(&mut self) -> Result<usize, FoldError>;
     fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError>;
+    fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError>; // (version, count)
 }
 
 pub struct InMemoryOrthoDatabase {
@@ -78,14 +79,25 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
     fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError> {
         Ok(self.map.values().find(|o| o.version() == version).cloned())
     }
+    fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError> {
+        use std::collections::HashMap as StdHashMap;
+        let mut counts: StdHashMap<usize, usize> = StdHashMap::new();
+        for o in self.map.values() { *counts.entry(o.version()).or_insert(0) += 1; }
+        let mut v: Vec<(usize, usize)> = counts.into_iter().collect();
+        v.sort_by_key(|(ver, _)| *ver);
+        Ok(v)
+    }
 }
 
 pub struct PostgresOrthoDatabase {
     pub client: Client,
+    follower_id: String,
+    upsert_prepared: bool,
 }
 
 impl PostgresOrthoDatabase {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::new_with_follower_id("default".to_string()) }
+    pub fn new_with_follower_id(follower_id: String) -> Self {
         let conn_str = env::var("FOLD_PG_URL").expect("FOLD_PG_URL environment variable must be set for PostgresOrthoDatabase");
         let mut client = Client::connect(&conn_str, NoTls).expect("Failed to connect to Postgres");
         client.batch_execute("
@@ -93,43 +105,57 @@ impl PostgresOrthoDatabase {
                 id BIGINT PRIMARY KEY,
                 version BIGINT NOT NULL,
                 dims BYTEA NOT NULL,
-                data BYTEA NOT NULL
+                data BYTEA NOT NULL,
+                claimed_at TIMESTAMPTZ,
+                claimed_by TEXT
             );
+            ALTER TABLE orthos ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+            ALTER TABLE orthos ADD COLUMN IF NOT EXISTS claimed_by TEXT;
         ").unwrap();
-        Self { client }
+        let _ = client.batch_execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_orthos_ready ON orthos (version, id) WHERE claimed_at IS NULL;");
+        Self { client, follower_id, upsert_prepared: false }
+    }
+
+    fn ensure_upsert_prepared(&mut self) {
+        if self.upsert_prepared { return; }
+        let _ = self.client.prepare("INSERT INTO orthos (id, version, dims, data) SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::bytea[], $4::bytea[]) ON CONFLICT (id) DO NOTHING RETURNING data");
+        self.upsert_prepared = true;
+    }
+
+    #[instrument(skip_all)]
+    pub fn reap_stale_claims(&mut self) {
+        // 45s timeout window
+        let _ = self.client.execute(
+            "UPDATE orthos SET claimed_at = NULL, claimed_by = NULL WHERE claimed_at < now() - interval '45 seconds'",
+            &[]
+        );
     }
 }
 
 impl OrthoDatabaseLike for PostgresOrthoDatabase {
     #[instrument(skip_all)]
     fn upsert(&mut self, orthos: Vec<Ortho>) -> Result<Vec<Ortho>, FoldError> {
-        if orthos.is_empty() {
-            return Ok(Vec::new());
+        if orthos.is_empty() { return Ok(Vec::new()); }
+        self.ensure_upsert_prepared();
+        let mut ids: Vec<i64> = Vec::with_capacity(orthos.len());
+        let mut versions: Vec<i64> = Vec::with_capacity(orthos.len());
+        let mut dims_arr: Vec<Vec<u8>> = Vec::with_capacity(orthos.len());
+        let mut data_arr: Vec<Vec<u8>> = Vec::with_capacity(orthos.len());
+        for o in &orthos {
+            ids.push(o.id() as i64);
+            versions.push(o.version() as i64);
+            dims_arr.push(encode_to_vec(&o.dims(), standard())?);
+            data_arr.push(encode_to_vec(o, standard())?);
         }
-        let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::new();
-        let mut values = Vec::new();
-        for (i, ortho) in orthos.iter().enumerate() {
-            values.push(format!("(${}, ${}, ${}, ${})", i*4+1, i*4+2, i*4+3, i*4+4));
-            params.push(Box::new(ortho.id() as i64));
-            params.push(Box::new(ortho.version() as i64));
-            params.push(Box::new(encode_to_vec(&ortho.dims(), standard())?));
-            params.push(Box::new(encode_to_vec(&ortho, standard())?));
-        }
-        let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = params.iter().map(|b| &**b).collect();
-        let sql = format!(
-            "INSERT INTO orthos (id, version, dims, data) VALUES {} ON CONFLICT (id) DO NOTHING RETURNING data",
-            values.join(", ")
-        );
-        let rows = self.client.query(&sql, &param_refs)?;
-        let result = rows
-            .into_iter()
-            .filter_map(|row| {
-                let data: Vec<u8> = row.get(0);
-                decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-            })
-            .collect();
-        Ok(result)
+        let rows = self.client.query(
+            "INSERT INTO orthos (id, version, dims, data) SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::bytea[], $4::bytea[]) ON CONFLICT (id) DO NOTHING RETURNING data",
+            &[&ids, &versions, &dims_arr, &data_arr],
+        )?;
+        let mut inserted = Vec::with_capacity(rows.len());
+        for row in rows { let data: Vec<u8> = row.get(0); if let Ok((o,_)) = decode_from_slice::<Ortho,_>(&data, standard()) { inserted.push(o); } }
+        Ok(inserted)
     }
+
     #[instrument(skip_all)]
     fn get(&mut self, key: &usize) -> Result<Option<Ortho>, FoldError> {
         let id = *key as i64;
@@ -197,8 +223,8 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
         let dims = encode_to_vec(&ortho.dims(), standard())?;
         let data = encode_to_vec(&ortho, standard())?;
         self.client.execute(
-            "INSERT INTO orthos (id, version, dims, data) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version",
+            "INSERT INTO orthos (id, version, dims, data, claimed_at, claimed_by) VALUES ($1, $2, $3, $4, NULL, NULL)
+             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, dims = EXCLUDED.dims, data = EXCLUDED.data, claimed_at = NULL, claimed_by = NULL",
             &[&id, &version, &dims, &data],
         )?;
         Ok(())
@@ -217,13 +243,34 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
     }
     #[instrument(skip_all)]
     fn sample_version(&mut self, _version: usize) -> Result<Option<Ortho>, FoldError> {
-        // Return a random Ortho with the given version, or None
         let version = _version as i64;
-        let row = self.client.query_opt("SELECT data FROM orthos WHERE version = $1 ORDER BY RANDOM() LIMIT 1", &[&version])?;
-        Ok(row.and_then(|r| {
-            let data: Vec<u8> = r.get(0);
-            decode_from_slice::<Ortho, _>(&data, standard()).ok().map(|(o, _)| o)
-        }))
+        let follower_id = &self.follower_id;
+        // Deterministic claim: pick lowest unclaimed id for version using index (version,id)
+        let q = r#"
+            UPDATE orthos o
+            SET claimed_at = now(), claimed_by = $2
+            WHERE o.id = (
+              SELECT id FROM orthos
+              WHERE version = $1 AND claimed_at IS NULL
+              ORDER BY id
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+            )
+            RETURNING o.data;
+        "#;
+        let row_opt = self.client.query_opt(q, &[&version, &follower_id])?;
+        if let Some(row) = row_opt {
+            let data: Vec<u8> = row.get(0);
+            if let Ok((o, _)) = decode_from_slice::<Ortho, _>(&data, standard()) { return Ok(Some(o)); }
+        }
+        Ok(None)
+    }
+    #[instrument(skip_all)]
+    fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError> {
+        let rows = self.client.query("SELECT version, COUNT(*) FROM orthos GROUP BY version ORDER BY version", &[])?;
+        Ok(rows.into_iter().map(|r| {
+            let v: i64 = r.get(0); let c: i64 = r.get(1); (v as usize, c as usize)
+        }).collect())
     }
 }
 

@@ -8,42 +8,37 @@ use bincode::Decode;
 pub struct Ortho {
     version: usize,
     dims: Vec<usize>,
-    payload: Vec<Option<usize>>,
+    payload: Vec<Option<usize>>, // length == capacity(dims)
+    // removed precomputed id field; id now computed on demand
 }
 
 impl Ortho {
-    pub fn new(version: usize) -> Self {
-        Ortho {
-            version,
-            dims: vec![2, 2],
-            payload: vec![None, None, None, None],
-        }
-    }
-
-    pub fn id(&self) -> usize {
-        if self.get_current_position() == 0 {
+    fn compute_id(version: usize, dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> usize {
+        // Empty (first None at 0 => all None) still uses version so distinct across versions
+        if payload.iter().all(|x| x.is_none()) {
             let mut hasher = DefaultHasher::new();
-            self.version.hash(&mut hasher);
-            hasher.finish() as usize
+            version.hash(&mut hasher);
+            (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
         } else {
             let mut hasher = DefaultHasher::new();
-            self.dims.hash(&mut hasher);
-            self.payload.hash(&mut hasher);
-            hasher.finish() as usize
+            dims.hash(&mut hasher);
+            payload.hash(&mut hasher);
+            (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
         }
     }
-
+    pub fn new(version: usize) -> Self {
+        let dims = vec![2,2];
+        let payload = vec![None; 4];
+        Ortho { version, dims, payload }
+    }
+    pub fn id(&self) -> usize { Self::compute_id(self.version, &self.dims, &self.payload) }
+    pub fn get_current_position(&self) -> usize { self.payload.iter().position(|x| x.is_none()).unwrap_or(self.payload.len()) }
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
-        let position = self.get_current_position();
-
-        let remaining_empty = self
-            .payload
-            .iter()
-            .skip(position)
-            .filter(|x| x.is_none())
-            .count();
-
-        if remaining_empty == 1 {
+        // Determine insertion index as first None (walk forward)
+        let insertion_index = self.get_current_position();
+        // Count remaining empty slots (walk) to determine if expansion follows this insert
+        let total_empty = self.payload.iter().filter(|x| x.is_none()).count();
+        if total_empty == 1 { // This insert triggers expansion
             if spatial::is_base(&self.dims) {
                 return Self::expand(
                     self,
@@ -55,81 +50,51 @@ impl Ortho {
                 return Self::expand(self, spatial::expand_over(&self.dims), value, version);
             }
         }
-
-        // Special case: third insert (position 2) needs axis sorting
-        if position == 2 && self.dims == vec![2, 2] {
-            let mut new_payload = self.payload.clone();
-            new_payload[position] = Some(value);
-
-            // Sort the second and third items by value to establish axis order
+        if insertion_index == 2 && self.dims.as_slice() == [2, 2] { // axis canonicalization step
+            let mut new_payload: Vec<Option<usize>> = self.payload.clone();
+            new_payload[insertion_index] = Some(value); // INSERT (bug fix)
+            // Canonicalize axis token order (positions 1 & 2)
             if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
-                if second > third {
-                    new_payload[1] = Some(third);
-                    new_payload[2] = Some(second);
-                }
+                if second > third { new_payload[1] = Some(third); new_payload[2] = Some(second); }
             }
-
-            return vec![Ortho {
-                version,
-                dims: self.dims.clone(),
-                payload: new_payload,
-            }];
+            return vec![Ortho { version, dims: self.dims.clone(), payload: new_payload }];
         }
-
-        // Normal case: just add to the current position
-        let mut new_payload = self.payload.clone();
-        new_payload[position] = Some(value);
-        return vec![Ortho {
-            version,
-            dims: self.dims.clone(),
-            payload: new_payload,
-        }];
+        // Normal (non-expansion) path
+        let len = self.payload.len();
+        let mut new_payload: Vec<Option<usize>> = Vec::with_capacity(len);
+        unsafe { new_payload.set_len(len); std::ptr::copy_nonoverlapping(self.payload.as_ptr(), new_payload.as_mut_ptr(), len); }
+        if insertion_index < new_payload.len() { new_payload[insertion_index] = Some(value); }
+        vec![Ortho { version, dims: self.dims.clone(), payload: new_payload }]
     }
-
     fn expand(
         ortho: &Ortho,
         expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
         value: usize,
         version: usize,
     ) -> Vec<Ortho> {
-        expansions
-            .into_iter()
-            .map(|(new_dims, new_capacity, reorganization_pattern)| {
-                let mut new_payload = vec![None; new_capacity];
-                for (i, &pos) in reorganization_pattern.iter().enumerate() {
-                    new_payload[pos] = ortho.payload.get(i).cloned().flatten();
-                }
-                let new_insert_position = new_payload.iter().position(|x| x.is_none()).unwrap();
-                new_payload[new_insert_position] = Some(value);
-                Ortho {
-                    version,
-                    dims: new_dims,
-                    payload: new_payload,
-                }
-            })
-            .collect()
+        let mut out = Vec::with_capacity(expansions.len());
+        for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
+            let mut new_payload = vec![None; new_capacity];
+            for (i, &pos) in reorg.iter().enumerate() { new_payload[pos] = ortho.payload.get(i).cloned().flatten(); }
+            if let Some(insert_pos) = new_payload.iter().position(|x| x.is_none()) { new_payload[insert_pos] = Some(value); }
+            else if !new_payload.is_empty() { let last = new_payload.len() - 1; new_payload[last] = Some(value); }
+            out.push(Ortho { version, dims: new_dims_vec, payload: new_payload });
+        }
+        out
     }
-
-    pub fn get_current_position(&self) -> usize {
-        self.payload.iter().position(|x| x.is_none()).unwrap()
-    }
-
     fn get_insert_position(&self, to_add: usize) -> usize {
         let axis_positions = spatial::get_axis_positions(&self.dims);
         let mut idx = 0;
         for &pos in axis_positions.iter() {
             if let Some(&axis) = self.payload.get(pos).and_then(|x| x.as_ref()) {
-                if to_add < axis {
-                    return idx;
-                }
+                if to_add < axis { return idx; }
                 idx += 1;
             }
         }
         idx
     }
-
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
-        let pos = self.get_current_position();
+        let pos = self.get_current_position(); // next insert position
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
         let forbidden: Vec<usize> = diagonals
             .into_iter()
@@ -147,39 +112,26 @@ impl Ortho {
             .collect();
         (forbidden, required)
     }
-
-    pub fn version(&self) -> usize {
-        self.version
-    }
-
+    pub fn version(&self) -> usize { self.version }
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
-        // For each position in the payload, get the prefix indices from spatial::get_requirements
         let mut result = Vec::new();
         for pos in 0..self.payload.len() {
             let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims);
             for prefix in prefixes {
                 if !prefix.is_empty() {
-                    // Map indices to payload values, skipping None
                     let values: Vec<usize> = prefix
                         .iter()
                         .filter_map(|&i| self.payload.get(i).cloned().flatten())
                         .collect();
-                    if !values.is_empty() {
-                        result.push(values);
-                    }
+                    if !values.is_empty() { result.push(values); }
                 }
             }
         }
         result
     }
-
     pub fn prefixes_for_last_filled(&self) -> Vec<Vec<usize>> {
-        let pos = if let Some(p) = self.payload.iter().position(|x| x.is_none()) {
-            if p == 0 { return vec![]; }
-            p - 1
-        } else {
-            self.payload.len() - 1
-        };
+        if self.get_current_position() == 0 { return vec![]; }
+        let pos = self.get_current_position() - 1;
         let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims);
         prefixes.into_iter()
             .filter(|prefix| !prefix.is_empty())
@@ -191,22 +143,11 @@ impl Ortho {
             .filter(|v| !v.is_empty())
             .collect()
     }
-
-    pub fn dims(&self) -> &Vec<usize> {
-        &self.dims
-    }
-
+    pub fn dims(&self) -> &Vec<usize> { &self.dims }
     pub(crate) fn set_version(&self, version: usize) -> Ortho {
-        Ortho {
-            version,
-            dims: self.dims.clone(),
-            payload: self.payload.clone(),
-        }
+        Ortho { version, dims: self.dims.clone(), payload: self.payload.clone() }
     }
-
-    pub fn payload(&self) -> &Vec<Option<usize>> {
-        &self.payload
-    }
+    pub fn payload(&self) -> &Vec<Option<usize>> { &self.payload }
 }
 
 #[cfg(test)]
@@ -217,7 +158,7 @@ mod tests {
     fn test_new() {
         let ortho = Ortho::new(1);
         assert_eq!(ortho.version, 1);
-        assert_eq!(ortho.dims, vec![2, 2]);
+        assert_eq!(ortho.dims, vec![2,2]);
         assert_eq!(ortho.payload, vec![None, None, None, None]);
     }
 
@@ -617,5 +558,35 @@ mod tests {
             "Ortho::id() should be unique for different payloads, but got collisions: {:?}",
             ids
         );
+    }
+
+    #[test]
+    fn test_canonicalization_invariant_axis_permutation() {
+        // This test is intended to expose the canonicalization issue: inserting the two axis tokens
+        // in different orders should yield (after inserting the 4th token that triggers expansion)
+        // an equivalent canonical set of children. Currently (with the swap removed) they differ.
+        // Axis tokens are the 2nd and 3rd overall inserts into base dims [2,2].
+        // Path 1: a < b < c
+        let mut o1 = Ortho::new(1);
+        o1 = o1.add(10, 1).pop().unwrap(); // a
+        o1 = o1.add(20, 1).pop().unwrap(); // b
+        o1 = o1.add(30, 1).pop().unwrap(); // c
+        // Path 2: a < c but b < c (second and third swapped relative to path 1)
+        let mut o2 = Ortho::new(1);
+        o2 = o2.add(10, 1).pop().unwrap(); // a
+        o2 = o2.add(30, 1).pop().unwrap(); // c
+        o2 = o2.add(20, 1).pop().unwrap(); // b (unsorted axis order)
+        // Insert 4th token to force expansion candidates
+        let children1 = o1.add(40, 1);
+        let children2 = o2.add(40, 1);
+        // Normalize each child to (dims, filled_values_in_order)
+        fn norm(o: &Ortho) -> (Vec<usize>, Vec<usize>) {
+            (o.dims.clone(), o.payload.iter().filter_map(|x| *x).collect())
+        }
+        let mut norms1: Vec<_> = children1.iter().map(norm).collect();
+        let mut norms2: Vec<_> = children2.iter().map(norm).collect();
+        norms1.sort();
+        norms2.sort();
+        assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
     }
 }

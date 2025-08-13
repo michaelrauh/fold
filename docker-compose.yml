@@ -20,7 +20,6 @@ services:
     restart: unless-stopped
   follower:
     image: fold-services:latest
-    container_name: follower
     working_dir: /app
     command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "./wait-for-it.sh", "postgres:5432", "--timeout=30", "--", "./wait-for-it.sh", "minio:9000", "--timeout=30", "--", "/app/follower"]
     environment:  

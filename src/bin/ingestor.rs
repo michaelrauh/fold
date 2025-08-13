@@ -39,6 +39,8 @@ enum Commands {
         size: usize,
     },
     InternerVersions,
+    /// Show counts of orthos per version
+    VersionCounts,
 }
 
 // Helper to parse s3://bucket/key
@@ -215,5 +217,14 @@ fn main() {
                 let versions = holder.versions();
                 println!("Interner versions: {:?}", versions);
             }
+        Commands::VersionCounts => {
+            match db.version_counts() {
+                Ok(pairs) => {
+                    println!("version\tcount");
+                    for (v,c) in pairs { println!("{}\t{}", v, c); }
+                }
+                Err(e) => eprintln!("Failed to get version counts: {}", e),
+            }
+        }
     }
 }

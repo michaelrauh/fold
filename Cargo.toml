@@ -26,6 +26,10 @@ opentelemetry_sdk = "0.29"
 opentelemetry-otlp = { version = "0.29", features = ["reqwest-blocking-client"] }
 clap = { version = "4", features = ["derive"] }
 bb8 = "0.9.0"
+lru = "0.12"
+once_cell = "1.19"
+rustc-hash = "1.1"
+smallvec = "1.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

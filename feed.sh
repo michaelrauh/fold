@@ -14,13 +14,16 @@ sleep 10
 make feed-s3 FILE=e.txt-part-55
 make db-count
 make queue-count
-make scale REPLICAS=50
+make scale-worker REPLICAS=50
 sleep 10
 make db-count
 make queue-count
 make optimal
 make logs
 
-# todo make a flow that feeds periodically, ideally from a folder
-# todo check results by calling optimal periodically and ensuring all subphrases are in the source text.
-# todo add some ability to track redundancy rate
+# todo add more benchmarks 
+# todo k8s 
+# todo results explorer:
+# - start empty and show all possible fills for each possible direction
+# - indicate directions toward optimal
+# - allow for rotating and showing different points of view in single orthos
