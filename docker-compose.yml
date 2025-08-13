@@ -74,6 +74,8 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
     restart: unless-stopped
   postgres:
     image: postgres:15
@@ -116,3 +118,4 @@ volumes:
   pgdata:
   internerdata:
   miniostorage:
+  rabbitmqdata:

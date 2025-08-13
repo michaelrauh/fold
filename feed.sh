@@ -21,6 +21,9 @@ make queue-count
 make optimal
 make logs
 
+# todo throttling and auto-scaling
+# todo managed DBs 
+# todo persistent queues
 # todo add more benchmarks 
 # todo k8s 
 # todo results explorer:

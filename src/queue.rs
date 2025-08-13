@@ -1,6 +1,6 @@
 use crate::ortho::Ortho;
 use crate::error::FoldError;
-use amiquip::{QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish};
+use amiquip::{QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish, AmqpProperties};
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
 
 pub trait QueueLenLike {
@@ -63,7 +63,9 @@ impl QueueProducerLike for QueueProducer {
         let exchange = Exchange::direct(&channel);
         for ortho in orthos {
             let payload = encode_to_vec(&ortho, standard())?;
-            exchange.publish(Publish::new(&payload, &self.name))?;
+            // Publish as persistent (delivery_mode = 2) so messages are not lost on broker restart.
+            let props = AmqpProperties::default().with_delivery_mode(2);
+            exchange.publish(Publish::with_properties(&payload, &self.name, props))?;
         }
         println!("[queue][producer] pushed {} item(s) to {}", count, self.name);
         Ok(())
