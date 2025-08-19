@@ -3,8 +3,12 @@ start:
 	sleep 15
 	./feed.sh
 
+# Directory used by the interner for temporary blob files. Set this to a
+# path inside the repo or an explicit directory. Defaults to a safe local
+# tmp path to avoid accidental removal of system files when running `make clean`.
+
 build:
-	docker build -t fold-services:latest -f Dockerfile .
+	docker build -t fold:latest -f Dockerfile .
 
 up: build
 	docker-compose up --build -d
@@ -19,9 +23,8 @@ reset:
 test:
 	cargo test
 
-clean:
-	rm -rf $(INTERNER_FILE_LOCATION)/*
-	@echo "Cleaned interner files in $(INTERNER_FILE_LOCATION)"
+
+# `clean` target intentionally removed per user request (do not run destructive clean here).
 
 setup-s3:
 	mc alias set localminio http://localhost:9000 minioadmin minioadmin || true
@@ -90,6 +93,19 @@ scale-status:
 	@echo "feeder: $$(docker ps --filter 'name=feeder' --format '{{.Names}}' | wc -l)"
 	@echo "follower: $$(docker ps --filter 'name=follower' --format '{{.Names}}' | wc -l)"
 
+# Scale production worker deployment (Kubernetes)
+# Usage: REPLICAS=3 make scale-prod-worker
+scale-prod-worker:
+	@echo "Attempting to scale worker in namespace $(NAMESPACE) to $(REPLICAS) replicas..."
+	@sh -c '\
+if kubectl -n $(NAMESPACE) get deployment fold-worker >/dev/null 2>&1; then \
+	echo "Found deployment 'fold-worker' — scaling it to $(REPLICAS)..."; \
+	kubectl -n $(NAMESPACE) scale deployment fold-worker --replicas=$(REPLICAS); \
+	kubectl -n $(NAMESPACE) get deployment fold-worker -o wide || true; \
+else \
+	echo "Deployment 'fold-worker' not found; nothing to scale."; \
+fi'
+
 feeder-stats:
 	# Follow feeder container logs and show only stats lines
 	docker compose logs -f feeder 2>&1 | grep -F '[feeder][stats]'
@@ -124,14 +140,14 @@ prod-stats:
 
 # Minimal k8s deploy for production (uses build_prod.sh)
 REGISTRY ?= registry.digitalocean.com/fold
-IMAGE_NAME ?= fold-services
+IMAGE_NAME ?= fold
 IMAGE_TAG ?= latest
 FULL_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 NAMESPACE ?= fold
 FEED_JOB ?= fold-feed-job
 FEED_TIMEOUT ?= 600s
 
-.PHONY: build-prod deploy-prod feed-prod start-prod clean-prod provision-prod teardown-prod build-prod-and-feed pf-start pf-stop pf-status
+.PHONY: build-prod deploy-prod feed-prod start-prod clean-prod provision-prod teardown-prod build-prod-and-feed pf-start pf-stop pf-status scale-prod-worker
 
 deploy-prod:
 	@echo "==> build + deploy (simple)"
@@ -140,8 +156,12 @@ deploy-prod:
 build-prod:
 	@echo "==> build (prod image)"
 	./build_prod.sh
-	@echo "==> waiting for rollout (180s)..."
-	kubectl -n $(NAMESPACE) rollout status deployment/fold-services --timeout=180s || true
+	@echo "==> waiting for rollouts (180s) for per-component deployments..."
+	@sh -c '\
+for d in fold-worker fold-feeder fold-follower fold-ingestor; do \
+  echo "waiting for rollout $${d}"; \
+  kubectl -n $(NAMESPACE) rollout status deployment/$${d} --timeout=180s || true; \
+done'
 
 # Separate target that runs build-prod and then feed-prod for the full flow.
 build-prod-and-feed: build-prod

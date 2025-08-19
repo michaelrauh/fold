@@ -2,6 +2,7 @@
 *.txt
 .vscode/
 /interner_data
+passwords.sh
 
 # Added by cargo
 #

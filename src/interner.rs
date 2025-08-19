@@ -468,11 +468,13 @@ impl BlobInternerHolder {
             let head_result = client.head_bucket().bucket(&bucket_clone).send().await;
             if head_result.is_err() {
                 if let Err(e) = client.create_bucket().bucket(&bucket_clone).send().await {
-                    let msg = e.to_string();
-                    if !(msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists")) {
-                        return Err(FoldError::Other(format!("Failed to ensure S3 bucket exists: {}", e)));
+                        // Emit debug representation to capture connector/dispatch details (more verbose than Display)
+                        eprintln!("[interner] create_bucket error debug: {:#?}", e);
+                        let msg = e.to_string();
+                        if !(msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists")) {
+                            return Err(FoldError::Other(format!("Failed to ensure S3 bucket exists: {}", e)));
+                        }
                     }
-                }
             }
             Ok::<(), FoldError>(())
         })?;
