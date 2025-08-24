@@ -3,13 +3,14 @@ use fold::interner::{BlobInternerHolder, InternerHolderLike};
 use fold::ortho_database::PostgresOrthoDatabase;
 use fold::{OrthoDatabaseLike, QueueLenLike};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "ingestor")]
 #[command(about = "Distributed ingestor CLI for fold", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -110,11 +111,11 @@ fn main() {
     let mut db = PostgresOrthoDatabase::new();
     let s3_client = S3Client::new();
     match cli.command {
-        Commands::Queues => {
-                        println!("workq depth: {}", workq.len().unwrap_or(0));
-                        println!("dbq depth: {}", dbq.len().unwrap_or(0));
-            }
-        Commands::PrintOptimal => {
+        Some(Commands::Queues) => {
+            println!("workq depth: {}", workq.len().unwrap_or(0));
+            println!("dbq depth: {}", dbq.len().unwrap_or(0));
+        }
+        Some(Commands::PrintOptimal) => {
                 let ortho_opt = db.get_optimal();
                 if let Ok(Some(ortho)) = ortho_opt {
                     println!("Optimal Ortho: {:?}", ortho);
@@ -130,7 +131,7 @@ fn main() {
                     println!("No optimal Ortho found.");
                 }
             }
-        Commands::IngestS3Split { s3_path, delimiter } => {
+        Some(Commands::IngestS3Split { s3_path, delimiter }) => {
                 if let Some((bucket, key)) = parse_s3_path(&s3_path) {
                     if let Some(data) = s3_client.get_object_blocking(&key) {
                         let s = String::from_utf8_lossy(&data);
@@ -159,7 +160,7 @@ fn main() {
                     panic!("Invalid S3 path: {}", s3_path);
                 }
             }
-        Commands::FeedS3 { s3_path } => {
+        Some(Commands::FeedS3 { s3_path }) => {
                 if let Some((bucket, key)) = parse_s3_path(&s3_path) {
                     if let Some(data) = s3_client.get_object_blocking(&key) {
                         let s = String::from_utf8_lossy(&data);
@@ -184,7 +185,7 @@ fn main() {
                     panic!("Invalid S3 path: {}", s3_path);
                 }
             }
-        Commands::CleanS3Small { size } => {
+        Some(Commands::CleanS3Small { size }) => {
                 let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap();
                 let client = &s3_client.client;
                 let rt = &s3_client.rt;
@@ -209,21 +210,60 @@ fn main() {
                     println!("{} ({} bytes)", key, sz);
                 }
             }
-        Commands::Database => {
-                let db_len = db.len().unwrap_or(0);
-                println!("Database length: {}", db_len);
+        Some(Commands::Database) => {
+            let db_len = db.len().unwrap_or(0);
+            println!("Database length: {}", db_len);
+            match db.total_bytes() {
+                Ok(b) => println!("Database total bytes: {}", b),
+                Err(e) => eprintln!("Failed to compute total bytes: {}", e),
             }
-        Commands::InternerVersions => {
-                let versions = holder.versions();
-                println!("Interner versions: {:?}", versions);
+            match db.version_byte_sizes() {
+                Ok(pairs) => {
+                    println!("version\tbytes");
+                    for (v, b) in pairs { println!("{}\t{}", v, b); }
+                }
+                Err(e) => eprintln!("Failed to compute per-version bytes: {}", e),
             }
-        Commands::VersionCounts => {
+        }
+        Some(Commands::InternerVersions) => {
+            let versions = holder.versions();
+            println!("Interner versions: {:?}", versions);
+        }
+        Some(Commands::VersionCounts) => {
             match db.version_counts() {
                 Ok(pairs) => {
                     println!("version\tcount");
                     for (v,c) in pairs { println!("{}\t{}", v, c); }
                 }
                 Err(e) => eprintln!("Failed to get version counts: {}", e),
+            }
+        }
+        None => {
+            // Default daemon mode: periodically print queue/db sizes and wait
+            println!("[ingestor] starting daemon mode (no subcommand provided)");
+            while holder.get_latest().is_none() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            loop {
+                let workq_len = workq.len().unwrap_or(0);
+                let dbq_len = dbq.len().unwrap_or(0);
+                let db_len = db.len().unwrap_or(0);
+                // Emit concise status summary
+                let version_pairs = match db.version_counts() {
+                    Ok(v) => v,
+                    Err(_) => Vec::new(),
+                };
+                // Compact into comma-separated `version:count` pairs.
+                let vc_line = if version_pairs.is_empty() {
+                    "-".to_string()
+                } else {
+                    version_pairs.into_iter().map(|(v,c)| format!("{}:{}", v, c)).collect::<Vec<_>>().join(",")
+                };
+                println!(
+                    "[ingestor][status] workq={} dbq={} db_len={} versions={}",
+                    workq_len, dbq_len, db_len, vc_line
+                );
+                std::thread::sleep(Duration::from_secs(10));
             }
         }
     }

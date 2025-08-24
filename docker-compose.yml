@@ -1,6 +1,6 @@
 services:
   fold_worker:
-    image: fold-services:latest
+    image: fold:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -19,7 +19,7 @@ services:
       - minio
     restart: unless-stopped
   follower:
-    image: fold-services:latest
+    image: fold:latest
     working_dir: /app
     command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "./wait-for-it.sh", "postgres:5432", "--timeout=30", "--", "./wait-for-it.sh", "minio:9000", "--timeout=30", "--", "/app/follower"]
     environment:  
@@ -35,7 +35,7 @@ services:
       - minio
     restart: unless-stopped
   feeder:
-    image: fold-services:latest
+    image: fold:latest
     working_dir: /app
     command: ["./wait-for-it.sh", "rabbitmq:5672", "--timeout=30", "--", "./wait-for-it.sh", "postgres:5432", "--timeout=30", "--", "./wait-for-it.sh", "minio:9000", "--timeout=30", "--", "/app/feeder"]
     environment:  
@@ -51,7 +51,7 @@ services:
       - minio
     restart: unless-stopped
   ingestor:
-    image: fold-services:latest
+    image: fold:latest
     container_name: ingestor
     working_dir: /app
     environment:
