@@ -12,11 +12,17 @@ COPY benches ./benches
 RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y libssl3 curl postgresql-client bash && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+ && apt-get install -y libssl3 curl postgresql-client bash \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/target/release/fold_worker .
-COPY --from=builder /app/target/release/follower .
-COPY --from=builder /app/target/release/feeder .
-COPY --from=builder /app/target/release/ingestor .
-COPY wait-for-it.sh .
-RUN chmod +x ./wait-for-it.sh
+
+# Copy the release artifacts with cleaner paths
+COPY --from=builder /app/target/release/fold_worker /app/fold_worker
+COPY --from=builder /app/target/release/follower /app/follower
+COPY --from=builder /app/target/release/feeder /app/feeder
+COPY --from=builder /app/target/release/ingestor /app/ingestor
+COPY wait-for-it.sh /app/wait-for-it.sh
+
+# Ensure executables have the right mode
+RUN chmod +x /app/fold_worker /app/follower /app/feeder /app/ingestor /app/wait-for-it.sh

@@ -18,6 +18,10 @@ pub trait OrthoDatabaseLike {
     fn len(&mut self) -> Result<usize, FoldError>;
     fn sample_version(&mut self, version: usize) -> Result<Option<Ortho>, FoldError>;
     fn version_counts(&mut self) -> Result<Vec<(usize, usize)>, FoldError>; // (version, count)
+    // Total size in bytes of serialized ortho.data stored in the DB
+    fn total_bytes(&mut self) -> Result<usize, FoldError>;
+    // Per-version total size in bytes: Vec of (version, bytes)
+    fn version_byte_sizes(&mut self) -> Result<Vec<(usize, usize)>, FoldError>;
 }
 
 pub struct InMemoryOrthoDatabase {
@@ -86,6 +90,29 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
         let mut v: Vec<(usize, usize)> = counts.into_iter().collect();
         v.sort_by_key(|(ver, _)| *ver);
         Ok(v)
+    }
+
+    fn total_bytes(&mut self) -> Result<usize, FoldError> {
+        use bincode::config::standard;
+        let mut total: usize = 0;
+        for o in self.map.values() {
+            let v = bincode::encode_to_vec(o, standard())?;
+            total += v.len();
+        }
+        Ok(total)
+    }
+
+    fn version_byte_sizes(&mut self) -> Result<Vec<(usize, usize)>, FoldError> {
+        use std::collections::HashMap as StdHashMap;
+        use bincode::config::standard;
+        let mut sizes: StdHashMap<usize, usize> = StdHashMap::new();
+        for o in self.map.values() {
+            let v = bincode::encode_to_vec(o, standard())?;
+            *sizes.entry(o.version()).or_insert(0) += v.len();
+        }
+        let mut out: Vec<(usize, usize)> = sizes.into_iter().collect();
+        out.sort_by_key(|(ver, _)| *ver);
+        Ok(out)
     }
 }
 
@@ -270,6 +297,19 @@ impl OrthoDatabaseLike for PostgresOrthoDatabase {
         let rows = self.client.query("SELECT version, COUNT(*) FROM orthos GROUP BY version ORDER BY version", &[])?;
         Ok(rows.into_iter().map(|r| {
             let v: i64 = r.get(0); let c: i64 = r.get(1); (v as usize, c as usize)
+        }).collect())
+    }
+
+    fn total_bytes(&mut self) -> Result<usize, FoldError> {
+        let row = self.client.query_one("SELECT SUM(octet_length(data)) FROM orthos", &[])?;
+        let sum_opt: Option<i64> = row.get(0);
+        Ok(sum_opt.unwrap_or(0) as usize)
+    }
+
+    fn version_byte_sizes(&mut self) -> Result<Vec<(usize, usize)>, FoldError> {
+        let rows = self.client.query("SELECT version, SUM(octet_length(data)) FROM orthos GROUP BY version ORDER BY version", &[])?;
+        Ok(rows.into_iter().map(|r| {
+            let v: i64 = r.get(0); let s: Option<i64> = r.get(1); (v as usize, s.unwrap_or(0) as usize)
         }).collect())
     }
 }

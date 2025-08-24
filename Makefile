@@ -4,7 +4,7 @@ start:
 	./feed.sh
 
 build:
-	docker build -t fold-services:latest -f Dockerfile .
+	docker build -t fold:latest -f Dockerfile .
 
 up: build
 	docker-compose up --build -d
@@ -121,3 +121,28 @@ follower-diff:
 prod-stats:
 	# Show high-level production stats from feeder + follower
 	docker compose logs -f feeder follower 2>&1 | grep -E '\[feeder\]\[stats\]|\[follower\]\[stats\]'
+
+# Simple Kubernetes deployment targets
+REGISTRY ?= registry.digitalocean.com/fold
+IMAGE_NAME ?= fold
+IMAGE_TAG ?= latest
+NAMESPACE ?= fold
+
+.PHONY: k8s-deploy k8s-status k8s-scale k8s-clean
+
+k8s-deploy:
+	# Build and deploy to Kubernetes
+	./deploy.sh
+
+k8s-status:
+	# Show Kubernetes deployment status
+	kubectl get pods -n $(NAMESPACE)
+	kubectl get deployments -n $(NAMESPACE)
+
+k8s-scale:
+	# Scale worker deployment (usage: REPLICAS=3 make k8s-scale)
+	kubectl scale deployment fold-worker --replicas=$(REPLICAS) -n $(NAMESPACE)
+
+k8s-clean:
+	# Remove all fold resources from Kubernetes
+	kubectl delete namespace $(NAMESPACE) --ignore-not-found
