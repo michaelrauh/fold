@@ -30,10 +30,15 @@ pub fn init_tracing(service_name: &str) {
     if std::env::var("FOLD_LOG_VERBOSE").is_ok() {
         builder = EnvFilter::new("debug");
     }
+    // Allow overriding the OTLP endpoint via env so developers can point to a local
+    // collector or the in-cluster Jaeger collector. Default to the jaeger-collector
+    // service in the default namespace which the Jaeger Helm chart installs.
+    let default_otlp_endpoint = "http://jaeger-collector.default.svc.cluster.local:4318/v1/traces".to_string();
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or(default_otlp_endpoint);
     let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .with_endpoint("http://jaeger:4318/v1/traces")
+        .with_endpoint(&otlp_endpoint)
         .build()
         .expect("Failed to build OTLP exporter");
     let resource = Resource::builder_empty()
