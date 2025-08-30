@@ -122,17 +122,33 @@ prod-stats:
 	# Show high-level production stats from feeder + follower
 	docker compose logs -f feeder follower 2>&1 | grep -E '\[feeder\]\[stats\]|\[follower\]\[stats\]'
 
-# Simple Kubernetes deployment targets
+# Kubernetes deployment targets - complete workflow
 REGISTRY ?= registry.digitalocean.com/fold
 IMAGE_NAME ?= fold
 IMAGE_TAG ?= latest
 NAMESPACE ?= fold
 
-.PHONY: k8s-deploy k8s-status k8s-scale k8s-clean
+.PHONY: k8s-provision k8s-build k8s-deploy k8s-feed k8s-monitor k8s-status k8s-scale k8s-clean
+
+k8s-provision:
+	# Provision infrastructure for Kubernetes deployment
+	./provision.sh
+
+k8s-build:
+	# Build Docker image
+	./build.sh
 
 k8s-deploy:
-	# Build and deploy to Kubernetes
+	# Deploy to Kubernetes (run after provision and build)
 	./deploy.sh
+
+k8s-feed:
+	# Feed data to the deployed application
+	./feed.sh
+
+k8s-monitor:
+	# Monitor the deployed application
+	./monitor.sh
 
 k8s-status:
 	# Show Kubernetes deployment status

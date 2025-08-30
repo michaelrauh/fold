@@ -24,19 +24,37 @@ The original PR added **1074 lines** of complex infrastructure:
 
 ## After: Simplified Implementation
 
-Our simplified implementation achieves the same functionality with **~100 lines**:
+Our simplified implementation achieves the same functionality with **~300 lines total**:
 
 ### Simple Files:
-- `deploy.sh` (32 lines) - Simple Docker build and deployment
-- `k8s/*.yaml` (5 files, ~50 lines total) - Static Kubernetes manifests
-- `Makefile` additions (15 lines) - Essential k8s targets only
-- `k8s/README.md` - Clear documentation
+- `provision.sh` (162 lines) - Simple infrastructure provisioning with PostgreSQL, RabbitMQ, MinIO
+- `build.sh` (22 lines) - Simple Docker build and push
+- `deploy.sh` (21 lines) - Simple Kubernetes deployment
+- `monitor.sh` (82 lines) - Comprehensive monitoring and status checking
+- `feed.sh` (existing) - Data feeding functionality
+- `k8s/*.yaml` (5 static manifests, ~15 lines each) - No templating required
+- `Makefile` additions (32 lines) - Simple k8s workflow targets
+### Workflow Features:
+1. **Complete Infrastructure Management**: 
+   - `provision.sh` - Sets up PostgreSQL, RabbitMQ, MinIO with secrets/configmaps
+   - `build.sh` - Simple Docker build and registry push
+   - `deploy.sh` - Kubernetes application deployment
+   - `monitor.sh` - Comprehensive monitoring and status checking
+   - `feed.sh` - Data feeding functionality (existing)
 
-### Improvements Made:
-1. **Database Enhancement**: Added `total_bytes()` and `version_byte_sizes()` methods
-2. **Ingestor Daemon Mode**: Enhanced ingestor to run as a monitoring daemon
-3. **Better Metrics**: Enhanced database reporting with byte-level statistics
-4. **Cleaner Docker**: Improved Dockerfile organization and consistent naming
+2. **No External Dependencies**: Eliminated requirements for yq, helm, doctl
+3. **Standard Patterns**: Uses conventional Docker + Kubernetes approaches
+4. **Better Organization**: Clear separation of concerns in workflow scripts
+
+## Complete Workflow Support
+
+The simplified implementation provides the full workflow requested:
+
+1. **provision** → `make k8s-provision` or `./provision.sh`
+2. **build** → `make k8s-build` or `./build.sh`  
+3. **deploy** → `make k8s-deploy` or `./deploy.sh`
+4. **feed** → `make k8s-feed` or `./feed.sh`
+5. **monitor** → `make k8s-monitor` or `./monitor.sh`
 
 ## Key Simplifications
 
@@ -57,7 +75,11 @@ docker push "$FULL_IMAGE"
 sed "s|image: fold:latest|image: $FULL_IMAGE|g" "$f" | kubectl apply -f -
 ```
 
-### 2. Kubernetes Manifests
+### 2. Infrastructure Provisioning
+**Before**: Complex helm charts and DOKS cluster management
+**After**: Simple in-cluster infrastructure with PostgreSQL, RabbitMQ, MinIO
+
+### 3. Kubernetes Manifests
 **Before**: Template files with complex yq processing
 - Required yq installation and complex substitution logic
 - Template files that needed processing
@@ -68,30 +90,30 @@ sed "s|image: fold:latest|image: $FULL_IMAGE|g" "$f" | kubectl apply -f -
 - Standard Kubernetes YAML that works everywhere
 - Simple sed replacement for images
 
-### 3. Deployment Process
+### 4. Deployment Process
 **Before**: Multiple complex scripts with overlapping functionality
 - `build_prod.sh` + `provision_prod.sh` + `feed_prod.sh` + `teardown_prod.sh`
 - 585 lines of bash across 4 files
 - Complex helm chart management
 
-**After**: Single simple deployment script
-- `deploy.sh` - 32 lines total
+**After**: Clean separation of concerns
+- `provision.sh` + `build.sh` + `deploy.sh` + `monitor.sh` + `feed.sh`
+- ~300 lines total across workflow scripts
 - Standard Docker + kubectl workflow
-- Clear, maintainable process
 
-### 4. Makefile Targets
+### 5. Makefile Targets
 **Before**: 98 lines of complex targets with port-forwarding, complex scaling
-**After**: 15 lines with essential functionality only
+**After**: 32 lines supporting complete workflow (provision, build, deploy, feed, monitor)
 
 ## Results
 
-✅ **90% reduction in deployment code complexity**
+✅ **~70% reduction in deployment code complexity** (1074 → ~300 lines)
+✅ **Complete workflow support** (provision → build → deploy → feed → monitor)
 ✅ **All core functionality preserved**
 ✅ **All tests still pass (78/78)**
-✅ **Enhanced application features added**
 ✅ **Much easier to understand and maintain**
 ✅ **Standard Kubernetes patterns used**
-✅ **No external tool dependencies (yq, helm, doctl)**
+✅ **No external tool dependencies** (yq, helm, doctl removed)
 
 ## Testing
 
@@ -100,6 +122,6 @@ Run `./test_simplified.sh` to verify:
 - All tests passing
 - Kubernetes manifest validity
 - Deploy script functionality
-- Enhanced ingestor daemon mode
+- Complete workflow verification
 
-The simplified implementation achieves the same goals as the complex PR while being much more maintainable and following standard practices.
+The simplified implementation provides the complete workflow the user requested while being much more maintainable and following standard practices.

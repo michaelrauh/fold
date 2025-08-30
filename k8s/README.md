@@ -2,63 +2,90 @@
 
 This directory contains simplified Kubernetes deployment manifests for the fold application.
 
-## Quick Start
+## Complete Workflow
 
-1. Build and deploy to Kubernetes:
-   ```bash
-   make k8s-deploy
-   ```
+The fold application can be deployed to Kubernetes using a complete workflow:
 
-2. Check deployment status:
-   ```bash
-   make k8s-status
-   ```
+### 1. Provision Infrastructure
+Set up required infrastructure dependencies (PostgreSQL, RabbitMQ, MinIO):
+```bash
+make k8s-provision
+```
 
-3. Scale workers:
-   ```bash
-   REPLICAS=5 make k8s-scale
-   ```
+### 2. Build Application
+Build and push the Docker image:
+```bash
+make k8s-build
+```
 
-4. Clean up:
-   ```bash
-   make k8s-clean
-   ```
+### 3. Deploy Application
+Deploy the fold application to Kubernetes:
+```bash
+make k8s-deploy
+```
+
+### 4. Feed Data
+Feed initial data to the system:
+```bash
+make k8s-feed
+```
+
+### 5. Monitor
+Monitor the running application:
+```bash
+make k8s-monitor
+```
+
+## Quick Commands
+
+- **Check deployment status**: `make k8s-status`
+- **Scale workers**: `REPLICAS=5 make k8s-scale`
+- **Clean up**: `make k8s-clean`
 
 ## Manual Deployment
 
 If you prefer manual control:
 
-1. Build the Docker image:
+1. Provision infrastructure:
    ```bash
-   docker build -t fold:latest .
-   docker tag fold:latest your-registry/fold:latest
-   docker push your-registry/fold:latest
+   ./provision.sh
    ```
 
-2. Update the image in the deployment files:
+2. Build the Docker image:
    ```bash
-   sed -i 's|image: fold:latest|image: your-registry/fold:latest|g' k8s/*-deployment.yaml
+   ./build.sh
    ```
 
-3. Apply the manifests:
+3. Deploy to Kubernetes:
    ```bash
-   kubectl apply -f k8s/
+   ./deploy.sh
    ```
 
-## Configuration
+4. Feed data:
+   ```bash
+   ./feed.sh
+   ```
 
-The deployment expects the following secrets and config maps to be created in the cluster:
+5. Monitor:
+   ```bash
+   ./monitor.sh
+   ```
 
-- `fold-secrets`: Contains database credentials, queue URLs, and blob storage keys
-- `fold-config`: Contains blob storage endpoint and bucket configuration
+## Infrastructure Components
 
-You'll need to create these manually or use a tool like Helm to manage your infrastructure dependencies (PostgreSQL, RabbitMQ, MinIO).
+The provision script creates:
 
-## Components
+- **PostgreSQL**: Database for storing ortho data
+- **RabbitMQ**: Message queue for work distribution
+- **MinIO**: S3-compatible object storage for blob data
+- **Secrets**: Contains database credentials, queue URLs, and storage keys
+- **ConfigMaps**: Contains storage endpoints and configuration
+
+## Application Components
 
 - **fold-worker**: Processes work items from the queue
 - **fold-feeder**: Feeds the system with new work
 - **fold-follower**: Follows and processes updates
-- **fold-ingestor**: Ingests data and provides status (runs in daemon mode)
+- **fold-ingestor**: Ingests data and provides status
 
 All components are deployed as separate Kubernetes Deployments in the `fold` namespace.

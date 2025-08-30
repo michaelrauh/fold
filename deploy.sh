@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simple Docker build and Kubernetes deployment script
-# Replaces the complex build_prod.sh with a simplified version
+# Deploy fold application to Kubernetes
+# Run after provision.sh and build.sh
 
 REGISTRY=${REGISTRY:-registry.digitalocean.com/fold}
 IMAGE_NAME=${IMAGE_NAME:-fold}
@@ -10,19 +10,14 @@ IMAGE_TAG=${IMAGE_TAG:-latest}
 FULL_IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
 NAMESPACE=${NAMESPACE:-fold}
 
-echo "Building and deploying fold application to Kubernetes..."
+echo "Deploying fold application to Kubernetes..."
 
-# Build and push Docker image (simple version without buildx complexity)
-echo "Building Docker image: $FULL_IMAGE"
-docker build -t "$FULL_IMAGE" -f Dockerfile .
-docker push "$FULL_IMAGE"
-
-# Create namespace
-echo "Creating namespace: $NAMESPACE"
+# Ensure namespace exists
+echo "Ensuring namespace exists: $NAMESPACE"
 kubectl apply -f k8s/namespace.yaml
 
 # Update image in deployment files and apply
-echo "Deploying to Kubernetes..."
+echo "Applying deployment manifests..."
 for f in k8s/*-deployment.yaml; do
     echo "Applying $f..."
     # Use sed to replace the image tag (simpler than yq)
