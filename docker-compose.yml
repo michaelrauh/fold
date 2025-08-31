@@ -50,24 +50,6 @@ services:
       - postgres
       - minio
     restart: unless-stopped
-  ingestor:
-    image: fold:latest
-    container_name: ingestor
-    working_dir: /app
-    environment:
-      - FOLD_AMQP_URL=amqp://guest:guest@rabbitmq:5672/
-      - FOLD_PG_URL=postgres://fold:fold@postgres:5432/fold
-      - FOLD_INTERNER_BLOB_ENDPOINT=http://minio:9000
-      - FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin
-      - FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin  
-      - FOLD_INTERNER_BLOB_BUCKET=internerdata
-    depends_on:
-      - rabbitmq
-      - postgres
-      - minio
-    profiles:
-      - manual
-    restart: unless-stopped
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq

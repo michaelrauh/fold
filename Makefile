@@ -31,16 +31,16 @@ list-s3:
 
 split:
 	# Usage: make split FILE=yourfile.txt DELIM="\n"
-	docker compose run --rm ingestor /app/ingestor ingest-s3-split s3://internerdata/$(FILE) $(DELIM)
+	docker compose run --rm fold_worker /app/s3_util ingest-s3-split s3://internerdata/$(FILE) $(DELIM)
 
 queue-count:
-	docker compose run --rm ingestor /app/ingestor queues
+	docker compose run --rm fold_worker /app/queue_checker
 
 db-count:
-	docker compose run --rm ingestor /app/ingestor database
+	docker compose run --rm feeder /app/db_checker database
 
 optimal:
-	docker compose run --rm ingestor /app/ingestor print-optimal
+	docker compose run --rm feeder /app/db_checker print-optimal
 
 logs:
 	docker-compose logs -f 
@@ -62,19 +62,27 @@ put-s3:
 
 clean-s3-small:
 	# Usage: make clean-s3-small SIZE=1000
-	docker compose run --rm ingestor /app/ingestor clean-s3-small $(SIZE)
+	docker compose run --rm fold_worker /app/s3_util clean-s3-small $(SIZE)
 
 feed-s3:
-	docker compose run --rm ingestor /app/ingestor feed-s3 s3://internerdata/$(FILE)
+	docker compose run --rm fold_worker /app/interner_util feed-s3 s3://internerdata/$(FILE)
 
 help-ingestor:
-	docker compose run --rm ingestor /app/ingestor --help
+	@echo "Ingestor replaced with individual utilities:"
+	@echo "  queue_checker - Check queue depths"
+	@echo "  db_checker database - Check database size"
+	@echo "  db_checker print-optimal - Print optimal ortho"
+	@echo "  db_checker version-counts - Show version counts"
+	@echo "  interner_util interner-versions - Show interner versions"
+	@echo "  interner_util feed-s3 - Feed from S3"
+	@echo "  s3_util ingest-s3-split - Split S3 objects"
+	@echo "  s3_util clean-s3-small - Clean small S3 objects"
 
 interner-versions:
-	docker compose run --rm ingestor /app/ingestor interner-versions
+	docker compose run --rm fold_worker /app/interner_util interner-versions
 
 version-counts:
-	docker compose run --rm ingestor /app/ingestor version-counts
+	docker compose run --rm feeder /app/db_checker version-counts
 
 scale-worker:
 	docker compose up --scale fold_worker=$(REPLICAS) -d

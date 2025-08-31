@@ -72,39 +72,6 @@ kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: fold-ingestor
-  namespace: $NAMESPACE
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: fold-ingestor
-  template:
-    metadata:
-      labels:
-        app: fold-ingestor
-    spec:
-      containers:
-      - name: ingestor
-        image: $FULL_IMAGE
-        command: ["/app/ingestor"]
-        env:
-        - name: FOLD_AMQP_URL
-          value: "amqp://user:$RABBIT_PASSWORD@rabbit-k-rabbitmq.default.svc.cluster.local:5672/"
-        - name: FOLD_PG_URL
-          value: "postgresql://fold:$POSTGRES_PASSWORD@postgres-k-postgresql.default.svc.cluster.local:5432/fold"
-        - name: FOLD_INTERNER_BLOB_ENDPOINT
-          value: "http://minio-k.default.svc.cluster.local:9000"
-        - name: FOLD_INTERNER_BLOB_BUCKET
-          value: "internerdata"
-        - name: FOLD_INTERNER_BLOB_ACCESS_KEY
-          value: "$MINIO_ROOT_USER"
-        - name: FOLD_INTERNER_BLOB_SECRET_KEY
-          value: "$MINIO_ROOT_PASSWORD"
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
   name: fold-worker
   namespace: $NAMESPACE
 spec:
