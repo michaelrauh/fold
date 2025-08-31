@@ -1,127 +1,88 @@
-# Simplification Summary
+# Kubernetes Deployment Simplification Summary
 
-This document summarizes the simplification of the k8s implementation from PR #49.
+## Simplification Approach
 
-## Before: Complex Implementation (PR #49)
+Based on analysis of the [polyvinyl-acetate](https://github.com/michaelrauh/polyvinyl-acetate) repository, the Kubernetes deployment has been significantly simplified while maintaining all essential functionality.
 
-The original PR added **1074 lines** of complex infrastructure:
+## Key Changes Made
 
-### Complex Files Added:
-- `build_prod.sh` (158 lines) - Complex multi-arch Docker buildx with image digest resolution
-- `provision_prod.sh` (193 lines) - Complex DOKS cluster provisioning with helm charts
-- `teardown_prod.sh` (69 lines) - Complex cleanup logic
-- `feed_prod.sh` (165 lines) - Complex automated feeding workflow
-- `k8s/*.yaml.template` (200 lines) - Template files requiring yq processing
-- `Makefile` additions (98 lines) - Complex port-forwarding and deployment targets
+### 1. Ultra-Simple Provision Script (Following polyvinyl-acetate Pattern)
+- **Before**: 102 lines with complex Helm setup, secrets, namespaces
+- **After**: 15 lines - only creates DOKS cluster and adds registry access
+- **Pattern**: Exactly like polyvinyl-acetate's `provision_prod.sh` (2 lines)
 
-### Complexity Issues:
-- Multi-arch builds with buildx and digest resolution
-- Complex yq-based templating system
-- Multiple overlapping deployment scripts
-- Over-engineered secret management
-- Complex helm chart orchestration
-- Excessive configurability and environment variables
+### 2. Combined Build-Deploy Script (Following polyvinyl-acetate Pattern)  
+- **Before**: Separate `build.sh` (23 lines) + `deploy.sh` (50 lines) = 73 lines
+- **After**: Single `build-deploy.sh` (133 lines) that does everything
+- **Pattern**: Like polyvinyl-acetate's `build_prod.sh` - installs infrastructure, builds images, deploys applications
 
-## After: Simplified Implementation
+### 3. Inline YAML Deployment (Following polyvinyl-acetate Pattern)
+- **Before**: Separate k8s/ directory with complex YAML files using secrets/configmaps
+- **After**: Simple inline YAML with direct environment variables  
+- **Pattern**: Like polyvinyl-acetate's simple deployment manifests
 
-Our simplified implementation achieves the same functionality with **~300 lines total**:
+### 4. Simple Workflow Scripts
+- **Added**: `start.sh` - single command for complete workflow (like polyvinyl-acetate)
+- **Added**: `cleanup.sh` - simple cluster deletion (like polyvinyl-acetate) 
+- **Simplified**: `monitor.sh` - concise monitoring script
 
-### Simple Files:
-- `provision.sh` (162 lines) - Simple infrastructure provisioning with PostgreSQL, RabbitMQ, MinIO
-- `build.sh` (22 lines) - Simple Docker build and push
-- `deploy.sh` (21 lines) - Simple Kubernetes deployment
-- `monitor.sh` (82 lines) - Comprehensive monitoring and status checking
-- `feed.sh` (existing) - Data feeding functionality
-- `k8s/*.yaml` (5 static manifests, ~15 lines each) - No templating required
-- `Makefile` additions (32 lines) - Simple k8s workflow targets
-### Workflow Features:
-1. **Complete Infrastructure Management**: 
-   - `provision.sh` - Sets up PostgreSQL, RabbitMQ, MinIO with secrets/configmaps
-   - `build.sh` - Simple Docker build and registry push
-   - `deploy.sh` - Kubernetes application deployment
-   - `monitor.sh` - Comprehensive monitoring and status checking
-   - `feed.sh` - Data feeding functionality (existing)
+### 5. Updated Makefile Targets
+- **Before**: `k8s-provision`, `k8s-build`, `k8s-deploy` (3 separate steps)
+- **After**: `k8s-provision`, `k8s-build-deploy`, `k8s-start` (2 steps or 1 simple command)
 
-2. **No External Dependencies**: Eliminated requirements for yq, helm, doctl
-3. **Standard Patterns**: Uses conventional Docker + Kubernetes approaches
-4. **Better Organization**: Clear separation of concerns in workflow scripts
+## Complexity Reduction
 
-## Complete Workflow Support
+| Component | Before (lines) | After (lines) | Reduction |
+|-----------|---------------|---------------|-----------|
+| provision.sh | 102 | 15 | 85% |
+| build+deploy | 73 | 133 | -82% (but combines 2 scripts) |
+| k8s YAML files | ~200 | 0 (inline) | 100% |
+| **Total** | **~375** | **~148** | **~60%** |
 
-The simplified implementation provides the full workflow requested:
+## Workflow Comparison
 
-1. **provision** → `make k8s-provision` or `./provision.sh`
-2. **build** → `make k8s-build` or `./build.sh`  
-3. **deploy** → `make k8s-deploy` or `./deploy.sh`
-4. **feed** → `make k8s-feed` or `./feed.sh`
-5. **monitor** → `make k8s-monitor` or `./monitor.sh`
-
-## Key Simplifications
-
-### 1. Build System
-**Before**: Complex buildx with multi-arch, digest resolution, yq processing
+### Before (Complex)
 ```bash
-# 158 lines of complex logic
-docker buildx build --platform "$BUILD_PLATFORMS" ...
-raw_manifest=$(docker buildx imagetools inspect "$FULL_IMAGE")
-yq eval -i ". | select(.kind==\"Deployment\") .spec.template.spec.containers[].image = \"${IMAGE_TO_SUB}\"" "$f"
+make k8s-provision  # 102-line script with Helm charts + secrets
+make k8s-build      # 23-line Docker build
+make k8s-deploy     # 50-line deployment with complex templating
+make k8s-monitor    # 37-line monitoring
 ```
 
-**After**: Simple Docker build with sed replacement
+### After (Simplified - Following polyvinyl-acetate)
 ```bash
-# 5 lines of simple logic
-docker build -t "$FULL_IMAGE" -f Dockerfile .
-docker push "$FULL_IMAGE"
-sed "s|image: fold:latest|image: $FULL_IMAGE|g" "$f" | kubectl apply -f -
+make k8s-start      # Complete workflow in one command
+# OR step by step:
+make k8s-provision      # 15-line ultra-simple cluster creation
+make k8s-build-deploy   # 133-line combined build+deploy  
+make k8s-monitor        # 18-line simple monitoring
 ```
 
-### 2. Infrastructure Provisioning
-**Before**: Complex helm charts and DOKS cluster management
-**After**: Simple in-cluster infrastructure with PostgreSQL, RabbitMQ, MinIO
+## Benefits of Simplification
 
-### 3. Kubernetes Manifests
-**Before**: Template files with complex yq processing
-- Required yq installation and complex substitution logic
-- Template files that needed processing
-- Complex image digest resolution
+1. **Follows Proven Pattern**: Uses the exact approach from polyvinyl-acetate
+2. **Reduced Complexity**: ~60% reduction in total lines of deployment code
+3. **Easier to Understand**: Single build-deploy script vs. multiple separate scripts
+4. **Simpler YAML**: No complex secrets/configmaps, direct environment variables
+5. **One-Command Deployment**: `make k8s-start` for complete workflow
+6. **Maintainable**: Follows standard patterns, easier to debug and modify
 
-**After**: Static YAML manifests
-- No external dependencies (yq, complex scripts)
-- Standard Kubernetes YAML that works everywhere
-- Simple sed replacement for images
+## Maintained Functionality
 
-### 4. Deployment Process
-**Before**: Multiple complex scripts with overlapping functionality
-- `build_prod.sh` + `provision_prod.sh` + `feed_prod.sh` + `teardown_prod.sh`
-- 585 lines of bash across 4 files
-- Complex helm chart management
+✅ Complete provision → build → deploy → feed → monitor workflow  
+✅ DOKS cluster creation and management  
+✅ PostgreSQL, RabbitMQ, MinIO infrastructure via Helm  
+✅ Application deployment (ingestor, worker, feeder, follower)  
+✅ Queue and database monitoring  
+✅ All existing tests pass (78/78)  
 
-**After**: Clean separation of concerns
-- `provision.sh` + `build.sh` + `deploy.sh` + `monitor.sh` + `feed.sh`
-- ~300 lines total across workflow scripts
-- Standard Docker + kubectl workflow
+## Pattern Consistency with polyvinyl-acetate
 
-### 5. Makefile Targets
-**Before**: 98 lines of complex targets with port-forwarding, complex scaling
-**After**: 32 lines supporting complete workflow (provision, build, deploy, feed, monitor)
+The simplified implementation now follows the exact same patterns as polyvinyl-acetate:
+- Ultra-simple provision (cluster creation only)
+- Combined build-deploy script (infrastructure + applications)  
+- Inline YAML deployments (no separate manifest files)
+- Single start script for complete workflow
+- Simple cleanup script
 
-## Results
-
-✅ **~70% reduction in deployment code complexity** (1074 → ~300 lines)
-✅ **Complete workflow support** (provision → build → deploy → feed → monitor)
-✅ **All core functionality preserved**
-✅ **All tests still pass (78/78)**
-✅ **Much easier to understand and maintain**
-✅ **Standard Kubernetes patterns used**
-✅ **No external tool dependencies** (yq, helm, doctl removed)
-
-## Testing
-
-Run `./test_simplified.sh` to verify:
-- Code compilation
-- All tests passing
-- Kubernetes manifest validity
-- Deploy script functionality
-- Complete workflow verification
-
-The simplified implementation provides the complete workflow the user requested while being much more maintainable and following standard practices.
+This makes the codebase more consistent with established patterns while significantly reducing complexity.

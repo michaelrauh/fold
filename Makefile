@@ -122,25 +122,25 @@ prod-stats:
 	# Show high-level production stats from feeder + follower
 	docker compose logs -f feeder follower 2>&1 | grep -E '\[feeder\]\[stats\]|\[follower\]\[stats\]'
 
-# Kubernetes deployment targets - complete workflow
+# Kubernetes deployment targets - simplified workflow like polyvinyl-acetate
 REGISTRY ?= registry.digitalocean.com/fold
 IMAGE_NAME ?= fold
 IMAGE_TAG ?= latest
 NAMESPACE ?= fold
 
-.PHONY: k8s-provision k8s-build k8s-deploy k8s-feed k8s-monitor k8s-status k8s-scale k8s-clean
+.PHONY: k8s-provision k8s-build-deploy k8s-start k8s-feed k8s-monitor k8s-status k8s-scale k8s-clean
 
 k8s-provision:
-	# Provision infrastructure for Kubernetes deployment
+	# Provision DOKS cluster only (ultra-simple like polyvinyl-acetate)
 	./provision.sh
 
-k8s-build:
-	# Build Docker image
-	./build.sh
+k8s-build-deploy:
+	# Combined build and deploy (like polyvinyl-acetate)
+	./build-deploy.sh
 
-k8s-deploy:
-	# Deploy to Kubernetes (run after provision and build)
-	./deploy.sh
+k8s-start:
+	# Complete workflow: provision + build-deploy
+	./start.sh
 
 k8s-feed:
 	# Feed data to the deployed application
@@ -160,5 +160,5 @@ k8s-scale:
 	kubectl scale deployment fold-worker --replicas=$(REPLICAS) -n $(NAMESPACE)
 
 k8s-clean:
-	# Remove all fold resources from Kubernetes
-	kubectl delete namespace $(NAMESPACE) --ignore-not-found
+	# Clean up entire cluster (like polyvinyl-acetate)
+	./cleanup.sh
