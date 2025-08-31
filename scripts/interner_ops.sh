@@ -42,15 +42,41 @@ case "$1" in
         SECRET_KEY=${FOLD_INTERNER_BLOB_SECRET_KEY:-minioadmin}
         mc alias set local "$ENDPOINT" "$ACCESS_KEY" "$SECRET_KEY" >/dev/null 2>&1
         
-        # Download and delete the S3 object (simplified version)
+        # Download the S3 object and feed it to the interner
         temp_file="/tmp/s3_feed_$$"
         if mc cp "local/$BUCKET/$key" "$temp_file" 2>/dev/null; then
             echo "Downloaded S3 object $s3_path ($(wc -l < "$temp_file") lines)"
-            # In a full implementation, this would feed to the interner
-            # For now, we just acknowledge and clean up
-            mc rm "local/$BUCKET/$key"
+            
+            # Use the dedicated feed utility to add text with seed
+            if [[ -x "/app/feed_util" ]]; then
+                # Use the feed_util binary
+                cat "$temp_file" | /app/feed_util && {
+                    echo "Successfully fed text to interner"
+                    mc rm "local/$BUCKET/$key"
+                    echo "Deleted original S3 object"
+                } || {
+                    echo "Failed to feed text to interner"
+                    rm -f "$temp_file"
+                    exit 1
+                }
+            elif [[ -x "./target/release/feed_util" ]]; then
+                # Use local build
+                cat "$temp_file" | ./target/release/feed_util && {
+                    echo "Successfully fed text to interner"
+                    mc rm "local/$BUCKET/$key"
+                    echo "Deleted original S3 object"
+                } || {
+                    echo "Failed to feed text to interner"
+                    rm -f "$temp_file"
+                    exit 1
+                }
+            else
+                echo "Error: feed_util binary not found (required for feeding)"
+                rm -f "$temp_file"
+                exit 1
+            fi
+            
             rm -f "$temp_file"
-            echo "Deleted original S3 object"
         else
             echo "Failed to download $s3_path"
             exit 1

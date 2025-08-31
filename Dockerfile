@@ -10,7 +10,8 @@ RUN --mount=type=cache,target=/home/rust/.cargo/git \
     cargo build --release && \
     cp target/x86_64-unknown-linux-musl/release/fold_worker ./fold_worker && \
     cp target/x86_64-unknown-linux-musl/release/follower ./follower && \
-    cp target/x86_64-unknown-linux-musl/release/feeder ./feeder
+    cp target/x86_64-unknown-linux-musl/release/feeder ./feeder && \
+    cp target/x86_64-unknown-linux-musl/release/feed_util ./feed_util
 
 FROM alpine
 RUN apk --no-cache add curl postgresql-client && \
@@ -20,10 +21,11 @@ WORKDIR /app
 COPY --from=builder /home/rust/src/fold_worker /app/fold_worker
 COPY --from=builder /home/rust/src/follower /app/follower  
 COPY --from=builder /home/rust/src/feeder /app/feeder
+COPY --from=builder /home/rust/src/feed_util /app/feed_util
 COPY wait-for-it.sh /app/wait-for-it.sh
 COPY scripts/ /app/scripts/
 
 # Ensure executables have the right mode
-RUN chmod +x /app/fold_worker /app/follower /app/feeder /app/wait-for-it.sh /app/scripts/*.sh
+RUN chmod +x /app/fold_worker /app/follower /app/feeder /app/feed_util /app/wait-for-it.sh /app/scripts/*.sh
 
 USER 1000
