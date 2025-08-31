@@ -123,10 +123,6 @@ prod-stats:
 	docker compose logs -f feeder follower 2>&1 | grep -E '\[feeder\]\[stats\]|\[follower\]\[stats\]'
 
 # Kubernetes deployment targets - simplified workflow like polyvinyl-acetate
-REGISTRY ?= registry.digitalocean.com/fold
-IMAGE_NAME ?= fold
-IMAGE_TAG ?= latest
-NAMESPACE ?= fold
 
 .PHONY: k8s-provision k8s-build-deploy k8s-start k8s-feed k8s-monitor k8s-status k8s-scale k8s-clean
 

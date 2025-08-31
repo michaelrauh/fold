@@ -35,23 +35,19 @@ run_mc() {
 echo "Listing S3 objects..."
 run_mc "mc ls localminio/internerdata"
 
-echo "Uploading test file e.txt..."
-# First create the test file locally, then upload it via a temporary pod
-kubectl run file-upload-$(date +%s) --rm -i --restart=Never \
+echo "Uploading local file e.txt..."
+# Check if e.txt exists locally
+if [[ ! -f "e.txt" ]]; then
+    echo "Error: e.txt file not found. Please create a local e.txt file with CHAPTER delimiters."
+    exit 1
+fi
+
+# Upload the real local file via a temporary pod
+cat e.txt | kubectl run file-upload-$(date +%s) --rm -i --restart=Never \
     --image=minio/mc \
     --namespace=default \
     -- sh -c "
-    echo 'CHAPTER 1
-This is test content for chapter 1.
-Some more content here.
-
-CHAPTER 2  
-This is test content for chapter 2.
-More test data.
-
-CHAPTER 3
-Final chapter content.
-End of test file.' > /tmp/e.txt
+    cat > /tmp/e.txt
     mc alias set localminio http://minio-k.default.svc.cluster.local:9000 minioadmin minioadmin
     mc cp /tmp/e.txt localminio/internerdata/e.txt"
 
