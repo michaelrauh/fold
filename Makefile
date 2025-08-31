@@ -31,16 +31,16 @@ list-s3:
 
 split:
 	# Usage: make split FILE=yourfile.txt DELIM="\n"
-	docker compose run --rm fold_worker /app/s3_util ingest-s3-split s3://internerdata/$(FILE) $(DELIM)
+	./scripts/s3_ops.sh split s3://internerdata/$(FILE) $(DELIM)
 
 queue-count:
-	docker compose run --rm fold_worker /app/queue_checker
+	./scripts/queue_depths.sh
 
 db-count:
-	docker compose run --rm feeder /app/db_checker database
+	./scripts/database_ops.sh size
 
 optimal:
-	docker compose run --rm feeder /app/db_checker print-optimal
+	./scripts/database_ops.sh optimal
 
 logs:
 	docker-compose logs -f 
@@ -62,21 +62,27 @@ put-s3:
 
 clean-s3-small:
 	# Usage: make clean-s3-small SIZE=1000
-	docker compose run --rm fold_worker /app/s3_util clean-s3-small $(SIZE)
+	./scripts/s3_ops.sh clean-small $(SIZE)
 
 feed-s3:
-	docker compose run --rm fold_worker /app/interner_util feed-s3 s3://internerdata/$(FILE)
+	./scripts/interner_ops.sh feed-s3 s3://internerdata/$(FILE)
+
+version-counts:
+	./scripts/database_ops.sh version-counts
+
+interner-versions:
+	./scripts/interner_ops.sh versions
 
 help-ingestor:
-	@echo "Ingestor replaced with individual utilities:"
-	@echo "  queue_checker - Check queue depths"
-	@echo "  db_checker database - Check database size"
-	@echo "  db_checker print-optimal - Print optimal ortho"
-	@echo "  db_checker version-counts - Show version counts"
-	@echo "  interner_util interner-versions - Show interner versions"
-	@echo "  interner_util feed-s3 - Feed from S3"
-	@echo "  s3_util ingest-s3-split - Split S3 objects"
-	@echo "  s3_util clean-s3-small - Clean small S3 objects"
+	@echo "Ingestor replaced with bash scripts:"
+	@echo "  ./scripts/queue_depths.sh - Check queue depths"
+	@echo "  ./scripts/database_ops.sh size - Check database size"
+	@echo "  ./scripts/database_ops.sh optimal - Print optimal ortho"
+	@echo "  ./scripts/database_ops.sh version-counts - Show version counts"
+	@echo "  ./scripts/interner_ops.sh versions - Show interner versions"
+	@echo "  ./scripts/interner_ops.sh feed-s3 - Feed from S3"
+	@echo "  ./scripts/s3_ops.sh split - Split S3 objects"
+	@echo "  ./scripts/s3_ops.sh clean-small - Clean small S3 objects"
 
 interner-versions:
 	docker compose run --rm fold_worker /app/interner_util interner-versions

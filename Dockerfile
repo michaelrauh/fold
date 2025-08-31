@@ -10,24 +10,20 @@ RUN --mount=type=cache,target=/home/rust/.cargo/git \
     cargo build --release && \
     cp target/x86_64-unknown-linux-musl/release/fold_worker ./fold_worker && \
     cp target/x86_64-unknown-linux-musl/release/follower ./follower && \
-    cp target/x86_64-unknown-linux-musl/release/feeder ./feeder && \
-    cp target/x86_64-unknown-linux-musl/release/queue_checker ./queue_checker && \
-    cp target/x86_64-unknown-linux-musl/release/db_checker ./db_checker && \
-    cp target/x86_64-unknown-linux-musl/release/interner_util ./interner_util && \
-    cp target/x86_64-unknown-linux-musl/release/s3_util ./s3_util
+    cp target/x86_64-unknown-linux-musl/release/feeder ./feeder
 
 FROM alpine
+RUN apk --no-cache add curl postgresql-client && \
+    wget -O /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && \
+    chmod +x /usr/local/bin/mc
 WORKDIR /app
 COPY --from=builder /home/rust/src/fold_worker /app/fold_worker
 COPY --from=builder /home/rust/src/follower /app/follower  
 COPY --from=builder /home/rust/src/feeder /app/feeder
-COPY --from=builder /home/rust/src/queue_checker /app/queue_checker
-COPY --from=builder /home/rust/src/db_checker /app/db_checker
-COPY --from=builder /home/rust/src/interner_util /app/interner_util
-COPY --from=builder /home/rust/src/s3_util /app/s3_util
 COPY wait-for-it.sh /app/wait-for-it.sh
+COPY scripts/ /app/scripts/
 
 # Ensure executables have the right mode
-RUN chmod +x /app/fold_worker /app/follower /app/feeder /app/queue_checker /app/db_checker /app/interner_util /app/s3_util /app/wait-for-it.sh
+RUN chmod +x /app/fold_worker /app/follower /app/feeder /app/wait-for-it.sh /app/scripts/*.sh
 
 USER 1000

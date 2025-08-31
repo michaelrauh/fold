@@ -1,7 +1,7 @@
 [package]
 name = "fold"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 amiquip = "0.4.2"
@@ -24,7 +24,6 @@ tracing-opentelemetry = "0.30"
 opentelemetry = "0.29"
 opentelemetry_sdk = "0.29"
 opentelemetry-otlp = { version = "0.29", features = ["reqwest-blocking-client"] }
-clap = { version = "4", features = ["derive"] }
 bb8 = "0.9.0"
 lru = "0.12"
 once_cell = "1.19"

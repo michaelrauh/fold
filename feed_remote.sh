@@ -2,15 +2,17 @@
 set -e
 
 # Remote feed script that works against the Kubernetes cluster
-# Uses kubectl to run ingestor commands inside the cluster
+# Uses kubectl to run bash scripts inside the cluster
 
 NAMESPACE=${NAMESPACE:-fold}
 
 echo "Running feed sequence against remote Kubernetes cluster..."
 
-# Helper function to run database checker commands in the cluster
-run_db_checker() {
-    kubectl run db-checker-cmd-$(date +%s) --rm -i --restart=Never \
+# Helper function to run bash scripts in the cluster
+run_script() {
+    local script_name="$1"
+    shift
+    kubectl run script-cmd-$(date +%s) --rm -i --restart=Never \
         --image=$(kubectl get deployment fold-feeder -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') \
         --namespace=$NAMESPACE \
         --env="FOLD_AMQP_URL=amqp://user:foldpass@rabbit-k-rabbitmq.default.svc.cluster.local:5672/" \
@@ -19,49 +21,16 @@ run_db_checker() {
         --env="FOLD_INTERNER_BLOB_BUCKET=internerdata" \
         --env="FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin" \
         --env="FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin" \
-        -- /app/db_checker "$@"
-}
-
-# Helper function to run queue checker commands in the cluster
-run_queue_checker() {
-    kubectl run queue-checker-cmd-$(date +%s) --rm -i --restart=Never \
-        --image=$(kubectl get deployment fold-worker -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') \
-        --namespace=$NAMESPACE \
-        --env="FOLD_AMQP_URL=amqp://user:foldpass@rabbit-k-rabbitmq.default.svc.cluster.local:5672/" \
-        --env="FOLD_PG_URL=postgresql://fold:foldpass@postgres-k-postgresql.default.svc.cluster.local:5432/fold" \
-        --env="FOLD_INTERNER_BLOB_ENDPOINT=http://minio-k.default.svc.cluster.local:9000" \
-        --env="FOLD_INTERNER_BLOB_BUCKET=internerdata" \
-        --env="FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin" \
-        --env="FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin" \
-        -- /app/queue_checker
-}
-
-# Helper function to run interner util commands in the cluster
-run_interner_util() {
-    kubectl run interner-util-cmd-$(date +%s) --rm -i --restart=Never \
-        --image=$(kubectl get deployment fold-worker -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') \
-        --namespace=$NAMESPACE \
-        --env="FOLD_AMQP_URL=amqp://user:foldpass@rabbit-k-rabbitmq.default.svc.cluster.local:5672/" \
-        --env="FOLD_PG_URL=postgresql://fold:foldpass@postgres-k-postgresql.default.svc.cluster.local:5432/fold" \
-        --env="FOLD_INTERNER_BLOB_ENDPOINT=http://minio-k.default.svc.cluster.local:9000" \
-        --env="FOLD_INTERNER_BLOB_BUCKET=internerdata" \
-        --env="FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin" \
-        --env="FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin" \
-        -- /app/interner_util "$@"
-}
-
-# Helper function to run S3 util commands in the cluster
-run_s3_util() {
-    kubectl run s3-util-cmd-$(date +%s) --rm -i --restart=Never \
-        --image=$(kubectl get deployment fold-worker -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].image}') \
-        --namespace=$NAMESPACE \
-        --env="FOLD_AMQP_URL=amqp://user:foldpass@rabbit-k-rabbitmq.default.svc.cluster.local:5672/" \
-        --env="FOLD_PG_URL=postgresql://fold:foldpass@postgres-k-postgresql.default.svc.cluster.local:5432/fold" \
-        --env="FOLD_INTERNER_BLOB_ENDPOINT=http://minio-k.default.svc.cluster.local:9000" \
-        --env="FOLD_INTERNER_BLOB_BUCKET=internerdata" \
-        --env="FOLD_INTERNER_BLOB_ACCESS_KEY=minioadmin" \
-        --env="FOLD_INTERNER_BLOB_SECRET_KEY=minioadmin" \
-        -- /app/s3_util "$@"
+        --env="FOLD_POSTGRES_HOST=postgres-k-postgresql.default.svc.cluster.local" \
+        --env="FOLD_POSTGRES_PORT=5432" \
+        --env="FOLD_POSTGRES_DB=fold" \
+        --env="FOLD_POSTGRES_USER=fold" \
+        --env="FOLD_POSTGRES_PASSWORD=foldpass" \
+        --env="FOLD_AMQP_HOST=rabbit-k-rabbitmq.default.svc.cluster.local" \
+        --env="FOLD_AMQP_PORT=15672" \
+        --env="FOLD_AMQP_USER=user" \
+        --env="FOLD_AMQP_PASSWORD=foldpass" \
+        -- /app/scripts/"$script_name" "$@"
 }
 
 # Helper function to run mc commands for MinIO operations
@@ -94,40 +63,40 @@ cat e.txt | kubectl run file-upload-$(date +%s) --rm -i --restart=Never \
     mc cp /tmp/e.txt localminio/internerdata/e.txt"
 
 echo "Splitting file by CHAPTER delimiter..."
-run_s3_util ingest-s3-split s3://internerdata/e.txt CHAPTER
+run_script s3_ops.sh split s3://internerdata/e.txt CHAPTER
 
 echo "Listing S3 objects after split..."
 run_mc "mc ls localminio/internerdata"
 
 echo "Cleaning small files (size < 100)..."
-run_s3_util clean-s3-small 100
+run_script s3_ops.sh clean-small 100
 
 echo "Listing S3 objects after cleanup..."
 run_mc "mc ls localminio/internerdata"
 
 echo "Feeding data from e.txt-part-56..."
-run_interner_util feed-s3 s3://internerdata/e.txt-part-56 || echo "Part 56 may not exist, continuing..."
+run_script interner_ops.sh feed-s3 s3://internerdata/e.txt-part-56 || echo "Part 56 may not exist, continuing..."
 
 echo "Checking database count..."
-run_db_checker database
+run_script database_ops.sh size
 
 echo "Checking queue count..."
-run_queue_checker
+run_script queue_depths.sh
 
 echo "Checking interner versions..."
-run_interner_util interner-versions
+run_script interner_ops.sh versions
 
 echo "Waiting 10 seconds..."
 sleep 10
 
 echo "Feeding data from e.txt-part-55..."
-run_interner_util feed-s3 s3://internerdata/e.txt-part-55 || echo "Part 55 may not exist, continuing..."
+run_script interner_ops.sh feed-s3 s3://internerdata/e.txt-part-55 || echo "Part 55 may not exist, continuing..."
 
 echo "Checking database count..."
-run_db_checker database
+run_script database_ops.sh size
 
 echo "Checking queue count..."
-run_queue_checker
+run_script queue_depths.sh
 
 echo "Scaling workers to 50 replicas..."
 kubectl scale deployment fold-worker --replicas=50 -n $NAMESPACE
@@ -136,13 +105,13 @@ echo "Waiting 10 seconds..."
 sleep 10
 
 echo "Checking database count..."
-run_db_checker database
+run_script database_ops.sh size
 
 echo "Checking queue count..."
-run_queue_checker
+run_script queue_depths.sh
 
 echo "Printing optimal result..."
-run_db_checker print-optimal
+run_script database_ops.sh optimal
 
 echo "Showing recent logs..."
 kubectl logs -n $NAMESPACE deployment/fold-worker --tail=20
