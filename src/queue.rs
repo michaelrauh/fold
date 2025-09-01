@@ -1,7 +1,5 @@
 use crate::ortho::Ortho;
 use crate::error::FoldError;
-use amiquip::{QueueDeclareOptions, ConsumerMessage, ConsumerOptions, Exchange, Publish, AmqpProperties};
-use bincode::{encode_to_vec, decode_from_slice, config::standard};
 
 pub trait QueueLenLike {
     fn len(&mut self) -> Result<usize, FoldError>;
@@ -21,92 +19,71 @@ pub trait QueueConsumerLike: QueueLenLike {
     fn consume_batch_forever<F>(&mut self, batch_size: usize, callback: F) -> Result<(), FoldError>
     where
         F: FnMut(&[Ortho]) -> Result<(), FoldError>;
+    /// Try to consume up to `batch_size` items once in a non-blocking fashion.
+    /// Returns the number of items processed (0 if none available).
+    fn try_consume_batch_once<F>(&mut self, batch_size: usize, callback: F) -> Result<usize, FoldError>
+    where
+        F: FnMut(&[Ortho]) -> Result<(), FoldError>;
 }
+
+// In-memory wrappers and mock queue. The project no longer depends on RabbitMQ/amiquip.
 
 pub struct QueueProducer {
     pub name: String,
-    pub connection: amiquip::Connection,
+    pub inner: MockQueue,
 }
 
 impl QueueProducer {
     pub fn new(name: &str) -> Result<Self, FoldError> {
-        let url = std::env::var("FOLD_AMQP_URL").expect("FOLD_AMQP_URL env var must be set");
-        let mut connection = amiquip::Connection::insecure_open(&url)?;
-        // Ensure queue exists BEFORE we ever publish so early publishes are not dropped.
-        {
-            let channel = connection.open_channel(None)?;
-            let _ = channel.queue_declare(name, QueueDeclareOptions { durable: true, ..QueueDeclareOptions::default() })?;
-        }
-        Ok(Self {
-            name: name.to_string(),
-            connection,
-        })
+        Ok(Self { name: name.to_string(), inner: MockQueue::new() })
+    }
+}
+
+impl QueueProducer {
+    pub fn save_to_path(&mut self, path: &std::path::Path) -> Result<(), FoldError> {
+        self.inner.save_to_path(path)
+    }
+    pub fn load_from_path(&mut self, path: &std::path::Path) -> Result<(), FoldError> {
+        self.inner.load_from_path(path)
     }
 }
 
 impl QueueLenLike for QueueProducer {
     fn len(&mut self) -> Result<usize, FoldError> {
-        let channel = self.connection.open_channel(None)?;
-        let queue = channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        })?;
-        Ok(queue.declared_message_count().unwrap_or(0) as usize)
+        self.inner.len()
     }
 }
 
 impl QueueProducerLike for QueueProducer {
-    fn push_many(&mut self, orthos: Vec<Ortho>) -> Result<(), FoldError> {
-        let count = orthos.len();
-        if count == 0 { return Ok(()); }
-        let channel = self.connection.open_channel(None)?;
-        let exchange = Exchange::direct(&channel);
-        for ortho in orthos {
-            let payload = encode_to_vec(&ortho, standard())?;
-            // Publish as persistent (delivery_mode = 2) so messages are not lost on broker restart.
-            let props = AmqpProperties::default().with_delivery_mode(2);
-            exchange.publish(Publish::with_properties(&payload, &self.name, props))?;
-        }
-        println!("[queue][producer] pushed {} item(s) to {}", count, self.name);
-        Ok(())
+    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), FoldError> {
+        self.inner.push_many(items)
     }
 }
 
 pub struct QueueConsumer {
     pub name: String,
+    pub inner: MockQueue,
 }
 
 impl QueueConsumer {
     pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-        }
+        Self { name: name.to_string(), inner: MockQueue::new() }
     }
-    fn get_url() -> String {
-        std::env::var("FOLD_AMQP_URL").expect("FOLD_AMQP_URL env var must be set")
+}
+
+impl QueueConsumer {
+    pub fn save_to_path(&mut self, path: &std::path::Path) -> Result<(), FoldError> {
+        self.inner.save_to_path(path)
+    }
+    pub fn load_from_path(&mut self, path: &std::path::Path) -> Result<(), FoldError> {
+        self.inner.load_from_path(path)
     }
 }
 
 impl QueueLenLike for QueueConsumer {
     fn len(&mut self) -> Result<usize, FoldError> {
-        let url = QueueConsumer::get_url();
-        let mut connection = amiquip::Connection::insecure_open(&url)?;
-        let channel = connection.open_channel(None)?;
-        let queue = channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        })?;
-        Ok(queue.declared_message_count().unwrap_or(0) as usize)
+        self.inner.len()
     }
-}
-
-fn handle_delivery_result(result: &Result<(), FoldError>, delivery: amiquip::Delivery, channel: &amiquip::Channel) -> Result<(), FoldError> {
-    if result.is_ok() {
-        delivery.ack(channel)?;
-    } else {
-        delivery.nack(channel, true)?;
-    }
-    Ok(())
 }
 
 impl QueueConsumerLike for QueueConsumer {
@@ -114,101 +91,42 @@ impl QueueConsumerLike for QueueConsumer {
     where
         F: FnMut(&Ortho) -> Result<(), FoldError>,
     {
-        let url = QueueConsumer::get_url();
-        let mut connection = amiquip::Connection::insecure_open(&url)?;
-        let channel = connection.open_channel(None)?;
-        // Set prefetch (qos) to 1 to ensure fair dispatch across multiple workers
-        channel.qos(0, 1, false)?; // prefetch_count = 1
-        let queue = channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        })?;
-        println!("[queue][consumer] starting consume loop on {} (prefetch=1)", self.name);
-        let consumer = queue.consume(ConsumerOptions::default())?;
-        for msg in consumer.receiver().iter() {
-            if let ConsumerMessage::Delivery(delivery) = msg {
-                if let Ok((ortho, _)) = decode_from_slice::<Ortho, _>(&delivery.body, standard()) {
-                    println!("[queue][consumer] received ortho id={} version={} on {}", ortho.id(), ortho.version(), self.name);
-                    let result = callback(&ortho);
-                    handle_delivery_result(&result, delivery, &channel)?;
-                } else {
-                    println!("[queue][consumer] failed to decode message on {}", self.name);
-                }
+        loop {
+            if self.inner.items.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
+            let ortho = self.inner.items.remove(0);
+            callback(&ortho)?;
         }
-        consumer.cancel().ok();
-        Ok(())
     }
+
     fn consume_batch_forever<F>(&mut self, batch_size: usize, mut callback: F) -> Result<(), FoldError>
     where
         F: FnMut(&[Ortho]) -> Result<(), FoldError>,
     {
-        let url = QueueConsumer::get_url();
-        let mut connection = amiquip::Connection::insecure_open(&url)?;
-        let channel = connection.open_channel(None)?;
-        channel.qos(0, batch_size as u16, false)?; // prefetch = batch_size
-        let queue = channel.queue_declare(&self.name, QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        })?;
-        println!("[queue][consumer] starting batch consume loop on {} (batch_size={})", self.name, batch_size);
-        let consumer = queue.consume(ConsumerOptions::default())?;
-        let mut batch = Vec::with_capacity(batch_size);
-        let mut deliveries = Vec::with_capacity(batch_size);
-        use std::time::{Duration, Instant};
-        use crossbeam_channel::RecvTimeoutError;
-        let flush_interval = Duration::from_secs(1);
-        let mut last_flush = Instant::now();
         loop {
-            // Try to receive with timeout to allow periodic flush
-            match consumer.receiver().recv_timeout(flush_interval) {
-                Ok(ConsumerMessage::Delivery(delivery)) => {
-                    if let Ok((ortho, _)) = decode_from_slice(&delivery.body, standard()) {
-                        batch.push(ortho);
-                        deliveries.push(delivery);
-                        if batch.len() % 250 == 0 || batch.len() == 1 {
-                            println!("[queue][consumer] accumulating batch: size={} on {}", batch.len(), self.name);
-                        }
-                        if batch.len() >= batch_size {
-                            println!("[queue][consumer] flushing full batch size={} on {}", batch.len(), self.name);
-                            let result = callback(&batch);
-                            for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
-                            batch.clear();
-                            last_flush = Instant::now();
-                        } else if !batch.is_empty() && last_flush.elapsed() >= flush_interval {
-                            println!("[queue][consumer] flushing timed partial batch size={} on {}", batch.len(), self.name);
-                            let result = callback(&batch);
-                            for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
-                            batch.clear();
-                            last_flush = Instant::now();
-                        }
-                    } else {
-                        // decoding failed; requeue
-                        handle_delivery_result(&Err(FoldError::Queue("decode failed".into())), delivery, &channel)?;
-                    }
-                }
-                Ok(_) => { // cancellation variants
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if !batch.is_empty() {
-                        println!("[queue][consumer] flushing timed partial batch size={} on {}", batch.len(), self.name);
-                        let result = callback(&batch);
-                        for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
-                        batch.clear();
-                    }
-                    last_flush = Instant::now();
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
+            if self.inner.items.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             }
+            let take = usize::min(batch_size, self.inner.items.len());
+            let batch: Vec<Ortho> = self.inner.items.drain(0..take).collect();
+            callback(&batch)?;
         }
-        if !batch.is_empty() {
-            println!("[queue][consumer] final flush size={} on {}", batch.len(), self.name);
-            let result = callback(&batch);
-            for d in deliveries.drain(..) { handle_delivery_result(&result, d, &channel)?; }
+    }
+
+    fn try_consume_batch_once<F>(&mut self, batch_size: usize, mut callback: F) -> Result<usize, FoldError>
+    where
+        F: FnMut(&[Ortho]) -> Result<(), FoldError>,
+    {
+        if self.inner.items.is_empty() {
+            return Ok(0);
         }
-        consumer.cancel().ok();
-        Ok(())
+        let take = usize::min(batch_size, self.inner.items.len());
+        let batch: Vec<Ortho> = self.inner.items.drain(0..take).collect();
+        callback(&batch)?;
+        Ok(batch.len())
     }
 }
 
@@ -219,6 +137,19 @@ pub struct MockQueue {
 impl MockQueue {
     pub fn new() -> Self {
         MockQueue { items: Vec::new() }
+    }
+
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), FoldError> {
+        let bytes = bincode::encode_to_vec(&self.items, bincode::config::standard())?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_from_path(&mut self, path: &std::path::Path) -> Result<(), FoldError> {
+        let data = std::fs::read(path)?;
+        let (items, _): (Vec<Ortho>, usize) = bincode::decode_from_slice(&data, bincode::config::standard())?;
+        self.items = items;
+        Ok(())
     }
 }
 
@@ -258,6 +189,18 @@ impl QueueConsumerLike for MockQueue {
         let batch: Vec<Ortho> = self.items.drain(0..take).collect();
         callback(&batch)?;
         Ok(())
+    }
+
+    fn try_consume_batch_once<F>(&mut self, batch_size: usize, mut callback: F) -> Result<usize, FoldError>
+    where
+        F: FnMut(&[Ortho]) -> Result<(), FoldError> {
+        if self.items.is_empty() {
+            return Ok(0);
+        }
+        let take = usize::min(batch_size, self.items.len());
+        let batch: Vec<Ortho> = self.items.drain(0..take).collect();
+        callback(&batch)?;
+        Ok(batch.len())
     }
 }
 

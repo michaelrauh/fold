@@ -33,12 +33,6 @@ impl From<postgres::Error> for FoldError {
     }
 }
 
-impl From<amiquip::Error> for FoldError {
-    fn from(err: amiquip::Error) -> Self {
-        FoldError::Queue(err.to_string())
-    }
-}
-
 impl From<Box<bincode::error::EncodeError>> for FoldError {
     fn from(err: Box<bincode::error::EncodeError>) -> Self {
         FoldError::Serialization(err)

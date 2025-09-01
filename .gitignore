@@ -8,3 +8,13 @@
 # already existing elements were commented out
 
 #/target
+
+# Local interner and state files
+interner/
+internerdata/
+internerdata/**
+state/
+state/db.bin
+state/workq.bin
+state/dbq.bin
+*.bin

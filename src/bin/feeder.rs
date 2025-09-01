@@ -1,11 +1,11 @@
 use fold::{QueueConsumer, QueueConsumerLike, QueueProducer};
-use fold::{OrthoFeeder, ortho_database::PostgresOrthoDatabase};
+use fold::{OrthoFeeder, ortho_database::InMemoryOrthoDatabase};
 
 fn main() {
     fold::init_tracing("fold-feeder");
     let mut dbq = QueueConsumer::new("dbq");
     let mut workq = QueueProducer::new("workq").expect("Failed to create workq");
-    let mut db = PostgresOrthoDatabase::new();
+    let mut db = InMemoryOrthoDatabase::new();
     let mut cumulative_new: usize = 0;
     let mut cumulative_total: usize = 0;
     let mut window_new: usize = 0;

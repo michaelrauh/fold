@@ -23,15 +23,10 @@ clean:
 	rm -rf $(INTERNER_FILE_LOCATION)/*
 	@echo "Cleaned interner files in $(INTERNER_FILE_LOCATION)"
 
-setup-s3:
-	mc alias set localminio http://localhost:9000 minioadmin minioadmin || true
-
-list-s3:
-	mc ls localminio/internerdata
 
 split:
 	# Usage: make split FILE=yourfile.txt DELIM="\n"
-	docker compose run --rm ingestor /app/ingestor ingest-s3-split s3://internerdata/$(FILE) $(DELIM)
+	docker compose run --rm ingestor /app/ingestor ingest-file-split $(FILE) $(DELIM)
 
 queue-count:
 	docker compose run --rm ingestor /app/ingestor queues
@@ -48,24 +43,25 @@ logs:
 services:
 	docker compose config --services
 
-show-s3:
-	# Usage: make show-s3 FILE=yourfile.txt
-	mc cat localminio/internerdata/$(FILE)
 
-delete-s3:
-	# Usage: make delete-s3 FILE=yourfile.txt
-	mc rm localminio/internerdata/$(FILE)
+show-file:
+	# Usage: make show-file FILE=yourfile.txt
+	docker compose run --rm ingestor /app/ingestor print-file $(FILE)
 
-put-s3:
-	# Usage: make put-s3 FILE=yourfile.txt
-	mc cp $(FILE) localminio/internerdata/$(FILE)
+delete-file:
+	# Usage: make delete-file FILE=yourfile.txt
+	docker compose run --rm ingestor /app/ingestor delete-file $(FILE)
 
-clean-s3-small:
-	# Usage: make clean-s3-small SIZE=1000
-	docker compose run --rm ingestor /app/ingestor clean-s3-small $(SIZE)
+put-file:
+	# Usage: make put-file FILE=yourfile.txt
+	docker compose run --rm ingestor /app/ingestor put-file $(FILE)
 
-feed-s3:
-	docker compose run --rm ingestor /app/ingestor feed-s3 s3://internerdata/$(FILE)
+clean-files-small:
+	# Usage: make clean-files-small SIZE=1000
+	docker compose run --rm ingestor /app/ingestor clean-files-small $(SIZE)
+
+feed-file:
+	docker compose run --rm ingestor /app/ingestor feed-file $(FILE)
 
 help-ingestor:
 	docker compose run --rm ingestor /app/ingestor --help

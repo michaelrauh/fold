@@ -1,8 +1,7 @@
 use clap::{Parser, Subcommand};
-use fold::interner::{BlobInternerHolder, InternerHolderLike};
-use fold::ortho_database::PostgresOrthoDatabase;
+use fold::interner::{FileInternerHolder, InternerHolderLike};
+use fold::ortho_database::InMemoryOrthoDatabase;
 use fold::{OrthoDatabaseLike, QueueLenLike};
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "ingestor")]
@@ -21,20 +20,20 @@ enum Commands {
     /// Add text from a file to the queue/interner
     /// Print latest optimal ortho and its strings
     PrintOptimal,
-    /// Ingest from an S3 object, splitting by a delimiter
-    IngestS3Split {
-        /// S3 path (e.g., s3://bucket/key)
-        s3_path: String,
-        /// Delimiter to split the object
+    /// Split from a local file by a delimiter (writes parts and deletes original)
+    SplitFile {
+        /// File path (relative to interner data dir or absolute)
+        file_path: String,
+        /// Delimiter to split the file
         delimiter: String,
     },
-    /// Feed an S3 object into the interner and delete it
-    FeedS3 {
-        /// S3 path (e.g., s3://bucket/key)
-        s3_path: String,
+    /// Feed a local file into the interner and delete it
+    FeedFile {
+        /// File path (relative to interner data dir or absolute)
+        file_path: String,
     },
-    /// Delete S3 objects under a given size threshold (in bytes)
-    CleanS3Small {
+    /// Delete files under a given size threshold (in bytes)
+    CleanFilesSmall {
         /// Size threshold in bytes
         size: usize,
     },
@@ -43,62 +42,57 @@ enum Commands {
     VersionCounts,
 }
 
-// Helper to parse s3://bucket/key
-fn parse_s3_path(s3_path: &str) -> Option<(String, String)> {
-    let s = s3_path.strip_prefix("s3://")?;
-    let mut parts = s.splitn(2, '/');
-    let bucket = parts.next()?.to_string();
-    let key = parts.next()?.to_string();
-    Some((bucket, key))
+// All paths are plain file paths now.
+
+// Disk-backed client for ingestor: stores blobs under ./internerdata by default
+struct DiskClient {
+    base: std::path::PathBuf,
 }
 
-struct S3Client {
-    client: aws_sdk_s3::Client,
-    bucket: String,
-    rt: Arc<tokio::runtime::Runtime>,
-}
-
-impl S3Client {
+impl DiskClient {
     fn new() -> Self {
-        let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap();
-        let endpoint_url = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap();
-        let access_key = std::env::var("FOLD_INTERNER_BLOB_ACCESS_KEY").unwrap();
-        let secret_key = std::env::var("FOLD_INTERNER_BLOB_SECRET_KEY").unwrap();
-        let region = "us-east-1";
-        let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
-        let config = rt.block_on(async {
-            aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(region)
-                .endpoint_url(&endpoint_url)
-                .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                    &access_key,
-                    &secret_key,
-                    None,
-                    None,
-                    "minio",
-                ))
-                .load()
-                .await
-        });
-        let s3_config = aws_sdk_s3::config::Builder::from(&config)
-            .force_path_style(true)
-            .build();
-        let client = aws_sdk_s3::Client::from_conf(s3_config);
-        Self { client, bucket, rt }
+        let base = std::env::var("FOLD_INTERNER_BLOB_DIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("./internerdata"));
+        let _ = std::fs::create_dir_all(&base);
+        DiskClient { base }
     }
+
     fn get_object_blocking(&self, key: &str) -> Option<Vec<u8>> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        self.rt.block_on(async move {
-            match client.get_object().bucket(&bucket).key(key).send().await {
-                Ok(resp) => {
-                    let data = resp.body.collect().await.ok()?;
-                    let bytes = data.into_bytes();
-                    Some(bytes.to_vec())
-                },
-                Err(_e) => None,
+        let path = self.base.join(key);
+        std::fs::read(path).ok()
+    }
+
+    fn put_object_blocking(&self, key: &str, data: &[u8]) -> std::io::Result<()> {
+        let path = self.base.join(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, data)
+    }
+
+    fn delete_object_blocking(&self, key: &str) -> std::io::Result<()> {
+        let path = self.base.join(key);
+        if path.exists() {
+            std::fs::remove_file(path)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn list_objects(&self) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.base) {
+            for de in entries.flatten() {
+                if let Ok(meta) = de.metadata() {
+                    if meta.is_file() {
+                        if let Some(name) = de.file_name().to_str() {
+                            out.push((name.to_string(), meta.len() as usize));
+                        }
+                    }
+                }
             }
-        })
+        }
+        out
     }
 }
 
@@ -106,9 +100,9 @@ fn main() {
     let cli = Cli::parse();
     let mut dbq = fold::queue::QueueConsumer::new("dbq");
     let mut workq = fold::queue::QueueProducer::new("workq").expect("queue creation failed");
-    let mut holder = BlobInternerHolder::new().expect("Failed to create BlobInternerHolder");
-    let mut db = PostgresOrthoDatabase::new();
-    let s3_client = S3Client::new();
+    let mut holder = FileInternerHolder::new().expect("Failed to create FileInternerHolder");
+    let mut db = InMemoryOrthoDatabase::new();
+    let disk_client = DiskClient::new();
     match cli.command {
         Commands::Queues => {
                         println!("workq depth: {}", workq.len().unwrap_or(0));
@@ -130,81 +124,49 @@ fn main() {
                     println!("No optimal Ortho found.");
                 }
             }
-        Commands::IngestS3Split { s3_path, delimiter } => {
-                if let Some((bucket, key)) = parse_s3_path(&s3_path) {
-                    if let Some(data) = s3_client.get_object_blocking(&key) {
-                        let s = String::from_utf8_lossy(&data);
-                        let parts: Vec<&str> = s.split(&delimiter).collect();
-                        // Write each part to S3 as a new object
-                        for (i, part) in parts.iter().enumerate() {
-                            let new_key = format!("{}-part-{}", key, i);
-                            s3_client.rt.block_on(s3_client.client.put_object()
-                                .bucket(&bucket)
-                                .key(&new_key)
-                                .body(aws_sdk_s3::primitives::ByteStream::from(part.as_bytes().to_vec()))
-                                .send())
-                                .expect("Failed to write split part to S3");
-                        }
-                        // Delete the original object
-                        s3_client.rt.block_on(s3_client.client.delete_object()
-                            .bucket(&bucket)
-                            .key(&key)
-                            .send())
-                            .expect("Failed to delete original S3 object after split");
-                        println!("Split S3 object {} into {} parts, wrote to bucket {}, deleted original.", s3_path, parts.len(), bucket);
-                    } else {
-                        panic!("Failed to ingest from S3 path {}", s3_path);
+    Commands::SplitFile { file_path, delimiter } => {
+        if let Some(data) = disk_client.get_object_blocking(&file_path) {
+                    let s = String::from_utf8_lossy(&data);
+                    let parts: Vec<&str> = s.split(&delimiter).collect();
+                    // Write each part back to disk as new objects
+                    for (i, part) in parts.iter().enumerate() {
+                        let new_key = format!("{}-part-{}", file_path, i);
+                        disk_client.put_object_blocking(&new_key, part.as_bytes()).expect("Failed to write split part to disk");
                     }
+                    // Delete the original object
+                    disk_client.delete_object_blocking(&file_path).ok();
+                    println!("Split file {} into {} parts, wrote to disk, deleted original.", file_path, parts.len());
                 } else {
-                    panic!("Invalid S3 path: {}", s3_path);
+                    panic!("Failed to split file from path {}", file_path);
                 }
             }
-        Commands::FeedS3 { s3_path } => {
-                if let Some((bucket, key)) = parse_s3_path(&s3_path) {
-                    if let Some(data) = s3_client.get_object_blocking(&key) {
-                        let s = String::from_utf8_lossy(&data);
-                        match holder.add_text_with_seed(&s, &mut workq) {
-                            Ok(()) => {
-                                // Only delete the object after successful feed
-                                s3_client.rt.block_on(s3_client.client.delete_object()
-                                    .bucket(&bucket)
-                                    .key(&key)
-                                    .send())
-                                    .expect("Failed to delete S3 object after feed");
-                                println!("Fed S3 object {} into interner and deleted original.", s3_path);
-                            }
-                            Err(e) => {
-                                panic!("Failed to feed S3 object {} into interner: {}", s3_path, e);
-                            }
+        Commands::FeedFile { file_path } => {
+                if let Some(data) = disk_client.get_object_blocking(&file_path) {
+                    let s = String::from_utf8_lossy(&data);
+                    match holder.add_text_with_seed(&s, &mut workq) {
+                        Ok(()) => {
+                            // Only delete the object after successful feed
+                            disk_client.delete_object_blocking(&file_path).ok();
+                            println!("Fed file {} into interner and deleted original.", file_path);
                         }
-                    } else {
-                        panic!("Failed to feed from S3 path {}", s3_path);
+                        Err(e) => {
+                            panic!("Failed to feed file {} into interner: {}", file_path, e);
+                        }
                     }
                 } else {
-                    panic!("Invalid S3 path: {}", s3_path);
+                    panic!("Failed to feed from path {}", file_path);
                 }
             }
-        Commands::CleanS3Small { size } => {
-                let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap();
-                let client = &s3_client.client;
-                let rt = &s3_client.rt;
+        Commands::CleanFilesSmall { size } => {
                 let mut deleted = Vec::new();
-                let objects = rt.block_on(async {
-                    client.list_objects_v2().bucket(&bucket).send().await
-                });
-                if let Ok(resp) = objects {
-                    for obj in resp.contents() {
-                        let key = obj.key().unwrap_or("");
-                        let size_bytes = obj.size().unwrap_or(0) as usize;
-                        if size_bytes < size {
-                            let _ = rt.block_on(async {
-                                client.delete_object().bucket(&bucket).key(key).send().await
-                            });
-                            deleted.push((key.to_string(), size_bytes));
-                        }
+                let objects = disk_client.list_objects();
+                for (key, size_bytes) in objects {
+                    if size_bytes < size {
+                        let _ = disk_client.delete_object_blocking(&key);
+                        deleted.push((key, size_bytes));
                     }
                 }
-                println!("Deleted objects under {} bytes:", size);
+                println!("Deleted files under {} bytes:", size);
                 for (key, sz) in deleted {
                     println!("{} ({} bytes)", key, sz);
                 }

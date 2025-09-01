@@ -1,5 +1,5 @@
-use fold::{Follower, PostgresOrthoDatabase, QueueProducer};
-use fold::interner::{BlobInternerHolder, InternerHolderLike};
+use fold::{Follower, InMemoryOrthoDatabase, QueueProducer};
+use fold::interner::{FileInternerHolder, InternerHolderLike};
 use dotenv::dotenv;
 use std::time::{Instant, Duration};
 
@@ -11,12 +11,12 @@ fn main() {
     println!("[follower] local follower_id={}", follower_id);
     fold::init_tracing("fold-follower");
     let mut dbq_producer = QueueProducer::new("dbq").expect("Failed to create dbq producer");
-    let mut holder = BlobInternerHolder::new().expect("Failed to create BlobInternerHolder");
-    let mut db = PostgresOrthoDatabase::new_with_follower_id(follower_id);
+    let mut holder = FileInternerHolder::new().expect("Failed to create FileInternerHolder");
+    let mut db = InMemoryOrthoDatabase::new();
     let mut follower = Follower::new();
     let mut last_reap = Instant::now();
     let reap_interval = Duration::from_secs(30);
-    let mut cumulative_bumped: usize = 0; // retained if needed elsewhere
+    let mut _cumulative_bumped: usize = 0; // retained if needed elsewhere
     let mut cumulative_children: usize = 0;
     let mut window_children: usize = 0;
     let mut window_iters: usize = 0;
@@ -28,13 +28,13 @@ fn main() {
 
     loop {
         if last_reap.elapsed() >= reap_interval {
-            db.reap_stale_claims();
+            // no-op for in-memory DB; retained timing for compatibility
             last_reap = Instant::now();
         }
         match (&mut follower).run_follower_once(&mut db, &mut dbq_producer, &mut holder) {
             Ok((bumped, produced_children, diff_duration)) => {
                 if bumped + produced_children > 0 || bumped > 0 { // processed a parent ortho
-                    cumulative_bumped += bumped;
+                    _cumulative_bumped += bumped;
                     cumulative_children += produced_children;
                     window_children += produced_children;
                     window_iters += 1;

@@ -1,32 +1,54 @@
 #!/bin/bash
-set -e
-make list-s3
-make put-s3 FILE=e.txt
-make split FILE=e.txt DELIM=CHAPTER
-make list-s3
-make clean-s3-small SIZE=100
-make list-s3
-make feed-s3 FILE=e.txt-part-56
-make db-count
-make queue-count
-make interner-versions
-sleep 10
-make feed-s3 FILE=e.txt-part-55
-make db-count
-make queue-count
-make scale-worker REPLICAS=50
-sleep 10
-make db-count
-make queue-count
-make optimal
-make logs
+set -euo pipefail
 
-# todo throttling and auto-scaling
-# todo managed DBs 
-# todo persistent queues
-# todo add more benchmarks 
-# todo k8s 
-# todo results explorer:
-# - start empty and show all possible fills for each possible direction
-# - indicate directions toward optimal
-# - allow for rotating and showing different points of view in single orthos
+# Build once
+echo "Building..."
+cargo build
+
+BIN="target/debug/fold"
+FIFO="/tmp/fold-cmds.$$"
+rm -f "$FIFO"
+mkfifo "$FIFO"
+
+# Start the REPL reading from the FIFO
+"$BIN" < "$FIFO" &
+FOLD_PID=$!
+echo "Started fold (pid=$FOLD_PID); sending commands via $FIFO"
+
+send() {
+	echo "$@" > "$FIFO"
+}
+
+# Workflow (commands are sent to the running REPL)
+send list-files
+send stage-file e.txt
+send ingest-file-split e.txt CHAPTER
+send list-files
+send clean-files-small 100
+send list-files
+send feed-file e.txt-part-56
+send database
+send queues
+send interner-versions
+
+sleep 10
+
+send feed-file e.txt-part-55
+send database
+send queues
+
+echo "scale-worker: skipped in local mode"
+sleep 10
+
+send database
+send queues
+send print-optimal
+
+# Gracefully exit the REPL
+send exit
+
+# Wait for process to finish and cleanup
+wait "$FOLD_PID"
+rm -f "$FIFO"
+
+echo "Workflow complete."

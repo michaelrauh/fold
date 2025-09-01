@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use aws_sdk_s3::{Client, primitives::ByteStream};
-use aws_config;
 
 #[derive(Clone)]
 pub struct Interner {
@@ -76,7 +74,7 @@ impl Interner {
 
     fn add_text(&self, text: &str) -> Self {
         if text.trim().is_empty() {
-            let mut interner = Interner {
+            let interner = Interner {
                 version: self.version + 1,
                 vocabulary: self.vocabulary.clone(),
                 prefix_to_completions: self.prefix_to_completions.clone(),
@@ -369,6 +367,14 @@ impl FileInternerHolder {
         fs::write(path, data).map_err(|e| FoldError::Io(e))?;
         Ok(())
     }
+
+    /// Create a FileInternerHolder that stores interner files under the provided directory.
+    /// This lets callers explicitly pass a filesystem location instead of relying on an env var.
+    pub fn new_with_path<P: AsRef<std::path::Path>>(path: P) -> Result<Self, FoldError> {
+        let dir = PathBuf::from(path.as_ref());
+        fs::create_dir_all(&dir).map_err(|e| FoldError::Io(e))?;
+        Ok(Self { dir })
+    }
 }
 
 impl InternerHolderLike for FileInternerHolder {
@@ -418,181 +424,8 @@ impl InternerHolderLike for FileInternerHolder {
         workq.push_many(vec![ortho_seed])?;
         Ok(())
     }
-    
     fn new() -> Result<Self, FoldError> {
-        let dir = std::env::var("INTERNER_FILE_LOCATION").unwrap();
-        let dir = PathBuf::from(dir);
-        fs::create_dir_all(&dir).map_err(|e| FoldError::Io(e))?;
-        Ok(Self { dir })
-    }
-}
-
-pub struct BlobInternerHolder {
-    client: Client,
-    bucket: String,
-    rt: std::sync::Arc<tokio::runtime::Runtime>,
-}
-
-impl BlobInternerHolder {
-    fn new_internal() -> Result<Self, FoldError> {
-        let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap();
-        let endpoint_url = std::env::var("FOLD_INTERNER_BLOB_ENDPOINT").unwrap();
-        let access_key = std::env::var("FOLD_INTERNER_BLOB_ACCESS_KEY").unwrap();
-        let secret_key = std::env::var("FOLD_INTERNER_BLOB_SECRET_KEY").unwrap();
-        let region = "us-east-1";
-        // Redact secrets in logs
-        println!("[interner] init: bucket='{}' endpoint='{}' access_key='{}'", bucket, endpoint_url, access_key);
-        let rt = std::sync::Arc::new(tokio::runtime::Runtime::new()
-            .map_err(|e| FoldError::Other(format!("Failed to create Tokio runtime: {}", e)))?);
-        let config = rt.block_on(async {
-            aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(region)
-                .endpoint_url(&endpoint_url)
-                .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                    &access_key,
-                    &secret_key,
-                    None,
-                    None,
-                    "minio",
-                ))
-                .load()
-                .await
-        });
-        let s3_config = aws_sdk_s3::config::Builder::from(&config)
-            .force_path_style(true)
-            .build();
-        let client = Client::from_conf(s3_config);
-        // Create bucket if missing; ignore already-exists style errors
-        let bucket_clone = bucket.clone();
-        rt.block_on(async {
-            let head_result = client.head_bucket().bucket(&bucket_clone).send().await;
-            if head_result.is_err() {
-                if let Err(e) = client.create_bucket().bucket(&bucket_clone).send().await {
-                    let msg = e.to_string();
-                    if !(msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists")) {
-                        return Err(FoldError::Other(format!("Failed to ensure S3 bucket exists: {}", e)));
-                    }
-                }
-            }
-            Ok::<(), FoldError>(())
-        })?;
-        Ok(Self { client, bucket, rt })
-    }
-    fn put_blocking(&self, key: &str, data: &[u8]) -> Result<(), FoldError> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let data = data.to_vec();
-        self.rt.block_on(async move {
-            let result = client.put_object()
-                .bucket(&bucket)
-                .key(key)
-                .body(ByteStream::from(data))
-                .send()
-                .await;
-            result.map(|_| ()).map_err(|e| FoldError::Other(format!("S3 put operation failed: {}", e)))
-        })
-    }
-    fn get_blocking(&self, key: &str) -> Result<Option<Vec<u8>>, FoldError> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        self.rt.block_on(async move {
-            match client.get_object().bucket(&bucket).key(key).send().await {
-                Ok(resp) => {
-                    match resp.body.collect().await {
-                        Ok(data) => {
-                            let bytes = data.into_bytes();
-                            Ok(Some(bytes.to_vec()))
-                        }
-                        Err(e) => Err(FoldError::Other(format!("Failed to read S3 object body: {}", e)))
-                    }
-                },
-                Err(e) => {
-                    // Check if it's a "not found" error, which is expected
-                    if e.to_string().contains("NoSuchKey") {
-                        Ok(None)
-                    } else {
-                        Err(FoldError::Other(format!("S3 get operation failed: {}", e)))
-                    }
-                },
-            }
-        })
-    }
-    fn list_blocking(&self) -> Result<Vec<String>, FoldError> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        self.rt.block_on(async move {
-            match client.list_objects_v2().bucket(&bucket).send().await {
-                Ok(resp) => {
-                    let raw = resp.contents();
-                    // println!("[interner] raw keys: {:?}", raw);
-                    let keys: Vec<String> = raw.iter().filter_map(|obj| obj.key().map(|k| k.to_string())).collect();
-                    Ok(keys)
-                },
-                Err(e) => {
-                    // println!("[interner] Error listing S3 objects: {}", e);
-                    Err(FoldError::Other(format!("S3 list operation failed: {}", e)))
-                },
-            }
-        })
-    }
-    fn delete_blocking(&self, key: &str) -> Result<(), FoldError> {
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        self.rt.block_on(async move {
-            client.delete_object().bucket(&bucket).key(key).send().await
-                .map(|_| ())
-                .map_err(|e| FoldError::Other(format!("S3 delete operation failed: {}", e)))
-        })
-    }
-}
-
-impl InternerHolderLike for BlobInternerHolder {
-    fn get(&self, version: usize) -> Option<Interner> {
-        let key = version.to_string();
-        let result = self.get_blocking(&key).ok()?.and_then(|data| {
-            bincode::decode_from_slice::<Interner, _>(&data, bincode::config::standard()).ok().map(|(v, _)| v)
-        });
-        result
-    }
-    fn latest_version(&self) -> usize {
-        let versions = self.list_blocking().unwrap_or_default().iter().filter_map(|key| key.parse::<usize>().ok()).collect::<Vec<_>>();
-        versions.into_iter().max().unwrap_or(0)
-    }
-    fn get_latest(&self) -> Option<Interner> {
-        let v = self.latest_version();
-        self.get(v)
-    }
-    fn versions(&self) -> Vec<usize> {
-        let list = self.list_blocking().unwrap();
-        // println!("[interner] S3 versions: {:?}", list);
-        // println!("[interner] S3 versions (parsed): {:?}", list.iter().filter_map(|key| key.parse::<usize>().ok()).collect::<Vec<_>>());
-        list.iter().filter_map(|key| key.parse::<usize>().ok()).collect()
-    }
-    fn delete(&mut self, version: usize) {
-        let key = version.to_string();
-        let _ = self.delete_blocking(&key);
-    }
-    fn add_text_with_seed<Q: crate::queue::QueueProducerLike>(&mut self, text: &str, workq: &mut Q) -> Result<(), FoldError> {
-        let interner = if self.get_latest().is_none() {
-            // Holder is empty, create new with seed
-            Interner::from_text(text)
-        } else {
-            // Holder is nonempty, add text to latest
-            let latest = self.get_latest().unwrap();
-            latest.add_text(text)
-        };
-        let key = interner.version().to_string();
-        let data = bincode::encode_to_vec(&interner, bincode::config::standard())
-            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
-        self.put_blocking(&key, &data)?;
-        let version = interner.version();
-        let ortho_seed = crate::ortho::Ortho::new(version);
-        println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
-        workq.push_many(vec![ortho_seed])?;
-        Ok(())
-    }
-    fn new() -> Result<Self, FoldError> {
-        BlobInternerHolder::new_internal()
+        FileInternerHolder::new_with_path("./interner")
     }
 }
 
