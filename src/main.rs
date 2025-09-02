@@ -66,6 +66,17 @@ enum Commands {
         /// Number of iterations to run (positive integer)
         iterations: usize,
     },
+    /// Run the ingest loop for N iterations, but drain each component until it runs out of work per iteration.
+    /// This makes worker/feeder repeatedly consume until empty, and follower run until idle each iteration.
+    /// If ITERATIONS is 0, run until drained/one interner version remains (no outer iteration limit).
+    ProcessDrain {
+        /// Number of iterations to run (positive integer)
+        iterations: usize,
+        /// How often (in iterations) to save state; if omitted, never auto-save
+        save_every: Option<usize>,
+        /// How often (in follower iterations) to print status/version counts; 0 disables
+        follower_report_freq: Option<usize>,
+    },
     /// Save DB and queues to the configured state location (overwrites files)
     SaveState,
     /// Load DB and queues from the configured state location
@@ -242,14 +253,32 @@ fn run_command(
             let mut follower = fold::Follower::new();
             let mut cached_interner_opt = holder.get_latest();
 
-            for it in 0..iterations {
-                // Early exit: nothing to do and only one (or zero) interner version
+                // If iterations == 0 treat as "run until drained" by using a very large bound
+                let max_iterations = if iterations == 0 { usize::MAX } else { iterations };
+                for it in 0..max_iterations {
+                // Early exit: nothing to do and DB already has a single version.
+                // Prefer checking DB state (version_counts) rather than filesystem interner files,
+                // since the DB may contain orthos for older versions even if interner files are missing.
                 let work_len = workq.len().unwrap_or(0);
                 let dbq_len = dbq.len().unwrap_or(0);
-                let versions = holder.versions();
-                if work_len == 0 && dbq_len == 0 && versions.len() <= 1 {
-                    println!("iteration {}: idle (workq=0, dbq=0, interner_versions={}), exiting early", it, versions.len());
-                    break;
+                if work_len == 0 && dbq_len == 0 {
+                    match db.version_counts() {
+                        Ok(pairs) => {
+                            if pairs.len() <= 1 {
+                                println!("iteration {}: idle (workq=0, dbq=0, db_versions={}), exiting early", it, pairs.len());
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[process-drain] failed to compute DB version counts: {}", e);
+                            // Fallback: check interner files on disk
+                            let versions = holder.versions();
+                            if versions.len() <= 1 {
+                                println!("iteration {}: idle (workq=0, dbq=0, interner_versions={}), exiting early", it, versions.len());
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 let mut did_work = false;
@@ -265,7 +294,7 @@ fn run_command(
                         }
                         if ortho.version() > cached_interner_opt.as_ref().unwrap().version() {
                             if let Some(updated) = holder.get_latest() {
-                                println!("[process] refreshing cached interner {} -> {} (ortho version {})", cached_interner_opt.as_ref().unwrap().version(), updated.version(), ortho.version());
+                                println!("{} [process] refreshing cached interner {} -> {} (ortho version {})", fold::now_timestamp(), cached_interner_opt.as_ref().unwrap().version(), updated.version(), ortho.version());
                                 cached_interner_opt = Some(updated);
                             } else {
                                 return Err(fold::FoldError::Interner("No interner found during refresh".to_string()));
@@ -277,7 +306,7 @@ fn run_command(
                     Ok(())
                 });
                 if res.is_err() {
-                    eprintln!("[process][worker] error: {:?}", res.err());
+                    eprintln!("{} [process][worker] error: {:?}", fold::now_timestamp(), res.err());
                 } else if processed_in_batch > 0 {
                     did_work = true;
                 }
@@ -290,7 +319,7 @@ fn run_command(
                     Ok(())
                 });
                 if res.is_err() {
-                    eprintln!("[process][feeder] error: {:?}", res.err());
+                    eprintln!("{} [process][feeder] error: {:?}", fold::now_timestamp(), res.err());
                 } else if processed_dbq_batch > 0 {
                     did_work = true;
                 }
@@ -299,9 +328,9 @@ fn run_command(
                 match follower.run_follower_once(db, dbq, holder) {
                     Ok((bumped, produced_children, _)) => {
                         if bumped + produced_children > 0 { did_work = true; }
-                        println!("[process][follower] iter={} bumped={} produced_children={}", it, bumped, produced_children);
+                        println!("{} [process][follower] iter={} bumped={} produced_children={}", fold::now_timestamp(), it, bumped, produced_children);
                     }
-                    Err(e) => { eprintln!("[process][follower] error: {:?}", e); }
+                    Err(e) => { eprintln!("{} [process][follower] error: {:?}", fold::now_timestamp(), e); }
                 }
 
                 if !did_work {
@@ -310,6 +339,179 @@ fn run_command(
                 }
             }
             println!("Process loop complete.");
+        }
+        Commands::ProcessDrain { iterations, save_every, follower_report_freq } => {
+            println!("Starting draining process loop for {} iterations (save_every={:?}, follower_report_freq={:?})", iterations, save_every, follower_report_freq);
+            let mut follower = fold::Follower::new();
+            // Cumulative follower iteration counter across the whole ProcessDrain run
+            let mut follower_iter_count: usize = 0;
+            // Reporting frequency: use positional param if provided, otherwise default to 1000. 0 disables.
+            let follower_report_freq: usize = follower_report_freq.unwrap_or(1000);
+
+            for it in 0..iterations {
+                // Early exit: nothing to do and only one (or zero) interner version
+                let work_len = workq.len().unwrap_or(0);
+                let dbq_len = dbq.len().unwrap_or(0);
+                let versions = holder.versions();
+                if work_len == 0 && dbq_len == 0 && versions.len() <= 1 {
+                    println!("iteration {}: idle (workq=0, dbq=0, interner_versions={}), exiting early", it, versions.len());
+                    break;
+                }
+
+                let mut did_work = false;
+
+                // Worker: drain until empty but process using a simple thread pool.
+                // Minimal approach: pull all items out of workq into a Vec, then split across threads.
+                let mut drained: Vec<fold::ortho::Ortho> = Vec::new();
+                loop {
+                    let mut processed = 0usize;
+                    let res = fold::queue::QueueConsumerLike::try_consume_batch_once(workq, 1024, |batch| {
+                        processed = batch.len();
+                        drained.extend_from_slice(batch);
+                        Ok(())
+                    });
+                    if res.is_err() {
+                        eprintln!("[process-drain][worker] error: {:?}", res.err());
+                        break;
+                    }
+                    if processed == 0 { break; }
+                }
+                if !drained.is_empty() {
+                    did_work = true;
+                    let threads = num_cpus::get();
+                    let chunk_size = (drained.len() + threads - 1) / threads;
+                    use std::sync::{Arc, Mutex};
+                    let drained_arc = Arc::new(drained);
+                    let produced_children: Arc<Mutex<Vec<fold::ortho::Ortho>>> = Arc::new(Mutex::new(Vec::new()));
+                    // Capture a snapshot of the latest interner to avoid borrowing `holder` across threads.
+                    let interner_snapshot = holder.get_latest();
+                    let mut handles = Vec::new();
+                    for i in 0..threads {
+                        let arr = drained_arc.clone();
+                        let prod = produced_children.clone();
+                        let interner_for_thread = interner_snapshot.clone();
+                        let handle = std::thread::spawn(move || {
+                            let start = i * chunk_size;
+                            let end = std::cmp::min(start + chunk_size, arr.len());
+                            if start >= end { return; }
+                            let mut local_interner = interner_for_thread;
+                            for ortho in &arr[start..end] {
+                                if let Some(interner) = local_interner.as_ref() {
+                                    // collect children produced by this ortho
+                                    let mut local_children = Vec::new();
+                                    let (forbidden, required) = ortho.get_requirements();
+                                    let completions = interner.intersect(&required, &forbidden);
+                                    let version = interner.version();
+                                    for completion in completions {
+                                        let mut batch = ortho.add(completion, version);
+                                        local_children.append(&mut batch);
+                                    }
+                                    if !local_children.is_empty() {
+                                        let mut guard = prod.lock().unwrap();
+                                        guard.extend(local_children.drain(..));
+                                    }
+                                }
+                            }
+                        });
+                        handles.push(handle);
+                    }
+                    for h in handles { let _ = h.join(); }
+                    // Move produced children into dbq on main thread
+                    let produced = produced_children.lock().unwrap().drain(..).collect::<Vec<_>>();
+                    if !produced.is_empty() { let _ = fold::queue::QueueProducerLike::push_many(dbq, produced); }
+                }
+
+                // Feeder: drain until empty
+                loop {
+                    let mut processed = 0usize;
+                    let res = fold::queue::QueueConsumerLike::try_consume_batch_once(dbq, 1024, |batch| {
+                        processed = batch.len();
+                        let _ = fold::OrthoFeeder::run_feeder_once(batch, db, workq)?;
+                        Ok(())
+                    });
+                    if res.is_err() {
+                        eprintln!("[process-drain][feeder] error: {:?}", res.err());
+                        break;
+                    }
+                    if processed == 0 { break; }
+                    did_work = true;
+                }
+
+                // Follower: run until it reports no progress
+                // Snapshot DB length once on entering follower phase to avoid repeated heavy scans.
+                let db_len_snapshot = db.len().unwrap_or(0);
+                loop {
+                    match follower.run_follower_once(db, dbq, holder) {
+                        Ok((bumped, produced_children, _)) => {
+                            println!("[process-drain][follower] iter={} bumped={} produced_children={}", it, bumped, produced_children);
+
+                            // Increment the follower iteration counter after the follower step.
+                            follower_iter_count += 1;
+                            if follower_report_freq > 0 && follower_iter_count % follower_report_freq == 0 {
+                                // Print simple progress: iterations / DB-length-snapshot. Do not call
+                                // version_counts or re-check DB length here per request.
+                                println!("[process-drain][follower] progress follower_iter={}/{}", follower_iter_count, db_len_snapshot);
+                            }
+
+                            if bumped + produced_children == 0 {
+                                // Consider deleting the low interner version, but only if
+                                // - DB contains zero orthos for that version, and
+                                // - both workq and dbq are empty. This avoids deleting interners
+                                //   while there are in-flight orthos or DB entries that still
+                                //   reference that version.
+                                let versions = holder.versions();
+                                if let Some(&low_version) = versions.first() {
+                                    let work_len = workq.len().unwrap_or(0);
+                                    let dbq_len = dbq.len().unwrap_or(0);
+                                    if work_len == 0 && dbq_len == 0 {
+                                        match db.version_counts() {
+                                            Ok(pairs) => {
+                                                let count = pairs.iter().find(|(v, _)| *v == low_version).map(|(_, c)| *c).unwrap_or(0);
+                                                if count == 0 {
+                                                    holder.delete(low_version);
+                                                    println!("[process-drain][follower] deleted interner version {} (db count=0, queues empty)", low_version);
+                                                }
+                                            }
+                                            Err(e) => eprintln!("[process-drain][follower] failed to get version counts before delete: {}", e),
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            did_work = true;
+                        }
+                        Err(e) => { eprintln!("[process-drain][follower] error: {:?}", e); break; }
+                    }
+                }
+
+                // Print iteration progress and sizes
+                let work_len = workq.len().unwrap_or(0);
+                let dbq_len = dbq.len().unwrap_or(0);
+                let db_len = db.len().unwrap_or(0);
+                println!("iteration {}/{}: workq={}, dbq={}, db={}", it + 1, iterations, work_len, dbq_len, db_len);
+
+                // Periodic save if requested
+                if let Some(freq) = save_every {
+                    if freq > 0 && (it + 1) % freq == 0 {
+                        let state_dir = std::env::var("FOLD_STATE_DIR").unwrap_or_else(|_| "./state".to_string());
+                        let path = std::path::Path::new(&state_dir);
+                        let _ = std::fs::create_dir_all(path);
+                        let db_path = path.join("db.bin");
+                        let workq_path = path.join("workq.bin");
+                        let dbq_path = path.join("dbq.bin");
+                        if let Err(e) = db.save_to_path(&db_path) { eprintln!("Periodic save failed (db): {}", e); }
+                        if let Err(e) = workq.save_to_path(&workq_path) { eprintln!("Periodic save failed (workq): {}", e); }
+                        if let Err(e) = dbq.save_to_path(&dbq_path) { eprintln!("Periodic save failed (dbq): {}", e); }
+                        println!("Periodic save complete at iteration {}/{}", it + 1, iterations);
+                    }
+                }
+
+                if !did_work {
+                    println!("iteration {}: no work produced this iteration, exiting early", it);
+                    break;
+                }
+            }
+            println!("Draining process loop complete.");
         }
         Commands::CleanInterner { version } => {
             let versions = holder.versions();

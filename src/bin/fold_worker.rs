@@ -20,7 +20,7 @@ fn main() {
     workq.consume_one_at_a_time_forever(|ortho| {
         if ortho.version() > cached_interner.version() {
             if let Some(updated) = holder.get_latest() {
-                println!("[worker] Refreshing cached interner {} -> {} (ortho version {})", cached_interner.version(), updated.version(), ortho.version());
+                println!("{} [worker] Refreshing cached interner {} -> {} (ortho version {})", fold::now_timestamp(), cached_interner.version(), updated.version(), ortho.version());
                 cached_interner = updated;
             } else {
                 return Err(fold::FoldError::Interner("No interner found during refresh".to_string()));
@@ -30,14 +30,14 @@ fn main() {
         let res = fold::process_worker_item_with_cached(ortho, &mut dbq, &cached_interner);
         let dur = start.elapsed();
         perf_durations_us.push(dur.as_micros());
-        println!("[worker][perf-iter] time_us={}", dur.as_micros());
+    println!("{} [worker][perf-iter] time_us={}", fold::now_timestamp(), dur.as_micros());
         if perf_durations_us.len() >= perf_window {
             let sum: u128 = perf_durations_us.iter().sum();
             let count = perf_durations_us.len() as u128;
             let avg = sum as f64 / count as f64;
             let max = *perf_durations_us.iter().max().unwrap();
             let min = *perf_durations_us.iter().min().unwrap();
-            println!("[worker][perf-window {}] avg_us={:.2} min_us={} max_us={}", perf_window, avg, min, max);
+            println!("{} [worker][perf-window {}] avg_us={:.2} min_us={} max_us={}", fold::now_timestamp(), perf_window, avg, min, max);
             perf_durations_us.clear();
         }
         res

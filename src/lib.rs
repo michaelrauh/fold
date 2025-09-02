@@ -52,6 +52,13 @@ pub fn init_tracing(service_name: &str) {
         .init();
 }
 
+pub fn now_timestamp() -> String {
+    // Return elapsed time since process start in seconds with millisecond precision.
+    static START: Lazy<std::time::Instant> = Lazy::new(|| std::time::Instant::now());
+    let elapsed = START.elapsed();
+    format!("{:.3}s", elapsed.as_secs_f64())
+}
+
 pub struct Follower {
     low_version: Option<usize>,
     high_version: Option<usize>,
@@ -96,8 +103,13 @@ impl Follower {
         let ortho = match candidate { 
             Some(o) => o, 
             None => { 
-                println!("[follower][iter] ts={} status=EMPTY reason=NO_MORE_ORTHOS low_version={}", ts_ms, low_version); 
-                holder.delete(low_version); self.low_interner = None; self.low_version = None; return Ok((0,0,None)); 
+                // No candidate found for this low_version right now. Do NOT delete the interner file here;
+                // absence can be transient (orthos may be in-flight to workq/dbq). Deleting the interner
+                // file can cause the system to lose the mapping information while the DB still contains
+                // orthos for that version. Instead, clear cached interners and retry later.
+                println!("[follower][iter] ts={} status=EMPTY reason=NO_MORE_ORTHOS low_version={}: not deleting interner; will retry", ts_ms, low_version);
+                self.low_interner = None; self.low_version = None; 
+                return Ok((0,0,None)); 
             } 
         };
         let (forbidden, required) = ortho.get_requirements();
@@ -210,7 +222,7 @@ pub fn process_worker_item_with_cached<P: crate::queue::QueueProducerLike>(
     dbq: &mut P,
     interner: &crate::interner::Interner,
 ) -> Result<(), FoldError> {
-    println!("[worker] Popped ortho from workq: id={}, version={}", ortho.id(), ortho.version());
+    println!("{} [worker] Popped ortho from workq: id={}, version={}", now_timestamp(), ortho.id(), ortho.version());
     let (forbidden, required) = ortho.get_requirements();
     let completions = interner.intersect(&required, &forbidden);
     let version = interner.version();

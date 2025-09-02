@@ -99,7 +99,6 @@ impl OrthoDatabaseLike for InMemoryOrthoDatabase {
         Ok(v)
     }
 }
-// Postgres-backed database removed. Use InMemoryOrthoDatabase for local/in-memory operation.
 
 #[cfg(test)]
 mod tests {
