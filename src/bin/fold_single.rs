@@ -172,9 +172,9 @@ fn process_input_folder(state_dir: &str) -> Result<(), FoldError> {
         ingest_text(resume_path.to_str().unwrap(), file_path.to_str().unwrap())?;
         println!("");
         
-        // Run the worker
+        // Run the worker with file context
         println!("[fold_single][process] >>> Stage 2/3: RUN WORKER <<<");
-        run_worker(resume_path.to_str().unwrap())?;
+        run_worker(resume_path.to_str().unwrap(), file_name, file_num, total_files)?;
         println!("");
         
         // Delete the file
@@ -204,7 +204,7 @@ fn process_input_folder(state_dir: &str) -> Result<(), FoldError> {
     Ok(())
 }
 
-fn run_worker(resume_path: &str) -> Result<(), FoldError> {
+fn run_worker(resume_path: &str, file_name: &str, file_num: usize, total_files: usize) -> Result<(), FoldError> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let start_time = SystemTime::now();
     let timestamp = start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -236,12 +236,13 @@ fn run_worker(resume_path: &str) -> Result<(), FoldError> {
     while let Some(ortho) = work_queue.pop_front() {
         processed += 1;
         
-        if processed % 100 == 0 {
+        // Report progress every 1000 orthos (less chatty)
+        if processed % 1000 == 0 {
             let progress_pct = if total_initial > 0 { 
                 (processed as f64 / total_initial as f64 * 100.0).min(100.0)
             } else { 0.0 };
-            println!("[fold_single][run] Progress: processed {}/{} orthos ({:.1}%), queue: {}, frontier: {}", 
-                     processed, total_initial, progress_pct, work_queue.len(), new_frontier.len());
+            println!("[fold_single][run] File {}/{} ({}): processed {}/{} orthos ({:.1}%), queue: {}, frontier: {}", 
+                     file_num, total_files, file_name, processed, total_initial, progress_pct, work_queue.len(), new_frontier.len());
         }
         
         // Get requirements for this ortho
@@ -263,13 +264,17 @@ fn run_worker(resume_path: &str) -> Result<(), FoldError> {
         }
     }
     
-    println!("[fold_single][run] Worker loop complete. Processed {} orthos total", processed);
-    println!("[fold_single][run] Frontier before deduplication: {} orthos", new_frontier.len());
+    println!("[fold_single][run] File {}/{} ({}): Worker loop complete. Processed {} orthos total", 
+             file_num, total_files, file_name, processed);
+    println!("[fold_single][run] File {}/{} ({}): Frontier before deduplication: {} orthos", 
+             file_num, total_files, file_name, new_frontier.len());
     
     // Deduplicate frontier using prefix rule
-    println!("[fold_single][run] Deduplicating frontier...");
-    new_frontier = deduplicate_frontier(new_frontier);
-    println!("[fold_single][run] Frontier after deduplication: {} orthos", new_frontier.len());
+    println!("[fold_single][run] File {}/{} ({}): Deduplicating frontier...", 
+             file_num, total_files, file_name);
+    new_frontier = deduplicate_frontier(new_frontier, file_name, file_num, total_files);
+    println!("[fold_single][run] File {}/{} ({}): Frontier after deduplication: {} orthos", 
+             file_num, total_files, file_name, new_frontier.len());
     
     // Save frontier and interner
     println!("[fold_single][run] Saving checkpoint...");
@@ -371,18 +376,36 @@ fn save_resume(path: &str, resume: &ResumeFile) -> Result<(), FoldError> {
     Ok(())
 }
 
-fn deduplicate_frontier(frontier: Vec<Ortho>) -> Vec<Ortho> {
+fn deduplicate_frontier(frontier: Vec<Ortho>, file_name: &str, file_num: usize, total_files: usize) -> Vec<Ortho> {
     // Group orthos by shape (dims)
     use std::collections::HashMap;
     let mut by_shape: HashMap<Vec<usize>, Vec<Ortho>> = HashMap::new();
+    
+    let total_orthos = frontier.len();
+    println!("[fold_single][run] File {}/{} ({}): Grouping {} orthos by shape...", 
+             file_num, total_files, file_name, total_orthos);
     
     for ortho in frontier {
         by_shape.entry(ortho.dims().clone()).or_insert_with(Vec::new).push(ortho);
     }
     
+    let num_shapes = by_shape.len();
+    println!("[fold_single][run] File {}/{} ({}): Found {} unique shapes", 
+             file_num, total_files, file_name, num_shapes);
+    
     let mut result = Vec::new();
+    let mut processed_shapes = 0;
     
     for (_shape, orthos) in by_shape {
+        processed_shapes += 1;
+        
+        // Report progress every 100 shapes for large deduplication operations
+        if processed_shapes % 100 == 0 || processed_shapes == num_shapes {
+            let progress_pct = (processed_shapes as f64 / num_shapes as f64) * 100.0;
+            println!("[fold_single][run] File {}/{} ({}): Deduplication progress: {}/{} shapes ({:.1}%)", 
+                     file_num, total_files, file_name, processed_shapes, num_shapes, progress_pct);
+        }
+        
         // For each ortho, check if it's a prefix of another (non-lead node detection)
         let mut to_keep = Vec::new();
         
@@ -498,7 +521,7 @@ mod tests {
         let ortho3 = ortho3.add(2, version).pop().unwrap(); // Add 'c' (different)
         
         let frontier = vec![ortho1, ortho2, ortho3];
-        let deduplicated = deduplicate_frontier(frontier);
+        let deduplicated = deduplicate_frontier(frontier, "test_file.txt", 1, 1);
         
         // Should keep ortho2 and ortho3, remove ortho1 (prefix of ortho2)
         assert_eq!(deduplicated.len(), 2);
