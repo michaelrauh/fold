@@ -396,7 +396,7 @@ fn deduplicate_frontier(frontier: Vec<Ortho>, file_name: &str, file_num: usize, 
     let mut result = Vec::new();
     let mut processed_shapes = 0;
     
-    for (_shape, orthos) in by_shape {
+    for (_shape, mut orthos) in by_shape {
         processed_shapes += 1;
         
         // Report progress every 100 shapes for large deduplication operations
@@ -406,26 +406,49 @@ fn deduplicate_frontier(frontier: Vec<Ortho>, file_name: &str, file_num: usize, 
                      file_num, total_files, file_name, processed_shapes, num_shapes, progress_pct);
         }
         
-        // For each ortho, check if it's a prefix of another (non-lead node detection)
-        let mut to_keep = Vec::new();
+        // OPTIMIZATION: Sort by number of filled positions (ascending)
+        // This allows us to only compare orthos with fewer filled against those with more
+        orthos.sort_by_key(|o| {
+            o.payload().iter().filter(|v| v.is_some()).count()
+        });
         
-        for (i, ortho) in orthos.iter().enumerate() {
-            let mut is_prefix = false;
-            
-            // Check if this ortho is a prefix of any other ortho with same shape
-            for (j, other) in orthos.iter().enumerate() {
-                if i != j && is_canonicalized_prefix(ortho, other) {
-                    is_prefix = true;
-                    break;
-                }
+        // Mark prefixes for removal
+        let mut is_prefix_flags = vec![false; orthos.len()];
+        
+        // For each ortho, only check against orthos with MORE filled positions
+        for i in 0..orthos.len() {
+            if is_prefix_flags[i] {
+                continue; // Already marked as prefix
             }
             
-            if !is_prefix {
-                to_keep.push(ortho.clone());
+            let candidate = &orthos[i];
+            let candidate_filled = candidate.payload().iter().filter(|v| v.is_some()).count();
+            
+            // Only compare with orthos that have more filled positions
+            // Start from i+1 since array is sorted by filled count
+            for j in (i + 1)..orthos.len() {
+                let other = &orthos[j];
+                let other_filled = other.payload().iter().filter(|v| v.is_some()).count();
+                
+                // Skip orthos with same filled count (not prefixes)
+                if candidate_filled >= other_filled {
+                    continue;
+                }
+                
+                // Check if candidate is a prefix of other
+                if is_canonicalized_prefix_fast(candidate, other, candidate_filled, other_filled) {
+                    is_prefix_flags[i] = true;
+                    break; // Found a match, candidate is a prefix
+                }
             }
         }
         
-        result.extend(to_keep);
+        // Collect non-prefix orthos
+        for (i, ortho) in orthos.into_iter().enumerate() {
+            if !is_prefix_flags[i] {
+                result.push(ortho);
+            }
+        }
     }
     
     result
@@ -459,6 +482,28 @@ fn is_canonicalized_prefix(candidate: &Ortho, other: &Ortho) -> bool {
     let other_filled = other_payload.iter().filter(|v| v.is_some()).count();
     
     candidate_filled < other_filled
+}
+
+// Optimized version that accepts pre-calculated filled counts
+fn is_canonicalized_prefix_fast(candidate: &Ortho, other: &Ortho, _candidate_filled: usize, _other_filled: usize) -> bool {
+    // Shape already guaranteed to match by grouping
+    // Filled count comparison already done by caller (candidate_filled < other_filled guaranteed)
+    
+    let candidate_payload = candidate.payload();
+    let other_payload = other.payload();
+    
+    if candidate_payload.len() > other_payload.len() {
+        return false;
+    }
+    
+    // Check if all filled positions in candidate match other
+    for (i, val) in candidate_payload.iter().enumerate() {
+        if val.is_some() && val != &other_payload[i] {
+            return false;
+        }
+    }
+    
+    true
 }
 
 #[cfg(test)]
