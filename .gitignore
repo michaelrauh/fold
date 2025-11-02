@@ -2,6 +2,7 @@
 *.txt
 .vscode/
 /interner_data
+fold_resume.bin
 
 # Added by cargo
 #

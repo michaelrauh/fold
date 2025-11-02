@@ -53,7 +53,7 @@ impl<Context> bincode::Decode<Context> for Interner {
 }
 
 impl Interner {
-    fn from_text(text: &str) -> Self {
+    pub fn from_text(text: &str) -> Self {
         let splitter = Splitter::new();
         let vocab = splitter.vocabulary(text);
         let phrases = splitter.phrases(text);
@@ -74,7 +74,7 @@ impl Interner {
         interner
     }
 
-    fn add_text(&self, text: &str) -> Self {
+    pub fn add_text(&self, text: &str) -> Self {
         if text.trim().is_empty() {
             let mut interner = Interner {
                 version: self.version + 1,
