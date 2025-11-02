@@ -2,10 +2,14 @@ use crate::splitter::Splitter;
 use crate::error::FoldError;
 use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
+#[cfg(feature = "distributed")]
 use std::fs;
+#[cfg(feature = "distributed")]
 use std::path::PathBuf;
 
+#[cfg(feature = "distributed")]
 use aws_sdk_s3::{Client, primitives::ByteStream};
+#[cfg(feature = "distributed")]
 use aws_config;
 
 #[derive(Clone)]
@@ -288,6 +292,7 @@ impl Interner {
     }
 }
 
+#[cfg(feature = "distributed")]
 pub trait InternerHolderLike {
     fn get(&self, version: usize) -> Option<Interner>;
     fn latest_version(&self) -> usize;
@@ -298,12 +303,15 @@ pub trait InternerHolderLike {
     fn new() -> Result<Self, FoldError> where Self: Sized;
 }
 
+#[cfg(feature = "distributed")]
 pub struct InMemoryInternerHolder {
     pub interners: std::collections::HashMap<usize, Interner>,
 }
 
+#[cfg(feature = "distributed")]
 impl InMemoryInternerHolder {}
 
+#[cfg(feature = "distributed")]
 impl InternerHolderLike for InMemoryInternerHolder {
     fn get(&self, version: usize) -> Option<Interner> {
         self.interners.get(&version).cloned()
@@ -346,10 +354,12 @@ impl InternerHolderLike for InMemoryInternerHolder {
     }
 }
 
+#[cfg(feature = "distributed")]
 pub struct FileInternerHolder {
     dir: PathBuf,
 }
 
+#[cfg(feature = "distributed")]
 impl FileInternerHolder {
     fn file_path(&self, version: usize) -> PathBuf {
         self.dir.join(format!("interner_{}.bin", version))
@@ -371,6 +381,7 @@ impl FileInternerHolder {
     }
 }
 
+#[cfg(feature = "distributed")]
 impl InternerHolderLike for FileInternerHolder {
     fn get(&self, version: usize) -> Option<Interner> {
         self.load_interner(version)
@@ -427,12 +438,14 @@ impl InternerHolderLike for FileInternerHolder {
     }
 }
 
+#[cfg(feature = "distributed")]
 pub struct BlobInternerHolder {
     client: Client,
     bucket: String,
     rt: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
+#[cfg(feature = "distributed")]
 impl BlobInternerHolder {
     fn new_internal() -> Result<Self, FoldError> {
         let bucket = std::env::var("FOLD_INTERNER_BLOB_BUCKET").unwrap();
@@ -546,6 +559,7 @@ impl BlobInternerHolder {
     }
 }
 
+#[cfg(feature = "distributed")]
 impl InternerHolderLike for BlobInternerHolder {
     fn get(&self, version: usize) -> Option<Interner> {
         let key = version.to_string();
@@ -596,11 +610,12 @@ impl InternerHolderLike for BlobInternerHolder {
     }
 }
 
+#[cfg(feature = "distributed")]
 pub fn queue_push_many<Q: crate::queue::QueueProducerLike>(q: &mut Q, items: Vec<crate::ortho::Ortho>) {
     q.push_many(items).expect("queue connection failed");
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed"))]
 mod tests {
     use super::*;
     use fixedbitset::FixedBitSet;
@@ -733,7 +748,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed"))]
 mod container_tests {
     use super::*;
     #[test]
@@ -746,7 +761,7 @@ mod container_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed"))]
 mod holder_tests {
     use super::*;
     use crate::queue::MockQueue;

@@ -1,27 +1,44 @@
 pub mod error;
 pub mod interner;
 pub mod ortho;
+#[cfg(feature = "distributed")]
 pub mod ortho_database;
+#[cfg(feature = "distributed")]
 pub mod queue;
 pub mod spatial;
 pub mod splitter;
 
 pub use error::*;
 pub use interner::*;
+#[cfg(feature = "distributed")]
 pub use ortho_database::*;
+#[cfg(feature = "distributed")]
 pub use queue::*;
+
+#[cfg(feature = "distributed")]
 use tracing::instrument;
+#[cfg(feature = "distributed")]
 use opentelemetry::{KeyValue};
+#[cfg(feature = "distributed")]
 use opentelemetry_sdk::{Resource, trace as sdktrace};
+#[cfg(feature = "distributed")]
 use opentelemetry_otlp::{Protocol, WithExportConfig};
+#[cfg(feature = "distributed")]
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+#[cfg(feature = "distributed")]
 use tracing_subscriber::util::SubscriberInitExt;
+#[cfg(feature = "distributed")]
 use opentelemetry::trace::TracerProvider;
+#[cfg(feature = "distributed")]
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "distributed")]
 use once_cell::sync::Lazy;
+#[cfg(feature = "distributed")]
 use std::sync::Mutex;
+#[cfg(feature = "distributed")]
 use lru::LruCache;
 
+#[cfg(feature = "distributed")]
 pub fn init_tracing(service_name: &str) {
     let mut builder = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // Default filter: info for our crate, warn for noisy deps
@@ -52,6 +69,7 @@ pub fn init_tracing(service_name: &str) {
         .init();
 }
 
+#[cfg(feature = "distributed")]
 pub struct Follower {
     low_version: Option<usize>,
     high_version: Option<usize>,
@@ -59,6 +77,7 @@ pub struct Follower {
     high_interner: Option<crate::interner::Interner>,
 }
 
+#[cfg(feature = "distributed")]
 impl Follower {
     pub fn new() -> Self {
         Follower {
@@ -69,7 +88,7 @@ impl Follower {
         }
     }
 
-    #[instrument(skip_all)]
+    #[cfg_attr(feature = "distributed", instrument(skip_all))]
     pub fn run_follower_once<Q: crate::queue::QueueProducerLike, D: crate::ortho_database::OrthoDatabaseLike, H: crate::interner::InternerHolderLike>(
         &mut self,
         db: &mut D,
@@ -153,8 +172,10 @@ impl Follower {
     }
 }
 
+#[cfg(feature = "distributed")]
 pub struct OrthoFeeder;
 
+#[cfg(feature = "distributed")]
 impl OrthoFeeder {
     #[instrument(skip_all)]
     pub fn run_feeder_once<D: crate::ortho_database::OrthoDatabaseLike, P:crate::queue::QueueProducerLike>(
@@ -204,6 +225,7 @@ impl OrthoFeeder {
     }
 }
 
+#[cfg(feature = "distributed")]
 #[instrument(skip_all)]
 pub fn process_worker_item_with_cached<P: crate::queue::QueueProducerLike>(
     ortho: &crate::ortho::Ortho,
@@ -223,7 +245,7 @@ pub fn process_worker_item_with_cached<P: crate::queue::QueueProducerLike>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "distributed"))]
 mod follower_diff_tests {
     use super::*;
     use crate::interner::InMemoryInternerHolder;
