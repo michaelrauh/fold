@@ -81,46 +81,74 @@ fn main() -> Result<(), FoldError> {
 }
 
 fn ingest_text(resume_path: &str, text_path: &str) -> Result<(), FoldError> {
-    println!("[fold_single] Ingesting text from {}", text_path);
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let start_time = SystemTime::now();
+    let timestamp = start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    println!("[fold_single][ingest] Starting ingest at timestamp {}", timestamp);
+    println!("[fold_single][ingest] Reading text from {}", text_path);
     
     let text = fs::read_to_string(text_path)
         .map_err(|e| FoldError::Interner(format!("Failed to read text file: {}", e)))?;
     
+    let text_len = text.len();
+    println!("[fold_single][ingest] Read {} characters from file", text_len);
+    
     let mut resume = load_resume(resume_path)?;
     let old_interner = resume.interner.clone();
     
-    println!("[fold_single] Current interner version: {}, vocab size: {}", 
-             old_interner.version(), old_interner.vocabulary().len());
+    println!("[fold_single][ingest] Current state: interner v{}, vocab size: {}, frontier size: {}", 
+             old_interner.version(), old_interner.vocabulary().len(), resume.frontier.len());
     
     // Add text to interner
+    println!("[fold_single][ingest] Merging text into interner...");
     let new_interner = old_interner.add_text(&text);
-    println!("[fold_single] New interner version: {}, vocab size: {}", 
-             new_interner.version(), new_interner.vocabulary().len());
+    let vocab_added = new_interner.vocabulary().len() - old_interner.vocabulary().len();
+    println!("[fold_single][ingest] New interner v{}, vocab size: {} (+{} new words)", 
+             new_interner.version(), new_interner.vocabulary().len(), vocab_added);
     
     // Detect affected orthos and update frontier
+    println!("[fold_single][ingest] Detecting affected orthos...");
     let affected = detect_affected_orthos(&resume.frontier, &old_interner, &new_interner);
-    println!("[fold_single] Detected {} affected orthos from vocabulary changes", affected.len());
+    println!("[fold_single][ingest] Detected {} affected orthos from vocabulary changes", affected.len());
     
     // Add affected orthos to frontier (they become new starting points)
     let mut frontier_set: HashSet<usize> = resume.frontier.iter().map(|o| o.id()).collect();
+    let mut added_count = 0;
     for ortho in affected {
         if !frontier_set.contains(&ortho.id()) {
             frontier_set.insert(ortho.id());
             resume.frontier.push(ortho);
+            added_count += 1;
         }
     }
     
     resume.interner = new_interner;
     
-    println!("[fold_single] Updated frontier size: {}", resume.frontier.len());
+    println!("[fold_single][ingest] Added {} new orthos to frontier (total: {})", added_count, resume.frontier.len());
+    println!("[fold_single][ingest] Saving checkpoint...");
     save_resume(resume_path, &resume)?;
-    println!("[fold_single] Saved updated resume file with merged interner and expanded frontier");
+    
+    let end_time = SystemTime::now();
+    let end_timestamp = end_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let duration = end_time.duration_since(start_time).unwrap().as_secs();
+    println!("[fold_single][ingest] CHECKPOINT SAVED at timestamp {} (duration: {}s)", end_timestamp, duration);
+    println!("[fold_single][ingest] Ingest complete - safe to stop before next stage");
     
     Ok(())
 }
 
 fn process_input_folder(state_dir: &str) -> Result<(), FoldError> {
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let batch_start_time = SystemTime::now();
+    let batch_start_timestamp = batch_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    println!("[fold_single][process] ========================================");
+    println!("[fold_single][process] BATCH PROCESSING START");
+    println!("[fold_single][process] Timestamp: {}", batch_start_timestamp);
+    println!("[fold_single][process] ========================================");
     
     // Setup state folder structure
     let state_path = PathBuf::from(state_dir);
@@ -133,15 +161,15 @@ fn process_input_folder(state_dir: &str) -> Result<(), FoldError> {
     fs::create_dir_all(&state_path)
         .map_err(|e| FoldError::Io(e))?;
     
-    println!("[fold_single] State directory: {}", state_path.display());
-    println!("[fold_single] Input directory: {}", input_dir.display());
+    println!("[fold_single][process] State directory: {}", state_path.display());
+    println!("[fold_single][process] Input directory: {}", input_dir.display());
     
     // Ensure resume file exists
     if !resume_path.exists() {
-        println!("[fold_single] No resume file found, creating blank state");
+        println!("[fold_single][process] No resume file found, creating blank state");
         let blank = create_blank_resume()?;
         save_resume(resume_path.to_str().unwrap(), &blank)?;
-        println!("[fold_single] Blank resume file created at {}", resume_path.display());
+        println!("[fold_single][process] Blank resume file created at {}", resume_path.display());
     }
     
     // Get list of input files
@@ -160,47 +188,77 @@ fn process_input_folder(state_dir: &str) -> Result<(), FoldError> {
     let total_files = input_files.len();
     
     if total_files == 0 {
-        println!("[fold_single] No input files found in {}", input_dir.display());
+        println!("[fold_single][process] No input files found in {}", input_dir.display());
+        println!("[fold_single][process] Batch processing complete (0 files)");
         return Ok(());
     }
     
-    println!("[fold_single] Found {} input files to process", total_files);
+    println!("[fold_single][process] Found {} input files to process", total_files);
+    println!("[fold_single][process] ========================================\n");
     
     // Process each file
     for (index, file_path) in input_files.iter().enumerate() {
         let file_name = file_path.file_name().unwrap().to_str().unwrap();
-        let progress = ((index + 1) as f64 / total_files as f64) * 100.0;
+        let file_num = index + 1;
+        let overall_progress = (file_num as f64 / total_files as f64) * 100.0;
         
-        println!("\n[fold_single] ===== Processing file {}/{} ({:.1}%) =====", 
-                 index + 1, total_files, progress);
-        println!("[fold_single] File: {}", file_name);
+        let file_start_time = SystemTime::now();
+        let file_start_timestamp = file_start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        println!("[fold_single][process] ========================================");
+        println!("[fold_single][process] FILE {}/{} ({:.1}% complete)", file_num, total_files, overall_progress);
+        println!("[fold_single][process] Name: {}", file_name);
+        println!("[fold_single][process] Timestamp: {}", file_start_timestamp);
+        println!("[fold_single][process] ========================================\n");
         
         // Ingest the file
-        println!("[fold_single] Step 1/3: Ingesting...");
+        println!("[fold_single][process] >>> Stage 1/3: INGEST <<<");
         ingest_text(resume_path.to_str().unwrap(), file_path.to_str().unwrap())?;
+        println!("");
         
         // Run the worker
-        println!("[fold_single] Step 2/3: Running worker...");
+        println!("[fold_single][process] >>> Stage 2/3: RUN WORKER <<<");
         run_worker(resume_path.to_str().unwrap())?;
+        println!("");
         
         // Delete the file
-        println!("[fold_single] Step 3/3: Deleting processed file...");
+        println!("[fold_single][process] >>> Stage 3/3: CLEANUP <<<");
+        let cleanup_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        println!("[fold_single][process] Deleting processed file at timestamp {}...", cleanup_timestamp);
         fs::remove_file(file_path)
             .map_err(|e| FoldError::Io(e))?;
-        println!("[fold_single] Deleted: {}", file_name);
+        println!("[fold_single][process] Deleted: {}", file_name);
+        
+        let file_end_time = SystemTime::now();
+        let file_duration = file_end_time.duration_since(file_start_time).unwrap().as_secs();
+        println!("[fold_single][process] File processing time: {}s\n", file_duration);
     }
     
-    println!("\n[fold_single] ===== Processing complete! =====");
-    println!("[fold_single] Processed {} files (100.0%)", total_files);
+    let batch_end_time = SystemTime::now();
+    let batch_end_timestamp = batch_end_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let batch_duration = batch_end_time.duration_since(batch_start_time).unwrap().as_secs();
+    
+    println!("[fold_single][process] ========================================");
+    println!("[fold_single][process] BATCH PROCESSING COMPLETE");
+    println!("[fold_single][process] Files processed: {}", total_files);
+    println!("[fold_single][process] Total time: {}s", batch_duration);
+    println!("[fold_single][process] End timestamp: {}", batch_end_timestamp);
+    println!("[fold_single][process] ========================================");
     
     Ok(())
 }
 
 fn run_worker(resume_path: &str) -> Result<(), FoldError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let start_time = SystemTime::now();
+    let timestamp = start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    println!("[fold_single][run] Starting worker at timestamp {}", timestamp);
+    
     // Load resume file
     let mut resume = load_resume(resume_path)?;
     
-    println!("[fold_single] Loaded frontier with {} orthos, interner version {}, vocab size: {}", 
+    println!("[fold_single][run] Loaded state: frontier {} orthos, interner v{}, vocab size: {}", 
              resume.frontier.len(), resume.interner.version(), resume.interner.vocabulary().len());
     
     // Initialize work queue from frontier
@@ -208,22 +266,26 @@ fn run_worker(resume_path: &str) -> Result<(), FoldError> {
     
     // Add seed ortho to work queue
     let seed = Ortho::new(resume.interner.version());
-    println!("[fold_single] Adding seed ortho to work queue");
+    println!("[fold_single][run] Adding seed ortho to explore vocabulary at origin");
     work_queue.push_back(seed);
     
     // Process work queue
     let mut frontier_set: HashSet<usize> = resume.frontier.iter().map(|o| o.id()).collect();
     let mut new_frontier: Vec<Ortho> = resume.frontier.clone();
     let mut processed = 0;
+    let total_initial = work_queue.len();
     
-    println!("[fold_single] Starting worker loop with {} items in queue", work_queue.len());
+    println!("[fold_single][run] Starting worker loop with {} items in initial queue", total_initial);
     
     while let Some(ortho) = work_queue.pop_front() {
         processed += 1;
         
         if processed % 100 == 0 {
-            println!("[fold_single] Processed {} orthos, queue size: {}, frontier size: {}", 
-                     processed, work_queue.len(), new_frontier.len());
+            let progress_pct = if total_initial > 0 { 
+                (processed as f64 / total_initial as f64 * 100.0).min(100.0)
+            } else { 0.0 };
+            println!("[fold_single][run] Progress: processed {}/{} orthos ({:.1}%), queue: {}, frontier: {}", 
+                     processed, total_initial, progress_pct, work_queue.len(), new_frontier.len());
         }
         
         // Get requirements for this ortho
@@ -245,17 +307,24 @@ fn run_worker(resume_path: &str) -> Result<(), FoldError> {
         }
     }
     
-    println!("[fold_single] Worker loop complete. Processed {} orthos", processed);
-    println!("[fold_single] Final frontier size before deduplication: {}", new_frontier.len());
+    println!("[fold_single][run] Worker loop complete. Processed {} orthos total", processed);
+    println!("[fold_single][run] Frontier before deduplication: {} orthos", new_frontier.len());
     
     // Deduplicate frontier using prefix rule
+    println!("[fold_single][run] Deduplicating frontier...");
     new_frontier = deduplicate_frontier(new_frontier);
-    println!("[fold_single] Final frontier size after deduplication: {}", new_frontier.len());
+    println!("[fold_single][run] Frontier after deduplication: {} orthos", new_frontier.len());
     
     // Save frontier and interner
+    println!("[fold_single][run] Saving checkpoint...");
     resume.frontier = new_frontier;
     save_resume(resume_path, &resume)?;
-    println!("[fold_single] Saved resume file to {}", resume_path);
+    
+    let end_time = SystemTime::now();
+    let end_timestamp = end_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let duration = end_time.duration_since(start_time).unwrap().as_secs();
+    println!("[fold_single][run] CHECKPOINT SAVED at timestamp {} (duration: {}s)", end_timestamp, duration);
+    println!("[fold_single][run] Run complete - safe to stop before next stage");
     
     Ok(())
 }
