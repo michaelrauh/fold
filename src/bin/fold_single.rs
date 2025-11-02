@@ -24,6 +24,12 @@ enum Commands {
     },
     /// Run the worker loop
     Run,
+    /// Process all files in the input folder
+    Process {
+        /// Path to the state folder (default: ./fold_state)
+        #[arg(long, default_value = "./fold_state")]
+        state_dir: String,
+    },
 }
 
 struct ResumeFile {
@@ -66,6 +72,9 @@ fn main() -> Result<(), FoldError> {
         Some(Commands::Run) | None => {
             run_worker(resume_path)?;
         }
+        Some(Commands::Process { state_dir }) => {
+            process_input_folder(&state_dir)?;
+        }
     }
     
     Ok(())
@@ -106,6 +115,83 @@ fn ingest_text(resume_path: &str, text_path: &str) -> Result<(), FoldError> {
     println!("[fold_single] Updated frontier size: {}", resume.frontier.len());
     save_resume(resume_path, &resume)?;
     println!("[fold_single] Saved updated resume file with merged interner and expanded frontier");
+    
+    Ok(())
+}
+
+fn process_input_folder(state_dir: &str) -> Result<(), FoldError> {
+    use std::path::PathBuf;
+    
+    // Setup state folder structure
+    let state_path = PathBuf::from(state_dir);
+    let input_dir = state_path.join("input");
+    let resume_path = state_path.join("fold_resume.bin");
+    
+    // Create directories if they don't exist
+    fs::create_dir_all(&input_dir)
+        .map_err(|e| FoldError::Io(e))?;
+    fs::create_dir_all(&state_path)
+        .map_err(|e| FoldError::Io(e))?;
+    
+    println!("[fold_single] State directory: {}", state_path.display());
+    println!("[fold_single] Input directory: {}", input_dir.display());
+    
+    // Ensure resume file exists
+    if !resume_path.exists() {
+        println!("[fold_single] No resume file found, creating blank state");
+        let blank = create_blank_resume()?;
+        save_resume(resume_path.to_str().unwrap(), &blank)?;
+        println!("[fold_single] Blank resume file created at {}", resume_path.display());
+    }
+    
+    // Get list of input files
+    let mut input_files: Vec<PathBuf> = Vec::new();
+    if input_dir.exists() {
+        for entry in fs::read_dir(&input_dir).map_err(|e| FoldError::Io(e))? {
+            let entry = entry.map_err(|e| FoldError::Io(e))?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("txt") {
+                input_files.push(path);
+            }
+        }
+    }
+    
+    input_files.sort();
+    let total_files = input_files.len();
+    
+    if total_files == 0 {
+        println!("[fold_single] No input files found in {}", input_dir.display());
+        return Ok(());
+    }
+    
+    println!("[fold_single] Found {} input files to process", total_files);
+    
+    // Process each file
+    for (index, file_path) in input_files.iter().enumerate() {
+        let file_name = file_path.file_name().unwrap().to_str().unwrap();
+        let progress = ((index + 1) as f64 / total_files as f64) * 100.0;
+        
+        println!("\n[fold_single] ===== Processing file {}/{} ({:.1}%) =====", 
+                 index + 1, total_files, progress);
+        println!("[fold_single] File: {}", file_name);
+        
+        // Ingest the file
+        println!("[fold_single] Step 1/3: Ingesting...");
+        ingest_text(resume_path.to_str().unwrap(), file_path.to_str().unwrap())?;
+        
+        // Run the worker
+        println!("[fold_single] Step 2/3: Running worker...");
+        run_worker(resume_path.to_str().unwrap())?;
+        
+        // Delete the file
+        println!("[fold_single] Step 3/3: Deleting processed file...");
+        fs::remove_file(file_path)
+            .map_err(|e| FoldError::Io(e))?;
+        println!("[fold_single] Deleted: {}", file_name);
+    }
+    
+    println!("\n[fold_single] ===== Processing complete! =====");
+    println!("[fold_single] Processed {} files (100.0%)", total_files);
     
     Ok(())
 }
