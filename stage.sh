@@ -1,11 +1,13 @@
 #!/bin/bash
 # stage.sh - Split a file by delimiter and move chunks to input folder
 #
-# Usage: ./stage.sh <input_file> <delimiter> [max_length] [state_dir]
+# Usage: ./stage.sh <input_file> <delimiter> [min_length] [state_dir]
 #   input_file  - Path to the file to split
 #   delimiter   - Word or phrase to split on (e.g., "chapter", "CHAPTER")
-#   max_length  - Optional: Maximum length of each chunk in characters (default: unlimited)
+#   min_length  - Optional: Minimum length in characters to keep chunk (default: 0, keep all)
 #   state_dir   - Optional: State directory path (default: ./fold_state)
+#
+# Chunks smaller than min_length are automatically deleted to filter out junk.
 #
 # Example: ./stage.sh book.txt "CHAPTER" 50000 ./fold_state
 
@@ -14,7 +16,7 @@ set -e
 # Parse arguments
 INPUT_FILE="${1:-}"
 DELIMITER="${2:-}"
-MAX_LENGTH="${3:-0}"
+MIN_LENGTH="${3:-0}"
 STATE_DIR="${4:-./fold_state}"
 
 INPUT_DIR="${STATE_DIR}/input"
@@ -22,7 +24,7 @@ INPUT_DIR="${STATE_DIR}/input"
 # Validate arguments
 if [ -z "$INPUT_FILE" ]; then
     echo "Error: No input file specified"
-    echo "Usage: $0 <input_file> <delimiter> [max_length] [state_dir]"
+    echo "Usage: $0 <input_file> <delimiter> [min_length] [state_dir]"
     exit 1
 fi
 
@@ -33,7 +35,7 @@ fi
 
 if [ -z "$DELIMITER" ]; then
     echo "Error: No delimiter specified"
-    echo "Usage: $0 <input_file> <delimiter> [max_length] [state_dir]"
+    echo "Usage: $0 <input_file> <delimiter> [min_length] [state_dir]"
     exit 1
 fi
 
@@ -42,7 +44,7 @@ mkdir -p "$INPUT_DIR"
 
 echo "[stage] Input file: $INPUT_FILE"
 echo "[stage] Delimiter: $DELIMITER"
-echo "[stage] Max length: ${MAX_LENGTH} chars (0 = unlimited)"
+echo "[stage] Minimum length: ${MIN_LENGTH} chars (chunks smaller will be deleted)"
 echo "[stage] State directory: $STATE_DIR"
 echo "[stage] Input directory: $INPUT_DIR"
 echo ""
@@ -51,7 +53,7 @@ echo ""
 BASENAME=$(basename "$INPUT_FILE" .txt)
 
 # Split the file using awk
-awk -v delimiter="$DELIMITER" -v max_len="$MAX_LENGTH" -v output_dir="$INPUT_DIR" -v basename="$BASENAME" '
+awk -v delimiter="$DELIMITER" -v output_dir="$INPUT_DIR" -v basename="$BASENAME" '
 BEGIN {
     chunk = 0
     current_length = 0
@@ -85,15 +87,6 @@ tolower($0) ~ tolower(delimiter) {
         current_length = 0
     }
     
-    # Check if adding this line would exceed max_length
-    if (max_len > 0 && current_length > 0 && (current_length + length($0) + 1) > max_len) {
-        # Close current chunk and start a new one
-        close(filename)
-        chunk++
-        filename = sprintf("%s/%s_chunk_%04d.txt", output_dir, basename, chunk)
-        current_length = 0
-    }
-    
     # Write line to current chunk
     print $0 > filename
     current_length += length($0) + 1
@@ -111,8 +104,35 @@ END {
 NUM_FILES=$(ls -1 "$INPUT_DIR"/${BASENAME}_chunk_*.txt 2>/dev/null | wc -l)
 
 echo ""
-echo "[stage] Successfully created $NUM_FILES files in $INPUT_DIR"
-echo "[stage] Files ready for processing"
+echo "[stage] Successfully created $NUM_FILES chunks"
+
+# Filter out small chunks if min_length is specified
+if [ "$MIN_LENGTH" -gt 0 ]; then
+    echo "[stage] Filtering chunks smaller than $MIN_LENGTH characters..."
+    
+    DELETED_COUNT=0
+    for file in "$INPUT_DIR"/${BASENAME}_chunk_*.txt; do
+        if [ -f "$file" ]; then
+            # Get file size in characters
+            FILE_SIZE=$(wc -c < "$file")
+            
+            if [ "$FILE_SIZE" -lt "$MIN_LENGTH" ]; then
+                echo "[stage] Deleting small chunk: $(basename "$file") ($FILE_SIZE chars)"
+                rm "$file"
+                DELETED_COUNT=$((DELETED_COUNT + 1))
+            fi
+        fi
+    done
+    
+    REMAINING_FILES=$(ls -1 "$INPUT_DIR"/${BASENAME}_chunk_*.txt 2>/dev/null | wc -l)
+    echo "[stage] Deleted $DELETED_COUNT small chunks"
+    echo "[stage] Remaining files: $REMAINING_FILES"
+else
+    REMAINING_FILES=$NUM_FILES
+fi
+
+echo ""
+echo "[stage] $REMAINING_FILES files ready for processing in $INPUT_DIR"
 echo ""
 
 # Optionally delete the input file

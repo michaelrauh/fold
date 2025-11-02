@@ -24,7 +24,7 @@ Fold operates in a single automatic mode that processes text files from an input
    ```bash
    ./stage.sh book.txt "CHAPTER" 50000
    ```
-   This splits `book.txt` by the delimiter "CHAPTER" with a maximum chunk size of 50,000 characters, placing the chunks into `./fold_state/input/`.
+   This splits `book.txt` by the delimiter "CHAPTER", automatically deleting any chunks smaller than 50,000 characters to filter out junk, and placing the remaining chunks into `./fold_state/input/`.
 
 2. **Run the processor**:
    ```bash
@@ -56,18 +56,18 @@ The program will automatically:
 The `stage.sh` script prepares large files for processing:
 
 ```bash
-./stage.sh <input_file> <delimiter> [max_length] [state_dir]
+./stage.sh <input_file> <delimiter> [min_length] [state_dir]
 ```
 
 **Parameters:**
 - `input_file`: Path to the file to split
 - `delimiter`: Word or phrase to split on (case-insensitive, e.g., "CHAPTER")
-- `max_length`: Optional maximum chunk size in characters (default: unlimited)
+- `min_length`: Optional minimum chunk size in characters (default: 0, keep all). Chunks smaller than this are automatically deleted to filter out junk.
 - `state_dir`: Optional state directory path (default: ./fold_state)
 
 **Example:**
 ```bash
-# Split a book by chapters, max 50k characters per chunk
+# Split a book by chapters, delete chunks smaller than 50k characters
 ./stage.sh book.txt "CHAPTER" 50000
 
 # Run the processor
