@@ -3,34 +3,10 @@ use fold::ortho::Ortho;
 use fold::error::FoldError;
 use std::collections::{VecDeque, HashSet};
 use std::fs;
-use std::path::Path;
 use bincode::{encode_to_vec, decode_from_slice, config::standard};
-use clap::{Parser, Subcommand};
 
-#[derive(Parser)]
-#[command(name = "fold_single")]
-#[command(about = "Single-node fold optimizer", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Add text to the interner from a file
-    Ingest {
-        /// Path to the text file
-        path: String,
-    },
-    /// Run the worker loop
-    Run,
-    /// Process all files in the input folder
-    Process {
-        /// Path to the state folder (default: ./fold_state)
-        #[arg(long, default_value = "./fold_state")]
-        state_dir: String,
-    },
-}
+// Hardcoded state directory location
+const STATE_DIR: &str = "./fold_state";
 
 struct ResumeFile {
     frontier: Vec<Ortho>,
@@ -54,28 +30,8 @@ impl<Context> bincode::Decode<Context> for ResumeFile {
 }
 
 fn main() -> Result<(), FoldError> {
-    let cli = Cli::parse();
-    let resume_path = "fold_resume.bin";
-    
-    // Ensure resume file exists
-    if !Path::new(resume_path).exists() {
-        println!("[fold_single] No resume file found, creating blank state");
-        let blank = create_blank_resume()?;
-        save_resume(resume_path, &blank)?;
-        println!("[fold_single] Blank resume file created at {}", resume_path);
-    }
-    
-    match cli.command {
-        Some(Commands::Ingest { path }) => {
-            ingest_text(resume_path, &path)?;
-        }
-        Some(Commands::Run) | None => {
-            run_worker(resume_path)?;
-        }
-        Some(Commands::Process { state_dir }) => {
-            process_input_folder(&state_dir)?;
-        }
-    }
+    // Simply process the input folder at the hardcoded location
+    process_input_folder(STATE_DIR)?;
     
     Ok(())
 }
