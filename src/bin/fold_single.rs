@@ -377,76 +377,90 @@ fn save_resume(path: &str, resume: &ResumeFile) -> Result<(), FoldError> {
 }
 
 fn deduplicate_frontier(frontier: Vec<Ortho>, file_name: &str, file_num: usize, total_files: usize) -> Vec<Ortho> {
-    // Group orthos by shape (dims)
+    // OPTIMIZATION: Group orthos by origin (first payload item) first, then by shape within each origin
+    // This dramatically reduces the comparison pool since prefixes must share the same origin
     use std::collections::HashMap;
-    let mut by_shape: HashMap<Vec<usize>, Vec<Ortho>> = HashMap::new();
     
     let total_orthos = frontier.len();
-    println!("[fold_single][run] File {}/{} ({}): Grouping {} orthos by shape...", 
+    println!("[fold_single][run] File {}/{} ({}): Grouping {} orthos by origin...", 
              file_num, total_files, file_name, total_orthos);
     
+    // Group by origin (first filled payload item)
+    let mut by_origin: HashMap<Option<usize>, Vec<Ortho>> = HashMap::new();
+    
     for ortho in frontier {
-        by_shape.entry(ortho.dims().clone()).or_insert_with(Vec::new).push(ortho);
+        let origin = ortho.payload().get(0).and_then(|v| *v);
+        by_origin.entry(origin).or_insert_with(Vec::new).push(ortho);
     }
     
-    let num_shapes = by_shape.len();
-    println!("[fold_single][run] File {}/{} ({}): Found {} unique shapes", 
-             file_num, total_files, file_name, num_shapes);
+    let num_origins = by_origin.len();
+    println!("[fold_single][run] File {}/{} ({}): Found {} unique origins", 
+             file_num, total_files, file_name, num_origins);
     
     let mut result = Vec::new();
-    let mut processed_shapes = 0;
+    let mut processed_origins = 0;
     
-    for (_shape, mut orthos) in by_shape {
-        processed_shapes += 1;
+    // Process each origin group
+    for (_origin, orthos_in_origin) in by_origin {
+        processed_origins += 1;
         
-        // Report progress every 100 shapes for large deduplication operations
-        if processed_shapes % 100 == 0 || processed_shapes == num_shapes {
-            let progress_pct = (processed_shapes as f64 / num_shapes as f64) * 100.0;
-            println!("[fold_single][run] File {}/{} ({}): Deduplication progress: {}/{} shapes ({:.1}%)", 
-                     file_num, total_files, file_name, processed_shapes, num_shapes, progress_pct);
+        if processed_origins % 10 == 0 || processed_origins == num_origins {
+            let progress_pct = (processed_origins as f64 / num_origins as f64) * 100.0;
+            println!("[fold_single][run] File {}/{} ({}): Processing origin {}/{} ({:.1}%)", 
+                     file_num, total_files, file_name, processed_origins, num_origins, progress_pct);
         }
         
-        // OPTIMIZATION: Sort by number of filled positions (ascending)
-        // This allows us to only compare orthos with fewer filled against those with more
-        orthos.sort_by_key(|o| {
-            o.payload().iter().filter(|v| v.is_some()).count()
-        });
+        // Now group by shape within this origin
+        let mut by_shape: HashMap<Vec<usize>, Vec<Ortho>> = HashMap::new();
         
-        // Mark prefixes for removal
-        let mut is_prefix_flags = vec![false; orthos.len()];
-        
-        // For each ortho, only check against orthos with MORE filled positions
-        for i in 0..orthos.len() {
-            if is_prefix_flags[i] {
-                continue; // Already marked as prefix
-            }
-            
-            let candidate = &orthos[i];
-            let candidate_filled = candidate.payload().iter().filter(|v| v.is_some()).count();
-            
-            // Only compare with orthos that have more filled positions
-            // Start from i+1 since array is sorted by filled count
-            for j in (i + 1)..orthos.len() {
-                let other = &orthos[j];
-                let other_filled = other.payload().iter().filter(|v| v.is_some()).count();
-                
-                // Skip orthos with same filled count (not prefixes)
-                if candidate_filled >= other_filled {
-                    continue;
-                }
-                
-                // Check if candidate is a prefix of other
-                if is_canonicalized_prefix_fast(candidate, other, candidate_filled, other_filled) {
-                    is_prefix_flags[i] = true;
-                    break; // Found a match, candidate is a prefix
-                }
-            }
+        for ortho in orthos_in_origin {
+            by_shape.entry(ortho.dims().clone()).or_insert_with(Vec::new).push(ortho);
         }
         
-        // Collect non-prefix orthos
-        for (i, ortho) in orthos.into_iter().enumerate() {
-            if !is_prefix_flags[i] {
-                result.push(ortho);
+        // Deduplicate within each shape group
+        for (_shape, mut orthos) in by_shape {
+            // OPTIMIZATION: Sort by number of filled positions (ascending)
+            // This allows us to only compare orthos with fewer filled against those with more
+            orthos.sort_by_key(|o| {
+                o.payload().iter().filter(|v| v.is_some()).count()
+            });
+            
+            // Mark prefixes for removal
+            let mut is_prefix_flags = vec![false; orthos.len()];
+            
+            // For each ortho, only check against orthos with MORE filled positions
+            for i in 0..orthos.len() {
+                if is_prefix_flags[i] {
+                    continue; // Already marked as prefix
+                }
+                
+                let candidate = &orthos[i];
+                let candidate_filled = candidate.payload().iter().filter(|v| v.is_some()).count();
+                
+                // Only compare with orthos that have more filled positions
+                // Start from i+1 since array is sorted by filled count
+                for j in (i + 1)..orthos.len() {
+                    let other = &orthos[j];
+                    let other_filled = other.payload().iter().filter(|v| v.is_some()).count();
+                    
+                    // Skip orthos with same filled count (not prefixes)
+                    if candidate_filled >= other_filled {
+                        continue;
+                    }
+                    
+                    // Check if candidate is a prefix of other
+                    if is_canonicalized_prefix_fast(candidate, other, candidate_filled, other_filled) {
+                        is_prefix_flags[i] = true;
+                        break; // Found a match, candidate is a prefix
+                    }
+                }
+            }
+            
+            // Collect non-prefix orthos
+            for (i, ortho) in orthos.into_iter().enumerate() {
+                if !is_prefix_flags[i] {
+                    result.push(ortho);
+                }
             }
         }
     }
