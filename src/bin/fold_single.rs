@@ -78,16 +78,34 @@ fn ingest_text(resume_path: &str, text_path: &str) -> Result<(), FoldError> {
         .map_err(|e| FoldError::Interner(format!("Failed to read text file: {}", e)))?;
     
     let mut resume = load_resume(resume_path)?;
+    let old_interner = resume.interner.clone();
+    
     println!("[fold_single] Current interner version: {}, vocab size: {}", 
-             resume.interner.version(), resume.interner.vocabulary().len());
+             old_interner.version(), old_interner.vocabulary().len());
     
     // Add text to interner
-    resume.interner = resume.interner.add_text(&text);
+    let new_interner = old_interner.add_text(&text);
     println!("[fold_single] New interner version: {}, vocab size: {}", 
-             resume.interner.version(), resume.interner.vocabulary().len());
+             new_interner.version(), new_interner.vocabulary().len());
     
+    // Detect affected orthos and update frontier
+    let affected = detect_affected_orthos(&resume.frontier, &old_interner, &new_interner);
+    println!("[fold_single] Detected {} affected orthos from vocabulary changes", affected.len());
+    
+    // Add affected orthos to frontier (they become new starting points)
+    let mut frontier_set: HashSet<usize> = resume.frontier.iter().map(|o| o.id()).collect();
+    for ortho in affected {
+        if !frontier_set.contains(&ortho.id()) {
+            frontier_set.insert(ortho.id());
+            resume.frontier.push(ortho);
+        }
+    }
+    
+    resume.interner = new_interner;
+    
+    println!("[fold_single] Updated frontier size: {}", resume.frontier.len());
     save_resume(resume_path, &resume)?;
-    println!("[fold_single] Saved updated resume file");
+    println!("[fold_single] Saved updated resume file with merged interner and expanded frontier");
     
     Ok(())
 }
@@ -154,6 +172,67 @@ fn run_worker(resume_path: &str) -> Result<(), FoldError> {
     println!("[fold_single] Saved resume file to {}", resume_path);
     
     Ok(())
+}
+
+fn detect_affected_orthos(
+    frontier: &[Ortho],
+    old_interner: &Interner,
+    new_interner: &Interner
+) -> Vec<Ortho> {
+    let old_vocab_len = old_interner.vocabulary().len();
+    let new_vocab_len = new_interner.vocabulary().len();
+    
+    // No changes? Return empty
+    if old_vocab_len == new_vocab_len {
+        return Vec::new();
+    }
+    
+    let mut affected = Vec::new();
+    
+    for ortho in frontier {
+        let (forbidden, required) = ortho.get_requirements();
+        let forbidden_set: HashSet<usize> = forbidden.iter().copied().collect();
+        
+        // Check for new vocabulary additions
+        let mut has_new_completions = false;
+        
+        if required.is_empty() {
+            // New vocab always creates completions for empty requirements
+            for i in old_vocab_len..new_vocab_len {
+                if !forbidden_set.contains(&i) {
+                    has_new_completions = true;
+                    break;
+                }
+            }
+        } else {
+            // Check each required prefix
+            for prefix in &required {
+                // Use existing interner method to detect differences
+                let diffs = old_interner.differing_completions_indices_up_to_vocab(new_interner, prefix);
+                
+                if !diffs.is_empty() {
+                    has_new_completions = true;
+                    break;
+                }
+                
+                // Check new vocabulary indices
+                if let Some(high_bs) = new_interner.completions_for_prefix(prefix) {
+                    for idx in old_vocab_len..new_vocab_len {
+                        if !forbidden_set.contains(&idx) && high_bs.contains(idx) {
+                            has_new_completions = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if has_new_completions {
+            affected.push(ortho.clone());
+        }
+    }
+    
+    affected
 }
 
 fn create_blank_resume() -> Result<ResumeFile, FoldError> {
