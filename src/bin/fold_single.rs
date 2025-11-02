@@ -221,6 +221,12 @@ fn deduplicate_frontier(frontier: Vec<Ortho>) -> Vec<Ortho> {
 fn is_canonicalized_prefix(candidate: &Ortho, other: &Ortho) -> bool {
     // Check if candidate's payload is a prefix of other's payload
     // Both are already canonicalized on construction
+    
+    // Shape must match for prefix check
+    if candidate.dims() != other.dims() {
+        return false;
+    }
+    
     let candidate_payload = candidate.payload();
     let other_payload = other.payload();
     
