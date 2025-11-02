@@ -241,3 +241,99 @@ fn is_canonicalized_prefix(candidate: &Ortho, other: &Ortho) -> bool {
     
     candidate_filled < other_filled
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_create_blank_resume() {
+        let resume = create_blank_resume().expect("Should create blank resume");
+        assert_eq!(resume.frontier.len(), 0);
+        assert_eq!(resume.interner.version(), 1);
+        assert_eq!(resume.interner.vocabulary().len(), 0);
+    }
+    
+    #[test]
+    fn test_is_canonicalized_prefix_different_filled_counts() {
+        // Create two orthos where one is a prefix of the other
+        let interner = Interner::from_text("a b c");
+        let version = interner.version();
+        
+        let ortho1 = Ortho::new(version);
+        let ortho1 = ortho1.add(0, version).pop().unwrap(); // Add 'a'
+        
+        let ortho2 = ortho1.clone();
+        let ortho2 = ortho2.add(1, version).pop().unwrap(); // Add 'b'
+        
+        // ortho1 should be a prefix of ortho2
+        assert!(is_canonicalized_prefix(&ortho1, &ortho2));
+        assert!(!is_canonicalized_prefix(&ortho2, &ortho1));
+    }
+    
+    #[test]
+    fn test_is_canonicalized_prefix_same_filled_counts() {
+        // Two orthos with same number of filled positions are not prefixes
+        let interner = Interner::from_text("a b c");
+        let version = interner.version();
+        
+        let ortho1 = Ortho::new(version);
+        let ortho1 = ortho1.add(0, version).pop().unwrap(); // Add 'a'
+        
+        let ortho2 = Ortho::new(version);
+        let ortho2 = ortho2.add(1, version).pop().unwrap(); // Add 'b'
+        
+        assert!(!is_canonicalized_prefix(&ortho1, &ortho2));
+        assert!(!is_canonicalized_prefix(&ortho2, &ortho1));
+    }
+    
+    #[test]
+    fn test_deduplicate_frontier_removes_prefixes() {
+        let interner = Interner::from_text("a b c");
+        let version = interner.version();
+        
+        let ortho1 = Ortho::new(version);
+        let ortho1 = ortho1.add(0, version).pop().unwrap(); // Add 'a'
+        
+        let ortho2 = ortho1.clone();
+        let ortho2 = ortho2.add(1, version).pop().unwrap(); // Add 'b' (prefix of ortho1)
+        
+        let ortho3 = Ortho::new(version);
+        let ortho3 = ortho3.add(2, version).pop().unwrap(); // Add 'c' (different)
+        
+        let frontier = vec![ortho1, ortho2, ortho3];
+        let deduplicated = deduplicate_frontier(frontier);
+        
+        // Should keep ortho2 and ortho3, remove ortho1 (prefix of ortho2)
+        assert_eq!(deduplicated.len(), 2);
+    }
+    
+    #[test]
+    fn test_save_and_load_resume() {
+        use std::fs;
+        let test_path = "/tmp/test_resume.bin";
+        
+        // Clean up any existing file
+        let _ = fs::remove_file(test_path);
+        
+        let interner = Interner::from_text("hello world");
+        let version = interner.version();
+        let ortho = Ortho::new(version);
+        let ortho = ortho.add(0, version).pop().unwrap();
+        
+        let resume = ResumeFile {
+            frontier: vec![ortho.clone()],
+            interner: interner.clone(),
+        };
+        
+        save_resume(test_path, &resume).expect("Should save resume");
+        let loaded = load_resume(test_path).expect("Should load resume");
+        
+        assert_eq!(loaded.frontier.len(), 1);
+        assert_eq!(loaded.interner.version(), interner.version());
+        assert_eq!(loaded.interner.vocabulary().len(), interner.vocabulary().len());
+        
+        // Clean up
+        let _ = fs::remove_file(test_path);
+    }
+}
