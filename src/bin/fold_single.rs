@@ -168,7 +168,7 @@ fn create_blank_resume() -> Result<ResumeFile, FoldError> {
 fn load_resume(path: &str) -> Result<ResumeFile, FoldError> {
     let bytes = fs::read(path)
         .map_err(|e| FoldError::Interner(format!("Failed to read resume file: {}", e)))?;
-    let (resume, _): (ResumeFile, _) = decode_from_slice(&bytes, standard())
+    let (resume, _len): (ResumeFile, _) = decode_from_slice(&bytes, standard())
         .map_err(|e| FoldError::Interner(format!("Failed to decode resume file: {}", e)))?;
     Ok(resume)
 }

@@ -88,7 +88,7 @@ impl Follower {
         }
     }
 
-    #[cfg_attr(feature = "distributed", instrument(skip_all))]
+    #[instrument(skip_all)]
     pub fn run_follower_once<Q: crate::queue::QueueProducerLike, D: crate::ortho_database::OrthoDatabaseLike, H: crate::interner::InternerHolderLike>(
         &mut self,
         db: &mut D,
