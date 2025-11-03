@@ -398,6 +398,7 @@ fn save_resume(path: &str, resume: &ResumeFile) -> Result<(), FoldError> {
 #[derive(Default)]
 struct TrieNode {
     children: std::collections::HashMap<Option<usize>, TrieNode>,
+    is_terminal: bool, // Marks if a complete ortho ends at this node
 }
 
 struct PayloadTrie {
@@ -407,20 +408,25 @@ struct PayloadTrie {
 impl PayloadTrie {
     fn new() -> Self {
         PayloadTrie {
-            root: TrieNode::default(),
+            root: TrieNode { children: std::collections::HashMap::new(), is_terminal: false },
         }
     }
     
-    // Insert a payload into the trie
+    // Insert a payload into the trie, marking the end as terminal
     fn insert(&mut self, payload: &[Option<usize>]) {
         let mut node = &mut self.root;
         // Only traverse filled positions
         for &value in payload.iter().filter(|v| v.is_some()) {
-            node = node.children.entry(value).or_insert_with(TrieNode::default);
+            node = node.children.entry(value).or_insert_with(|| TrieNode { 
+                children: std::collections::HashMap::new(), 
+                is_terminal: false 
+            });
         }
+        // Mark this node as terminal (an ortho ends here)
+        node.is_terminal = true;
     }
     
-    // Check if payload is a proper prefix (continues in trie beyond this point)
+    // Check if payload is a proper prefix (continues in trie beyond this point to another terminal)
     fn is_prefix_of_longer(&self, payload: &[Option<usize>]) -> bool {
         let mut node = &self.root;
         
@@ -433,7 +439,8 @@ impl PayloadTrie {
         }
         
         // After traversing payload, check if there are any children
-        // (indicating the payload continues in some other ortho)
+        // AND that we haven't reached a terminal (this would mean exact match, not a prefix)
+        // We're looking for cases where the path continues to another terminal node
         !node.children.is_empty()
     }
 }
@@ -625,6 +632,65 @@ mod tests {
         
         // Should keep ortho2 and ortho3, remove ortho1 (prefix of ortho2)
         assert_eq!(deduplicated.len(), 2);
+    }
+    
+    #[test]
+    fn test_trie_prefix_detection() {
+        // Test that trie correctly identifies prefixes
+        let interner = Interner::from_text("a b c");
+        let version = interner.version();
+        
+        let ortho1 = Ortho::new(version).add(0, version).pop().unwrap(); // [a]
+        let ortho2 = ortho1.clone().add(1, version).pop().unwrap(); // [a, b]
+        let ortho3 = ortho2.clone().add(2, version).pop().unwrap(); // [a, b, c]
+        
+        let frontier = vec![ortho1.clone(), ortho2.clone(), ortho3.clone()];
+        let deduplicated = deduplicate_frontier(frontier, "test", 1, 1);
+        
+        // Should only keep ortho3 (the longest), removing ortho1 and ortho2
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].payload(), ortho3.payload());
+    }
+    
+    #[test]
+    fn test_trie_divergent_payloads_not_prefixes() {
+        // Test that divergent payloads are NOT treated as prefixes
+        let interner = Interner::from_text("a b c d");
+        let version = interner.version();
+        
+        let ortho1 = Ortho::new(version).add(0, version).pop().unwrap(); // [a]
+        let ortho2 = ortho1.clone().add(1, version).pop().unwrap(); // [a, b]
+        let ortho3 = ortho1.clone().add(2, version).pop().unwrap(); // [a, c] - diverges!
+        
+        let frontier = vec![ortho1.clone(), ortho2.clone(), ortho3.clone()];
+        let deduplicated = deduplicate_frontier(frontier, "test", 1, 1);
+        
+        // Should remove ortho1 (prefix of both ortho2 and ortho3)
+        // But keep both ortho2 and ortho3 (they diverge, neither is prefix of other)
+        assert_eq!(deduplicated.len(), 2);
+        
+        // Verify both ortho2 and ortho3 remain
+        let payloads: Vec<_> = deduplicated.iter().map(|o| o.payload()).collect();
+        assert!(payloads.contains(&ortho2.payload()));
+        assert!(payloads.contains(&ortho3.payload()));
+    }
+    
+    #[test]
+    fn test_trie_same_start_different_length_not_all_prefixes() {
+        // Test edge case: [a] and [a,b] where both start with 'a'
+        // but only [a] should be marked as prefix
+        let interner = Interner::from_text("a b");
+        let version = interner.version();
+        
+        let ortho_short = Ortho::new(version).add(0, version).pop().unwrap(); // [a]
+        let ortho_long = ortho_short.clone().add(1, version).pop().unwrap(); // [a, b]
+        
+        let frontier = vec![ortho_short.clone(), ortho_long.clone()];
+        let deduplicated = deduplicate_frontier(frontier, "test", 1, 1);
+        
+        // Should only keep ortho_long, removing ortho_short (prefix)
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].payload(), ortho_long.payload());
     }
     
     #[test]
