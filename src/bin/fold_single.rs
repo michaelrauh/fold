@@ -332,30 +332,85 @@ fn detect_affected_orthos(
         return Vec::new();
     }
     
-    let mut affected = Vec::new();
+    // Step 1: Find impacted vocabulary indices by comparing interners
+    // For each prefix in old interner, check if completion sets differ
+    let mut impacted_indices = std::collections::HashSet::new();
+    let old_vocab = old_interner.vocabulary();
     
-    for ortho in frontier {
-        // An ortho is impacted if any of its required prefixes have different completions
-        // between old and new interners. This indicates that vocabulary changes
-        // create new expansion opportunities at non-leaf positions in the search tree.
-        let (_forbidden, required) = ortho.get_requirements();
-        
-        let mut is_impacted = false;
-        for prefix in &required {
-            // Compare completion bitsets for this prefix
-            let differing = old_interner.differing_completions_indices_up_to_vocab(new_interner, prefix);
-            if !differing.is_empty() {
-                is_impacted = true;
-                break;
-            }
-        }
-        
-        if is_impacted {
-            affected.push(ortho.clone());
+    for i in 0..old_vocab_len {
+        let prefix = vec![i];
+        let differing = old_interner.differing_completions_indices_up_to_vocab(new_interner, &prefix);
+        if !differing.is_empty() {
+            impacted_indices.insert(i);
         }
     }
     
-    affected
+    if impacted_indices.is_empty() {
+        return Vec::new();
+    }
+    
+    // Step 2: Find frontier orthos containing any impacted vocabulary index
+    let mut affected_orthos = Vec::new();
+    for ortho in frontier {
+        let payload = ortho.payload();
+        let contains_impacted = payload.iter()
+            .filter_map(|p| *p)
+            .any(|idx| impacted_indices.contains(&idx));
+        
+        if contains_impacted {
+            affected_orthos.push(ortho.clone());
+        }
+    }
+    
+    // Step 3: Back up the tree - create parent orthos by removing filled positions
+    // These parents are expansion points that compaction eliminated
+    let version = new_interner.version();
+    let mut backed_up_orthos = Vec::new();
+    
+    for ortho in affected_orthos {
+        // Get all filled positions
+        let payload = ortho.payload();
+        let filled_positions: Vec<usize> = payload.iter()
+            .enumerate()
+            .filter_map(|(i, p)| if p.is_some() { Some(i) } else { None })
+            .collect();
+        
+        // Create parent orthos by removing each filled position one at a time
+        // This backs up the tree to find expansion points
+        for &pos_to_remove in &filled_positions {
+            let mut parent_payload = payload.to_vec();
+            parent_payload[pos_to_remove] = None;
+            
+            // Rebuild ortho with canonicalization to handle geometry
+            if let Some(parent) = build_ortho_from_payload(&parent_payload, version) {
+                backed_up_orthos.push(parent);
+            }
+        }
+    }
+    
+    backed_up_orthos
+}
+
+// Helper function to build ortho from payload with canonicalization
+fn build_ortho_from_payload(payload: &[Option<usize>], version: u64) -> Option<Ortho> {
+    let mut ortho = Ortho::new(version);
+    
+    // Add filled positions in order
+    for (pos, val) in payload.iter().enumerate() {
+        if let Some(idx) = val {
+            // Try to add this index at this position
+            let children = ortho.add(*idx, version);
+            if let Some(child) = children.into_iter()
+                .find(|o| o.payload().get(pos) == Some(val)) {
+                ortho = child;
+            } else {
+                // Cannot build this ortho
+                return None;
+            }
+        }
+    }
+    
+    Some(ortho)
 }
 
 fn create_blank_resume() -> Result<ResumeFile, FoldError> {
