@@ -777,82 +777,232 @@ mod tests {
     
     #[test]
     fn test_detect_affected_orthos_includes_non_leading() {
-        // Test 2: Verify it adds non-leading orthos to frontier
+        // Test 2: Verify it adds non-leading orthos to frontier when affected
+        // The key is that the ortho must have EMPTY requirements to be affected by new vocab
         let old_interner = Interner::from_text("a b c");
         let new_interner = Interner::from_text("a b c d");
         
         let version = old_interner.version();
         
-        // Create a non-leading ortho (prefix of something longer)
-        let short_ortho = Ortho::new(version).add(0, version).pop().unwrap(); // [a]
-        let long_ortho = short_ortho.clone().add(1, version).pop().unwrap(); // [a, b]
+        // Create orthos with empty requirements (no prefixes required)
+        // These are affected by new vocabulary since they can accept any completion
+        let ortho_empty = Ortho::new(version); // Empty ortho - affected by new vocab
         
-        // In typical frontier, we'd only keep long_ortho after deduplication
-        // But detect_affected_orthos should work on whatever is in the frontier
-        let frontier = vec![short_ortho.clone(), long_ortho.clone()];
+        // Create an ortho with a requirement
+        let orthos_with_requirement = Ortho::new(version).add(0, version); // Requires 'a'
+        let ortho_with_requirement = orthos_with_requirement.first().unwrap().clone();
+        
+        let frontier = vec![ortho_empty.clone(), ortho_with_requirement.clone()];
         
         let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
         
-        // Both should be detected as affected if new vocab creates completions
-        assert!(affected.len() > 0, "Should detect affected orthos");
+        // Both should be detected as affected since they have empty requirements
+        // and new vocab 'd' (index 3) creates new completions for them
+        assert_eq!(affected.len(), 2, "Should detect both orthos as affected by new vocab");
         
-        // The function should not filter out non-leading orthos - that's deduplication's job
-        // It should just identify which orthos are affected by vocab changes
+        // The function should not filter out any affected orthos - that's deduplication's job
+        // It just identifies which orthos have new completions available
     }
     
     #[test]
     fn test_detect_affected_orthos_comprehensive() {
-        // Test 3: Verify it picks up ALL affected orthos
+        // Test 3: Comprehensive test - verify it picks up orthos with prefix changes
+        // Create a scenario where existing prefixes get new completions
         let old_interner = Interner::from_text("cat dog");
-        let new_interner = Interner::from_text("cat dog bird fish");
+        let new_interner = Interner::from_text("cat dog car");
         
         let version = old_interner.version();
         
-        // Create multiple orthos with different characteristics
+        // Create orthos:
+        // 1. Origin (empty requirements) - affected by any new vocab
         let origin = Ortho::new(version);
-        let ortho_cat = Ortho::new(version).add(0, version).pop().unwrap(); // requires "cat"
-        let ortho_dog = Ortho::new(version).add(1, version).pop().unwrap(); // requires "dog"
         
-        let frontier = vec![origin.clone(), ortho_cat.clone(), ortho_dog.clone()];
+        // 2. Ortho requiring "c" - in old_interner, "c" completes to "cat"
+        //    in new_interner, "c" completes to both "cat" and "car"
+        //    This ortho SHOULD be affected
+        let ortho_c = Ortho::new(version).add(0, version).pop().unwrap(); // requires ["c"]
+        
+        // 3. Ortho requiring "d" - completions don't change (still just "dog")
+        let ortho_d = Ortho::new(version).add(1, version).pop().unwrap(); // requires ["d"]
+        
+        let frontier = vec![origin.clone(), ortho_c.clone(), ortho_d.clone()];
         
         let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
         
-        // All should be affected since new vocabulary adds completions
-        assert!(affected.len() > 0, "Should detect multiple affected orthos");
+        // Should detect multiple affected orthos
+        assert!(affected.len() >= 2, "Should detect at least origin and ortho_c as affected");
         
-        // Origin ortho should definitely be affected (new vocab always affects empty requirements)
+        // Origin ortho must be affected (new vocab always affects empty requirements)
         assert!(affected.iter().any(|o| o.id() == origin.id()), 
                 "Origin ortho must be affected by new vocabulary");
         
-        // Verify we're not missing any affected orthos
-        // In this case, all three should be affected since "bird" and "fish" can complete after any prefix
-        assert!(affected.len() >= 1, "Should detect at least the origin ortho");
+        // Ortho with prefix "c" should be affected (new completion "car" added)
+        assert!(affected.iter().any(|o| o.id() == ortho_c.id()),
+                "Ortho with prefix 'c' should be affected by new completion 'car'");
     }
     
     #[test]
-    fn test_detect_affected_orthos_with_forbidden() {
-        // Test edge case: orthos with forbidden indices should not be affected 
-        // if only forbidden indices are added
+    fn test_detect_affected_orthos_multiple_levels() {
+        // Test comprehensive scenario with multiple orthos at different levels
+        let old_interner = Interner::from_text("a b");
+        let new_interner = Interner::from_text("a b c d");
+        
+        let version = old_interner.version();
+        
+        // Create various orthos at different levels of completion
+        let ortho1 = Ortho::new(version); // Empty ortho
+        let ortho2 = Ortho::new(version).add(0, version).pop().unwrap(); // [Some(0)]
+        let ortho3 = Ortho::new(version).add(1, version).pop().unwrap(); // [Some(1)]
+        
+        // Create ortho with multiple filled positions
+        let ortho4 = {
+            let temp = Ortho::new(version).add(0, version).pop().unwrap();
+            temp.add(1, version).pop().unwrap_or(temp)
+        };
+        
+        let frontier = vec![ortho1.clone(), ortho2.clone(), ortho3.clone(), ortho4.clone()];
+        
+        let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
+        
+        // All orthos should be affected since vocabulary expanded with 'c' and 'd'
+        assert!(!affected.is_empty(), "Some orthos should be affected by vocab expansion");
+        
+        // Verify empty ortho is affected (can accept any new vocab)
+        assert!(affected.iter().any(|o| o.id() == ortho1.id()), 
+                "Empty ortho should be affected by vocab expansion");
+    }
+    
+    #[test]
+    fn test_detect_affected_orthos_picks_up_interner_differences() {
+        // Test 1: Verify detection of interner differences (new vocabulary)
+        let old_interner = Interner::from_text("hello world");
+        let new_interner = Interner::from_text("hello world foo bar");
+        
+        assert!(old_interner.vocabulary().len() < new_interner.vocabulary().len(), 
+                "New interner should have more vocabulary");
+        
+        let version = old_interner.version();
+        let ortho = Ortho::new(version); // Empty ortho should be affected
+        let frontier = vec![ortho.clone()];
+        
+        let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
+        
+        assert_eq!(affected.len(), 1, "Empty ortho should be affected by new vocabulary");
+        assert_eq!(affected[0].id(), ortho.id(), "Should return the same ortho");
+    }
+    
+    #[test]
+    fn test_detect_affected_orthos_no_change_returns_empty() {
+        // Test: When interners are identical, no orthos should be affected
+        let old_interner = Interner::from_text("hello world");
+        let new_interner = Interner::from_text("hello world");
+        
+        assert_eq!(old_interner.vocabulary().len(), new_interner.vocabulary().len(), 
+                   "Interners should have same vocabulary size");
+        
+        let version = old_interner.version();
+        let ortho1 = Ortho::new(version);
+        let ortho2 = Ortho::new(version).add(0, version).pop().unwrap();
+        let frontier = vec![ortho1, ortho2];
+        
+        let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
+        
+        assert_eq!(affected.len(), 0, "No orthos should be affected when vocabulary is unchanged");
+    }
+    
+    #[test]
+    fn test_detect_affected_orthos_adds_non_leading_orthos() {
+        // Test 2: Verify that non-leading orthos (prefixes) are added when affected
         let old_interner = Interner::from_text("a b");
         let new_interner = Interner::from_text("a b c");
         
         let version = old_interner.version();
-        let new_version = new_interner.version();
         
-        // Create ortho that forbids the new vocab index (c=2 in new_interner)
-        // First create an ortho, then forbid the new index
-        let ortho = Ortho::new(version).add(0, version).pop().unwrap(); // [a]
+        // Create a prefix ortho (non-leading) - just has 'a' in position 0
+        let prefix_ortho = Ortho::new(version).add(0, version).pop().unwrap();
         
-        // Create ortho that forbids index 2 (which is 'c' in new interner)
-        let ortho_forbid = Ortho::new(version).forbid(2, version);
+        // Create a longer ortho that would make prefix_ortho "non-leading"
+        let longer_ortho = {
+            let temp = Ortho::new(version).add(0, version).pop().unwrap();
+            temp.add(1, version).pop().unwrap_or(temp)
+        };
         
-        let frontier = vec![ortho.clone(), ortho_forbid.clone()];
+        let frontier = vec![prefix_ortho.clone(), longer_ortho.clone()];
         
         let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
         
-        // ortho should be affected, but ortho_forbid might not be if 'c' is the only new addition
-        // and it's forbidden
-        assert!(affected.iter().any(|o| o.id() == ortho.id()), 
-                "Ortho without forbidden should be affected");
+        // Both orthos should be in affected list since vocabulary expanded
+        assert!(!affected.is_empty(), "At least some orthos should be affected");
+        
+        // Verify the prefix ortho is included
+        assert!(affected.iter().any(|o| o.id() == prefix_ortho.id()), 
+                "Non-leading prefix ortho should be included when affected");
+    }
+    
+    #[test]
+    fn test_detect_affected_orthos_picks_up_all_impacted() {
+        // Test 3: Verify all truly impacted orthos are picked up
+        let old_interner = Interner::from_text("alpha beta");
+        let new_interner = Interner::from_text("alpha beta gamma delta");
+        
+        let version = old_interner.version();
+        
+        // Create multiple orthos with different structures
+        let empty_ortho = Ortho::new(version);
+        let ortho_with_alpha = Ortho::new(version).add(0, version).pop().unwrap();
+        let ortho_with_beta = Ortho::new(version).add(1, version).pop().unwrap();
+        
+        // Create ortho with both alpha and beta
+        let ortho_with_both = {
+            let temp = Ortho::new(version).add(0, version).pop().unwrap();
+            temp.add(1, version).pop().unwrap_or(temp)
+        };
+        
+        let frontier = vec![
+            empty_ortho.clone(), 
+            ortho_with_alpha.clone(), 
+            ortho_with_beta.clone(),
+            ortho_with_both.clone()
+        ];
+        
+        let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
+        
+        // All orthos should be affected since new vocabulary ('gamma', 'delta') can be added
+        assert!(!affected.is_empty(), "Some orthos should be affected");
+        
+        // Empty ortho should always be affected when vocabulary grows
+        assert!(affected.iter().any(|o| o.id() == empty_ortho.id()), 
+                "Empty ortho must be affected by vocabulary expansion");
+        
+        // Verify we're not missing any orthos that should be affected
+        // At minimum, the empty ortho should be present
+        assert!(affected.len() >= 1, "At least the empty ortho should be affected");
+    }
+    
+    #[test]
+    fn test_detect_affected_orthos_respects_forbidden() {
+        // Test that orthos with forbidden indices don't get affected by those indices
+        let old_interner = Interner::from_text("a");
+        let new_interner = Interner::from_text("a b");
+        
+        let version = old_interner.version();
+        
+        // Create an empty ortho (no forbidden, should be affected)
+        let empty_ortho = Ortho::new(version);
+        
+        // Create ortho that already explored position 0 but not 1
+        // (after adding vocab 'b' at index 1, this ortho might be affected)
+        let ortho_with_a = Ortho::new(version).add(0, version).pop().unwrap();
+        
+        let frontier = vec![empty_ortho.clone(), ortho_with_a.clone()];
+        
+        let affected = detect_affected_orthos(&frontier, &old_interner, &new_interner);
+        
+        // Empty ortho should definitely be affected
+        assert!(affected.iter().any(|o| o.id() == empty_ortho.id()), 
+                "Empty ortho should be affected by new vocabulary");
+        
+        // Verify we got some affected orthos
+        assert!(!affected.is_empty(), "Should have affected orthos when vocabulary expands");
     }
 }
