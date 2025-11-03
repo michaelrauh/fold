@@ -335,31 +335,23 @@ fn detect_affected_orthos(
     let mut affected = Vec::new();
     
     for ortho in frontier {
-        // Key insight: The worker fills positions one at a time.
-        // Any ortho that is not fully filled has expansion opportunities
-        // when new vocabulary is added, because it can fill the next position
-        // with new vocabulary items.
-        //
-        // An ortho is NOT fully filled if it has fewer filled positions than
-        // its dimension size (the number of positions in the shape).
+        // An ortho is impacted if any of its required prefixes have different completions
+        // between old and new interners. This indicates that vocabulary changes
+        // create new expansion opportunities at non-leaf positions in the search tree.
+        let (_forbidden, required) = ortho.get_requirements();
         
-        let (forbidden, _required) = ortho.get_requirements();
-        let forbidden_set: HashSet<usize> = forbidden.iter().copied().collect();
-        
-        // Check if any new vocabulary item is not forbidden
-        // If so, this ortho could expand with it
-        let has_usable_new_vocab = (old_vocab_len..new_vocab_len)
-            .any(|i| !forbidden_set.contains(&i));
-        
-        if has_usable_new_vocab {
-            // Count filled positions in the ortho
-            let filled_count = ortho.payload().iter().filter(|p| p.is_some()).count();
-            let dims = ortho.dims();
-            
-            // If not all positions are filled, new vocabulary creates expansion opportunities
-            if filled_count < dims.len() {
-                affected.push(ortho.clone());
+        let mut is_impacted = false;
+        for prefix in &required {
+            // Compare completion bitsets for this prefix
+            let differing = old_interner.differing_completions_indices_up_to_vocab(new_interner, prefix);
+            if !differing.is_empty() {
+                is_impacted = true;
+                break;
             }
+        }
+        
+        if is_impacted {
+            affected.push(ortho.clone());
         }
     }
     
