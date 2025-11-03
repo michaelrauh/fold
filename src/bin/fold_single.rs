@@ -235,23 +235,34 @@ fn run_worker(resume_path: &str, file_name: &str, file_num: usize, total_files: 
     println!("[fold_single][run] IMPORTANT: Adding {} orthos to frontier (pausing 3 seconds before continuing)...", total_initial);
     std::thread::sleep(std::time::Duration::from_secs(3));
     
-    const FRONTIER_COMPACTION_THRESHOLD: usize = 10_000_000; // 10 million orthos
+    // Dynamic compaction: compact at 200% of baseline, then update baseline
+    let mut compaction_baseline = new_frontier.len();
     const COMPACTION_CHECK_INTERVAL: usize = 100; // Check every 100 iterations
+    
+    println!("[fold_single][run] File {}/{} ({}): Initial compaction baseline set to {} orthos", 
+             file_num, total_files, file_name, compaction_baseline);
     
     while let Some(ortho) = work_queue.pop_front() {
         processed += 1;
         
-        // Check if frontier is getting too large and compact if needed
-        if processed % COMPACTION_CHECK_INTERVAL == 0 && new_frontier.len() > FRONTIER_COMPACTION_THRESHOLD {
-            println!("[fold_single][run] File {}/{} ({}): Frontier size {} exceeds threshold {}, compacting...", 
-                     file_num, total_files, file_name, new_frontier.len(), FRONTIER_COMPACTION_THRESHOLD);
+        // Check if frontier has reached 200% (2x) of baseline and compact if needed
+        if processed % COMPACTION_CHECK_INTERVAL == 0 && new_frontier.len() >= compaction_baseline * 2 {
+            let compaction_threshold = compaction_baseline * 2;
+            println!("[fold_single][run] File {}/{} ({}): Frontier size {} exceeds 200% of baseline {} (threshold: {}), compacting...", 
+                     file_num, total_files, file_name, new_frontier.len(), compaction_baseline, compaction_threshold);
             let pre_compact_size = new_frontier.len();
             new_frontier = deduplicate_frontier(new_frontier, file_name, file_num, total_files);
             let post_compact_size = new_frontier.len();
             frontier_set.clear();
             frontier_set = new_frontier.iter().map(|o| o.id()).collect();
+            
+            // Update baseline to new size after compaction
+            compaction_baseline = post_compact_size;
+            
             println!("[fold_single][run] File {}/{} ({}): Compaction complete: {} -> {} orthos (removed {})", 
                      file_num, total_files, file_name, pre_compact_size, post_compact_size, pre_compact_size - post_compact_size);
+            println!("[fold_single][run] File {}/{} ({}): New compaction baseline set to {} orthos (next threshold: {})", 
+                     file_num, total_files, file_name, compaction_baseline, compaction_baseline * 2);
         }
         
         // Report progress every 1000 orthos (less chatty)
