@@ -335,45 +335,31 @@ fn detect_affected_orthos(
     let mut affected = Vec::new();
     
     for ortho in frontier {
-        let (forbidden, required) = ortho.get_requirements();
+        // Key insight: The worker fills positions one at a time.
+        // Any ortho that is not fully filled has expansion opportunities
+        // when new vocabulary is added, because it can fill the next position
+        // with new vocabulary items.
+        //
+        // An ortho is NOT fully filled if it has fewer filled positions than
+        // its dimension size (the number of positions in the shape).
+        
+        let (forbidden, _required) = ortho.get_requirements();
         let forbidden_set: HashSet<usize> = forbidden.iter().copied().collect();
         
-        // Check for new vocabulary additions
-        let mut has_new_completions = false;
+        // Check if any new vocabulary item is not forbidden
+        // If so, this ortho could expand with it
+        let has_usable_new_vocab = (old_vocab_len..new_vocab_len)
+            .any(|i| !forbidden_set.contains(&i));
         
-        if required.is_empty() {
-            // New vocab always creates completions for empty requirements
-            for i in old_vocab_len..new_vocab_len {
-                if !forbidden_set.contains(&i) {
-                    has_new_completions = true;
-                    break;
-                }
+        if has_usable_new_vocab {
+            // Count filled positions in the ortho
+            let filled_count = ortho.payload().iter().filter(|p| p.is_some()).count();
+            let dims = ortho.dims();
+            
+            // If not all positions are filled, new vocabulary creates expansion opportunities
+            if filled_count < dims.len() {
+                affected.push(ortho.clone());
             }
-        } else {
-            // Check each required prefix
-            for prefix in &required {
-                // Use existing interner method to detect differences
-                let diffs = old_interner.differing_completions_indices_up_to_vocab(new_interner, prefix);
-                
-                if !diffs.is_empty() {
-                    has_new_completions = true;
-                    break;
-                }
-                
-                // Check new vocabulary indices
-                if let Some(high_bs) = new_interner.completions_for_prefix(prefix) {
-                    for idx in old_vocab_len..new_vocab_len {
-                        if !forbidden_set.contains(&idx) && high_bs.contains(idx) {
-                            has_new_completions = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        
-        if has_new_completions {
-            affected.push(ortho.clone());
         }
     }
     
