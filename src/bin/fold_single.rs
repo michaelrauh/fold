@@ -394,6 +394,50 @@ fn save_resume(path: &str, resume: &ResumeFile) -> Result<(), FoldError> {
     Ok(())
 }
 
+// Trie node for fast prefix detection
+#[derive(Default)]
+struct TrieNode {
+    children: std::collections::HashMap<Option<usize>, TrieNode>,
+}
+
+struct PayloadTrie {
+    root: TrieNode,
+}
+
+impl PayloadTrie {
+    fn new() -> Self {
+        PayloadTrie {
+            root: TrieNode::default(),
+        }
+    }
+    
+    // Insert a payload into the trie
+    fn insert(&mut self, payload: &[Option<usize>]) {
+        let mut node = &mut self.root;
+        // Only traverse filled positions
+        for &value in payload.iter().filter(|v| v.is_some()) {
+            node = node.children.entry(value).or_insert_with(TrieNode::default);
+        }
+    }
+    
+    // Check if payload is a proper prefix (continues in trie beyond this point)
+    fn is_prefix_of_longer(&self, payload: &[Option<usize>]) -> bool {
+        let mut node = &self.root;
+        
+        // Only traverse filled positions
+        for &value in payload.iter().filter(|v| v.is_some()) {
+            match node.children.get(&value) {
+                Some(child) => node = child,
+                None => return false, // No matching path
+            }
+        }
+        
+        // After traversing payload, check if there are any children
+        // (indicating the payload continues in some other ortho)
+        !node.children.is_empty()
+    }
+}
+
 fn deduplicate_frontier(frontier: Vec<Ortho>, file_name: &str, file_num: usize, total_files: usize) -> Vec<Ortho> {
     // OPTIMIZATION: Group orthos by origin (first payload item) first, then by shape within each origin
     // This dramatically reduces the comparison pool since prefixes must share the same origin
@@ -435,50 +479,29 @@ fn deduplicate_frontier(frontier: Vec<Ortho>, file_name: &str, file_num: usize, 
             by_shape.entry(ortho.dims().clone()).or_insert_with(Vec::new).push(ortho);
         }
         
-        // Deduplicate within each shape group
+        // Deduplicate within each shape group using TRIE
         for (_shape, mut orthos) in by_shape {
-            // OPTIMIZATION: Sort by number of filled positions (ascending)
-            // This allows us to only compare orthos with fewer filled against those with more
+            // Sort by number of filled positions (ascending)
             orthos.sort_by_key(|o| {
                 o.payload().iter().filter(|v| v.is_some()).count()
             });
             
-            // Mark prefixes for removal
-            let mut is_prefix_flags = vec![false; orthos.len()];
-            
-            // For each ortho, only check against orthos with MORE filled positions
-            for i in 0..orthos.len() {
-                if is_prefix_flags[i] {
-                    continue; // Already marked as prefix
-                }
-                
-                let candidate = &orthos[i];
-                let candidate_filled = candidate.payload().iter().filter(|v| v.is_some()).count();
-                
-                // Only compare with orthos that have more filled positions
-                // Start from i+1 since array is sorted by filled count
-                for j in (i + 1)..orthos.len() {
-                    let other = &orthos[j];
-                    let other_filled = other.payload().iter().filter(|v| v.is_some()).count();
-                    
-                    // Skip orthos with same filled count (not prefixes)
-                    if candidate_filled >= other_filled {
-                        continue;
-                    }
-                    
-                    // Check if candidate is a prefix of other
-                    if is_canonicalized_prefix_fast(candidate, other, candidate_filled, other_filled) {
-                        is_prefix_flags[i] = true;
-                        break; // Found a match, candidate is a prefix
-                    }
-                }
+            // Build trie with ALL orthos
+            let mut trie = PayloadTrie::new();
+            for ortho in &orthos {
+                trie.insert(ortho.payload());
             }
             
-            // Collect non-prefix orthos
-            for (i, ortho) in orthos.into_iter().enumerate() {
-                if !is_prefix_flags[i] {
-                    result.push(ortho);
+            // Check each ortho to see if it's a prefix of a fuller ortho
+            for ortho in orthos {
+                // Use trie to check if this payload is a proper prefix
+                // (i.e., the trie path continues beyond this payload)
+                if trie.is_prefix_of_longer(ortho.payload()) {
+                    // This ortho's payload is a prefix of a longer one, skip it
+                    continue;
                 }
+                
+                result.push(ortho);
             }
         }
     }
