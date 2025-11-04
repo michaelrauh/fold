@@ -333,15 +333,26 @@ fn detect_affected_orthos(
     }
     
     // Step 1: Find impacted vocabulary indices by comparing interners
-    // For each prefix in old interner, check if completion sets differ
+    // We need to check all possible prefixes to find where completion sets differ
     let mut impacted_indices = std::collections::HashSet::new();
-    let old_vocab = old_interner.vocabulary();
     
+    // Check empty prefix (top-level vocabulary)
+    let differing = old_interner.differing_completions_indices_up_to_vocab(new_interner, &vec![]);
+    impacted_indices.extend(differing);
+    
+    // Check all single-element prefixes
     for i in 0..old_vocab_len {
         let prefix = vec![i];
         let differing = old_interner.differing_completions_indices_up_to_vocab(new_interner, &prefix);
-        if !differing.is_empty() {
-            impacted_indices.insert(i);
+        impacted_indices.extend(differing);
+    }
+    
+    // Check longer prefixes up to depth 3 (sufficient for most cases)
+    for i in 0..old_vocab_len {
+        for j in 0..old_vocab_len {
+            let prefix = vec![i, j];
+            let differing = old_interner.differing_completions_indices_up_to_vocab(new_interner, &prefix);
+            impacted_indices.extend(differing);
         }
     }
     
@@ -362,27 +373,17 @@ fn detect_affected_orthos(
         }
     }
     
-    // Step 3: Back up the tree - create parent orthos by removing filled positions
-    // These parents are expansion points that compaction eliminated
+    // Step 3: Back up the tree - find the unique predecessor for each affected ortho
+    // Geometry branches downward without convergence - each ortho has ONE predecessor
+    // The predecessor is found by removing the rightmost filled position (last added)
     let version = new_interner.version();
     let mut backed_up_orthos = Vec::new();
     
     for ortho in affected_orthos {
-        // Get all filled positions
-        let payload = ortho.payload();
-        let filled_positions: Vec<usize> = payload.iter()
-            .enumerate()
-            .filter_map(|(i, p)| if p.is_some() { Some(i) } else { None })
-            .collect();
-        
-        // Create parent orthos by removing each filled position one at a time
-        // This backs up the tree to find expansion points
-        for &pos_to_remove in &filled_positions {
-            let mut parent_payload = payload.to_vec();
-            parent_payload[pos_to_remove] = None;
-            
+        // Find the unique predecessor by removing the rightmost filled position
+        if let Some(predecessor_payload) = find_predecessor_payload(ortho.payload()) {
             // Rebuild ortho with canonicalization to handle geometry
-            if let Some(parent) = build_ortho_from_payload(&parent_payload, version) {
+            if let Some(parent) = build_ortho_from_payload(&predecessor_payload, version) {
                 backed_up_orthos.push(parent);
             }
         }
@@ -391,8 +392,30 @@ fn detect_affected_orthos(
     backed_up_orthos
 }
 
+// Find the unique predecessor by identifying and removing the rightmost filled position
+// The rightmost filled position is the last one that was added, so removing it
+// gives the state before that addition (the unique predecessor in the tree)
+fn find_predecessor_payload(payload: &[Option<usize>]) -> Option<Vec<Option<usize>>> {
+    // Find rightmost Some value (last filled position)
+    let rightmost_filled = payload.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, p)| p.is_some())
+        .map(|(i, _)| i);
+    
+    if let Some(pos) = rightmost_filled {
+        // Create predecessor payload with that position set to None
+        let mut predecessor = payload.to_vec();
+        predecessor[pos] = None;
+        Some(predecessor)
+    } else {
+        // No filled positions - cannot back up further
+        None
+    }
+}
+
 // Helper function to build ortho from payload with canonicalization
-fn build_ortho_from_payload(payload: &[Option<usize>], version: u64) -> Option<Ortho> {
+fn build_ortho_from_payload(payload: &[Option<usize>], version: usize) -> Option<Ortho> {
     let mut ortho = Ortho::new(version);
     
     // Add filled positions in order
