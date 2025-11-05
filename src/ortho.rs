@@ -93,6 +93,34 @@ impl Ortho {
         }
         idx
     }
+    pub fn subtract(&self) -> Option<Self> {
+        // Find the last filled position (position of last Some value before first None)
+        let current_position = self.get_current_position();
+        if current_position == 0 {
+            // Nothing to subtract - ortho is empty
+            return None;
+        }
+        
+        let last_filled_position = current_position - 1;
+        
+        // Create new payload with the last filled value removed
+        let mut new_payload = self.payload.clone();
+        new_payload[last_filled_position] = None;
+        
+        // Handle reverse canonicalization for [2,2] dims at position 2
+        // When we subtract from position 2, we need to restore the original order
+        // However, since canonicalization only swaps values at positions 1 and 2,
+        // and we're just removing position 2, we can leave positions 1 as is.
+        // The ortho will be in a valid state (though not necessarily the same state
+        // we had before the original add that triggered canonicalization).
+        
+        Some(Ortho {
+            version: self.version,
+            dims: self.dims.clone(),
+            payload: new_payload,
+        })
+    }
+    
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
         let pos = self.get_current_position(); // next insert position
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
@@ -588,5 +616,96 @@ mod tests {
         norms1.sort();
         norms2.sort();
         assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
+    }
+
+    #[test]
+    fn test_subtract_empty_ortho() {
+        let ortho = Ortho::new(1);
+        assert_eq!(ortho.subtract(), None);
+    }
+
+    #[test]
+    fn test_subtract_single_value() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10, 1)[0];
+        let subtracted = ortho.subtract().expect("Should be able to subtract");
+        assert_eq!(subtracted.payload, vec![None, None, None, None]);
+        assert_eq!(subtracted.dims, vec![2, 2]);
+        assert_eq!(subtracted.version, 1);
+    }
+
+    #[test]
+    fn test_subtract_multiple_values() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10, 1)[0];
+        let ortho = &ortho.add(20, 1)[0];
+        let ortho = &ortho.add(30, 1)[0];
+        
+        let subtracted = ortho.subtract().expect("Should be able to subtract");
+        assert_eq!(subtracted.payload, vec![Some(10), Some(20), None, None]);
+        
+        let subtracted2 = subtracted.subtract().expect("Should be able to subtract again");
+        assert_eq!(subtracted2.payload, vec![Some(10), None, None, None]);
+        
+        let subtracted3 = subtracted2.subtract().expect("Should be able to subtract once more");
+        assert_eq!(subtracted3.payload, vec![None, None, None, None]);
+        
+        let subtracted4 = subtracted3.subtract();
+        assert_eq!(subtracted4, None);
+    }
+
+    #[test]
+    fn test_subtract_preserves_dims() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10, 1)[0];
+        let ortho = &ortho.add(20, 1)[0];
+        
+        let subtracted = ortho.subtract().expect("Should be able to subtract");
+        assert_eq!(subtracted.dims, vec![2, 2]);
+    }
+
+    #[test]
+    fn test_subtract_preserves_version() {
+        let ortho = Ortho::new(5);
+        let ortho = &ortho.add(10, 5)[0];
+        
+        let subtracted = ortho.subtract().expect("Should be able to subtract");
+        assert_eq!(subtracted.version, 5);
+    }
+
+    #[test]
+    fn test_subtract_and_add_roundtrip() {
+        let ortho = Ortho::new(1);
+        let ortho1 = &ortho.add(10, 1)[0];
+        let ortho2 = &ortho1.add(20, 1)[0];
+        
+        let subtracted = ortho2.subtract().expect("Should be able to subtract");
+        assert_eq!(subtracted.payload, ortho1.payload);
+        assert_eq!(subtracted.dims, ortho1.dims);
+        
+        // Add the same value back
+        let re_added = &subtracted.add(20, 1)[0];
+        assert_eq!(re_added.payload, ortho2.payload);
+        assert_eq!(re_added.dims, ortho2.dims);
+    }
+
+    #[test]
+    fn test_subtract_with_canonicalized_ortho() {
+        // Create an ortho that goes through canonicalization
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10, 1)[0]; // position 0
+        let ortho = &ortho.add(30, 1)[0]; // position 1
+        let ortho = &ortho.add(20, 1)[0]; // position 2 - triggers canonicalization (20 < 30)
+        
+        // After canonicalization, positions 1 and 2 should be swapped if 20 < 30
+        assert_eq!(ortho.payload[0], Some(10));
+        assert_eq!(ortho.payload[1], Some(20));
+        assert_eq!(ortho.payload[2], Some(30));
+        
+        // Subtract should remove position 2
+        let subtracted = ortho.subtract().expect("Should be able to subtract");
+        assert_eq!(subtracted.payload[0], Some(10));
+        assert_eq!(subtracted.payload[1], Some(20));
+        assert_eq!(subtracted.payload[2], None);
     }
 }

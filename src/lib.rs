@@ -22,6 +22,7 @@ pub fn process_text(
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
     frontier: &mut HashSet<usize>,
+    frontier_orthos_saved: &mut HashMap<usize, Ortho>,
 ) -> (interner::Interner, usize, usize, usize) {
     // Build or update interner and track changed keys
     let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
@@ -36,8 +37,12 @@ pub fn process_text(
     
     let version = current_interner.version();
     
-    // Track frontier orthos for checking impacted keys
+    // Track frontier orthos for checking impacted keys and for next iteration
     let mut frontier_orthos: HashMap<usize, Ortho> = HashMap::new();
+    
+    // Find impacted orthos from previous frontier and rewind them
+    let rewound_orthos = find_and_rewind_impacted_orthos(frontier_orthos_saved, &changed_keys, version);
+    let impacted_frontier_count = rewound_orthos.len();
     
     // Create seed ortho and work queue
     let seed_ortho = Ortho::new(version);
@@ -49,6 +54,11 @@ pub fn process_text(
     
     let mut work_queue: VecDeque<Ortho> = VecDeque::new();
     work_queue.push_back(seed_ortho);
+    
+    // Add rewound orthos to work queue
+    for rewound_ortho in rewound_orthos {
+        work_queue.push_back(rewound_ortho);
+    }
     
     // Worker loop: process until queue is empty
     while let Some(ortho) = work_queue.pop_front() {
@@ -96,10 +106,78 @@ pub fn process_text(
     
     let frontier_size = frontier.len();
     
-    // Count frontier orthos that contain impacted keys in their payload
-    let impacted_frontier_count = count_impacted_frontier_orthos(&frontier_orthos, &changed_keys);
+    // Save frontier orthos for next iteration
+    frontier_orthos_saved.clear();
+    frontier_orthos_saved.extend(frontier_orthos);
     
     (current_interner, changed_keys_count, frontier_size, impacted_frontier_count)
+}
+
+/// Find impacted orthos from the frontier and rewind them until the impacted key
+/// is at the "most advanced position" (the next insertion point).
+fn find_and_rewind_impacted_orthos(
+    frontier_orthos: &HashMap<usize, Ortho>,
+    changed_keys: &[Vec<usize>],
+    new_version: usize,
+) -> Vec<Ortho> {
+    if changed_keys.is_empty() {
+        return vec![];
+    }
+    
+    // Convert changed keys to a flat set of impacted indices
+    let mut impacted_indices: HashSet<usize> = HashSet::new();
+    for key in changed_keys {
+        for &index in key {
+            impacted_indices.insert(index);
+        }
+    }
+    
+    let mut rewound_orthos = Vec::new();
+    
+    // For each frontier ortho
+    for ortho in frontier_orthos.values() {
+        // Check if this ortho contains any impacted index
+        let mut contains_impacted = false;
+        let mut first_impacted_position: Option<usize> = None;
+        
+        for (pos, &opt_idx) in ortho.payload().iter().enumerate() {
+            if let Some(idx) = opt_idx {
+                if impacted_indices.contains(&idx) {
+                    contains_impacted = true;
+                    if first_impacted_position.is_none() {
+                        first_impacted_position = Some(pos);
+                    }
+                }
+            }
+        }
+        
+        if !contains_impacted {
+            continue;
+        }
+        
+        // Rewind this ortho until the first impacted index is at the next insertion position
+        let first_impacted_pos = first_impacted_position.unwrap();
+        
+        // We need to subtract until first_impacted_pos == current_position - 1
+        // This means the next add would happen at the position where the impacted key is
+        let mut rewound = ortho.clone();
+        
+        // Subtract values that come after the first impacted position
+        while rewound.get_current_position() > first_impacted_pos + 1 {
+            if let Some(subtracted) = rewound.subtract() {
+                rewound = subtracted;
+            } else {
+                break;
+            }
+        }
+        
+        // Update version to new version
+        rewound = rewound.set_version(new_version);
+        
+        rewound_orthos.push(rewound);
+    }
+    
+    rewound_orthos
 }
 
 /// Count how many frontier orthos contain any of the impacted keys in their payload
