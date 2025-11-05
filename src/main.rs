@@ -19,6 +19,10 @@ impl SimpleQueue {
             items: VecDeque::new(),
         }
     }
+    
+    fn into_inner(self) -> VecDeque<Ortho> {
+        self.items
+    }
 }
 
 impl fold::queue::QueueProducerLike for SimpleQueue {
@@ -95,7 +99,7 @@ fn main() -> Result<(), FoldError> {
                  version, interner.vocabulary().len());
         
         // Get the seed ortho from the queue
-        let mut work_queue: VecDeque<Ortho> = seed_queue.items;
+        let mut work_queue: VecDeque<Ortho> = seed_queue.into_inner();
         
         println!("[main] Work queue initialized with {} ortho(s)", work_queue.len());
         

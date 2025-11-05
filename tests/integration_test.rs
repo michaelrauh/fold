@@ -6,6 +6,8 @@ use fold::{
 };
 use std::collections::VecDeque;
 
+const MAX_TEST_ITERATIONS: usize = 1000;
+
 #[test]
 fn test_simple_worker_loop() {
     // Test the basic worker loop with a simple text
@@ -44,7 +46,7 @@ fn test_simple_worker_loop() {
         }
         
         // Prevent infinite loop in test
-        if processed > 1000 {
+        if processed > MAX_TEST_ITERATIONS {
             break;
         }
     }
@@ -98,7 +100,7 @@ fn test_multiple_file_processing() {
                 }
             }
             
-            if processed > 1000 {
+            if processed > MAX_TEST_ITERATIONS {
                 break;
             }
         }
@@ -151,7 +153,7 @@ fn test_optimal_ortho_tracking() {
             }
         }
         
-        if processed > 1000 {
+        if processed > MAX_TEST_ITERATIONS {
             break;
         }
     }
