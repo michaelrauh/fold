@@ -93,6 +93,51 @@ impl Ortho {
         }
         idx
     }
+    /// Helper to find the ancestor of a shape in the expansion tree.
+    /// Returns None if the shape is the base shape [2,2].
+    fn find_ancestor(dims: &[usize]) -> Option<Vec<usize>> {
+        // Base shape [2,2] has no ancestor
+        if dims == [2, 2] {
+            return None;
+        }
+        
+        // If there's a dimension > 2, decrement the first such dimension (reverse expand_over)
+        for (i, &dim) in dims.iter().enumerate() {
+            if dim > 2 {
+                let mut ancestor = dims.to_vec();
+                ancestor[i] -= 1;
+                return Some(ancestor);
+            }
+        }
+        
+        // If all dimensions are 2 but there are more than 2 dimensions,
+        // remove the last dimension (reverse expand_up)
+        if dims.len() > 2 && dims.iter().all(|&d| d == 2) {
+            let mut ancestor = dims.to_vec();
+            ancestor.pop();
+            return Some(ancestor);
+        }
+        
+        None
+    }
+    
+    /// Check if candidate_dims is an ancestor of or on the same ancestral path as original_dims
+    fn is_on_same_ancestral_path(original_dims: &[usize], candidate_dims: &[usize]) -> bool {
+        // Walk up from original_dims and see if we encounter candidate_dims
+        let mut current = original_dims.to_vec();
+        loop {
+            if current == candidate_dims {
+                return true;
+            }
+            if let Some(ancestor) = Self::find_ancestor(&current) {
+                current = ancestor;
+            } else {
+                break;
+            }
+        }
+        false
+    }
+    
     /// Rebuild this ortho up to a specific target position.
     /// This creates a new ortho containing only the values up to (but not including) target_position.
     /// Returns None if target_position is invalid (> current_position).
@@ -131,7 +176,6 @@ impl Ortho {
         }
         
         // Rebuild ortho by adding values one at a time
-        // We need to track the target shape to choose the right branch when expansion occurs
         let mut rebuilt = Ortho::new(self.version);
         for (i, &value) in values_to_keep.iter().enumerate() {
             // Add the value
@@ -141,26 +185,16 @@ impl Ortho {
                 return None;
             }
             
-            // If this is the last value, we need to determine the target shape
-            if i == values_to_keep.len() - 1 {
-                // Choose the candidate that has the appropriate capacity/shape
-                // Base shape [2,2] has capacity 4. If target_position <= 4, use base shape
-                rebuilt = if target_position <= 4 {
-                    // Below or at base capacity - should be base [2,2]
-                    candidates.iter()
-                        .find(|c| c.dims == vec![2, 2])
-                        .unwrap_or(&candidates[0])
-                        .clone()
-                } else {
-                    // Above base capacity - need expanded shape
-                    // Choose candidate that matches current ortho's dimensional structure
-                    candidates.iter()
-                        .find(|c| c.dims.len() == self.dims.len())
-                        .unwrap_or(&candidates[0])
-                        .clone()
-                };
+            // If this is the last value and there are multiple candidates,
+            // select the one on the same ancestral path as the original ortho
+            if i == values_to_keep.len() - 1 && candidates.len() > 1 {
+                // Find candidate on same ancestral path as original shape
+                rebuilt = candidates.iter()
+                    .find(|c| Self::is_on_same_ancestral_path(&self.dims, &c.dims))
+                    .unwrap_or(&candidates[0])
+                    .clone();
             } else {
-                // Not the last value - just take the first candidate (usually only one)
+                // Not the last value or only one candidate - just take the first
                 rebuilt = candidates[0].clone();
             }
         }
@@ -872,6 +906,56 @@ mod tests {
         // This proves the approach: the rightmost item in each rebuilt ortho
         // corresponds to the changed interner key. By creating both rewound orthos,
         // we ensure the search explores the new paths available from BOTH changed keys.
+    }
+    
+    #[test]
+    fn test_rebuild_uses_ancestor_tree_correctly() {
+        // Test that rebuild stays on the same ancestral path when selecting among expansion candidates
+        
+        // Start with an ortho at [3,2] shape (capacity 6)
+        let mut ortho = Ortho::new(1);
+        ortho = ortho.add(10, 1)[0].clone();   // position 0->1
+        ortho = ortho.add(20, 1)[0].clone();   // position 1->2
+        ortho = ortho.add(30, 1)[0].clone();   // position 2->3
+        ortho = ortho.add(40, 1)[0].clone();   // position 3->4, triggers expansion to [3,2]
+        
+        assert_eq!(ortho.dims, vec![3, 2], "Should be at [3,2] shape");
+        assert_eq!(ortho.get_current_position(), 4);
+        
+        // Rebuild to position 3 - with 3 values we stay at [2,2] (expansion not yet triggered)
+        let rebuilt = ortho.rebuild_to_position(3).expect("Should rebuild");
+        assert_eq!(rebuilt.dims, vec![2, 2], "With 3 values, stays at [2,2] (no expansion yet)");
+        assert_eq!(rebuilt.get_current_position(), 3);
+        
+        // Rebuild to position 4 - with 4 values we trigger expansion
+        // Should choose [3,2] to stay on same ancestral path as original
+        let rebuilt4 = ortho.rebuild_to_position(4).expect("Should rebuild");
+        assert_eq!(rebuilt4.dims, vec![3, 2], "With 4 values, expands and stays on ancestral path [2,2]->[3,2]");
+        assert_eq!(rebuilt4.get_current_position(), 4);
+        
+        // Now test with [2,2,2] shape (capacity 8)
+        let mut ortho2 = Ortho::new(1);
+        for &val in &[10, 30, 20, 40, 50] {  // 5 values
+            let candidates = ortho2.add(val, 1);
+            // Choose [2,2,2] path if available (select one with more dimensions)
+            ortho2 = candidates.iter()
+                .max_by_key(|c| c.dims.len())
+                .unwrap_or(&candidates[0])
+                .clone();
+        }
+        
+        assert_eq!(ortho2.dims, vec![2, 2, 2], "Should be at [2,2,2] shape");
+        assert_eq!(ortho2.get_current_position(), 5);
+        
+        // Rebuild to position 5 - should stay at [2,2,2]
+        let rebuilt5 = ortho2.rebuild_to_position(5).expect("Should rebuild");
+        assert_eq!(rebuilt5.dims, vec![2, 2, 2], "With 5 values, should stay on 'up' expansion path");
+        assert_eq!(rebuilt5.get_current_position(), 5);
+        
+        // Rebuild to position 4 - with 4 values we still get expansion, should choose [2,2,2] (up path)
+        let rebuilt_ortho2_4 = ortho2.rebuild_to_position(4).expect("Should rebuild");
+        assert_eq!(rebuilt_ortho2_4.dims, vec![2, 2, 2], "With 4 values from [2,2,2] original, should stay on 'up' path");
+        assert_eq!(rebuilt_ortho2_4.get_current_position(), 4);
     }
 
 }
