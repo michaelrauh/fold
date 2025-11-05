@@ -141,7 +141,7 @@ fn find_and_rewind_impacted_orthos(
     
     // For each frontier ortho
     for ortho in frontier_orthos.values() {
-        // Find ALL impacted positions in this ortho (not just the first one)
+        // Find ALL impacted positions in this ortho
         let mut impacted_positions: Vec<usize> = Vec::new();
         
         for (pos, &opt_idx) in ortho.payload().iter().enumerate() {
@@ -156,20 +156,20 @@ fn find_and_rewind_impacted_orthos(
             continue;
         }
         
-        // Find the earliest (leftmost) impacted position
-        // We want to rewind to just after this position so it becomes the last value
-        // (at the "most advanced position", ready for the next add)
-        let earliest_impacted_pos = *impacted_positions.iter().min().unwrap();
-        
-        // Rebuild this ortho up to and including the earliest impacted position
-        // This means the impacted key will be at position earliest_impacted_pos,
-        // which is the last filled position (current_position - 1)
-        let target_position = earliest_impacted_pos + 1;
-        
-        if let Some(mut rewound) = ortho.rebuild_to_position(target_position) {
-            // Update version to new version
-            rewound = rewound.set_version(new_version);
-            rewound_orthos.push(rewound);
+        // Rebuild to EACH impacted position, not just the earliest
+        // For each impacted position, create a rewound ortho where that impacted key
+        // is at the "most advanced position" (rightmost, ready for next add)
+        for &impacted_pos in &impacted_positions {
+            // Rebuild this ortho up to and including the impacted position
+            // This means the impacted key will be at position impacted_pos,
+            // which is the last filled position (current_position - 1)
+            let target_position = impacted_pos + 1;
+            
+            if let Some(mut rewound) = ortho.rebuild_to_position(target_position) {
+                // Update version to new version
+                rewound = rewound.set_version(new_version);
+                rewound_orthos.push(rewound);
+            }
         }
     }
     
