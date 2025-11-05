@@ -40,6 +40,7 @@ fn main() -> Result<(), FoldError> {
     // Track optimal ortho and seen IDs across all files
     let mut optimal_ortho: Option<Ortho> = None;
     let mut seen_ids = HashSet::new();
+    let mut frontier = HashSet::new();
     let mut interner: Option<fold::interner::Interner> = None;
     
     // Process each file
@@ -54,7 +55,7 @@ fn main() -> Result<(), FoldError> {
         println!("[main] File size: {} bytes", text.len());
         
         // Process text through worker loop and track changed keys
-        let (new_interner, changed_keys_count) = fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho);
+        let (new_interner, changed_keys_count, frontier_size) = fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier);
         interner = Some(new_interner);
         
         let current_interner = interner.as_ref().unwrap();
@@ -66,6 +67,7 @@ fn main() -> Result<(), FoldError> {
         if let Some(ref optimal) = optimal_ortho {
             println!("[main] Optimal ortho so far:");
             print_ortho_details(optimal, current_interner);
+            println!("  Frontier size: {}", frontier_size);
         } else {
             println!("[main] No optimal ortho found yet");
         }
@@ -77,6 +79,7 @@ fn main() -> Result<(), FoldError> {
         println!("[main] Final optimal ortho:");
         let final_interner = interner.as_ref().unwrap();
         print_ortho_details(optimal, final_interner);
+        println!("  Frontier size: {}", frontier.len());
     } else {
         println!("[main] No optimal ortho found");
     }
