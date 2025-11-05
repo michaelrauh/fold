@@ -11,6 +11,74 @@ pub use interner::*;
 pub use ortho_database::*;
 pub use queue::*;
 
+use std::collections::{HashSet, VecDeque};
+use ortho::Ortho;
+
+/// Process a single text through the worker loop, updating the interner and tracking optimal ortho
+pub fn process_text(
+    text: &str,
+    interner: Option<interner::Interner>,
+    seen_ids: &mut HashSet<usize>,
+    optimal_ortho: &mut Option<Ortho>,
+) -> interner::Interner {
+    // Build or update interner
+    let current_interner = if let Some(prev_interner) = interner {
+        prev_interner.add_text(text)
+    } else {
+        interner::Interner::from_text(text)
+    };
+    
+    let version = current_interner.version();
+    
+    // Create seed ortho and work queue
+    let seed_ortho = Ortho::new(version);
+    let mut work_queue: VecDeque<Ortho> = VecDeque::new();
+    work_queue.push_back(seed_ortho);
+    
+    // Worker loop: process until queue is empty
+    while let Some(ortho) = work_queue.pop_front() {
+        // Get requirements for this ortho
+        let (forbidden, required) = ortho.get_requirements();
+        
+        // Get completions from interner
+        let completions = current_interner.intersect(&required, &forbidden);
+        
+        // Generate children
+        for completion in completions {
+            let children = ortho.add(completion, version);
+            for child in children {
+                let child_id = child.id();
+                // Only add to queue if never seen before
+                if !seen_ids.contains(&child_id) {
+                    seen_ids.insert(child_id);
+                    
+                    // Check if this child is optimal
+                    update_optimal(optimal_ortho, &child);
+                    
+                    work_queue.push_back(child);
+                }
+            }
+        }
+    }
+    
+    current_interner
+}
+
+/// Update the optimal ortho if the new candidate is better
+fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
+    let candidate_volume: usize = candidate.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let is_optimal = if let Some(current_optimal) = optimal_ortho.as_ref() {
+        let current_volume: usize = current_optimal.dims().iter().map(|d| d.saturating_sub(1)).product();
+        candidate_volume > current_volume
+    } else {
+        true
+    };
+    
+    if is_optimal {
+        *optimal_ortho = Some(candidate.clone());
+    }
+}
+
 #[cfg(test)]
 mod follower_diff_tests {
     use super::*;
