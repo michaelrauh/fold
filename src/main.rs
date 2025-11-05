@@ -1,42 +1,8 @@
-use fold::{
-    interner::{InMemoryInternerHolder, InternerHolderLike},
-    ortho::Ortho,
-    ortho_database::{InMemoryOrthoDatabase, OrthoDatabaseLike},
-    FoldError,
-};
-use std::collections::VecDeque;
+use fold::ortho::Ortho;
+use fold::FoldError;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-
-/// Simple in-memory queue implementation for the worker loop
-struct SimpleQueue {
-    items: VecDeque<Ortho>,
-}
-
-impl SimpleQueue {
-    fn new() -> Self {
-        SimpleQueue {
-            items: VecDeque::new(),
-        }
-    }
-    
-    fn into_inner(self) -> VecDeque<Ortho> {
-        self.items
-    }
-}
-
-impl fold::queue::QueueProducerLike for SimpleQueue {
-    fn push_many(&mut self, items: Vec<Ortho>) -> Result<(), FoldError> {
-        self.items.extend(items);
-        Ok(())
-    }
-}
-
-impl fold::queue::QueueLenLike for SimpleQueue {
-    fn len(&mut self) -> Result<usize, FoldError> {
-        Ok(self.items.len())
-    }
-}
 
 fn main() -> Result<(), FoldError> {
     let state_dir = std::env::var("FOLD_STATE_DIR").unwrap_or_else(|_| "./fold_state".to_string());
@@ -71,10 +37,10 @@ fn main() -> Result<(), FoldError> {
 
     println!("Found {} input files", input_files.len());
 
-    // Initialize interner holder and database
-    let mut interner_holder = InMemoryInternerHolder::new()?;
-    let mut db = InMemoryOrthoDatabase::new();
-    let mut seen_ids = std::collections::HashSet::new();
+    // Track optimal ortho and seen IDs across all files
+    let mut optimal_ortho: Option<Ortho> = None;
+    let mut seen_ids = HashSet::new();
+    let mut interner: Option<fold::interner::Interner> = None;
     
     // Process each file
     for (file_idx, file_path) in input_files.iter().enumerate() {
@@ -87,19 +53,23 @@ fn main() -> Result<(), FoldError> {
         
         println!("[main] File size: {} bytes", text.len());
         
-        // Add text to interner - this creates new version and seeds the queue
-        let mut seed_queue = SimpleQueue::new();
-        interner_holder.add_text_with_seed(&text, &mut seed_queue)?;
+        // Build or update interner
+        interner = Some(if let Some(prev_interner) = interner {
+            prev_interner.add_text(&text)
+        } else {
+            fold::interner::Interner::from_text(&text)
+        });
         
-        let version = interner_holder.latest_version();
-        let interner = interner_holder.get_latest()
-            .expect("interner should exist after add_text_with_seed");
+        let current_interner = interner.as_ref().unwrap();
+        let version = current_interner.version();
         
         println!("[main] Created interner version {}, vocabulary size: {}", 
-                 version, interner.vocabulary().len());
+                 version, current_interner.vocabulary().len());
         
-        // Get the seed ortho from the queue
-        let mut work_queue: VecDeque<Ortho> = seed_queue.into_inner();
+        // Create seed ortho and work queue
+        let seed_ortho = Ortho::new(version);
+        let mut work_queue: VecDeque<Ortho> = VecDeque::new();
+        work_queue.push_back(seed_ortho);
         
         println!("[main] Work queue initialized with {} ortho(s)", work_queue.len());
         
@@ -114,7 +84,7 @@ fn main() -> Result<(), FoldError> {
             let (forbidden, required) = ortho.get_requirements();
             
             // Get completions from interner
-            let completions = interner.intersect(&required, &forbidden);
+            let completions = current_interner.intersect(&required, &forbidden);
             
             // Generate children
             for completion in completions {
@@ -124,8 +94,20 @@ fn main() -> Result<(), FoldError> {
                     // Only add to queue if never seen before
                     if !seen_ids.contains(&child_id) {
                         seen_ids.insert(child_id);
-                        // Store in database
-                        db.insert_or_update(child.clone())?;
+                        
+                        // Check if this child is optimal
+                        let child_volume: usize = child.dims().iter().map(|d| d.saturating_sub(1)).product();
+                        let is_optimal = if let Some(ref current_optimal) = optimal_ortho {
+                            let current_volume: usize = current_optimal.dims().iter().map(|d| d.saturating_sub(1)).product();
+                            child_volume > current_volume
+                        } else {
+                            true
+                        };
+                        
+                        if is_optimal {
+                            optimal_ortho = Some(child.clone());
+                        }
+                        
                         work_queue.push_back(child);
                         generated += 1;
                     }
@@ -141,27 +123,26 @@ fn main() -> Result<(), FoldError> {
         println!("[main] File complete. Processed: {}, Generated: {}", 
                  processed, generated);
         
-        // Print optimal ortho for this file
-        if let Some(optimal) = db.get_optimal()? {
-            println!("[main] Optimal ortho for this file:");
-            print_ortho_details(&optimal, &interner);
+        // Print optimal ortho so far
+        if let Some(ref optimal) = optimal_ortho {
+            println!("[main] Optimal ortho so far:");
+            print_ortho_details(optimal, current_interner);
         } else {
-            println!("[main] No optimal ortho found");
+            println!("[main] No optimal ortho found yet");
         }
     }
     
     // Print final optimal ortho
     println!("\n[main] === Final Results ===");
-    if let Some(optimal) = db.get_optimal()? {
+    if let Some(ref optimal) = optimal_ortho {
         println!("[main] Final optimal ortho:");
-        let interner = interner_holder.get_latest().unwrap();
-        print_ortho_details(&optimal, &interner);
+        let final_interner = interner.as_ref().unwrap();
+        print_ortho_details(optimal, final_interner);
     } else {
         println!("[main] No optimal ortho found");
     }
     
-    let total_orthos = db.len()?;
-    println!("[main] Total orthos in database: {}", total_orthos);
+    println!("[main] Total unique orthos generated: {}", seen_ids.len());
     
     Ok(())
 }
