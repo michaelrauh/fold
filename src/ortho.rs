@@ -101,208 +101,37 @@ impl Ortho {
             return None;
         }
         
-        // Check if subtracting would require shape contraction
-        // An ortho with dims D was created by expansion if it has exactly capacity(D-contracted) values
-        // For example, [3,2] with 4 values came from full [2,2] (capacity 4)
-        // Subtracting from this should contract back to [2,2]
+        // Rebuild approach: collect values to keep, then rebuild from scratch
+        // This is simpler than the contraction logic and handles all cases uniformly
         
-        let values_after_subtract = current_position - 1;
-        
-        // Determine if we need to contract
-        let needs_contraction = self.should_contract_to(values_after_subtract);
-        
-        if needs_contraction {
-            // Contract to previous shape and reverse reorganization
-            self.contract()
-        } else {
-            // Simple case: just remove the last value
-            let last_filled_position = current_position - 1;
-            let mut new_payload = self.payload.clone();
-            new_payload[last_filled_position] = None;
-            
-            Some(Ortho {
-                version: self.version,
-                dims: self.dims.clone(),
-                payload: new_payload,
-            })
-        }
-    }
-    
-    fn should_contract_to(&self, values_after_subtract: usize) -> bool {
-        // Check if the ortho is in an expanded state and subtracting would
-        // take us below the minimum for the current shape
-        
-        // Base shape is specifically [2,2] - the starting shape
-        // Even [2,2,2] is an expanded shape
-        if self.dims == vec![2, 2] {
-            return false;
-        }
-        
-        // For non-base shapes, we need to check if we'd go below the threshold
-        // An expanded shape can contract when we subtract to the capacity of the contracted shape
-        
-        // Try to find a valid contraction target
-        if let Some(_) = self.find_contraction_target(values_after_subtract) {
-            return true;
-        }
-        
-        false
-    }
-    
-    fn find_contraction_target(&self, target_value_count: usize) -> Option<(Vec<usize>, Vec<usize>)> {
-        // Find a shape that could have expanded to self.dims and had target_value_count values
-        // Returns (contracted_dims, reverse_reorganization_pattern)
-        
-        // Try contracting "over" dimension (e.g., [3,2] -> [2,2])
-        if let Some(result) = self.try_contract_over(target_value_count) {
-            return Some(result);
-        }
-        
-        // Try contracting "up" dimension (e.g., [2,2,2] -> [2,2])
-        if let Some(result) = self.try_contract_up(target_value_count) {
-            return Some(result);
-        }
-        
-        None
-    }
-    
-    fn try_contract_over(&self, target_value_count: usize) -> Option<(Vec<usize>, Vec<usize>)> {
-        // Try to contract by reducing a dimension by 1
-        // For example: [3,2] -> [2,2]
-        // Expansion happens when we add to a full shape, so contracted shape
-        // had capacity - 1 values before expansion
-        for (i, &dim_val) in self.dims.iter().enumerate() {
-            if dim_val > 2 {
-                let mut contracted_dims = self.dims.clone();
-                contracted_dims[i] -= 1;
-                let contracted_capacity = spatial::capacity(&contracted_dims);
-                
-                // Check if the contracted shape would have had target_value_count values
-                // when it triggered expansion (which happens at capacity - 1 filled)
-                if contracted_capacity - 1 == target_value_count {
-                    // This is a valid contraction target
-                    // Get the forward reorganization pattern
-                    let reorg_patterns = spatial::expand_over(&contracted_dims);
-                    
-                    // Find the expansion that matches our current dims
-                    for (exp_dims, _cap, forward_reorg) in reorg_patterns {
-                        if exp_dims == self.dims {
-                            // Compute reverse mapping
-                            let reverse_reorg = Self::reverse_reorganization(&forward_reorg, contracted_capacity);
-                            return Some((contracted_dims, reverse_reorg));
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-    
-    fn try_contract_up(&self, target_value_count: usize) -> Option<(Vec<usize>, Vec<usize>)> {
-        // Try to contract by removing a dimension
-        // For example: [2,2,2] -> [2,2]
-        // The challenge: [2,2,2] has 3 dimensions each of size 2
-        // We need to figure out which was the inserted dimension during expansion
-        
-        if self.dims.len() <= 2 {
-            return None;
-        }
-        
-        // Check if this could be an up-expansion from a base shape
-        // Up expansion inserts a new dimension, so all dims should be the same for base
-        let all_same = self.dims.iter().all(|&d| d == self.dims[0]);
-        if !all_same {
-            return None; // Mixed dims suggest over-expansion, not up-expansion
-        }
-        
-        // For up contraction, any dimension can be removed since they're all the same
-        // But we need to find the right position that was used during expansion
-        let mut contracted_dims = self.dims.clone();
-        contracted_dims.pop(); // Remove last dimension as a candidate
-        let contracted_capacity = spatial::capacity(&contracted_dims);
-        
-        // Check if this matches our target
-        if contracted_capacity - 1 != target_value_count {
-            return None;
-        }
-        
-        // Now find which up expansion position matches our pattern
-        // Try all possible insertion positions
-        for pos in 0..=contracted_dims.len() {
-            let reorg_patterns = spatial::expand_up(&contracted_dims, pos);
-            
-            // Find the expansion that matches our current dims
-            for (i, (exp_dims, _cap, forward_reorg)) in reorg_patterns.iter().enumerate() {
-                if *exp_dims == self.dims {
-                    // Found a match!
-                    let reverse_reorg = Self::reverse_reorganization(&forward_reorg, contracted_capacity);
-                    return Some((contracted_dims.clone(), reverse_reorg));
+        // Collect all values except the last one, in order
+        let mut values_to_keep: Vec<usize> = Vec::new();
+        for (idx, &opt_val) in self.payload.iter().enumerate() {
+            if idx < current_position - 1 {
+                if let Some(val) = opt_val {
+                    values_to_keep.push(val);
                 }
             }
         }
         
-        None
-    }
-    
-    fn reverse_reorganization(forward_reorg: &[usize], old_capacity: usize) -> Vec<usize> {
-        // Given a forward reorganization pattern that maps old[i] -> new[forward_reorg[i]]
-        // Create reverse pattern that maps new[j] -> old[reverse[j]]
-        // The forward_reorg has length old_capacity, but maps to indices in new (expanded) space
-        
-        // Find the maximum index in forward_reorg to size the reverse array
-        let max_new_idx = forward_reorg.iter().max().copied().unwrap_or(0);
-        let mut reverse = vec![0; max_new_idx + 1];
-        
-        for (old_idx, &new_idx) in forward_reorg.iter().enumerate() {
-            if old_idx < old_capacity {
-                reverse[new_idx] = old_idx;
-            }
+        // If no values to keep, return empty ortho
+        if values_to_keep.is_empty() {
+            return Some(Ortho::new(self.version));
         }
-        reverse
-    }
-    
-    fn contract(&self) -> Option<Self> {
-        let current_position = self.get_current_position();
-        let values_after_subtract = current_position - 1;
         
-        if let Some((contracted_dims, _reverse_reorg)) = self.find_contraction_target(values_after_subtract) {
-            // Collect all filled values except the last one
-            let mut values_to_keep: Vec<usize> = Vec::new();
-            for (idx, &opt_val) in self.payload.iter().enumerate() {
-                if idx < current_position - 1 {
-                    if let Some(val) = opt_val {
-                        values_to_keep.push(val);
-                    }
-                }
+        // Rebuild ortho by adding values one at a time
+        let mut rebuilt = Ortho::new(self.version);
+        for &value in &values_to_keep {
+            // Add the value and take the first result (canonicalized path)
+            let candidates = rebuilt.add(value, self.version);
+            if candidates.is_empty() {
+                // This shouldn't happen, but handle gracefully
+                return None;
             }
-            
-            // Create contracted ortho and fill it with these values in order
-            let contracted_capacity = spatial::capacity(&contracted_dims);
-            let mut new_payload = vec![None; contracted_capacity];
-            for (i, &val) in values_to_keep.iter().enumerate() {
-                if i < contracted_capacity {
-                    new_payload[i] = Some(val);
-                }
-            }
-            
-            Some(Ortho {
-                version: self.version,
-                dims: contracted_dims,
-                payload: new_payload,
-            })
-        } else {
-            // Couldn't find a valid contraction, just do simple subtract
-            // This shouldn't happen in normal use, but handle it gracefully
-            let last_filled_position = current_position - 1;
-            let mut new_payload = self.payload.clone();
-            new_payload[last_filled_position] = None;
-            
-            Some(Ortho {
-                version: self.version,
-                dims: self.dims.clone(),
-                payload: new_payload,
-            })
+            rebuilt = candidates[0].clone();
         }
+        
+        Some(rebuilt)
     }
     
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
@@ -1049,5 +878,67 @@ mod tests {
         let subtracted = expanded.subtract().expect("Should be able to subtract");
         assert_eq!(subtracted.dims(), &vec![3, 2], "Should stay [3,2]");
         assert_eq!(subtracted.get_current_position(), 4, "Should have 4 values");
+    }
+
+    #[test]
+    fn test_subtract_rebuild_comprehensive() {
+        // Test to verify the rebuild approach handles all scenarios correctly
+        
+        // Test 1: Simple subtract with no expansion
+        let o1 = Ortho::new(1);
+        let o1 = o1.add(5, 1)[0].clone();
+        let o1 = o1.add(10, 1)[0].clone();
+        let sub1 = o1.subtract().expect("Should subtract");
+        assert_eq!(sub1.get_current_position(), 1);
+        assert_eq!(sub1.payload()[0], Some(5));
+        
+        // Test 2: Subtract after canonicalization preserves canonical order
+        let o2 = Ortho::new(1);
+        let o2 = o2.add(10, 1)[0].clone();
+        let o2 = o2.add(30, 1)[0].clone();
+        let o2 = o2.add(20, 1)[0].clone(); // Canonicalized (20 < 30)
+        let sub2 = o2.subtract().expect("Should subtract");
+        assert_eq!(sub2.get_current_position(), 2);
+        assert_eq!(sub2.payload()[0], Some(10));
+        assert_eq!(sub2.payload()[1], Some(20)); // Should preserve canonicalized order
+        
+        // Test 3: Subtract from expanded [3,2] contracts back to [2,2]
+        let o3 = Ortho::new(1);
+        let o3 = o3.add(1, 1)[0].clone();
+        let o3 = o3.add(2, 1)[0].clone();
+        let o3 = o3.add(3, 1)[0].clone();
+        let exp3 = o3.add(4, 1);
+        let expanded = exp3.iter().find(|o| o.dims() == &vec![3, 2]).expect("Should have [3,2]");
+        let sub3 = expanded.subtract().expect("Should subtract");
+        assert_eq!(sub3.dims(), &vec![2, 2], "Should contract to [2,2]");
+        assert_eq!(sub3.get_current_position(), 3);
+        
+        // Test 4: Subtract from expanded [2,2,2] contracts back to [2,2]
+        let o4 = Ortho::new(1);
+        let o4 = o4.add(5, 1)[0].clone();
+        let o4 = o4.add(15, 1)[0].clone();
+        let o4 = o4.add(10, 1)[0].clone(); // Canonicalized (10 < 15)
+        let exp4 = o4.add(20, 1);
+        let expanded222 = exp4.iter().find(|o| o.dims() == &vec![2, 2, 2]).expect("Should have [2,2,2]");
+        let sub4 = expanded222.subtract().expect("Should subtract");
+        assert_eq!(sub4.dims(), &vec![2, 2], "Should contract to [2,2]");
+        assert_eq!(sub4.get_current_position(), 3);
+        
+        // Test 5: Multiple subtracts in sequence
+        let o5 = Ortho::new(1);
+        let o5 = o5.add(100, 1)[0].clone();
+        let o5 = o5.add(200, 1)[0].clone();
+        let o5 = o5.add(300, 1)[0].clone();
+        
+        let sub5_1 = o5.subtract().expect("First subtract");
+        assert_eq!(sub5_1.get_current_position(), 2);
+        
+        let sub5_2 = sub5_1.subtract().expect("Second subtract");
+        assert_eq!(sub5_2.get_current_position(), 1);
+        
+        let sub5_3 = sub5_2.subtract().expect("Third subtract");
+        assert_eq!(sub5_3.get_current_position(), 0);
+        
+        assert_eq!(sub5_3.subtract(), None, "Should return None when empty");
     }
 }
