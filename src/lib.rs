@@ -13,8 +13,9 @@ pub use ortho_database::*;
 pub use queue::*;
 pub use disk_backed_queue::*;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use ortho::Ortho;
+use std::env;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho.
 /// Returns a tuple of (new_interner, changed_keys_count, frontier_size, impacted_frontier_count).
@@ -25,7 +26,7 @@ pub fn process_text(
     optimal_ortho: &mut Option<Ortho>,
     frontier: &mut HashSet<usize>,
     frontier_orthos_saved: &mut HashMap<usize, Ortho>,
-) -> (interner::Interner, usize, usize, usize) {
+) -> Result<(interner::Interner, usize, usize, usize), FoldError> {
     // Build or update interner and track changed keys
     let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
         let new_interner = prev_interner.add_text(text);
@@ -54,8 +55,10 @@ pub fn process_text(
     frontier.insert(seed_id);
     frontier_orthos.insert(seed_id, seed_ortho.clone());
     
-    let mut work_queue: VecDeque<Ortho> = VecDeque::new();
-    work_queue.push_back(seed_ortho);
+    // Create disk-backed work queue with 10K ortho buffer (~2-9 MB)
+    let temp_dir = env::temp_dir().join("fold_work_queue");
+    let mut work_queue = DiskBackedQueue::new(10000, temp_dir)?;
+    work_queue.push(seed_ortho)?;
     
     // Add rewound orthos to work queue, deduplicating by ID
     for rewound_ortho in rewound_orthos {
@@ -63,12 +66,12 @@ pub fn process_text(
         // Only add if we haven't seen this ortho before
         if !seen_ids.contains(&rewound_id) {
             seen_ids.insert(rewound_id);
-            work_queue.push_back(rewound_ortho);
+            work_queue.push(rewound_ortho)?;
         }
     }
     
     // Worker loop: process until queue is empty
-    while let Some(ortho) = work_queue.pop_front() {
+    while let Some(ortho) = work_queue.pop()? {
         let ortho_id = ortho.id();
         
         // Get requirements for this ortho
@@ -98,7 +101,7 @@ pub fn process_text(
                     
                     // Add to frontier orthos and work queue
                     frontier_orthos.insert(child_id, child.clone());
-                    work_queue.push_back(child);
+                    work_queue.push(child)?;
                 }
             }
         }
@@ -117,7 +120,7 @@ pub fn process_text(
     frontier_orthos_saved.clear();
     frontier_orthos_saved.extend(frontier_orthos);
     
-    (current_interner, changed_keys_count, frontier_size, impacted_frontier_count)
+    Ok((current_interner, changed_keys_count, frontier_size, impacted_frontier_count))
 }
 
 /// Find impacted orthos from the frontier and rewind them until the impacted key
@@ -376,19 +379,19 @@ mod impacted_backtracking_tests {
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        );
+        ).expect("process_text should succeed");
         
         let baseline_seen_count = seen_ids.len();
         
         // Second text - should trigger impacted backtracking
-        let (interner2, changed_count, _, impacted_count) = process_text(
+        let (interner2, changed_count, _, _impacted_count) = process_text(
             "a d",
             Some(interner1),
             &mut seen_ids,
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        );
+        ).expect("process_text should succeed");
         
         // Verify that changed keys were detected
         assert!(changed_count > 0, "Should have changed keys");
@@ -418,19 +421,19 @@ mod impacted_backtracking_tests {
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        );
+        ).expect("process_text should succeed");
         
         let seen_after_first = seen_ids.clone();
         
         // Second text: "a c" - adds new completion for prefix "a"
-        let (_, changed_count, _, impacted_count) = process_text(
+        let (_, changed_count, _, _impacted_count) = process_text(
             "a c",
             Some(interner1),
             &mut seen_ids,
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        );
+        ).expect("process_text should succeed");
         
         // Should have detected changes
         assert!(changed_count > 0, "Should detect changed keys");

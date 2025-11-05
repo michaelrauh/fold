@@ -56,7 +56,7 @@ fn main() -> Result<(), FoldError> {
         println!("[main] File size: {} bytes", text.len());
         
         // Process text through worker loop and track changed keys
-        let (new_interner, changed_keys_count, frontier_size, impacted_frontier_count) = fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut frontier_orthos_saved);
+        let (new_interner, changed_keys_count, frontier_size, impacted_frontier_count) = fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut frontier_orthos_saved)?;
         interner = Some(new_interner);
         
         let current_interner = interner.as_ref().unwrap();
