@@ -53,12 +53,14 @@ fn main() -> Result<(), FoldError> {
         
         println!("[main] File size: {} bytes", text.len());
         
-        // Process text through worker loop
-        interner = Some(fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho));
+        // Process text through worker loop and track changed keys
+        let (new_interner, changed_keys_count) = fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho);
+        interner = Some(new_interner);
         
         let current_interner = interner.as_ref().unwrap();
         println!("[main] Created interner version {}, vocabulary size: {}", 
                  current_interner.version(), current_interner.vocabulary().len());
+        println!("[main] Number of impacted keys: {}", changed_keys_count);
         
         // Print optimal ortho so far
         if let Some(ref optimal) = optimal_ortho {

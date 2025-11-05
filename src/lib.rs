@@ -14,18 +14,23 @@ pub use queue::*;
 use std::collections::{HashSet, VecDeque};
 use ortho::Ortho;
 
-/// Process a single text through the worker loop, updating the interner and tracking optimal ortho
+/// Process a single text through the worker loop, updating the interner and tracking optimal ortho.
+/// Returns a tuple of (new_interner, changed_keys_count).
 pub fn process_text(
     text: &str,
     interner: Option<interner::Interner>,
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
-) -> interner::Interner {
-    // Build or update interner
-    let current_interner = if let Some(prev_interner) = interner {
-        prev_interner.add_text(text)
+) -> (interner::Interner, usize) {
+    // Build or update interner and track changed keys
+    let (current_interner, changed_keys_count) = if let Some(prev_interner) = interner {
+        let new_interner = prev_interner.add_text(text);
+        let changed_keys = prev_interner.find_changed_keys(&new_interner);
+        let count = changed_keys.len();
+        (new_interner, count)
     } else {
-        interner::Interner::from_text(text)
+        // First interner - all keys are "new" but we return 0 as there's no previous state to compare
+        (interner::Interner::from_text(text), 0)
     };
     
     let version = current_interner.version();
@@ -61,7 +66,7 @@ pub fn process_text(
         }
     }
     
-    current_interner
+    (current_interner, changed_keys_count)
 }
 
 /// Update the optimal ortho if the new candidate is better

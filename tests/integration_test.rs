@@ -9,7 +9,7 @@ fn test_simple_worker_loop() {
     let mut optimal_ortho: Option<Ortho> = None;
     
     // Act
-    let interner = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho);
+    let (interner, _changed_keys_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho);
     
     // Assert
     assert_eq!(interner.version(), 1, "Should create version 1");
@@ -27,7 +27,8 @@ fn test_multiple_file_processing() {
     
     // Act
     for text in texts {
-        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho));
+        let (new_interner, _changed_keys_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho);
+        interner = Some(new_interner);
     }
     
     // Assert
@@ -45,7 +46,7 @@ fn test_optimal_ortho_tracking() {
     let mut optimal_ortho: Option<Ortho> = None;
     
     // Act
-    let _interner = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho);
+    let (_interner, _changed_keys_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho);
     
     // Assert
     let optimal = optimal_ortho.expect("Should have an optimal ortho");
@@ -66,7 +67,8 @@ fn test_end_to_end_run_pattern() {
     
     // Act
     for text in texts {
-        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho));
+        let (new_interner, _changed_keys_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho);
+        interner = Some(new_interner);
     }
     
     // Assert
@@ -87,9 +89,9 @@ fn test_interner_version_increments() {
     let mut optimal_ortho: Option<Ortho> = None;
     
     // Act
-    let interner1 = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho);
-    let interner2 = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho);
-    let interner3 = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho);
+    let (interner1, _) = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho);
+    let (interner2, _) = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho);
+    let (interner3, _) = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho);
     
     // Assert
     assert_eq!(interner3.version(), 3, "Should have version 3 after processing 3 texts");
@@ -105,10 +107,36 @@ fn test_seen_ids_accumulate() {
     
     // Act
     for text in texts {
-        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho));
+        let (new_interner, _changed_keys_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho);
+        interner = Some(new_interner);
     }
     
     // Assert
     // Seen IDs should accumulate across all files
     assert!(seen_ids.len() > 0, "Should track orthos across all files");
+}
+
+#[test]
+fn test_changed_keys_tracking() {
+    // Arrange
+    let mut seen_ids = HashSet::new();
+    let mut optimal_ortho: Option<Ortho> = None;
+    
+    // Act - first text (baseline)
+    let (interner1, changed_count1) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho);
+    
+    // Assert - first text should have 0 changed keys (no previous interner)
+    assert_eq!(changed_count1, 0, "First text should have 0 changed keys");
+    
+    // Act - second text adds new phrase structure
+    let (interner2, changed_count2) = fold::process_text("a c", Some(interner1), &mut seen_ids, &mut optimal_ortho);
+    
+    // Assert - second text should have some changed keys
+    assert!(changed_count2 > 0, "Second text should have changed keys: {}", changed_count2);
+    
+    // Act - third text with no new vocabulary or patterns within existing vocab
+    let (_interner3, changed_count3) = fold::process_text("x y z", Some(interner2), &mut seen_ids, &mut optimal_ortho);
+    
+    // Assert - third text adds new vocabulary, so should have changed keys
+    assert!(changed_count3 > 0, "Third text should have changed keys for new vocabulary");
 }
