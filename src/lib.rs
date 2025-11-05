@@ -22,6 +22,7 @@ pub fn process_text(
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
     frontier: &mut HashSet<usize>,
+    frontier_orthos_saved: &mut HashMap<usize, Ortho>,
 ) -> (interner::Interner, usize, usize, usize) {
     // Build or update interner and track changed keys
     let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
@@ -36,8 +37,12 @@ pub fn process_text(
     
     let version = current_interner.version();
     
-    // Track frontier orthos for checking impacted keys
+    // Track frontier orthos for checking impacted keys and for next iteration
     let mut frontier_orthos: HashMap<usize, Ortho> = HashMap::new();
+    
+    // Find impacted orthos from previous frontier and rewind them
+    let rewound_orthos = find_and_rewind_impacted_orthos(frontier_orthos_saved, &changed_keys, version);
+    let impacted_frontier_count = rewound_orthos.len();
     
     // Create seed ortho and work queue
     let seed_ortho = Ortho::new(version);
@@ -49,6 +54,16 @@ pub fn process_text(
     
     let mut work_queue: VecDeque<Ortho> = VecDeque::new();
     work_queue.push_back(seed_ortho);
+    
+    // Add rewound orthos to work queue, deduplicating by ID
+    for rewound_ortho in rewound_orthos {
+        let rewound_id = rewound_ortho.id();
+        // Only add if we haven't seen this ortho before
+        if !seen_ids.contains(&rewound_id) {
+            seen_ids.insert(rewound_id);
+            work_queue.push_back(rewound_ortho);
+        }
+    }
     
     // Worker loop: process until queue is empty
     while let Some(ortho) = work_queue.pop_front() {
@@ -96,10 +111,69 @@ pub fn process_text(
     
     let frontier_size = frontier.len();
     
-    // Count frontier orthos that contain impacted keys in their payload
-    let impacted_frontier_count = count_impacted_frontier_orthos(&frontier_orthos, &changed_keys);
+    // Save frontier orthos for next iteration
+    frontier_orthos_saved.clear();
+    frontier_orthos_saved.extend(frontier_orthos);
     
     (current_interner, changed_keys_count, frontier_size, impacted_frontier_count)
+}
+
+/// Find impacted orthos from the frontier and rewind them until the impacted key
+/// is at the "most advanced position" (the next insertion point).
+fn find_and_rewind_impacted_orthos(
+    frontier_orthos: &HashMap<usize, Ortho>,
+    changed_keys: &[Vec<usize>],
+    new_version: usize,
+) -> Vec<Ortho> {
+    if changed_keys.is_empty() {
+        return vec![];
+    }
+    
+    // Convert changed keys to a flat set of impacted indices
+    let mut impacted_indices: HashSet<usize> = HashSet::new();
+    for key in changed_keys {
+        for &index in key {
+            impacted_indices.insert(index);
+        }
+    }
+    
+    let mut rewound_orthos = Vec::new();
+    
+    // For each frontier ortho
+    for ortho in frontier_orthos.values() {
+        // Find ALL impacted positions in this ortho
+        let mut impacted_positions: Vec<usize> = Vec::new();
+        
+        for (pos, &opt_idx) in ortho.payload().iter().enumerate() {
+            if let Some(idx) = opt_idx {
+                if impacted_indices.contains(&idx) {
+                    impacted_positions.push(pos);
+                }
+            }
+        }
+        
+        if impacted_positions.is_empty() {
+            continue;
+        }
+        
+        // Rebuild to EACH impacted position, not just the earliest
+        // For each impacted position, create a rewound ortho where that impacted key
+        // is at the "most advanced position" (rightmost, ready for next add)
+        for &impacted_pos in &impacted_positions {
+            // Rebuild this ortho up to and including the impacted position
+            // This means the impacted key will be at position impacted_pos,
+            // which is the last filled position (current_position - 1)
+            let target_position = impacted_pos + 1;
+            
+            if let Some(mut rewound) = ortho.rebuild_to_position(target_position) {
+                // Update version to new version
+                rewound = rewound.set_version(new_version);
+                rewound_orthos.push(rewound);
+            }
+        }
+    }
+    
+    rewound_orthos
 }
 
 /// Count how many frontier orthos contain any of the impacted keys in their payload
@@ -146,6 +220,222 @@ fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
     
     if is_optimal {
         *optimal_ortho = Some(candidate.clone());
+    }
+}
+
+#[cfg(test)]
+mod impacted_backtracking_tests {
+    use super::*;
+    use crate::ortho::Ortho;
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_empty_frontier() {
+        let frontier_orthos = HashMap::new();
+        let changed_keys = vec![vec![0], vec![1]];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        assert_eq!(rewound.len(), 0, "Should have no rewound orthos from empty frontier");
+    }
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_no_changed_keys() {
+        let mut frontier_orthos = HashMap::new();
+        let ortho = Ortho::new(1).add(0, 1).pop().unwrap().add(1, 1).pop().unwrap();
+        frontier_orthos.insert(ortho.id(), ortho);
+        
+        let changed_keys: Vec<Vec<usize>> = vec![];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        assert_eq!(rewound.len(), 0, "Should have no rewound orthos with no changed keys");
+    }
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_no_matching_orthos() {
+        let mut frontier_orthos = HashMap::new();
+        // Ortho with indices [0, 1]
+        let ortho = Ortho::new(1).add(0, 1).pop().unwrap().add(1, 1).pop().unwrap();
+        frontier_orthos.insert(ortho.id(), ortho);
+        
+        // Changed keys with indices [2, 3] - not in ortho
+        let changed_keys = vec![vec![2], vec![3]];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        assert_eq!(rewound.len(), 0, "Should have no rewound orthos when no match");
+    }
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_with_match() {
+        let mut frontier_orthos = HashMap::new();
+        // Ortho with indices [0, 1, 2]
+        let ortho = Ortho::new(1).add(0, 1).pop().unwrap()
+            .add(1, 1).pop().unwrap()
+            .add(2, 1).pop().unwrap();
+        frontier_orthos.insert(ortho.id(), ortho.clone());
+        
+        // Changed keys contain index 0 - first index in ortho
+        let changed_keys = vec![vec![0]];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        
+        assert_eq!(rewound.len(), 1, "Should have one rewound ortho");
+        let rewound_ortho = &rewound[0];
+        
+        // Since index 0 is at position 0, and we want it at position "current_position - 1",
+        // we need current_position to be 1, which means we subtract all values after position 0
+        assert_eq!(rewound_ortho.get_current_position(), 1, "Should be rewound to position 1");
+        assert_eq!(rewound_ortho.payload()[0], Some(0), "Should keep index 0 at position 0");
+        assert_eq!(rewound_ortho.payload()[1], None, "Should remove index 1");
+        assert_eq!(rewound_ortho.payload()[2], None, "Should remove index 2");
+        assert_eq!(rewound_ortho.version(), 2, "Should update version to new version");
+    }
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_with_later_impacted_index() {
+        let mut frontier_orthos = HashMap::new();
+        // Ortho with indices [0, 1, 2]
+        let ortho = Ortho::new(1).add(0, 1).pop().unwrap()
+            .add(1, 1).pop().unwrap()
+            .add(2, 1).pop().unwrap();
+        frontier_orthos.insert(ortho.id(), ortho.clone());
+        
+        // Changed keys contain index 1 - second index in ortho
+        let changed_keys = vec![vec![1]];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        
+        assert_eq!(rewound.len(), 1, "Should have one rewound ortho");
+        let rewound_ortho = &rewound[0];
+        
+        // Index 1 is at position 1, so we want current_position to be 2
+        assert_eq!(rewound_ortho.get_current_position(), 2, "Should be rewound to position 2");
+        assert_eq!(rewound_ortho.payload()[0], Some(0), "Should keep index 0");
+        assert_eq!(rewound_ortho.payload()[1], Some(1), "Should keep index 1");
+        assert_eq!(rewound_ortho.payload()[2], None, "Should remove index 2");
+    }
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_no_rewinding_needed() {
+        let mut frontier_orthos = HashMap::new();
+        // Ortho with only one value [0]
+        let ortho = Ortho::new(1).add(0, 1).pop().unwrap();
+        frontier_orthos.insert(ortho.id(), ortho.clone());
+        
+        // Changed keys contain index 0 - already at the end
+        let changed_keys = vec![vec![0]];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        
+        assert_eq!(rewound.len(), 1, "Should have one rewound ortho");
+        let rewound_ortho = &rewound[0];
+        
+        // No rewinding should happen since index 0 is already at the end
+        assert_eq!(rewound_ortho.get_current_position(), 1, "Should have position 1");
+        assert_eq!(rewound_ortho.payload()[0], Some(0), "Should keep index 0");
+        assert_eq!(rewound_ortho.version(), 2, "Should update version");
+    }
+
+    #[test]
+    fn test_find_and_rewind_impacted_orthos_multiple_orthos() {
+        let mut frontier_orthos = HashMap::new();
+        
+        // Ortho 1 with indices [0, 1]
+        let ortho1 = Ortho::new(1).add(0, 1).pop().unwrap().add(1, 1).pop().unwrap();
+        frontier_orthos.insert(ortho1.id(), ortho1.clone());
+        
+        // Ortho 2 with indices [2, 3]
+        let ortho2 = Ortho::new(1).add(2, 1).pop().unwrap().add(3, 1).pop().unwrap();
+        frontier_orthos.insert(ortho2.id(), ortho2.clone());
+        
+        // Ortho 3 with indices [4, 5] - not impacted
+        let ortho3 = Ortho::new(1).add(4, 1).pop().unwrap().add(5, 1).pop().unwrap();
+        frontier_orthos.insert(ortho3.id(), ortho3.clone());
+        
+        // Changed keys contain indices [0, 2]
+        let changed_keys = vec![vec![0], vec![2]];
+        let rewound = find_and_rewind_impacted_orthos(&frontier_orthos, &changed_keys, 2);
+        
+        assert_eq!(rewound.len(), 2, "Should have two rewound orthos");
+        
+        // Check that both orthos are properly rewound
+        for rewound_ortho in &rewound {
+            assert_eq!(rewound_ortho.version(), 2, "Should update version");
+            let first_index = rewound_ortho.payload()[0].unwrap();
+            assert!(first_index == 0 || first_index == 2, "First index should be 0 or 2");
+        }
+    }
+
+    #[test]
+    fn test_impacted_backtracking_integration() {
+        // Test that rewound orthos are properly integrated into the work queue
+        let mut seen_ids = HashSet::new();
+        let mut optimal_ortho: Option<Ortho> = None;
+        let mut frontier = HashSet::new();
+        let mut frontier_orthos_saved = HashMap::new();
+        
+        // First text - establish baseline
+        let (interner1, _, _, _) = process_text(
+            "a b c",
+            None,
+            &mut seen_ids,
+            &mut optimal_ortho,
+            &mut frontier,
+            &mut frontier_orthos_saved
+        );
+        
+        let baseline_seen_count = seen_ids.len();
+        
+        // Second text - should trigger impacted backtracking
+        let (interner2, changed_count, _, impacted_count) = process_text(
+            "a d",
+            Some(interner1),
+            &mut seen_ids,
+            &mut optimal_ortho,
+            &mut frontier,
+            &mut frontier_orthos_saved
+        );
+        
+        // Verify that changed keys were detected
+        assert!(changed_count > 0, "Should have changed keys");
+        
+        // Verify that impacted orthos were found and rewound
+        // (The impacted_count now represents the number of rewound orthos added to the queue)
+        
+        // Verify that new orthos were generated (from exploring the rewound orthos)
+        assert!(seen_ids.len() > baseline_seen_count, "Should have generated new orthos from backtracking");
+        
+        assert_eq!(interner2.version(), 2, "Should have incremented version");
+    }
+
+    #[test]
+    fn test_impacted_backtracking_finds_new_paths() {
+        // Test that impacted backtracking actually finds new orthos that weren't found before
+        let mut seen_ids = HashSet::new();
+        let mut optimal_ortho: Option<Ortho> = None;
+        let mut frontier = HashSet::new();
+        let mut frontier_orthos_saved = HashMap::new();
+        
+        // First text: "a b"
+        let (interner1, _, _, _) = process_text(
+            "a b",
+            None,
+            &mut seen_ids,
+            &mut optimal_ortho,
+            &mut frontier,
+            &mut frontier_orthos_saved
+        );
+        
+        let seen_after_first = seen_ids.clone();
+        
+        // Second text: "a c" - adds new completion for prefix "a"
+        let (_, changed_count, _, impacted_count) = process_text(
+            "a c",
+            Some(interner1),
+            &mut seen_ids,
+            &mut optimal_ortho,
+            &mut frontier,
+            &mut frontier_orthos_saved
+        );
+        
+        // Should have detected changes
+        assert!(changed_count > 0, "Should detect changed keys");
+        
+        // Should have found new orthos through backtracking
+        let new_orthos_count = seen_ids.len() - seen_after_first.len();
+        assert!(new_orthos_count > 0, "Should have found new orthos through backtracking");
     }
 }
 

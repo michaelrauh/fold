@@ -93,6 +93,115 @@ impl Ortho {
         }
         idx
     }
+    /// Helper to find the ancestor of a shape in the expansion tree.
+    /// Returns None if the shape is the base shape [2,2].
+    fn find_ancestor(dims: &[usize]) -> Option<Vec<usize>> {
+        // Base shape [2,2] has no ancestor
+        if dims == [2, 2] {
+            return None;
+        }
+        
+        // If there's a dimension > 2, decrement the first such dimension (reverse expand_over)
+        for (i, &dim) in dims.iter().enumerate() {
+            if dim > 2 {
+                let mut ancestor = dims.to_vec();
+                ancestor[i] -= 1;
+                return Some(ancestor);
+            }
+        }
+        
+        // If all dimensions are 2 but there are more than 2 dimensions,
+        // remove the last dimension (reverse expand_up)
+        if dims.len() > 2 && dims.iter().all(|&d| d == 2) {
+            let mut ancestor = dims.to_vec();
+            ancestor.pop();
+            return Some(ancestor);
+        }
+        
+        None
+    }
+    
+    /// Check if candidate_dims is an ancestor of or on the same ancestral path as original_dims
+    fn is_on_same_ancestral_path(original_dims: &[usize], candidate_dims: &[usize]) -> bool {
+        // Walk up from original_dims and see if we encounter candidate_dims
+        let mut current = original_dims.to_vec();
+        loop {
+            if current == candidate_dims {
+                return true;
+            }
+            if let Some(ancestor) = Self::find_ancestor(&current) {
+                current = ancestor;
+            } else {
+                break;
+            }
+        }
+        false
+    }
+    
+    /// Rebuild this ortho up to a specific target position.
+    /// This creates a new ortho containing only the values up to (but not including) target_position.
+    /// Returns None if target_position is invalid (> current_position).
+    /// Returns empty ortho if target_position is 0.
+    pub fn rebuild_to_position(&self, target_position: usize) -> Option<Self> {
+        let current_position = self.get_current_position();
+        
+        // Validate target position
+        if target_position > current_position {
+            return None;
+        }
+        
+        if target_position == 0 {
+            // Return empty ortho
+            return Some(Ortho::new(self.version));
+        }
+        
+        if target_position == current_position {
+            // No rebuild needed - return a clone
+            return Some(self.clone());
+        }
+        
+        // Collect values up to target position
+        let mut values_to_keep: Vec<usize> = Vec::new();
+        for (idx, &opt_val) in self.payload.iter().enumerate() {
+            if idx < target_position {
+                if let Some(val) = opt_val {
+                    values_to_keep.push(val);
+                }
+            }
+        }
+        
+        // If no values to keep, return empty ortho
+        if values_to_keep.is_empty() {
+            return Some(Ortho::new(self.version));
+        }
+        
+        // Rebuild ortho by adding values one at a time
+        let mut rebuilt = Ortho::new(self.version);
+        for (i, &value) in values_to_keep.iter().enumerate() {
+            // Add the value
+            let candidates = rebuilt.add(value, self.version);
+            if candidates.is_empty() {
+                // This shouldn't happen, but handle gracefully
+                return None;
+            }
+            
+            // If this is the last value and there are multiple candidates,
+            // select the one on the same ancestral path as the original ortho
+            if i == values_to_keep.len() - 1 && candidates.len() > 1 {
+                // Find candidate on same ancestral path as original shape
+                rebuilt = candidates.iter()
+                    .find(|c| Self::is_on_same_ancestral_path(&self.dims, &c.dims))
+                    .unwrap_or(&candidates[0])
+                    .clone();
+            } else {
+                // Not the last value or only one candidate - just take the first
+                rebuilt = candidates[0].clone();
+            }
+        }
+        
+        Some(rebuilt)
+    }
+    
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
         let pos = self.get_current_position(); // next insert position
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
@@ -589,4 +698,264 @@ mod tests {
         norms2.sort();
         assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
     }
+
+    #[test]
+    fn test_rebuild_to_any_point_in_search_tree() {
+        // Demonstrate that rebuild_to_position can reconstruct any point in a search tree
+        // by rebuilding based on payload positions
+        
+        // Build a search tree
+        let root = Ortho::new(1);
+        
+        // Simple linear path: 10 -> 20 -> 30 -> 40
+        let n1 = root.add(10, 1)[0].clone();
+        let n2 = n1.add(20, 1)[0].clone();
+        let n3 = n2.add(30, 1)[0].clone();
+        let n4 = n3.add(40, 1)[0].clone();
+        
+        // Demonstrate we can rebuild from n4 to any earlier point
+        
+        // Rebuild to position 3 (should have first 3 payload values: [10, 20, 30])
+        let rebuild_3 = n4.rebuild_to_position(3).expect("Should rebuild to pos 3");
+        assert_eq!(rebuild_3.get_current_position(), 3);
+        let mut vals_3: Vec<usize> = rebuild_3.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_3.sort();
+        assert_eq!(vals_3, vec![10, 20, 30], "Should have first 3 values");
+        
+        // Rebuild to position 2 (should have first 2 payload values: [10, 20])
+        let rebuild_2 = n4.rebuild_to_position(2).expect("Should rebuild to pos 2");
+        assert_eq!(rebuild_2.get_current_position(), 2);
+        let mut vals_2: Vec<usize> = rebuild_2.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_2.sort();
+        assert_eq!(vals_2, vec![10, 20], "Should have first 2 values");
+        
+        // Rebuild to position 1 (should have first payload value: [10])
+        let rebuild_1 = n4.rebuild_to_position(1).expect("Should rebuild to pos 1");
+        assert_eq!(rebuild_1.get_current_position(), 1);
+        assert_eq!(rebuild_1.payload()[0], Some(10), "Should have first value");
+        
+        // Test with canonicalization path: 10 -> 50 -> 30 (causes swap)
+        let c1 = root.add(10, 1)[0].clone();
+        let c2 = c1.add(50, 1)[0].clone();
+        let c3 = c2.add(30, 1)[0].clone(); // Triggers canonicalization: 30 < 50
+        
+        // After canonicalization, payload is [10, 30, 50, None]
+        assert_eq!(c3.payload()[0], Some(10));
+        assert_eq!(c3.payload()[1], Some(30));
+        assert_eq!(c3.payload()[2], Some(50));
+        
+        // Rebuild to position 2 - takes first 2 payload values [10, 30]
+        let c_rebuild_2 = c3.rebuild_to_position(2).expect("Should rebuild to pos 2");
+        assert_eq!(c_rebuild_2.get_current_position(), 2);
+        assert_eq!(c_rebuild_2.payload()[0], Some(10));
+        assert_eq!(c_rebuild_2.payload()[1], Some(30));
+        
+        // Rebuild to position 1 - takes first payload value [10]
+        let c_rebuild_1 = c3.rebuild_to_position(1).expect("Should rebuild to pos 1");
+        assert_eq!(c_rebuild_1.get_current_position(), 1);
+        assert_eq!(c_rebuild_1.payload()[0], Some(10));
+        
+        // Key insight: rebuild_to_position operates on payload positions,
+        // collecting the first N values from the current payload and rebuilding them.
+        // This correctly handles all cases including canonicalization.
+    }
+
+    #[test]
+    fn test_rebuild_places_impacted_key_furthest_right() {
+        // Prove that when rebuilding an ortho to a specific position,
+        // the value at that position ends up at the "most advanced position"
+        // (furthest right, ready for next add)
+        
+        // Build an ortho with values [10, 20, 30, 40]
+        let ortho = Ortho::new(1);
+        let ortho = ortho.add(10, 1)[0].clone();
+        let ortho = ortho.add(20, 1)[0].clone();
+        let ortho = ortho.add(30, 1)[0].clone();
+        let ortho = ortho.add(40, 1)[0].clone();
+        
+        // Current position should be 4 (all 4 slots filled in base [2,2])
+        assert_eq!(ortho.get_current_position(), 4);
+        
+        // Rebuild to position 3 - keeps [10, 20, 30]
+        let rebuild3 = ortho.rebuild_to_position(3).expect("Should rebuild");
+        assert_eq!(rebuild3.get_current_position(), 3, "Should have 3 values");
+        // The value 30 should be at position 2 (furthest right)
+        assert_eq!(rebuild3.payload()[2], Some(30), "Last value should be at rightmost position");
+        assert_eq!(rebuild3.payload()[3], None, "Position after last value should be None");
+        
+        // Rebuild to position 2 - keeps [10, 20]
+        let rebuild2 = ortho.rebuild_to_position(2).expect("Should rebuild");
+        assert_eq!(rebuild2.get_current_position(), 2, "Should have 2 values");
+        // The value 20 should be at position 1 (furthest right)
+        assert_eq!(rebuild2.payload()[1], Some(20), "Last value should be at rightmost position");
+        assert_eq!(rebuild2.payload()[2], None, "Position after last value should be None");
+        
+        // Rebuild to position 1 - keeps [10]
+        let rebuild1 = ortho.rebuild_to_position(1).expect("Should rebuild");
+        assert_eq!(rebuild1.get_current_position(), 1, "Should have 1 value");
+        // The value 10 should be at position 0 (furthest right for 1 value)
+        assert_eq!(rebuild1.payload()[0], Some(10), "Last value should be at rightmost position");
+        assert_eq!(rebuild1.payload()[1], None, "Position after last value should be None");
+        
+        // This demonstrates that after rebuild, the last included value is always
+        // at the "most advanced position" - ready for the next add operation
+    }
+
+    #[test]
+    fn test_rebuild_reverses_through_full_add_tree() {
+        // Prove that rebuild_to_position can handle the full add tree
+        // with different canonicalization patterns
+        
+        // Start with empty ortho
+        let empty = Ortho::new(1);
+        
+        // Build a tree with two different canonicalization patterns
+        // Pattern 1: ascending order (10 < 30 < 50)
+        let p1_step1 = empty.add(10, 1)[0].clone();
+        let p1_step2 = p1_step1.add(30, 1)[0].clone();
+        let p1_step3 = p1_step2.add(50, 1)[0].clone();
+        
+        // Pattern 2: canonicalization order (10 < 50 < 30, triggers swap)
+        let p2_step1 = empty.add(10, 1)[0].clone();
+        let p2_step2 = p2_step1.add(50, 1)[0].clone();
+        let p2_step3 = p2_step2.add(30, 1)[0].clone(); // This triggers canonicalization
+        
+        // Verify canonicalization happened in pattern 2
+        assert_eq!(p2_step3.payload()[0], Some(10));
+        assert_eq!(p2_step3.payload()[1], Some(30)); // Swapped to canonical order
+        assert_eq!(p2_step3.payload()[2], Some(50));
+        
+        // Now prove we can rebuild from p1_step3 back through the tree
+        let p1_rebuild2 = p1_step3.rebuild_to_position(2).expect("Should rebuild");
+        assert_eq!(p1_rebuild2.get_current_position(), 2);
+        let mut vals_p1_r2: Vec<usize> = p1_rebuild2.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_p1_r2.sort();
+        assert_eq!(vals_p1_r2, vec![10, 30], "Should have first 2 values");
+        
+        let p1_rebuild1 = p1_step3.rebuild_to_position(1).expect("Should rebuild");
+        assert_eq!(p1_rebuild1.get_current_position(), 1);
+        assert_eq!(p1_rebuild1.payload()[0], Some(10), "Should have first value");
+        
+        let p1_rebuild0 = p1_step3.rebuild_to_position(0).expect("Should rebuild");
+        assert_eq!(p1_rebuild0.get_current_position(), 0);
+        assert_eq!(p1_rebuild0.payload()[0], None, "Should be empty");
+        
+        // Now prove we can rebuild from p2_step3 back through the tree
+        // Even though it went through canonicalization
+        let p2_rebuild2 = p2_step3.rebuild_to_position(2).expect("Should rebuild");
+        assert_eq!(p2_rebuild2.get_current_position(), 2);
+        let mut vals_p2_r2: Vec<usize> = p2_rebuild2.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_p2_r2.sort();
+        assert_eq!(vals_p2_r2, vec![10, 30], "Should have first 2 values in canonical order");
+        
+        let p2_rebuild1 = p2_step3.rebuild_to_position(1).expect("Should rebuild");
+        assert_eq!(p2_rebuild1.get_current_position(), 1);
+        assert_eq!(p2_rebuild1.payload()[0], Some(10), "Should have first value");
+        
+        let p2_rebuild0 = p2_step3.rebuild_to_position(0).expect("Should rebuild");
+        assert_eq!(p2_rebuild0.get_current_position(), 0);
+        assert_eq!(p2_rebuild0.payload()[0], None, "Should be empty");
+        
+        // Both patterns rebuild cleanly, proving rebuild_to_position handles
+        // any path through the add tree correctly
+    }
+
+    #[test]
+    fn test_rebuild_to_multiple_impacted_positions() {
+        // Prove that we can rebuild a single ortho to multiple different impacted positions,
+        // and each time the rightmost value matches the impacted interner key.
+        // This demonstrates why we need to rebuild to ALL impacted positions, not just the earliest.
+        
+        // Create an ortho with values at indices [0, 1, 2, 3]
+        let ortho = Ortho::new(1);
+        let ortho = ortho.add(100, 1)[0].clone();  // Index 100 at position 0
+        let ortho = ortho.add(200, 1)[0].clone();  // Index 200 at position 1
+        let ortho = ortho.add(300, 1)[0].clone();  // Index 300 at position 2
+        let ortho = ortho.add(400, 1)[0].clone();  // Index 400 at position 3
+        
+        assert_eq!(ortho.get_current_position(), 4);
+        assert_eq!(ortho.payload()[0], Some(100));
+        assert_eq!(ortho.payload()[1], Some(200));
+        assert_eq!(ortho.payload()[2], Some(300));
+        assert_eq!(ortho.payload()[3], Some(400));
+        
+        // Scenario: Interner changed keys at indices 100 and 300
+        // (e.g., new completions added for those keys)
+        // We need to rebuild to BOTH positions to explore both changed paths
+        
+        // Rebuild to position 1 (so index 100 is furthest right)
+        let rebuild_to_1 = ortho.rebuild_to_position(1).expect("Should rebuild to position 1");
+        assert_eq!(rebuild_to_1.get_current_position(), 1);
+        assert_eq!(rebuild_to_1.payload()[0], Some(100), "Index 100 should be at rightmost position");
+        assert_eq!(rebuild_to_1.payload()[1], None, "Position 1 should be empty");
+        // Next add operation will happen at position 1, using new completions for index 100
+        
+        // Rebuild to position 3 (so index 300 is furthest right)
+        let rebuild_to_3 = ortho.rebuild_to_position(3).expect("Should rebuild to position 3");
+        assert_eq!(rebuild_to_3.get_current_position(), 3);
+        assert_eq!(rebuild_to_3.payload()[0], Some(100));
+        assert_eq!(rebuild_to_3.payload()[1], Some(200));
+        assert_eq!(rebuild_to_3.payload()[2], Some(300), "Index 300 should be at rightmost position");
+        assert_eq!(rebuild_to_3.payload()[3], None, "Position 3 should be empty");
+        // Next add operation will happen at position 3, using new completions for index 300
+        
+        // This proves the approach: the rightmost item in each rebuilt ortho
+        // corresponds to the changed interner key. By creating both rewound orthos,
+        // we ensure the search explores the new paths available from BOTH changed keys.
+    }
+    
+    #[test]
+    fn test_rebuild_uses_ancestor_tree_correctly() {
+        // Test that rebuild stays on the same ancestral path when selecting among expansion candidates
+        
+        // Start with an ortho at [3,2] shape (capacity 6)
+        let mut ortho = Ortho::new(1);
+        ortho = ortho.add(10, 1)[0].clone();   // position 0->1
+        ortho = ortho.add(20, 1)[0].clone();   // position 1->2
+        ortho = ortho.add(30, 1)[0].clone();   // position 2->3
+        ortho = ortho.add(40, 1)[0].clone();   // position 3->4, triggers expansion to [3,2]
+        
+        assert_eq!(ortho.dims, vec![3, 2], "Should be at [3,2] shape");
+        assert_eq!(ortho.get_current_position(), 4);
+        
+        // Rebuild to position 3 - with 3 values we stay at [2,2] (expansion not yet triggered)
+        let rebuilt = ortho.rebuild_to_position(3).expect("Should rebuild");
+        assert_eq!(rebuilt.dims, vec![2, 2], "With 3 values, stays at [2,2] (no expansion yet)");
+        assert_eq!(rebuilt.get_current_position(), 3);
+        
+        // Rebuild to position 4 - with 4 values we trigger expansion
+        // Should choose [3,2] to stay on same ancestral path as original
+        let rebuilt4 = ortho.rebuild_to_position(4).expect("Should rebuild");
+        assert_eq!(rebuilt4.dims, vec![3, 2], "With 4 values, expands and stays on ancestral path [2,2]->[3,2]");
+        assert_eq!(rebuilt4.get_current_position(), 4);
+        
+        // Now test with [2,2,2] shape (capacity 8)
+        let mut ortho2 = Ortho::new(1);
+        for &val in &[10, 30, 20, 40, 50] {  // 5 values
+            let candidates = ortho2.add(val, 1);
+            // Choose [2,2,2] path if available (select one with more dimensions)
+            ortho2 = candidates.iter()
+                .max_by_key(|c| c.dims.len())
+                .unwrap_or(&candidates[0])
+                .clone();
+        }
+        
+        assert_eq!(ortho2.dims, vec![2, 2, 2], "Should be at [2,2,2] shape");
+        assert_eq!(ortho2.get_current_position(), 5);
+        
+        // Rebuild to position 5 - should stay at [2,2,2]
+        let rebuilt5 = ortho2.rebuild_to_position(5).expect("Should rebuild");
+        assert_eq!(rebuilt5.dims, vec![2, 2, 2], "With 5 values, should stay on 'up' expansion path");
+        assert_eq!(rebuilt5.get_current_position(), 5);
+        
+        // Rebuild to position 4 - with 4 values we still get expansion, should choose [2,2,2] (up path)
+        let rebuilt_ortho2_4 = ortho2.rebuild_to_position(4).expect("Should rebuild");
+        assert_eq!(rebuilt_ortho2_4.dims, vec![2, 2, 2], "With 4 values from [2,2,2] original, should stay on 'up' path");
+        assert_eq!(rebuilt_ortho2_4.get_current_position(), 4);
+    }
+
 }

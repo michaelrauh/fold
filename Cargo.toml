@@ -27,3 +27,7 @@ path = "benches/spatial_bench.rs"
 name = "ortho_bench"
 harness = false
 path = "benches/ortho_bench.rs"
+
+[[example]]
+name = "backtracking_demo"
+path = "examples/backtracking_demo.rs"
