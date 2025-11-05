@@ -10,217 +10,73 @@ pub use error::*;
 pub use interner::*;
 pub use ortho_database::*;
 pub use queue::*;
-use tracing::instrument;
-use opentelemetry::{KeyValue};
-use opentelemetry_sdk::{Resource, trace as sdktrace};
-use opentelemetry_otlp::{Protocol, WithExportConfig};
-use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use opentelemetry::trace::TracerProvider;
-use tracing_subscriber::EnvFilter;
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
-use lru::LruCache;
 
-pub fn init_tracing(service_name: &str) {
-    let mut builder = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default filter: info for our crate, warn for noisy deps
-        EnvFilter::new("info,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn,hyper=warn,aws_config=warn,aws_smithy_http=warn")
-    });
-    if std::env::var("FOLD_LOG_VERBOSE").is_ok() {
-        builder = EnvFilter::new("debug");
-    }
-    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint("http://jaeger:4318/v1/traces")
-        .build()
-        .expect("Failed to build OTLP exporter");
-    let resource = Resource::builder_empty()
-        .with_attributes(vec![KeyValue::new("service.name", service_name.to_string())])
-        .build();
-    let tracer_provider = sdktrace::SdkTracerProvider::builder()
-        .with_simple_exporter(otlp_exporter)
-        .with_resource(resource)
-        .build();
-    let tracer = tracer_provider.tracer(service_name.to_string());
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    tracing_subscriber::registry()
-        .with(builder)
-        .with(otel_layer)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-}
+use std::collections::{HashSet, VecDeque};
+use ortho::Ortho;
 
-pub struct Follower {
-    low_version: Option<usize>,
-    high_version: Option<usize>,
-    low_interner: Option<crate::interner::Interner>,
-    high_interner: Option<crate::interner::Interner>,
-}
-
-impl Follower {
-    pub fn new() -> Self {
-        Follower {
-            low_version: None,
-            high_version: None,
-            low_interner: None,
-            high_interner: None,
-        }
-    }
-
-    #[instrument(skip_all)]
-    pub fn run_follower_once<Q: crate::queue::QueueProducerLike, D: crate::ortho_database::OrthoDatabaseLike, H: crate::interner::InternerHolderLike>(
-        &mut self,
-        db: &mut D,
-        dbq: &mut Q,     // destination for generated child orthos
-        holder: &mut H,
-    ) -> Result<(usize, usize, Option<std::time::Duration>), FoldError> { // (bumped, produced_children, diff_duration)
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-        let versions = holder.versions();
-        if versions.len() < 2 { 
-            println!("[follower][iter] ts={} status=WAITING reason=INSUFFICIENT_VERSIONS versions={}", ts_ms, versions.len());
-            std::thread::sleep(std::time::Duration::from_millis(100)); 
-            return Ok((0,0,None)); 
-        }
-        let low_version = versions[0];
-        let high_version = *versions.last().unwrap();
-        if self.low_version != Some(low_version) { self.low_interner = holder.get(low_version); self.low_version = Some(low_version); }
-        if self.high_version != Some(high_version) { self.high_interner = holder.get(high_version); self.high_version = Some(high_version); }
-        if self.low_interner.is_none() || self.high_interner.is_none() { 
-            println!("[follower][iter] ts={} status=WAITING reason=INTERNER_MISSING low_ok={} high_ok={}", ts_ms, self.low_interner.is_some(), self.high_interner.is_some());
-            return Ok((0,0,None)); 
-        }
-        let candidate = db.sample_version(low_version).expect("queue connection failed");
-        let ortho = match candidate { 
-            Some(o) => o, 
-            None => { 
-                println!("[follower][iter] ts={} status=EMPTY reason=NO_MORE_ORTHOS low_version={}", ts_ms, low_version); 
-                holder.delete(low_version); self.low_interner = None; self.low_version = None; return Ok((0,0,None)); 
-            } 
-        };
+/// Process a single text through the worker loop, updating the interner and tracking optimal ortho
+pub fn process_text(
+    text: &str,
+    interner: Option<interner::Interner>,
+    seen_ids: &mut HashSet<usize>,
+    optimal_ortho: &mut Option<Ortho>,
+) -> interner::Interner {
+    // Build or update interner
+    let current_interner = if let Some(prev_interner) = interner {
+        prev_interner.add_text(text)
+    } else {
+        interner::Interner::from_text(text)
+    };
+    
+    let version = current_interner.version();
+    
+    // Create seed ortho and work queue
+    let seed_ortho = Ortho::new(version);
+    let mut work_queue: VecDeque<Ortho> = VecDeque::new();
+    work_queue.push_back(seed_ortho);
+    
+    // Worker loop: process until queue is empty
+    while let Some(ortho) = work_queue.pop_front() {
+        // Get requirements for this ortho
         let (forbidden, required) = ortho.get_requirements();
-        let low = self.low_interner.as_ref().unwrap();
-        let high = self.high_interner.as_ref().unwrap();
-        let low_vocab_len = low.vocabulary().len();
-        let high_vocab_len = high.vocabulary().len();
-        let t_start = std::time::Instant::now();
-        // Sparse additions collection: gather all new candidate indices (no threshold)
-        use std::collections::HashSet;
-        let mut additions: HashSet<usize> = HashSet::new();
-        let forbidden_set: HashSet<usize> = forbidden.iter().copied().collect();
-        if required.is_empty() {
-            for i in low_vocab_len..high_vocab_len { if !forbidden_set.contains(&i) { additions.insert(i); } }
-        } else {
-            for prefix in &required {
-                let high_bs_opt = high.completions_for_prefix(prefix);
-                if high_bs_opt.is_none() { continue; }
-                let high_bs = high_bs_opt.unwrap();
-                let diffs = low.differing_completions_indices_up_to_vocab(high, prefix);
-                for idx in diffs { if idx < low_vocab_len && !forbidden_set.contains(&idx) { if high_bs.contains(idx) { additions.insert(idx); } } }
-                if high_vocab_len > low_vocab_len {
-                    for idx in low_vocab_len..high_vocab_len { if forbidden_set.contains(&idx) { continue; } if high_bs.contains(idx) { additions.insert(idx); } }
+        
+        // Get completions from interner
+        let completions = current_interner.intersect(&required, &forbidden);
+        
+        // Generate children
+        for completion in completions {
+            let children = ortho.add(completion, version);
+            for child in children {
+                let child_id = child.id();
+                // Only add to queue if never seen before
+                if !seen_ids.contains(&child_id) {
+                    seen_ids.insert(child_id);
+                    
+                    // Check if this child is optimal
+                    update_optimal(optimal_ortho, &child);
+                    
+                    work_queue.push_back(child);
                 }
             }
         }
-        if additions.is_empty() {
-            println!("[follower][iter] ts={} status=BUMP reason=NO_ADDITIONS ortho_id={} low_version={} -> high_version={}", ts_ms, ortho.id(), low_version, high_version);
-            let bumped = ortho.set_version(high_version); db.insert_or_update(bumped)?; return Ok((1,0,None));
-        }
-        let mut final_candidates: Vec<usize> = Vec::with_capacity(additions.len());
-        'cand: for &cand in additions.iter() {
-            if forbidden_set.contains(&cand) { continue; }
-            for prefix in &required { if let Some(bs) = high.completions_for_prefix(prefix) { if !bs.contains(cand) { continue 'cand; } } else { continue 'cand; } }
-            final_candidates.push(cand);
-        }
-        final_candidates.sort_unstable();
-        let candidates_ct_for_log = final_candidates.len();
-        let mut children = Vec::new();
-        for completion in final_candidates { let mut batch = ortho.add(completion, high_version); children.append(&mut batch); }
-        let produced = children.len();
-        let elapsed = t_start.elapsed();
-        if produced > 0 { dbq.push_many(children)?; }
-        // Always log perf
-        let additions_ct = additions.len();
-        let candidates_ct = candidates_ct_for_log;
-        let time_us = elapsed.as_micros();
-        let per_add_us = if additions_ct>0 { time_us as f64 / additions_ct as f64 } else { 0.0 };
-        let per_child_us = if produced>0 { time_us as f64 / produced as f64 } else { 0.0 };
-        println!("[follower][iter] ts={} status=EXPAND additions={} candidates={} children={} time_us={} per_add_us={:.2} per_child_us={:.2} ortho_id={}", ts_ms, additions_ct, candidates_ct, produced, time_us, per_add_us, per_child_us, ortho.id());
-        let bumped = ortho.set_version(high_version); db.insert_or_update(bumped)?;
-        Ok((1, produced, Some(elapsed)))
     }
+    
+    current_interner
 }
 
-pub struct OrthoFeeder;
-
-impl OrthoFeeder {
-    #[instrument(skip_all)]
-    pub fn run_feeder_once<D: crate::ortho_database::OrthoDatabaseLike, P:crate::queue::QueueProducerLike>(
-        batch: &[crate::ortho::Ortho],
-        db: &mut D,
-        workq: &mut P,
-    ) -> Result<(usize, usize), FoldError> { // (new, total)
-        if batch.is_empty() { return Ok((0,0)); }
-        static FEEDER_LRU: Lazy<Mutex<LruCache<usize, ()>>> = Lazy::new(|| {
-            // Capacity chosen to balance memory (~16MB for 1M usize entries) vs hit rate; adjust via FOLD_FEEDER_LRU_CAP
-            let cap = std::env::var("FOLD_FEEDER_LRU_CAP").ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .and_then(|c| std::num::NonZeroUsize::new(c))
-                .unwrap_or_else(|| std::num::NonZeroUsize::new(1_000_000).unwrap());
-            Mutex::new(LruCache::new(cap))
-        });
-        let total = batch.len();
-        let mut cache_hits = 0usize;
-        let mut candidates = Vec::with_capacity(total);
-        {
-            let mut lru = FEEDER_LRU.lock().unwrap();
-            for o in batch.iter() {
-                let id = o.id();
-                if lru.contains(&id) {
-                    cache_hits += 1;
-                    continue;
-                }
-                // Insert before DB attempt so concurrent duplicates in same batch won't duplicate
-                lru.put(id, ());
-                candidates.push(o.clone());
-            }
-        }
-        let skipped = cache_hits;
-        if skipped > 0 {
-            let pct_skipped = skipped as f64 / total as f64;
-            println!("[feeder][cache] batch_total={} cache_hits={} attempted_db={} pct_skipped={:.4}", total, skipped, candidates.len(), pct_skipped);
-        } else {
-            println!("[feeder][cache] batch_total={} cache_hits=0 attempted_db={} pct_skipped=0.0000", total, candidates.len());
-        }
-        if candidates.is_empty() {
-            return Ok((0, total));
-        }
-        let new_orthos = db.upsert(candidates)?; // only freshly inserted
-        let new_count = new_orthos.len();
-        workq.push_many(new_orthos)?;
-        Ok((new_count, total))
+/// Update the optimal ortho if the new candidate is better
+fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
+    let candidate_volume: usize = candidate.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let is_optimal = if let Some(current_optimal) = optimal_ortho.as_ref() {
+        let current_volume: usize = current_optimal.dims().iter().map(|d| d.saturating_sub(1)).product();
+        candidate_volume > current_volume
+    } else {
+        true
+    };
+    
+    if is_optimal {
+        *optimal_ortho = Some(candidate.clone());
     }
-}
-
-#[instrument(skip_all)]
-pub fn process_worker_item_with_cached<P: crate::queue::QueueProducerLike>(
-    ortho: &crate::ortho::Ortho,
-    dbq: &mut P,
-    interner: &crate::interner::Interner,
-) -> Result<(), FoldError> {
-    println!("[worker] Popped ortho from workq: id={}, version={}", ortho.id(), ortho.version());
-    let (forbidden, required) = ortho.get_requirements();
-    let completions = interner.intersect(&required, &forbidden);
-    let version = interner.version();
-    let mut new_orthos = Vec::new();
-    for completion in completions {
-        let mut batch = ortho.add(completion, version);
-        new_orthos.append(&mut batch);
-    }
-    dbq.push_many(new_orthos)?;
-    Ok(())
 }
 
 #[cfg(test)]
