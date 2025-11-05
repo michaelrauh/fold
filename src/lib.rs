@@ -83,7 +83,7 @@ pub fn process_text(
         if produced_children {
             frontier.remove(&ortho_id);
         }
-        // Note: If it produced nothing, it stays in the frontier (already added when created)
+        // Note: If it produced nothing, it stays in the frontier (added when it was created as a child, or as seed)
     }
     
     let frontier_size = frontier.len();
