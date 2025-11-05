@@ -744,7 +744,7 @@ mod version_compare_tests {
         // May have empty keys but vocabulary-specific keys should be the same
         // The changed keys might include terminal phrases, so just verify it's a reasonable count
         // In this case, with no changes to existing vocab, changed keys should be minimal
-        assert!(changed_keys_in_old_vocab.is_empty() || changed_keys_in_old_vocab.len() == 0, 
+        assert!(changed_keys_in_old_vocab.is_empty(), 
                 "Empty text should not change keys in old vocab");
     }
 }
