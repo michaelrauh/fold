@@ -141,45 +141,36 @@ fn find_and_rewind_impacted_orthos(
     
     // For each frontier ortho
     for ortho in frontier_orthos.values() {
-        // Check if this ortho contains any impacted index
-        let mut contains_impacted = false;
-        let mut first_impacted_position: Option<usize> = None;
+        // Find ALL impacted positions in this ortho (not just the first one)
+        let mut impacted_positions: Vec<usize> = Vec::new();
         
         for (pos, &opt_idx) in ortho.payload().iter().enumerate() {
             if let Some(idx) = opt_idx {
                 if impacted_indices.contains(&idx) {
-                    contains_impacted = true;
-                    if first_impacted_position.is_none() {
-                        first_impacted_position = Some(pos);
-                    }
+                    impacted_positions.push(pos);
                 }
             }
         }
         
-        if !contains_impacted {
+        if impacted_positions.is_empty() {
             continue;
         }
         
-        // Rewind this ortho until the first impacted index is at the next insertion position
-        let first_impacted_pos = first_impacted_position.unwrap();
+        // Find the earliest (leftmost) impacted position
+        // We want to rewind to just after this position so it becomes the last value
+        // (at the "most advanced position", ready for the next add)
+        let earliest_impacted_pos = *impacted_positions.iter().min().unwrap();
         
-        // We need to subtract until first_impacted_pos == current_position - 1
-        // This means the next add would happen at the position where the impacted key is
-        let mut rewound = ortho.clone();
+        // Rebuild this ortho up to and including the earliest impacted position
+        // This means the impacted key will be at position earliest_impacted_pos,
+        // which is the last filled position (current_position - 1)
+        let target_position = earliest_impacted_pos + 1;
         
-        // Subtract values that come after the first impacted position
-        while rewound.get_current_position() > first_impacted_pos + 1 {
-            if let Some(subtracted) = rewound.subtract() {
-                rewound = subtracted;
-            } else {
-                break;
-            }
+        if let Some(mut rewound) = ortho.rebuild_to_position(target_position) {
+            // Update version to new version
+            rewound = rewound.set_version(new_version);
+            rewound_orthos.push(rewound);
         }
-        
-        // Update version to new version
-        rewound = rewound.set_version(new_version);
-        
-        rewound_orthos.push(rewound);
     }
     
     rewound_orthos

@@ -93,21 +93,32 @@ impl Ortho {
         }
         idx
     }
-    pub fn subtract(&self) -> Option<Self> {
-        // Find the last filled position (position of last Some value before first None)
+    /// Rebuild this ortho up to a specific target position.
+    /// This creates a new ortho containing only the values up to (but not including) target_position.
+    /// Returns None if target_position is invalid (> current_position).
+    /// Returns empty ortho if target_position is 0.
+    pub fn rebuild_to_position(&self, target_position: usize) -> Option<Self> {
         let current_position = self.get_current_position();
-        if current_position == 0 {
-            // Nothing to subtract - ortho is empty
+        
+        // Validate target position
+        if target_position > current_position {
             return None;
         }
         
-        // Rebuild approach: collect values to keep, then rebuild from scratch
-        // This is simpler than the contraction logic and handles all cases uniformly
+        if target_position == 0 {
+            // Return empty ortho
+            return Some(Ortho::new(self.version));
+        }
         
-        // Collect all values except the last one, in order
+        if target_position == current_position {
+            // No rebuild needed - return a clone
+            return Some(self.clone());
+        }
+        
+        // Collect values up to target position
         let mut values_to_keep: Vec<usize> = Vec::new();
         for (idx, &opt_val) in self.payload.iter().enumerate() {
-            if idx < current_position - 1 {
+            if idx < target_position {
                 if let Some(val) = opt_val {
                     values_to_keep.push(val);
                 }
@@ -130,25 +141,19 @@ impl Ortho {
                 return None;
             }
             
-            // If this is not the last value, we know what shape we should end up with
-            // because we're rebuilding towards the original shape
+            // If this is the last value, we need to determine the target shape
             if i == values_to_keep.len() - 1 {
-                // Last value - need to determine the target shape after subtracting one value
-                // The target shape should be based on capacity requirements
-                let target_capacity = current_position - 1;
-                
                 // Choose the candidate that has the appropriate capacity/shape
-                // If we're below expansion threshold, any candidate works (there's only one)
-                // If we're at expansion, choose based on what would contract back to base
-                rebuilt = if target_capacity <= 3 {
-                    // Below expansion threshold - should be base [2,2]
+                // Base shape [2,2] has capacity 4. If target_position <= 4, use base shape
+                rebuilt = if target_position <= 4 {
+                    // Below or at base capacity - should be base [2,2]
                     candidates.iter()
                         .find(|c| c.dims == vec![2, 2])
                         .unwrap_or(&candidates[0])
                         .clone()
                 } else {
-                    // At or above expansion - match the current ortho's shape if possible
-                    // by finding a candidate with matching number of dimensions
+                    // Above base capacity - need expanded shape
+                    // Choose candidate that matches current ortho's dimensional structure
                     candidates.iter()
                         .find(|c| c.dims.len() == self.dims.len())
                         .unwrap_or(&candidates[0])
@@ -161,6 +166,16 @@ impl Ortho {
         }
         
         Some(rebuilt)
+    }
+    
+    // Legacy subtract method for backward compatibility with existing tests
+    // This is now implemented in terms of rebuild_to_position
+    fn subtract(&self) -> Option<Self> {
+        let current_position = self.get_current_position();
+        if current_position == 0 {
+            return None;
+        }
+        self.rebuild_to_position(current_position - 1)
     }
     
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
@@ -658,6 +673,69 @@ mod tests {
         norms1.sort();
         norms2.sort();
         assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
+    }
+
+    #[test]
+    fn test_rebuild_to_any_point_in_search_tree() {
+        // Demonstrate that rebuild_to_position can reconstruct any point in a search tree
+        // by rebuilding based on payload positions
+        
+        // Build a search tree
+        let root = Ortho::new(1);
+        
+        // Simple linear path: 10 -> 20 -> 30 -> 40
+        let n1 = root.add(10, 1)[0].clone();
+        let n2 = n1.add(20, 1)[0].clone();
+        let n3 = n2.add(30, 1)[0].clone();
+        let n4 = n3.add(40, 1)[0].clone();
+        
+        // Demonstrate we can rebuild from n4 to any earlier point
+        
+        // Rebuild to position 3 (should have first 3 payload values: [10, 20, 30])
+        let rebuild_3 = n4.rebuild_to_position(3).expect("Should rebuild to pos 3");
+        assert_eq!(rebuild_3.get_current_position(), 3);
+        let mut vals_3: Vec<usize> = rebuild_3.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_3.sort();
+        assert_eq!(vals_3, vec![10, 20, 30], "Should have first 3 values");
+        
+        // Rebuild to position 2 (should have first 2 payload values: [10, 20])
+        let rebuild_2 = n4.rebuild_to_position(2).expect("Should rebuild to pos 2");
+        assert_eq!(rebuild_2.get_current_position(), 2);
+        let mut vals_2: Vec<usize> = rebuild_2.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_2.sort();
+        assert_eq!(vals_2, vec![10, 20], "Should have first 2 values");
+        
+        // Rebuild to position 1 (should have first payload value: [10])
+        let rebuild_1 = n4.rebuild_to_position(1).expect("Should rebuild to pos 1");
+        assert_eq!(rebuild_1.get_current_position(), 1);
+        assert_eq!(rebuild_1.payload()[0], Some(10), "Should have first value");
+        
+        // Test with canonicalization path: 10 -> 50 -> 30 (causes swap)
+        let c1 = root.add(10, 1)[0].clone();
+        let c2 = c1.add(50, 1)[0].clone();
+        let c3 = c2.add(30, 1)[0].clone(); // Triggers canonicalization: 30 < 50
+        
+        // After canonicalization, payload is [10, 30, 50, None]
+        assert_eq!(c3.payload()[0], Some(10));
+        assert_eq!(c3.payload()[1], Some(30));
+        assert_eq!(c3.payload()[2], Some(50));
+        
+        // Rebuild to position 2 - takes first 2 payload values [10, 30]
+        let c_rebuild_2 = c3.rebuild_to_position(2).expect("Should rebuild to pos 2");
+        assert_eq!(c_rebuild_2.get_current_position(), 2);
+        assert_eq!(c_rebuild_2.payload()[0], Some(10));
+        assert_eq!(c_rebuild_2.payload()[1], Some(30));
+        
+        // Rebuild to position 1 - takes first payload value [10]
+        let c_rebuild_1 = c3.rebuild_to_position(1).expect("Should rebuild to pos 1");
+        assert_eq!(c_rebuild_1.get_current_position(), 1);
+        assert_eq!(c_rebuild_1.payload()[0], Some(10));
+        
+        // Key insight: rebuild_to_position operates on payload positions,
+        // collecting the first N values from the current payload and rebuilding them.
+        // This correctly handles all cases including canonicalization.
     }
 
     #[test]
