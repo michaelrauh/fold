@@ -55,9 +55,14 @@ pub fn process_text(
     let mut work_queue: VecDeque<Ortho> = VecDeque::new();
     work_queue.push_back(seed_ortho);
     
-    // Add rewound orthos to work queue
+    // Add rewound orthos to work queue, deduplicating by ID
     for rewound_ortho in rewound_orthos {
-        work_queue.push_back(rewound_ortho);
+        let rewound_id = rewound_ortho.id();
+        // Only add if we haven't seen this ortho before
+        if !seen_ids.contains(&rewound_id) {
+            seen_ids.insert(rewound_id);
+            work_queue.push_back(rewound_ortho);
+        }
     }
     
     // Worker loop: process until queue is empty
