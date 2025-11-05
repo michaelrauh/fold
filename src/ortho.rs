@@ -120,15 +120,44 @@ impl Ortho {
         }
         
         // Rebuild ortho by adding values one at a time
+        // We need to track the target shape to choose the right branch when expansion occurs
         let mut rebuilt = Ortho::new(self.version);
-        for &value in &values_to_keep {
-            // Add the value and take the first result (canonicalized path)
+        for (i, &value) in values_to_keep.iter().enumerate() {
+            // Add the value
             let candidates = rebuilt.add(value, self.version);
             if candidates.is_empty() {
                 // This shouldn't happen, but handle gracefully
                 return None;
             }
-            rebuilt = candidates[0].clone();
+            
+            // If this is not the last value, we know what shape we should end up with
+            // because we're rebuilding towards the original shape
+            if i == values_to_keep.len() - 1 {
+                // Last value - need to determine the target shape after subtracting one value
+                // The target shape should be based on capacity requirements
+                let target_capacity = current_position - 1;
+                
+                // Choose the candidate that has the appropriate capacity/shape
+                // If we're below expansion threshold, any candidate works (there's only one)
+                // If we're at expansion, choose based on what would contract back to base
+                rebuilt = if target_capacity <= 3 {
+                    // Below expansion threshold - should be base [2,2]
+                    candidates.iter()
+                        .find(|c| c.dims == vec![2, 2])
+                        .unwrap_or(&candidates[0])
+                        .clone()
+                } else {
+                    // At or above expansion - match the current ortho's shape if possible
+                    // by finding a candidate with matching number of dimensions
+                    candidates.iter()
+                        .find(|c| c.dims.len() == self.dims.len())
+                        .unwrap_or(&candidates[0])
+                        .clone()
+                };
+            } else {
+                // Not the last value - just take the first candidate (usually only one)
+                rebuilt = candidates[0].clone();
+            }
         }
         
         Some(rebuilt)
@@ -632,6 +661,109 @@ mod tests {
     }
 
     #[test]
+    fn test_rebuild_places_impacted_key_furthest_right() {
+        // Prove that when rebuilding an ortho via subtract, the last remaining key
+        // ends up at the "most advanced position" (furthest right, ready for next add)
+        
+        // Build an ortho with values [10, 20, 30, 40]
+        let ortho = Ortho::new(1);
+        let ortho = ortho.add(10, 1)[0].clone();
+        let ortho = ortho.add(20, 1)[0].clone();
+        let ortho = ortho.add(30, 1)[0].clone();
+        let ortho = ortho.add(40, 1)[0].clone();
+        
+        // Current position should be 4 (all 4 slots filled in base [2,2])
+        assert_eq!(ortho.get_current_position(), 4);
+        
+        // Subtract once - removes 40, leaving [10, 20, 30]
+        let sub1 = ortho.subtract().expect("Should subtract");
+        assert_eq!(sub1.get_current_position(), 3, "Should have 3 values");
+        // The value 30 should be at position 2 (furthest right)
+        assert_eq!(sub1.payload()[2], Some(30), "Last value should be at rightmost position");
+        assert_eq!(sub1.payload()[3], None, "Position after last value should be None");
+        
+        // Subtract again - removes 30, leaving [10, 20]
+        let sub2 = sub1.subtract().expect("Should subtract");
+        assert_eq!(sub2.get_current_position(), 2, "Should have 2 values");
+        // The value 20 should be at position 1 (furthest right)
+        assert_eq!(sub2.payload()[1], Some(20), "Last value should be at rightmost position");
+        assert_eq!(sub2.payload()[2], None, "Position after last value should be None");
+        
+        // Subtract again - removes 20, leaving [10]
+        let sub3 = sub2.subtract().expect("Should subtract");
+        assert_eq!(sub3.get_current_position(), 1, "Should have 1 value");
+        // The value 10 should be at position 0 (furthest right for 1 value)
+        assert_eq!(sub3.payload()[0], Some(10), "Last value should be at rightmost position");
+        assert_eq!(sub3.payload()[1], None, "Position after last value should be None");
+        
+        // This demonstrates that after rebuild, the last remaining value is always
+        // at the "most advanced position" - ready for the next add operation
+    }
+
+    #[test]
+    fn test_rebuild_reverses_through_full_add_tree() {
+        // Prove that you can:
+        // 1. Call add on empty ortho multiple times with different canonicalization patterns
+        // 2. Capture the full tree of outputs
+        // 3. Then reverse back to any part of that tree via subtract
+        
+        // Start with empty ortho
+        let empty = Ortho::new(1);
+        
+        // Build a tree with two different canonicalization patterns
+        // Pattern 1: ascending order (10 < 30 < 50)
+        let p1_step1 = empty.add(10, 1)[0].clone();
+        let p1_step2 = p1_step1.add(30, 1)[0].clone();
+        let p1_step3 = p1_step2.add(50, 1)[0].clone();
+        
+        // Pattern 2: canonicalization order (10 < 50 < 30, triggers swap)
+        let p2_step1 = empty.add(10, 1)[0].clone();
+        let p2_step2 = p2_step1.add(50, 1)[0].clone();
+        let p2_step3 = p2_step2.add(30, 1)[0].clone(); // This triggers canonicalization
+        
+        // Verify canonicalization happened in pattern 2
+        assert_eq!(p2_step3.payload()[0], Some(10));
+        assert_eq!(p2_step3.payload()[1], Some(30)); // Swapped to canonical order
+        assert_eq!(p2_step3.payload()[2], Some(50));
+        
+        // Now prove we can reverse from p1_step3 back through the tree
+        let p1_reversed_1 = p1_step3.subtract().expect("Should reverse step 3");
+        assert_eq!(p1_reversed_1.get_current_position(), 2);
+        let mut vals_p1_r1: Vec<usize> = p1_reversed_1.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_p1_r1.sort();
+        assert_eq!(vals_p1_r1, vec![10, 30], "Should have first 2 values");
+        
+        let p1_reversed_2 = p1_reversed_1.subtract().expect("Should reverse step 2");
+        assert_eq!(p1_reversed_2.get_current_position(), 1);
+        assert_eq!(p1_reversed_2.payload()[0], Some(10), "Should have first value");
+        
+        let p1_reversed_3 = p1_reversed_2.subtract().expect("Should reverse step 1");
+        assert_eq!(p1_reversed_3.get_current_position(), 0);
+        assert_eq!(p1_reversed_3.payload()[0], None, "Should be empty");
+        
+        // Now prove we can reverse from p2_step3 back through the tree
+        // Even though it went through canonicalization
+        let p2_reversed_1 = p2_step3.subtract().expect("Should reverse step 3");
+        assert_eq!(p2_reversed_1.get_current_position(), 2);
+        let mut vals_p2_r1: Vec<usize> = p2_reversed_1.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_p2_r1.sort();
+        assert_eq!(vals_p2_r1, vec![10, 30], "Should have first 2 values in canonical order");
+        
+        let p2_reversed_2 = p2_reversed_1.subtract().expect("Should reverse step 2");
+        assert_eq!(p2_reversed_2.get_current_position(), 1);
+        assert_eq!(p2_reversed_2.payload()[0], Some(10), "Should have first value");
+        
+        let p2_reversed_3 = p2_reversed_2.subtract().expect("Should reverse step 1");
+        assert_eq!(p2_reversed_3.get_current_position(), 0);
+        assert_eq!(p2_reversed_3.payload()[0], None, "Should be empty");
+        
+        // Both patterns reverse cleanly back to empty, proving rebuild handles
+        // any path through the add tree correctly
+    }
+
+    #[test]
     fn test_subtract_empty_ortho() {
         let ortho = Ortho::new(1);
         assert_eq!(ortho.subtract(), None);
@@ -940,5 +1072,56 @@ mod tests {
         assert_eq!(sub5_3.get_current_position(), 0);
         
         assert_eq!(sub5_3.subtract(), None, "Should return None when empty");
+    }
+
+    #[test]
+    fn test_subtract_preserves_shape_through_expansion_choices() {
+        // This test verifies that subtract correctly chooses the right expansion path
+        // when rebuilding, matching the original ortho's dimensional structure
+        
+        // Create base ortho with 3 values
+        let base = Ortho::new(1);
+        let base = base.add(10, 1)[0].clone();
+        let base = base.add(20, 1)[0].clone();
+        let base = base.add(30, 1)[0].clone();
+        assert_eq!(base.dims(), &vec![2, 2]);
+        assert_eq!(base.get_current_position(), 3);
+        
+        // Add 4th value - triggers expansion to multiple candidates
+        let expansions = base.add(40, 1);
+        assert_eq!(expansions.len(), 2, "Should have 2 expansion candidates");
+        
+        // Get both expansion options
+        let exp_3_2 = expansions.iter().find(|o| o.dims() == &vec![3, 2])
+            .expect("Should have [3,2] expansion").clone();
+        let exp_2_2_2 = expansions.iter().find(|o| o.dims() == &vec![2, 2, 2])
+            .expect("Should have [2,2,2] expansion").clone();
+        
+        // Test subtracting from [3,2] gives back [2,2] with 3 values
+        let sub_from_3_2 = exp_3_2.subtract().expect("Should subtract from [3,2]");
+        assert_eq!(sub_from_3_2.dims(), &vec![2, 2], 
+                   "Subtracting from [3,2] should give [2,2]");
+        assert_eq!(sub_from_3_2.get_current_position(), 3,
+                   "Should have 3 values after subtract");
+        let mut vals_3_2: Vec<usize> = sub_from_3_2.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_3_2.sort();
+        assert_eq!(vals_3_2, vec![10, 20, 30], "Should have original 3 values");
+        
+        // Test subtracting from [2,2,2] also gives back [2,2] with 3 values
+        let sub_from_2_2_2 = exp_2_2_2.subtract().expect("Should subtract from [2,2,2]");
+        assert_eq!(sub_from_2_2_2.dims(), &vec![2, 2], 
+                   "Subtracting from [2,2,2] should give [2,2]");
+        assert_eq!(sub_from_2_2_2.get_current_position(), 3,
+                   "Should have 3 values after subtract");
+        let mut vals_2_2_2: Vec<usize> = sub_from_2_2_2.payload().iter()
+            .filter_map(|&v| v).collect();
+        vals_2_2_2.sort();
+        assert_eq!(vals_2_2_2, vec![10, 20, 30], "Should have original 3 values");
+        
+        // Both results should be equivalent (same values, same shape)
+        assert_eq!(sub_from_3_2.dims(), sub_from_2_2_2.dims(),
+                   "Both should contract to same dims");
+        assert_eq!(vals_3_2, vals_2_2_2, "Both should have same values");
     }
 }
