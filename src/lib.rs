@@ -189,4 +189,56 @@ mod follower_diff_tests {
         let diff: Vec<usize> = high_set.difference(&low_set).copied().collect();
         assert_eq!(diff, vec![2]);
     }
+    
+    #[test]
+    fn test_count_impacted_frontier_orthos_empty_changed_keys() {
+        let frontier_orthos = HashMap::new();
+        let changed_keys: Vec<Vec<usize>> = vec![];
+        assert_eq!(count_impacted_frontier_orthos(&frontier_orthos, &changed_keys), 0);
+    }
+    
+    #[test]
+    fn test_count_impacted_frontier_orthos_no_matching_orthos() {
+        // Create orthos with indices [0, 1]
+        let mut frontier_orthos = HashMap::new();
+        let ortho1 = Ortho::new(1).add(0, 1).pop().unwrap().add(1, 1).pop().unwrap();
+        frontier_orthos.insert(ortho1.id(), ortho1);
+        
+        // Changed keys contain indices [2, 3] - not in any ortho payload
+        let changed_keys = vec![vec![2], vec![3]];
+        assert_eq!(count_impacted_frontier_orthos(&frontier_orthos, &changed_keys), 0);
+    }
+    
+    #[test]
+    fn test_count_impacted_frontier_orthos_with_matches() {
+        // Create orthos with various indices
+        let mut frontier_orthos = HashMap::new();
+        
+        let ortho1 = Ortho::new(1).add(0, 1).pop().unwrap().add(1, 1).pop().unwrap();
+        let ortho2 = Ortho::new(1).add(2, 1).pop().unwrap().add(3, 1).pop().unwrap();
+        let ortho3 = Ortho::new(1).add(4, 1).pop().unwrap().add(5, 1).pop().unwrap();
+        
+        frontier_orthos.insert(ortho1.id(), ortho1);
+        frontier_orthos.insert(ortho2.id(), ortho2);
+        frontier_orthos.insert(ortho3.id(), ortho3);
+        
+        // Changed keys contain indices [0, 2] - should match ortho1 and ortho2
+        let changed_keys = vec![vec![0], vec![2]];
+        assert_eq!(count_impacted_frontier_orthos(&frontier_orthos, &changed_keys), 2);
+    }
+    
+    #[test]
+    fn test_count_impacted_frontier_orthos_with_partial_matches() {
+        let mut frontier_orthos = HashMap::new();
+        
+        let ortho1 = Ortho::new(1).add(0, 1).pop().unwrap().add(1, 1).pop().unwrap();
+        let ortho2 = Ortho::new(1).add(2, 1).pop().unwrap();
+        
+        frontier_orthos.insert(ortho1.id(), ortho1);
+        frontier_orthos.insert(ortho2.id(), ortho2);
+        
+        // Changed keys with compound prefix [0, 1] - both indices in ortho1
+        let changed_keys = vec![vec![0, 1]];
+        assert_eq!(count_impacted_frontier_orthos(&frontier_orthos, &changed_keys), 1);
+    }
 }
