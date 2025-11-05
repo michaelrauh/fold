@@ -1,8 +1,0 @@
-target/
-.git/
-log.txt
-*.md
-*.bk
-*.sh
-!wait-for-it.sh
-*.txt
