@@ -281,6 +281,55 @@ impl Interner {
     pub fn all_completions_equal_up_to_vocab(&self, other: &Interner, prefixes: &[Vec<usize>]) -> bool {
         prefixes.iter().all(|p| self.completions_equal_up_to_vocab(other, p))
     }
+
+    /// Compare this interner with another and return all keys (prefixes) whose bitsets differ.
+    /// This checks if ANY part of the bitset differs, including new indices beyond self's vocabulary.
+    pub fn find_changed_keys(&self, other: &Interner) -> Vec<Vec<usize>> {
+        use std::collections::HashSet;
+        
+        // Collect all unique keys from both interners
+        let mut all_keys: HashSet<Vec<usize>> = HashSet::new();
+        for key in self.prefix_to_completions.keys() {
+            all_keys.insert(key.clone());
+        }
+        for key in other.prefix_to_completions.keys() {
+            all_keys.insert(key.clone());
+        }
+        
+        // Filter to keys where the bitsets differ in any way
+        let mut changed_keys: Vec<Vec<usize>> = all_keys
+            .into_iter()
+            .filter(|key| {
+                let self_bitset = self.prefix_to_completions.get(key);
+                let other_bitset = other.prefix_to_completions.get(key);
+                
+                // If one exists and the other doesn't, it's changed
+                match (self_bitset, other_bitset) {
+                    (None, Some(_)) | (Some(_), None) => true,
+                    (None, None) => false,
+                    (Some(self_bs), Some(other_bs)) => {
+                        // Compare the full bitsets, not just up to old vocabulary
+                        // Check if they differ in the old vocabulary range first
+                        if !self.differing_completions_indices_up_to_vocab(other, key).is_empty() {
+                            return true;
+                        }
+                        // Also check if other has any new completions beyond self's vocabulary
+                        let self_vocab_len = self.vocabulary.len();
+                        for i in self_vocab_len..other.vocabulary.len() {
+                            if other_bs.contains(i) {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                }
+            })
+            .collect();
+        
+        // Sort for consistent ordering
+        changed_keys.sort();
+        changed_keys
+    }
 }
 
 pub trait InternerHolderLike {
@@ -655,5 +704,47 @@ mod version_compare_tests {
         let diffs = low.differing_completions_indices_up_to_vocab(&high, &prefix_a);
         assert!(diffs.contains(&0), "Should detect newly added completion index 0");
         assert!(!low.completions_equal_up_to_vocab(&high, &prefix_a));
+    }
+
+    #[test]
+    fn test_find_changed_keys_no_changes() {
+        let low = Interner::from_text("a b c");
+        let high = low.add_text("x y"); // adds new vocab only, no new connections in old vocab
+        let changed_keys = low.find_changed_keys(&high);
+        // Changed keys should only include new keys for new vocab items
+        // Since we're comparing within old vocab size, terminal phrases for x,y and their singles would be new
+        assert!(changed_keys.len() > 0, "Should detect new keys for new vocabulary");
+    }
+
+    #[test]
+    fn test_find_changed_keys_with_changes() {
+        let low = Interner::from_text("a b");
+        let high = low.add_text("a c"); // introduces prefix [a] -> c (index 2), changes [a]'s bitset
+        let changed_keys = low.find_changed_keys(&high);
+        // Should detect that prefix [a] (vec![0]) has changed
+        assert!(changed_keys.contains(&vec![0]), "Should detect prefix [a] changed");
+    }
+
+    #[test]
+    fn test_find_changed_keys_new_phrase() {
+        let low = Interner::from_text("a b c");
+        let high = low.add_text("a c b"); // introduces new prefix [a,c] -> b
+        let changed_keys = low.find_changed_keys(&high);
+        // Should detect new prefix [a,c] that wasn't in low
+        assert!(changed_keys.contains(&vec![0, 2]), "Should detect new prefix [a,c]");
+    }
+
+    #[test]
+    fn test_find_changed_keys_returns_zero_for_identical() {
+        let low = Interner::from_text("a b c");
+        // Create a copy by adding empty text (should not change anything in old vocab)
+        let high = low.add_text("");
+        // For the old vocabulary, everything should remain the same
+        let changed_keys_in_old_vocab = low.find_changed_keys(&high);
+        // May have empty keys but vocabulary-specific keys should be the same
+        // The changed keys might include terminal phrases, so just verify it's a reasonable count
+        // In this case, with no changes to existing vocab, changed keys should be minimal
+        assert!(changed_keys_in_old_vocab.is_empty(), 
+                "Empty text should not change keys in old vocab");
     }
 }
