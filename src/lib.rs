@@ -11,39 +11,43 @@ pub use interner::*;
 pub use ortho_database::*;
 pub use queue::*;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use ortho::Ortho;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho.
-/// Returns a tuple of (new_interner, changed_keys_count, frontier_size).
+/// Returns a tuple of (new_interner, changed_keys_count, frontier_size, impacted_frontier_count).
 pub fn process_text(
     text: &str,
     interner: Option<interner::Interner>,
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
     frontier: &mut HashSet<usize>,
-) -> (interner::Interner, usize, usize) {
+) -> (interner::Interner, usize, usize, usize) {
     // Build or update interner and track changed keys
-    let (current_interner, changed_keys_count) = if let Some(prev_interner) = interner {
+    let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
         let new_interner = prev_interner.add_text(text);
         let changed_keys = prev_interner.find_changed_keys(&new_interner);
         let count = changed_keys.len();
-        (new_interner, count)
+        (new_interner, changed_keys, count)
     } else {
         // First interner - all keys are "new" but we return 0 as there's no previous state to compare
-        (interner::Interner::from_text(text), 0)
+        (interner::Interner::from_text(text), vec![], 0)
     };
     
     let version = current_interner.version();
+    
+    // Track frontier orthos for checking impacted keys
+    let mut frontier_orthos: HashMap<usize, Ortho> = HashMap::new();
     
     // Create seed ortho and work queue
     let seed_ortho = Ortho::new(version);
     let seed_id = seed_ortho.id();
     let mut work_queue: VecDeque<Ortho> = VecDeque::new();
-    work_queue.push_back(seed_ortho);
+    work_queue.push_back(seed_ortho.clone());
     
     // Add seed to frontier (will be removed if it produces children)
     frontier.insert(seed_id);
+    frontier_orthos.insert(seed_id, seed_ortho);
     
     // Worker loop: process until queue is empty
     while let Some(ortho) = work_queue.pop_front() {
@@ -70,6 +74,7 @@ pub fn process_text(
                     
                     // Add newly discovered ortho to frontier
                     frontier.insert(child_id);
+                    frontier_orthos.insert(child_id, child.clone());
                     
                     // Check if this child is optimal
                     update_optimal(optimal_ortho, &child);
@@ -82,12 +87,42 @@ pub fn process_text(
         // Remove parent from frontier if it produced any children
         if produced_children {
             frontier.remove(&ortho_id);
+            frontier_orthos.remove(&ortho_id);
         }
         // Note: If it produced nothing, it stays in the frontier (added when it was created as a child, or as seed)
     }
     
     let frontier_size = frontier.len();
-    (current_interner, changed_keys_count, frontier_size)
+    
+    // Count frontier orthos that contain impacted keys in their payload
+    let impacted_frontier_count = count_impacted_frontier_orthos(&frontier_orthos, &changed_keys);
+    
+    (current_interner, changed_keys_count, frontier_size, impacted_frontier_count)
+}
+
+/// Count how many frontier orthos contain any of the impacted keys in their payload
+fn count_impacted_frontier_orthos(
+    frontier_orthos: &HashMap<usize, Ortho>,
+    changed_keys: &[Vec<usize>],
+) -> usize {
+    if changed_keys.is_empty() {
+        return 0;
+    }
+    
+    // Convert changed keys to a flat set for efficient lookup
+    let mut impacted_indices: HashSet<usize> = HashSet::new();
+    for key in changed_keys {
+        for &index in key {
+            impacted_indices.insert(index);
+        }
+    }
+    
+    // Count frontier orthos that contain any impacted index in their payload
+    frontier_orthos.values().filter(|ortho| {
+        ortho.payload().iter().any(|&opt_idx| {
+            opt_idx.map_or(false, |idx| impacted_indices.contains(&idx))
+        })
+    }).count()
 }
 
 /// Update the optimal ortho if the new candidate is better
