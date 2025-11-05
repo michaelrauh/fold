@@ -107,12 +107,13 @@ impl Ortho {
         let mut new_payload = self.payload.clone();
         new_payload[last_filled_position] = None;
         
-        // Handle reverse canonicalization for [2,2] dims at position 2
-        // When we subtract from position 2, we need to restore the original order
-        // However, since canonicalization only swaps values at positions 1 and 2,
-        // and we're just removing position 2, we can leave positions 1 as is.
-        // The ortho will be in a valid state (though not necessarily the same state
-        // we had before the original add that triggered canonicalization).
+        // Note: We don't reverse canonicalization here. The canonicalization that
+        // happens during add() at position 2 for [2,2] dims involves swapping values
+        // at positions 1 and 2 if they're out of order. When we subtract from position 2,
+        // we simply remove that value, leaving position 1 as is. This means the ortho
+        // may not be in the exact same state as before the original add that triggered
+        // canonicalization, but it will be in a valid state. The next add operation
+        // will re-canonicalize if needed.
         
         Some(Ortho {
             version: self.version,
