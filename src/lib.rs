@@ -42,12 +42,13 @@ pub fn process_text(
     // Create seed ortho and work queue
     let seed_ortho = Ortho::new(version);
     let seed_id = seed_ortho.id();
-    let mut work_queue: VecDeque<Ortho> = VecDeque::new();
-    work_queue.push_back(seed_ortho.clone());
     
     // Add seed to frontier (will be removed if it produces children)
     frontier.insert(seed_id);
-    frontier_orthos.insert(seed_id, seed_ortho);
+    frontier_orthos.insert(seed_id, seed_ortho.clone());
+    
+    let mut work_queue: VecDeque<Ortho> = VecDeque::new();
+    work_queue.push_back(seed_ortho);
     
     // Worker loop: process until queue is empty
     while let Some(ortho) = work_queue.pop_front() {
@@ -74,11 +75,12 @@ pub fn process_text(
                     
                     // Add newly discovered ortho to frontier
                     frontier.insert(child_id);
-                    frontier_orthos.insert(child_id, child.clone());
                     
                     // Check if this child is optimal
                     update_optimal(optimal_ortho, &child);
                     
+                    // Add to frontier orthos and work queue
+                    frontier_orthos.insert(child_id, child.clone());
                     work_queue.push_back(child);
                 }
             }
@@ -118,11 +120,18 @@ fn count_impacted_frontier_orthos(
     }
     
     // Count frontier orthos that contain any impacted index in their payload
-    frontier_orthos.values().filter(|ortho| {
-        ortho.payload().iter().any(|&opt_idx| {
-            opt_idx.map_or(false, |idx| impacted_indices.contains(&idx))
-        })
-    }).count()
+    let mut count = 0;
+    for ortho in frontier_orthos.values() {
+        for &opt_idx in ortho.payload() {
+            if let Some(idx) = opt_idx {
+                if impacted_indices.contains(&idx) {
+                    count += 1;
+                    break; // This ortho is impacted, no need to check more indices
+                }
+            }
+        }
+    }
+    count
 }
 
 /// Update the optimal ortho if the new candidate is better
