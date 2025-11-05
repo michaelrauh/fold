@@ -4,8 +4,8 @@ use std::fmt;
 pub enum FoldError {
     Database(String),
     Queue(String),
-    Serialization(Box<bincode::error::EncodeError>),
-    Deserialization(Box<bincode::error::DecodeError>),
+    Serialization(String),
+    Deserialization(String),
     Io(std::io::Error),
     Interner(String),
     Other(String),
@@ -29,25 +29,25 @@ impl std::error::Error for FoldError {}
 
 impl From<Box<bincode::error::EncodeError>> for FoldError {
     fn from(err: Box<bincode::error::EncodeError>) -> Self {
-        FoldError::Serialization(err)
+        FoldError::Serialization(err.to_string())
     }
 }
 
 impl From<bincode::error::EncodeError> for FoldError {
     fn from(err: bincode::error::EncodeError) -> Self {
-        FoldError::Serialization(Box::new(err))
+        FoldError::Serialization(err.to_string())
     }
 }
 
 impl From<Box<bincode::error::DecodeError>> for FoldError {
     fn from(err: Box<bincode::error::DecodeError>) -> Self {
-        FoldError::Deserialization(err)
+        FoldError::Deserialization(err.to_string())
     }
 }
 
 impl From<bincode::error::DecodeError> for FoldError {
     fn from(err: bincode::error::DecodeError) -> Self {
-        FoldError::Deserialization(Box::new(err))
+        FoldError::Deserialization(err.to_string())
     }
 }
 

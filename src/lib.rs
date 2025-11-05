@@ -5,11 +5,13 @@ pub mod ortho_database;
 pub mod queue;
 pub mod spatial;
 pub mod splitter;
+pub mod disk_backed_queue;
 
 pub use error::*;
 pub use interner::*;
 pub use ortho_database::*;
 pub use queue::*;
+pub use disk_backed_queue::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use ortho::Ortho;
