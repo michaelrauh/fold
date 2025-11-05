@@ -15,13 +15,14 @@ use std::collections::{HashSet, VecDeque};
 use ortho::Ortho;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho.
-/// Returns a tuple of (new_interner, changed_keys_count).
+/// Returns a tuple of (new_interner, changed_keys_count, frontier_size).
 pub fn process_text(
     text: &str,
     interner: Option<interner::Interner>,
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
-) -> (interner::Interner, usize) {
+    frontier: &mut HashSet<usize>,
+) -> (interner::Interner, usize, usize) {
     // Build or update interner and track changed keys
     let (current_interner, changed_keys_count) = if let Some(prev_interner) = interner {
         let new_interner = prev_interner.add_text(text);
@@ -37,16 +38,25 @@ pub fn process_text(
     
     // Create seed ortho and work queue
     let seed_ortho = Ortho::new(version);
+    let seed_id = seed_ortho.id();
     let mut work_queue: VecDeque<Ortho> = VecDeque::new();
     work_queue.push_back(seed_ortho);
     
+    // Add seed to frontier (will be removed if it produces children)
+    frontier.insert(seed_id);
+    
     // Worker loop: process until queue is empty
     while let Some(ortho) = work_queue.pop_front() {
+        let ortho_id = ortho.id();
+        
         // Get requirements for this ortho
         let (forbidden, required) = ortho.get_requirements();
         
         // Get completions from interner
         let completions = current_interner.intersect(&required, &forbidden);
+        
+        // Track if this ortho produced any children
+        let mut produced_children = false;
         
         // Generate children
         for completion in completions {
@@ -56,6 +66,10 @@ pub fn process_text(
                 // Only add to queue if never seen before
                 if !seen_ids.contains(&child_id) {
                     seen_ids.insert(child_id);
+                    produced_children = true;
+                    
+                    // Add newly discovered ortho to frontier
+                    frontier.insert(child_id);
                     
                     // Check if this child is optimal
                     update_optimal(optimal_ortho, &child);
@@ -64,9 +78,16 @@ pub fn process_text(
                 }
             }
         }
+        
+        // Remove parent from frontier if it produced any children
+        if produced_children {
+            frontier.remove(&ortho_id);
+        }
+        // Note: If it produced nothing, it stays in the frontier (added when it was created as a child, or as seed)
     }
     
-    (current_interner, changed_keys_count)
+    let frontier_size = frontier.len();
+    (current_interner, changed_keys_count, frontier_size)
 }
 
 /// Update the optimal ortho if the new candidate is better
