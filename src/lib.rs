@@ -38,8 +38,12 @@ pub fn process_text(
     
     // Create seed ortho and work queue
     let seed_ortho = Ortho::new(version);
+    let seed_id = seed_ortho.id();
     let mut work_queue: VecDeque<Ortho> = VecDeque::new();
     work_queue.push_back(seed_ortho);
+    
+    // Add seed to frontier (will be removed if it produces children)
+    frontier.insert(seed_id);
     
     // Worker loop: process until queue is empty
     while let Some(ortho) = work_queue.pop_front() {
@@ -78,10 +82,8 @@ pub fn process_text(
         // Remove parent from frontier if it produced any children
         if produced_children {
             frontier.remove(&ortho_id);
-        } else {
-            // If it produced nothing, ensure it's in the frontier
-            frontier.insert(ortho_id);
         }
+        // Note: If it produced nothing, it stays in the frontier (already added when created)
     }
     
     let frontier_size = frontier.len();
