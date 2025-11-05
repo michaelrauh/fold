@@ -895,60 +895,138 @@ mod tests {
 
     #[test]
     fn test_subtract_from_expanded_ortho_contracts() {
-        // Create an ortho and expand it
-        let ortho = Ortho::new(1);
-        let ortho = &ortho.add(1, 1)[0];
-        let ortho = &ortho.add(2, 1)[0];
-        let ortho = &ortho.add(3, 1)[0];
+        // Build up an ortho through multiple adds with different values to test complex canonicalization
+        let ortho0 = Ortho::new(1);
+        assert_eq!(ortho0.dims(), &vec![2, 2]);
+        assert_eq!(ortho0.get_current_position(), 0);
         
-        // This triggers expansion - take the [3,2] option
-        let expanded_orthos = ortho.add(4, 1);
-        let expanded = expanded_orthos.iter().find(|o| o.dims() == &vec![3, 2]).expect("Should have [3,2] expansion");
+        // Add first value
+        let ortho1 = ortho0.add(10, 1)[0].clone();
+        assert_eq!(ortho1.dims(), &vec![2, 2]);
+        assert_eq!(ortho1.get_current_position(), 1);
+        assert_eq!(ortho1.payload()[0], Some(10));
         
-        assert_eq!(expanded.dims(), &vec![3, 2]);
-        assert_eq!(expanded.get_current_position(), 4); // 4 values filled
+        // Add second value (larger)
+        let ortho2 = ortho1.add(30, 1)[0].clone();
+        assert_eq!(ortho2.dims(), &vec![2, 2]);
+        assert_eq!(ortho2.get_current_position(), 2);
+        assert_eq!(ortho2.payload()[0], Some(10));
+        assert_eq!(ortho2.payload()[1], Some(30));
         
-        // Subtracting should contract back to [2,2]
-        let subtracted = expanded.subtract().expect("Should be able to subtract from expanded ortho");
-        assert_eq!(subtracted.dims(), &vec![2, 2], "Should contract back to [2,2]");
-        assert_eq!(subtracted.get_current_position(), 3, "Should have 3 values after subtract");
+        // Add third value (triggers canonicalization since 20 < 30)
+        let ortho3 = ortho2.add(20, 1)[0].clone();
+        assert_eq!(ortho3.dims(), &vec![2, 2]);
+        assert_eq!(ortho3.get_current_position(), 3);
+        assert_eq!(ortho3.payload()[0], Some(10));
+        assert_eq!(ortho3.payload()[1], Some(20)); // Canonicalized: swapped with 30
+        assert_eq!(ortho3.payload()[2], Some(30));
         
-        // Verify the values are correct (should be 1, 2, 3 in some order)
-        let mut values: Vec<usize> = subtracted.payload()
-            .iter()
-            .filter_map(|&v| v)
-            .collect();
-        values.sort();
-        assert_eq!(values, vec![1, 2, 3]);
+        // Add fourth value (triggers expansion to [3,2])
+        let expanded_orthos = ortho3.add(40, 1);
+        let ortho4 = expanded_orthos.iter().find(|o| o.dims() == &vec![3, 2])
+            .expect("Should have [3,2] expansion").clone();
+        assert_eq!(ortho4.dims(), &vec![3, 2]);
+        assert_eq!(ortho4.get_current_position(), 4);
+        
+        // Now test subtracting back through the states
+        // Subtract from ortho4 should contract back to ortho3 state
+        let back_to_3 = ortho4.subtract().expect("Should subtract from expanded");
+        assert_eq!(back_to_3.dims(), &vec![2, 2], "Should contract back to [2,2]");
+        assert_eq!(back_to_3.get_current_position(), 3);
+        let mut values3: Vec<usize> = back_to_3.payload().iter().filter_map(|&v| v).collect();
+        values3.sort();
+        assert_eq!(values3, vec![10, 20, 30], "Should have original 3 values");
+        
+        // Subtract again should go back to ortho2 state
+        let back_to_2 = back_to_3.subtract().expect("Should subtract again");
+        assert_eq!(back_to_2.dims(), &vec![2, 2]);
+        assert_eq!(back_to_2.get_current_position(), 2);
+        assert_eq!(back_to_2.payload()[0], Some(10));
+        assert_eq!(back_to_2.payload()[1], Some(20)); // Should preserve the canonicalized value
+        
+        // Subtract again should go back to ortho1 state
+        let back_to_1 = back_to_2.subtract().expect("Should subtract again");
+        assert_eq!(back_to_1.dims(), &vec![2, 2]);
+        assert_eq!(back_to_1.get_current_position(), 1);
+        assert_eq!(back_to_1.payload()[0], Some(10));
+        assert_eq!(back_to_1.payload()[1], None);
+        
+        // Subtract once more should go back to ortho0 state
+        let back_to_0 = back_to_1.subtract().expect("Should subtract to empty");
+        assert_eq!(back_to_0.dims(), &vec![2, 2]);
+        assert_eq!(back_to_0.get_current_position(), 0);
+        assert_eq!(back_to_0.payload()[0], None);
+        
+        // One more subtract should return None
+        assert_eq!(back_to_0.subtract(), None, "Subtracting from empty should return None");
     }
 
     #[test]
     fn test_subtract_from_expanded_ortho_222_contracts() {
-        // Create an ortho and expand it to [2,2,2]
-        let ortho = Ortho::new(1);
-        let ortho = &ortho.add(1, 1)[0];
-        let ortho = &ortho.add(2, 1)[0];
-        let ortho = &ortho.add(3, 1)[0];
+        // Build up an ortho through multiple adds with different values to test complex canonicalization
+        let ortho0 = Ortho::new(1);
+        assert_eq!(ortho0.dims(), &vec![2, 2]);
+        assert_eq!(ortho0.get_current_position(), 0);
         
-        // This triggers expansion - take the [2,2,2] option
-        let expanded_orthos = ortho.add(4, 1);
-        let expanded = expanded_orthos.iter().find(|o| o.dims() == &vec![2, 2, 2]).expect("Should have [2,2,2] expansion");
+        // Add first value
+        let ortho1 = ortho0.add(5, 1)[0].clone();
+        assert_eq!(ortho1.dims(), &vec![2, 2]);
+        assert_eq!(ortho1.get_current_position(), 1);
+        assert_eq!(ortho1.payload()[0], Some(5));
         
-        assert_eq!(expanded.dims(), &vec![2, 2, 2]);
-        assert_eq!(expanded.get_current_position(), 4); // 4 values filled
+        // Add second value (larger)
+        let ortho2 = ortho1.add(25, 1)[0].clone();
+        assert_eq!(ortho2.dims(), &vec![2, 2]);
+        assert_eq!(ortho2.get_current_position(), 2);
+        assert_eq!(ortho2.payload()[0], Some(5));
+        assert_eq!(ortho2.payload()[1], Some(25));
         
-        // Subtracting should contract back to [2,2]
-        let subtracted = expanded.subtract().expect("Should be able to subtract from expanded ortho");
-        assert_eq!(subtracted.dims(), &vec![2, 2], "Should contract back to [2,2]");
-        assert_eq!(subtracted.get_current_position(), 3, "Should have 3 values after subtract");
+        // Add third value (triggers canonicalization since 15 < 25)
+        let ortho3 = ortho2.add(15, 1)[0].clone();
+        assert_eq!(ortho3.dims(), &vec![2, 2]);
+        assert_eq!(ortho3.get_current_position(), 3);
+        assert_eq!(ortho3.payload()[0], Some(5));
+        assert_eq!(ortho3.payload()[1], Some(15)); // Canonicalized: swapped with 25
+        assert_eq!(ortho3.payload()[2], Some(25));
         
-        // Verify the values are correct (should be 1, 2, 3 in some order)
-        let mut values: Vec<usize> = subtracted.payload()
-            .iter()
-            .filter_map(|&v| v)
-            .collect();
-        values.sort();
-        assert_eq!(values, vec![1, 2, 3]);
+        // Add fourth value (triggers expansion to [2,2,2])
+        let expanded_orthos = ortho3.add(35, 1);
+        let ortho4 = expanded_orthos.iter().find(|o| o.dims() == &vec![2, 2, 2])
+            .expect("Should have [2,2,2] expansion").clone();
+        assert_eq!(ortho4.dims(), &vec![2, 2, 2]);
+        assert_eq!(ortho4.get_current_position(), 4);
+        
+        // Now test subtracting back through the states
+        // Subtract from ortho4 should contract back to ortho3 state
+        let back_to_3 = ortho4.subtract().expect("Should subtract from expanded");
+        assert_eq!(back_to_3.dims(), &vec![2, 2], "Should contract back to [2,2]");
+        assert_eq!(back_to_3.get_current_position(), 3);
+        let mut values3: Vec<usize> = back_to_3.payload().iter().filter_map(|&v| v).collect();
+        values3.sort();
+        assert_eq!(values3, vec![5, 15, 25], "Should have original 3 values");
+        
+        // Subtract again should go back to ortho2 state
+        let back_to_2 = back_to_3.subtract().expect("Should subtract again");
+        assert_eq!(back_to_2.dims(), &vec![2, 2]);
+        assert_eq!(back_to_2.get_current_position(), 2);
+        assert_eq!(back_to_2.payload()[0], Some(5));
+        assert_eq!(back_to_2.payload()[1], Some(15)); // Should preserve the canonicalized value
+        
+        // Subtract again should go back to ortho1 state
+        let back_to_1 = back_to_2.subtract().expect("Should subtract again");
+        assert_eq!(back_to_1.dims(), &vec![2, 2]);
+        assert_eq!(back_to_1.get_current_position(), 1);
+        assert_eq!(back_to_1.payload()[0], Some(5));
+        assert_eq!(back_to_1.payload()[1], None);
+        
+        // Subtract once more should go back to ortho0 state
+        let back_to_0 = back_to_1.subtract().expect("Should subtract to empty");
+        assert_eq!(back_to_0.dims(), &vec![2, 2]);
+        assert_eq!(back_to_0.get_current_position(), 0);
+        assert_eq!(back_to_0.payload()[0], None);
+        
+        // One more subtract should return None
+        assert_eq!(back_to_0.subtract(), None, "Subtracting from empty should return None");
     }
 
     #[test]
