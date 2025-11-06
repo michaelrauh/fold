@@ -139,6 +139,179 @@ where
     Ok((current_interner, changed_keys_count, frontier_size, impacted_frontier_count, processed_count))
 }
 
+/// Parallel version of process_text using Rayon for batch parallelism.
+/// Process a single text through the worker loop with multithreading, updating the interner and tracking optimal ortho.
+/// The checkpoint_fn callback is called every 100k orthos processed.
+/// Returns a tuple of (new_interner, changed_keys_count, frontier_size, impacted_frontier_count, total_processed).
+pub fn process_text_parallel<F>(
+    text: &str,
+    interner: Option<interner::Interner>,
+    seen_ids: &mut HashSet<usize>,
+    optimal_ortho: &mut Option<Ortho>,
+    frontier: &mut HashSet<usize>,
+    frontier_orthos_saved: &mut HashMap<usize, Ortho>,
+    mut checkpoint_fn: F,
+) -> Result<(interner::Interner, usize, usize, usize, usize), FoldError>
+where
+    F: FnMut(usize) -> Result<(), FoldError>,
+{
+    use dashmap::DashSet;
+    use rayon::prelude::*;
+    use std::sync::{Arc, Mutex};
+    
+    // Build or update interner and track changed keys
+    let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
+        let new_interner = prev_interner.add_text(text);
+        let changed_keys = prev_interner.find_changed_keys(&new_interner);
+        let count = changed_keys.len();
+        (new_interner, changed_keys, count)
+    } else {
+        // First interner - all keys are "new" but we return 0 as there's no previous state to compare
+        (interner::Interner::from_text(text), vec![], 0)
+    };
+    
+    let version = current_interner.version();
+    
+    // Track frontier orthos for checking impacted keys and for next iteration
+    let frontier_orthos: Arc<Mutex<HashMap<usize, Ortho>>> = Arc::new(Mutex::new(HashMap::new()));
+    
+    // Find impacted orthos from previous frontier and rewind them
+    let rewound_orthos = find_and_rewind_impacted_orthos(frontier_orthos_saved, &changed_keys, version);
+    let impacted_frontier_count = rewound_orthos.len();
+    
+    // Create seed ortho and work queue
+    let seed_ortho = Ortho::new(version);
+    let seed_id = seed_ortho.id();
+    
+    // Add seed to frontier (will be removed if it produces children)
+    frontier.insert(seed_id);
+    frontier_orthos.lock().unwrap().insert(seed_id, seed_ortho.clone());
+    
+    // Use in-memory Vec for work queue (batch parallelism works better with in-memory)
+    let mut current_batch: Vec<Ortho> = vec![seed_ortho];
+    
+    // Add rewound orthos to work queue, deduplicating by ID
+    for rewound_ortho in rewound_orthos {
+        let rewound_id = rewound_ortho.id();
+        // Only add if we haven't seen this ortho before
+        if !seen_ids.contains(&rewound_id) {
+            seen_ids.insert(rewound_id);
+            current_batch.push(rewound_ortho);
+        }
+    }
+    
+    // Use DashSet for thread-safe seen_ids tracking
+    let seen_ids_concurrent = Arc::new(DashSet::new());
+    for &id in seen_ids.iter() {
+        seen_ids_concurrent.insert(id);
+    }
+    
+    // Track optimal in thread-safe way
+    let optimal_concurrent = Arc::new(Mutex::new(optimal_ortho.clone()));
+    
+    // Track frontier in thread-safe way
+    let frontier_concurrent = Arc::new(DashSet::new());
+    for &id in frontier.iter() {
+        frontier_concurrent.insert(id);
+    }
+    
+    let mut processed_count = 0;
+    let checkpoint_interval = 100000; // Checkpoint every 100k orthos
+    
+    // Worker loop: process batches in parallel until no more work
+    while !current_batch.is_empty() {
+        processed_count += current_batch.len();
+        
+        // Checkpoint every 100k processed
+        if processed_count % checkpoint_interval < current_batch.len() || processed_count / checkpoint_interval != (processed_count - current_batch.len()) / checkpoint_interval {
+            checkpoint_fn(processed_count)?;
+        }
+        
+        // Process current batch in parallel
+        let interner_ref = &current_interner;
+        let seen_ref = &seen_ids_concurrent;
+        let optimal_ref = &optimal_concurrent;
+        let frontier_ref = &frontier_concurrent;
+        let frontier_orthos_ref = &frontier_orthos;
+        
+        let new_children: Vec<(Ortho, usize)> = current_batch
+            .par_iter()
+            .flat_map(|ortho| {
+                let ortho_id = ortho.id();
+                
+                // Get requirements for this ortho
+                let (forbidden, required) = ortho.get_requirements();
+                
+                // Get completions from interner
+                let completions = interner_ref.intersect(&required, &forbidden);
+                
+                let mut local_children = Vec::new();
+                let mut produced_any = false;
+                
+                // Generate children
+                for completion in completions {
+                    let children = ortho.add(completion, version);
+                    for child in children {
+                        let child_id = child.id();
+                        // Only add to queue if never seen before
+                        if seen_ref.insert(child_id) {
+                            produced_any = true;
+                            local_children.push((child, ortho_id));
+                        }
+                    }
+                }
+                
+                // Remove parent from frontier if it produced any children
+                if produced_any {
+                    frontier_ref.remove(&ortho_id);
+                }
+                
+                local_children
+            })
+            .collect();
+        
+        // Update frontier and optimal with new children
+        current_batch.clear();
+        for (child, _parent_id) in new_children {
+            let child_id = child.id();
+            
+            // Add newly discovered ortho to frontier
+            frontier_ref.insert(child_id);
+            
+            // Check if this child is optimal
+            {
+                let mut opt = optimal_ref.lock().unwrap();
+                update_optimal(&mut opt, &child);
+            }
+            
+            // Add to frontier orthos and next batch
+            frontier_orthos_ref.lock().unwrap().insert(child_id, child.clone());
+            current_batch.push(child);
+        }
+    }
+    
+    let frontier_size = frontier_concurrent.len();
+    
+    // Copy concurrent data structures back to regular ones
+    seen_ids.clear();
+    for id in seen_ids_concurrent.iter() {
+        seen_ids.insert(*id);
+    }
+    
+    frontier.clear();
+    for id in frontier_concurrent.iter() {
+        frontier.insert(*id);
+    }
+    
+    *optimal_ortho = optimal_concurrent.lock().unwrap().clone();
+    
+    // Save frontier orthos for next iteration
+    frontier_orthos_saved.clear();
+    frontier_orthos_saved.extend(frontier_orthos.lock().unwrap().clone());
+    
+    Ok((current_interner, changed_keys_count, frontier_size, impacted_frontier_count, processed_count))
+}
+
 /// Find impacted orthos from the frontier and rewind them until the impacted key
 /// is at the "most advanced position" (the next insertion point).
 fn find_and_rewind_impacted_orthos(
@@ -563,5 +736,120 @@ mod follower_diff_tests {
         // Changed keys with compound prefix [0, 1] - both indices in ortho1
         let changed_keys = vec![vec![0, 1]];
         assert_eq!(count_impacted_frontier_orthos(&frontier_orthos, &changed_keys), 1);
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::ortho::Ortho;
+
+    fn no_op_checkpoint(_: usize) -> Result<(), FoldError> { Ok(()) }
+
+    #[test]
+    fn test_parallel_produces_same_results_as_sequential() {
+        let text = "the quick brown fox jumps over the lazy dog";
+        
+        // Run sequential version
+        let mut seen_ids_seq = HashSet::new();
+        let mut optimal_ortho_seq: Option<Ortho> = None;
+        let mut frontier_seq = HashSet::new();
+        let mut frontier_orthos_saved_seq = HashMap::new();
+        
+        let (interner_seq, changed_count_seq, frontier_size_seq, impacted_count_seq, processed_seq) = 
+            process_text(
+                text,
+                None,
+                &mut seen_ids_seq,
+                &mut optimal_ortho_seq,
+                &mut frontier_seq,
+                &mut frontier_orthos_saved_seq,
+                no_op_checkpoint,
+            ).expect("Sequential process_text should succeed");
+        
+        // Run parallel version
+        let mut seen_ids_par = HashSet::new();
+        let mut optimal_ortho_par: Option<Ortho> = None;
+        let mut frontier_par = HashSet::new();
+        let mut frontier_orthos_saved_par = HashMap::new();
+        
+        let (interner_par, changed_count_par, frontier_size_par, impacted_count_par, processed_par) = 
+            process_text_parallel(
+                text,
+                None,
+                &mut seen_ids_par,
+                &mut optimal_ortho_par,
+                &mut frontier_par,
+                &mut frontier_orthos_saved_par,
+                no_op_checkpoint,
+            ).expect("Parallel process_text should succeed");
+        
+        // Verify results are identical
+        assert_eq!(changed_count_seq, changed_count_par, "Changed count should match");
+        assert_eq!(frontier_size_seq, frontier_size_par, "Frontier size should match");
+        assert_eq!(impacted_count_seq, impacted_count_par, "Impacted count should match");
+        assert_eq!(processed_seq, processed_par, "Processed count should match");
+        assert_eq!(seen_ids_seq.len(), seen_ids_par.len(), "Seen IDs count should match");
+        assert_eq!(interner_seq.version(), interner_par.version(), "Interner version should match");
+        
+        // Check that all seen IDs are the same
+        assert_eq!(seen_ids_seq, seen_ids_par, "Seen IDs should be identical");
+        
+        // Check that frontiers are the same
+        assert_eq!(frontier_seq, frontier_par, "Frontiers should be identical");
+        
+        // Check optimal ortho
+        match (optimal_ortho_seq, optimal_ortho_par) {
+            (Some(opt_seq), Some(opt_par)) => {
+                let vol_seq: usize = opt_seq.dims().iter().map(|d| d.saturating_sub(1)).product();
+                let vol_par: usize = opt_par.dims().iter().map(|d| d.saturating_sub(1)).product();
+                assert_eq!(vol_seq, vol_par, "Optimal ortho volumes should match");
+            }
+            (None, None) => {},
+            _ => panic!("Optimal ortho presence should match"),
+        }
+    }
+
+    #[test]
+    fn test_parallel_with_multiple_texts() {
+        let text1 = "a b c";
+        let text2 = "a d";
+        
+        // Sequential version
+        let mut seen_ids_seq = HashSet::new();
+        let mut optimal_ortho_seq: Option<Ortho> = None;
+        let mut frontier_seq = HashSet::new();
+        let mut frontier_orthos_saved_seq = HashMap::new();
+        
+        let (interner1_seq, _, _, _, _) = process_text(
+            text1, None, &mut seen_ids_seq, &mut optimal_ortho_seq, 
+            &mut frontier_seq, &mut frontier_orthos_saved_seq, no_op_checkpoint
+        ).unwrap();
+        
+        let (_, _, _, _, processed_seq) = process_text(
+            text2, Some(interner1_seq), &mut seen_ids_seq, &mut optimal_ortho_seq, 
+            &mut frontier_seq, &mut frontier_orthos_saved_seq, no_op_checkpoint
+        ).unwrap();
+        
+        // Parallel version
+        let mut seen_ids_par = HashSet::new();
+        let mut optimal_ortho_par: Option<Ortho> = None;
+        let mut frontier_par = HashSet::new();
+        let mut frontier_orthos_saved_par = HashMap::new();
+        
+        let (interner1_par, _, _, _, _) = process_text_parallel(
+            text1, None, &mut seen_ids_par, &mut optimal_ortho_par, 
+            &mut frontier_par, &mut frontier_orthos_saved_par, no_op_checkpoint
+        ).unwrap();
+        
+        let (_, _, _, _, processed_par) = process_text_parallel(
+            text2, Some(interner1_par), &mut seen_ids_par, &mut optimal_ortho_par, 
+            &mut frontier_par, &mut frontier_orthos_saved_par, no_op_checkpoint
+        ).unwrap();
+        
+        // Results should match
+        assert_eq!(processed_seq, processed_par, "Total processed should match");
+        assert_eq!(seen_ids_seq.len(), seen_ids_par.len(), "Seen IDs count should match");
+        assert_eq!(frontier_seq.len(), frontier_par.len(), "Frontier size should match");
     }
 }
