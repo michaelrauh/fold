@@ -1,6 +1,9 @@
 use fold::ortho::Ortho;
 use std::collections::{HashSet, HashMap};
 
+
+// Helper for tests - no-op checkpoint function
+fn no_op_checkpoint(_: usize) -> Result<(), fold::FoldError> { Ok(()) }
 #[test]
 fn test_simple_worker_loop() {
     // Arrange
@@ -10,7 +13,7 @@ fn test_simple_worker_loop() {
     let mut frontier = HashSet::new();
     
     // Act
-    let (interner, _changed_keys_count, frontier_size, _impacted_frontier_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner, _changed_keys_count, frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert_eq!(interner.version(), 1, "Should create version 1");
@@ -31,7 +34,7 @@ fn test_multiple_file_processing() {
     
     // Act
     for text in texts {
-        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
         interner = Some(new_interner);
     }
     
@@ -51,7 +54,7 @@ fn test_optimal_ortho_tracking() {
     let mut frontier = HashSet::new();
     
     // Act
-    let (_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     let optimal = optimal_ortho.expect("Should have an optimal ortho");
@@ -73,7 +76,7 @@ fn test_end_to_end_run_pattern() {
     
     // Act
     for text in texts {
-        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
         interner = Some(new_interner);
     }
     
@@ -96,9 +99,9 @@ fn test_interner_version_increments() {
     let mut frontier = HashSet::new();
     
     // Act
-    let (interner1, _, _, _) = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
-    let (interner2, _, _, _) = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
-    let (interner3, _, _, _) = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, _, _, _, _processed) = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
+    let (interner2, _, _, _, _processed) = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
+    let (interner3, _, _, _, _processed) = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert_eq!(interner3.version(), 3, "Should have version 3 after processing 3 texts");
@@ -115,7 +118,7 @@ fn test_seen_ids_accumulate() {
     
     // Act
     for text in texts {
-        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
         interner = Some(new_interner);
     }
     
@@ -132,19 +135,19 @@ fn test_changed_keys_tracking() {
     let mut frontier = HashSet::new();
     
     // Act - first text (baseline)
-    let (interner1, changed_count1, _, _) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, changed_count1, _, _, _processed) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert - first text should have 0 changed keys (no previous interner)
     assert_eq!(changed_count1, 0, "First text should have 0 changed keys");
     
     // Act - second text adds new phrase structure
-    let (interner2, changed_count2, _, _) = fold::process_text("a c", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner2, changed_count2, _, _, _processed) = fold::process_text("a c", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert - second text should have some changed keys
     assert!(changed_count2 > 0, "Second text should have changed keys: {}", changed_count2);
     
     // Act - third text with no new vocabulary or patterns within existing vocab
-    let (_interner3, changed_count3, _, _) = fold::process_text("x y z", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner3, changed_count3, _, _, _processed) = fold::process_text("x y z", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert - third text adds new vocabulary, so should have changed keys
     assert!(changed_count3 > 0, "Third text should have changed keys for new vocabulary");
@@ -159,7 +162,7 @@ fn test_frontier_tracks_leaf_orthos() {
     let mut frontier = HashSet::new();
     
     // Act
-    let (_interner, _changed_keys_count, frontier_size, _impacted_frontier_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner, _changed_keys_count, frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert!(frontier_size > 0, "Frontier should not be empty");
@@ -176,7 +179,7 @@ fn test_frontier_only_contains_leaf_orthos() {
     let mut frontier = HashSet::new();
     
     // Act
-    let (_interner, _changed_keys_count, frontier_size, _impacted_frontier_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner, _changed_keys_count, frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     // With simple text "a b", we expect some orthos to be in frontier
@@ -197,7 +200,7 @@ fn test_frontier_accumulates_across_files() {
     // Act
     let mut frontier_sizes = Vec::new();
     for text in texts {
-        let (new_interner, _changed_keys_count, frontier_size, _impacted_frontier_count) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+        let (new_interner, _changed_keys_count, frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
         frontier_sizes.push(frontier_size);
         interner = Some(new_interner);
     }
@@ -218,7 +221,7 @@ fn test_frontier_is_subset_of_seen_ids() {
     let mut frontier = HashSet::new();
     
     // Act
-    let (_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count, _processed) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     // Every ID in frontier should be in seen_ids
@@ -237,14 +240,14 @@ fn test_impacted_frontier_count_with_no_changes() {
     let mut frontier = HashSet::new();
     
     // Act - first text (baseline, no previous interner to compare)
-    let (interner1, changed_count1, _, impacted_count1) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, changed_count1, _, impacted_count1, _processed) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert_eq!(changed_count1, 0, "First text should have 0 changed keys");
     assert_eq!(impacted_count1, 0, "Should have 0 impacted frontier orthos with no changed keys");
     
     // Act - second text with empty text (no changes)
-    let (_interner2, changed_count2, _, impacted_count2) = fold::process_text("", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner2, changed_count2, _, impacted_count2, _processed) = fold::process_text("", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert_eq!(changed_count2, 0, "Empty text should have 0 changed keys");
@@ -259,7 +262,7 @@ fn test_impacted_frontier_count_with_changes() {
     let mut frontier = HashSet::new();
     
     // Act - first text (baseline)
-    let (interner1, changed_count1, frontier_size1, impacted_count1) = fold::process_text("a b", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, changed_count1, frontier_size1, impacted_count1, _processed) = fold::process_text("a b", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert_eq!(changed_count1, 0, "First text should have 0 changed keys");
@@ -267,7 +270,7 @@ fn test_impacted_frontier_count_with_changes() {
     assert!(frontier_size1 > 0, "Should have frontier orthos");
     
     // Act - second text adds new completion for existing vocab
-    let (_interner2, changed_count2, frontier_size2, impacted_count2) = fold::process_text("a c", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner2, changed_count2, frontier_size2, impacted_count2, _processed) = fold::process_text("a c", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert!(changed_count2 > 0, "Second text should have changed keys");
@@ -284,10 +287,10 @@ fn test_impacted_frontier_count_with_new_vocabulary() {
     let mut frontier = HashSet::new();
     
     // Act - first text
-    let (interner1, _, _, _) = fold::process_text("hello world", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, _, _, _, _processed) = fold::process_text("hello world", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Act - second text with completely new vocabulary
-    let (_interner2, changed_count2, frontier_size2, impacted_count2) = fold::process_text("foo bar", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner2, changed_count2, frontier_size2, impacted_count2, _processed) = fold::process_text("foo bar", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert!(changed_count2 > 0, "Should have changed keys for new vocabulary");
@@ -304,16 +307,16 @@ fn test_impacted_frontier_count_accumulates_correctly() {
     let mut frontier = HashSet::new();
     
     // Act - process multiple texts and track impacted counts
-    let (interner1, _, _, impacted1) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, _, _, impacted1, _processed) = fold::process_text("a b c", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     assert_eq!(impacted1, 0, "First should have 0 impacted");
     
-    let (interner2, changed2, _, impacted2) = fold::process_text("a d", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner2, changed2, _, impacted2, _processed) = fold::process_text("a d", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     if changed2 > 0 {
         // If there were changes, impacted count should be meaningful
         assert!(impacted2 <= frontier.len(), "Impacted should not exceed frontier size");
     }
     
-    let (_interner3, changed3, frontier_size3, impacted3) = fold::process_text("e f", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner3, changed3, frontier_size3, impacted3, _processed) = fold::process_text("e f", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     if changed3 > 0 {
         assert!(impacted3 <= frontier_size3, "Impacted should not exceed frontier size");
     }
@@ -330,10 +333,10 @@ fn test_impacted_frontier_orthos_contain_changed_keys() {
     let mut frontier = HashSet::new();
     
     // Act - Create baseline with simple vocabulary
-    let (interner1, _, _, _) = fold::process_text("the cat", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (interner1, _, _, _, _processed) = fold::process_text("the cat", None, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Act - Add text that changes existing key completions
-    let (_interner2, changed_count, frontier_size, impacted_count) = fold::process_text("the dog", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new()).expect("process_text should succeed");
+    let (_interner2, changed_count, frontier_size, impacted_count, _processed) = fold::process_text("the dog", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut HashMap::new(), no_op_checkpoint).expect("process_text should succeed");
     
     // Assert
     assert!(changed_count > 0, "Should have changed keys when adding new completions");
@@ -360,13 +363,14 @@ fn test_checkpoint_save_and_restore() {
     let mut frontier_orthos_saved = HashMap::new();
     
     // Process first text
-    let (interner1, _, _, _) = fold::process_text(
+    let (interner1, _, _, _, _processed) = fold::process_text(
         "hello world",
         None,
         &mut seen_ids,
         &mut optimal_ortho,
         &mut frontier,
-        &mut frontier_orthos_saved
+        &mut frontier_orthos_saved,
+        no_op_checkpoint
     ).expect("process_text should succeed");
     
     let checkpoint1 = Checkpoint::new(
@@ -376,6 +380,7 @@ fn test_checkpoint_save_and_restore() {
         optimal_ortho.clone(),
         frontier.clone(),
         frontier_orthos_saved.clone(),
+        0, // processed_count
     );
     
     // Save checkpoint
@@ -418,13 +423,14 @@ fn test_checkpoint_continuation() {
     let mut frontier = HashSet::new();
     let mut frontier_orthos_saved = HashMap::new();
     
-    let (interner1, _, _, _) = fold::process_text(
+    let (interner1, _, _, _, _processed) = fold::process_text(
         "first text",
         None,
         &mut seen_ids,
         &mut optimal_ortho,
         &mut frontier,
         &mut frontier_orthos_saved
+        ,no_op_checkpoint
     ).expect("process_text should succeed");
     
     let checkpoint1 = Checkpoint::new(
@@ -434,6 +440,7 @@ fn test_checkpoint_continuation() {
         optimal_ortho.clone(),
         frontier.clone(),
         frontier_orthos_saved.clone(),
+        0, // processed_count
     );
     
     manager.save_checkpoint(&checkpoint1).expect("Should save checkpoint");
@@ -449,13 +456,14 @@ fn test_checkpoint_continuation() {
     let interner = loaded.interner;
     
     // Process second text
-    let (interner2, _, _, _) = fold::process_text(
+    let (interner2, _, _, _, _processed) = fold::process_text(
         "second text",
         interner,
         &mut seen_ids,
         &mut optimal_ortho,
         &mut frontier,
         &mut frontier_orthos_saved
+        ,no_op_checkpoint
     ).expect("process_text should succeed");
     
     // Verify continuation

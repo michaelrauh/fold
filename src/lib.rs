@@ -20,15 +20,20 @@ use ortho::Ortho;
 use std::env;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho.
-/// Returns a tuple of (new_interner, changed_keys_count, frontier_size, impacted_frontier_count).
-pub fn process_text(
+/// The checkpoint_fn callback is called every 100k orthos processed.
+/// Returns a tuple of (new_interner, changed_keys_count, frontier_size, impacted_frontier_count, total_processed).
+pub fn process_text<F>(
     text: &str,
     interner: Option<interner::Interner>,
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
     frontier: &mut HashSet<usize>,
     frontier_orthos_saved: &mut HashMap<usize, Ortho>,
-) -> Result<(interner::Interner, usize, usize, usize), FoldError> {
+    mut checkpoint_fn: F,
+) -> Result<(interner::Interner, usize, usize, usize, usize), FoldError>
+where
+    F: FnMut(usize) -> Result<(), FoldError>,
+{
     // Build or update interner and track changed keys
     let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
         let new_interner = prev_interner.add_text(text);
@@ -74,16 +79,15 @@ pub fn process_text(
     
     // Worker loop: process until queue is empty
     let mut processed_count = 0;
-    let log_interval = 1000; // Log every 1000 orthos processed
+    let checkpoint_interval = 100000; // Checkpoint every 100k orthos
     
     while let Some(ortho) = work_queue.pop()? {
         let ortho_id = ortho.id();
         processed_count += 1;
         
-        // Periodic logging of queue state
-        if processed_count % log_interval == 0 {
-            eprintln!("[worker] Processed: {}, Queue: {}, Seen: {}, Frontier: {}", 
-                processed_count, work_queue.len(), seen_ids.len(), frontier.len());
+        // Checkpoint every 100k processed
+        if processed_count % checkpoint_interval == 0 {
+            checkpoint_fn(processed_count)?;
         }
         
         // Get requirements for this ortho
@@ -132,7 +136,7 @@ pub fn process_text(
     frontier_orthos_saved.clear();
     frontier_orthos_saved.extend(frontier_orthos);
     
-    Ok((current_interner, changed_keys_count, frontier_size, impacted_frontier_count))
+    Ok((current_interner, changed_keys_count, frontier_size, impacted_frontier_count, processed_count))
 }
 
 /// Find impacted orthos from the frontier and rewind them until the impacted key
@@ -375,6 +379,9 @@ mod impacted_backtracking_tests {
         }
     }
 
+    // Helper for tests
+    fn no_op_checkpoint(_: usize) -> Result<(), FoldError> { Ok(()) }
+
     #[test]
     fn test_impacted_backtracking_integration() {
         // Test that rewound orthos are properly integrated into the work queue
@@ -384,26 +391,26 @@ mod impacted_backtracking_tests {
         let mut frontier_orthos_saved = HashMap::new();
         
         // First text - establish baseline
-        let (interner1, _, _, _) = process_text(
+        let (interner1, _, _, _, _processed) = process_text(
             "a b c",
             None,
             &mut seen_ids,
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        ).expect("process_text should succeed");
+        , no_op_checkpoint).expect("process_text should succeed");
         
         let baseline_seen_count = seen_ids.len();
         
         // Second text - should trigger impacted backtracking
-        let (interner2, changed_count, _, _impacted_count) = process_text(
+        let (interner2, changed_count, _, _impacted_count, _processed) = process_text(
             "a d",
             Some(interner1),
             &mut seen_ids,
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        ).expect("process_text should succeed");
+        , no_op_checkpoint).expect("process_text should succeed");
         
         // Verify that changed keys were detected
         assert!(changed_count > 0, "Should have changed keys");
@@ -426,26 +433,26 @@ mod impacted_backtracking_tests {
         let mut frontier_orthos_saved = HashMap::new();
         
         // First text: "a b"
-        let (interner1, _, _, _) = process_text(
+        let (interner1, _, _, _, _processed) = process_text(
             "a b",
             None,
             &mut seen_ids,
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        ).expect("process_text should succeed");
+        , no_op_checkpoint).expect("process_text should succeed");
         
         let seen_after_first = seen_ids.clone();
         
         // Second text: "a c" - adds new completion for prefix "a"
-        let (_, changed_count, _, _impacted_count) = process_text(
+        let (_, changed_count, _, _impacted_count, _processed) = process_text(
             "a c",
             Some(interner1),
             &mut seen_ids,
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        ).expect("process_text should succeed");
+        , no_op_checkpoint).expect("process_text should succeed");
         
         // Should have detected changes
         assert!(changed_count > 0, "Should detect changed keys");

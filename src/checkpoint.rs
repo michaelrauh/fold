@@ -1,14 +1,14 @@
 use crate::error::FoldError;
 use crate::interner::Interner;
 use crate::ortho::Ortho;
-use serde::{Deserialize, Serialize};
+use bincode::{Decode, Encode};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
 /// Checkpoint state that can be saved and restored
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Checkpoint {
     /// Index of the last completed file (0-based)
     pub last_completed_file_index: Option<usize>,
@@ -24,6 +24,57 @@ pub struct Checkpoint {
     pub frontier_orthos_saved: HashMap<usize, Ortho>,
     /// Timestamp when checkpoint was created
     pub timestamp: String,
+    /// Number of orthos processed when checkpoint was created
+    pub processed_count: usize,
+}
+
+// Manual bincode implementation for Checkpoint
+impl Encode for Checkpoint {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        self.last_completed_file_index.encode(encoder)?;
+        self.interner.encode(encoder)?;
+        // Convert HashSet to Vec for encoding
+        let seen_ids_vec: Vec<usize> = self.seen_ids.iter().copied().collect();
+        seen_ids_vec.encode(encoder)?;
+        self.optimal_ortho.encode(encoder)?;
+        let frontier_vec: Vec<usize> = self.frontier.iter().copied().collect();
+        frontier_vec.encode(encoder)?;
+        // Convert HashMap to Vec of tuples
+        let frontier_orthos_vec: Vec<(usize, Ortho)> = self.frontier_orthos_saved.iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        frontier_orthos_vec.encode(encoder)?;
+        self.timestamp.encode(encoder)?;
+        self.processed_count.encode(encoder)?;
+        Ok(())
+    }
+}
+
+impl<Context> Decode<Context> for Checkpoint {
+    fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
+        let last_completed_file_index = Option::<usize>::decode(decoder)?;
+        let interner = Option::<Interner>::decode(decoder)?;
+        let seen_ids_vec = Vec::<usize>::decode(decoder)?;
+        let seen_ids: HashSet<usize> = seen_ids_vec.into_iter().collect();
+        let optimal_ortho = Option::<Ortho>::decode(decoder)?;
+        let frontier_vec = Vec::<usize>::decode(decoder)?;
+        let frontier: HashSet<usize> = frontier_vec.into_iter().collect();
+        let frontier_orthos_vec = Vec::<(usize, Ortho)>::decode(decoder)?;
+        let frontier_orthos_saved: HashMap<usize, Ortho> = frontier_orthos_vec.into_iter().collect();
+        let timestamp = String::decode(decoder)?;
+        let processed_count = usize::decode(decoder)?;
+        
+        Ok(Checkpoint {
+            last_completed_file_index,
+            interner,
+            seen_ids,
+            optimal_ortho,
+            frontier,
+            frontier_orthos_saved,
+            timestamp,
+            processed_count,
+        })
+    }
 }
 
 impl Checkpoint {
@@ -35,6 +86,7 @@ impl Checkpoint {
         optimal_ortho: Option<Ortho>,
         frontier: HashSet<usize>,
         frontier_orthos_saved: HashMap<usize, Ortho>,
+        processed_count: usize,
     ) -> Self {
         let timestamp = chrono::Utc::now().to_rfc3339();
         Self {
@@ -45,23 +97,26 @@ impl Checkpoint {
             frontier,
             frontier_orthos_saved,
             timestamp,
+            processed_count,
         }
     }
 
-    /// Save checkpoint to a file
+    /// Save checkpoint to a file using bincode
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), FoldError> {
         let file = File::create(path).map_err(|e| FoldError::Io(e))?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, self)
+        let mut writer = BufWriter::new(file);
+        let config = bincode::config::standard();
+        bincode::encode_into_std_write(self, &mut writer, config)
             .map_err(|e| FoldError::Serialization(e.to_string()))?;
         Ok(())
     }
 
-    /// Load checkpoint from a file
+    /// Load checkpoint from a file using bincode
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, FoldError> {
         let file = File::open(path).map_err(|e| FoldError::Io(e))?;
-        let reader = BufReader::new(file);
-        let checkpoint = serde_json::from_reader(reader)
+        let mut reader = BufReader::new(file);
+        let config = bincode::config::standard();
+        let checkpoint = bincode::decode_from_std_read(&mut reader, config)
             .map_err(|e| FoldError::Deserialization(e.to_string()))?;
         Ok(checkpoint)
     }
@@ -74,6 +129,13 @@ pub struct CheckpointManager {
 }
 
 impl CheckpointManager {
+    /// Get the checkpoint filename (for use in naming)
+    pub fn checkpoint_filename() -> &'static str {
+        "checkpoint.bin"
+    }
+}
+
+impl CheckpointManager {
     /// Create a new checkpoint manager for the given state directory
     pub fn new<P: AsRef<Path>>(state_dir: P) -> Result<Self, FoldError> {
         let checkpoint_dir = state_dir.as_ref().to_path_buf();
@@ -83,7 +145,7 @@ impl CheckpointManager {
             fs::create_dir_all(&checkpoint_dir).map_err(|e| FoldError::Io(e))?;
         }
         
-        let checkpoint_file = checkpoint_dir.join("checkpoint.json");
+        let checkpoint_file = checkpoint_dir.join(Self::checkpoint_filename());
         
         Ok(Self {
             checkpoint_dir,
@@ -144,6 +206,7 @@ mod tests {
             None,
             HashSet::new(),
             HashMap::new(),
+            0, // processed_count
         );
         assert_eq!(checkpoint.last_completed_file_index, Some(0));
         assert!(!checkpoint.timestamp.is_empty());
@@ -155,7 +218,7 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
         
-        let checkpoint_path = temp_dir.join("test_checkpoint.json");
+        let checkpoint_path = temp_dir.join("test_checkpoint.bin");
         
         // Create checkpoint with some state
         let mut seen_ids = HashSet::new();
@@ -172,6 +235,7 @@ mod tests {
             None,
             frontier.clone(),
             HashMap::new(),
+            0, // processed_count
         );
         
         // Save
@@ -193,7 +257,7 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
         
-        let checkpoint_path = temp_dir.join("test_checkpoint.json");
+        let checkpoint_path = temp_dir.join("test_checkpoint.bin");
         
         let ortho = Ortho::new(1);
         let checkpoint = Checkpoint::new(
@@ -203,6 +267,7 @@ mod tests {
             Some(ortho.clone()),
             HashSet::new(),
             HashMap::new(),
+            0, // processed_count
         );
         
         checkpoint.save(&checkpoint_path).expect("Should save checkpoint");
@@ -241,6 +306,7 @@ mod tests {
             None,
             HashSet::new(),
             HashMap::new(),
+            0, // processed_count
         );
         
         manager.save_checkpoint(&checkpoint).expect("Should save checkpoint");
@@ -267,6 +333,7 @@ mod tests {
             None,
             HashSet::new(),
             HashMap::new(),
+            0, // processed_count
         );
         
         manager.save_checkpoint(&checkpoint).expect("Should save checkpoint");
@@ -284,7 +351,7 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
         
-        let checkpoint_path = temp_dir.join("test_checkpoint.json");
+        let checkpoint_path = temp_dir.join("test_checkpoint.bin");
         
         let ortho1 = Ortho::new(1);
         let ortho2 = Ortho::new(2);
@@ -300,6 +367,7 @@ mod tests {
             None,
             HashSet::new(),
             frontier_orthos.clone(),
+            0, // processed_count
         );
         
         checkpoint.save(&checkpoint_path).expect("Should save checkpoint");
