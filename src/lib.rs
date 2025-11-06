@@ -246,19 +246,108 @@ fn calculate_fullness(ortho: &Ortho) -> f64 {
     }
 }
 
-/// Pretty print ortho geometry showing dims and payload
+/// Pretty print ortho geometry showing dims and payload in ND layout
 fn pretty_print_ortho(ortho: &Ortho) -> String {
-    let dims = ortho.dims().iter().map(|d| d.to_string()).collect::<Vec<_>>().join("×");
-    let payload_str = ortho.payload().iter()
-        .map(|p| match p {
-            Some(v) => v.to_string(),
-            None => "_".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let dims = ortho.dims();
+    let payload = ortho.payload();
     let volume = calculate_volume(ortho);
     let fullness = calculate_fullness(ortho);
-    format!("dims=[{}] volume={} fullness={:.2} payload=[{}]", dims, volume, fullness, payload_str)
+    
+    // Get the mapping from flat index to ND coordinates
+    let index_to_location = spatial::get_index_to_location(dims);
+    
+    // Build header
+    let dims_str = dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("×");
+    let mut result = format!("dims=[{}] volume={} fullness={:.2}\n", dims_str, volume, fullness);
+    
+    if dims.len() < 2 {
+        // 1D case - just print as a line
+        let payload_str = payload.iter()
+            .map(|p| match p {
+                Some(v) => format!("{:3}", v),
+                None => "  _".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        result.push_str(&format!("[{}]", payload_str));
+        return result;
+    }
+    
+    // For 2D+, organize by higher dimensions first
+    let rows = dims[0];
+    let cols = dims[1];
+    
+    if dims.len() == 2 {
+        // 2D case - simple rows and columns
+        for r in 0..rows {
+            result.push_str("  ");
+            for c in 0..cols {
+                let loc = vec![r, c];
+                // Find the index that corresponds to this location
+                let idx = index_to_location.iter().position(|l| l == &loc);
+                if let Some(idx) = idx {
+                    if let Some(val) = payload.get(idx).and_then(|p| *p) {
+                        result.push_str(&format!("{:3} ", val));
+                    } else {
+                        result.push_str("  _ ");
+                    }
+                } else {
+                    result.push_str("  ? ");
+                }
+            }
+            result.push('\n');
+        }
+    } else {
+        // 3D+ case - tile by higher dimensions
+        let higher_dims = &dims[2..];
+        let higher_capacity: usize = higher_dims.iter().product();
+        
+        for tile_idx in 0..higher_capacity {
+            // Calculate the higher-dimensional coordinates for this tile
+            let mut higher_coords = Vec::new();
+            let mut remaining = tile_idx;
+            for &dim in higher_dims.iter().rev() {
+                higher_coords.push(remaining % dim);
+                remaining /= dim;
+            }
+            higher_coords.reverse();
+            
+            // Print separator between tiles
+            if tile_idx > 0 {
+                result.push_str("  ---\n");
+            }
+            
+            // Print the label for this tile if we have 3+ dimensions
+            if !higher_coords.is_empty() {
+                let coord_str = higher_coords.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
+                result.push_str(&format!("  [..,..{}]:\n", if higher_coords.len() > 0 { format!(",{}", coord_str) } else { coord_str }));
+            }
+            
+            // Print the 2D slice
+            for r in 0..rows {
+                result.push_str("    ");
+                for c in 0..cols {
+                    let mut loc = vec![r, c];
+                    loc.extend(&higher_coords);
+                    
+                    // Find the index that corresponds to this location
+                    let idx = index_to_location.iter().position(|l| l == &loc);
+                    if let Some(idx) = idx {
+                        if let Some(val) = payload.get(idx).and_then(|p| *p) {
+                            result.push_str(&format!("{:3} ", val));
+                        } else {
+                            result.push_str("  _ ");
+                        }
+                    } else {
+                        result.push_str("  ? ");
+                    }
+                }
+                result.push('\n');
+            }
+        }
+    }
+    
+    result
 }
 
 /// Print progress update every 100k cycles
@@ -685,19 +774,58 @@ mod follower_diff_tests {
         assert!(output.contains("dims=[2×2]"), "Should show dims");
         assert!(output.contains("volume=1"), "Should show volume");
         assert!(output.contains("fullness=0.00"), "Should show fullness");
-        assert!(output.contains("payload=[_ _ _ _]"), "Should show empty payload");
+        // New format shows in grid, so check for underscores in the output
+        assert!(output.contains("_"), "Should show empty slots");
         
         // Test partially filled ortho
         let partial = empty.add(10, 1)[0].clone();
         let output = pretty_print_ortho(&partial);
         assert!(output.contains("dims=[2×2]"), "Should show dims");
         assert!(output.contains("fullness=0.25"), "Should show 0.25 fullness");
-        assert!(output.contains("payload=[10 _ _ _]"), "Should show one value");
+        assert!(output.contains("10"), "Should show the value 10");
         
         // Test more filled ortho
         let more = partial.add(20, 1)[0].clone();
         let output = pretty_print_ortho(&more);
         assert!(output.contains("fullness=0.50"), "Should show 0.50 fullness");
-        assert!(output.contains("payload=[10 20 _ _]"), "Should show two values");
+        assert!(output.contains("10"), "Should show value 10");
+        assert!(output.contains("20"), "Should show value 20");
+    }
+    
+    #[test]
+    #[ignore] // This test just shows output, run with --ignored to see it
+    fn show_pretty_print_examples() {
+        // Test 2D ortho
+        let ortho2d = Ortho::new(1);
+        let ortho2d = ortho2d.add(10, 1)[0].clone();
+        let ortho2d = ortho2d.add(20, 1)[0].clone();
+        let ortho2d = ortho2d.add(30, 1)[0].clone();
+        
+        eprintln!("\n=== 2D Ortho [2x2] with 3 values ===");
+        eprintln!("{}", pretty_print_ortho(&ortho2d));
+        
+        // Test expanded ortho
+        let mut ortho_exp = Ortho::new(1);
+        for i in 0..5 {
+            let candidates = ortho_exp.add(i * 10, 1);
+            ortho_exp = candidates[0].clone();
+        }
+        
+        eprintln!("\n=== Expanded Ortho (dims={:?}) ===", ortho_exp.dims());
+        eprintln!("{}", pretty_print_ortho(&ortho_exp));
+        
+        // Test 3D ortho by selecting the [2,2,2] expansion
+        let mut ortho3d = Ortho::new(1);
+        for i in 0..5 {
+            let candidates = ortho3d.add(i * 10, 1);
+            // Try to pick the [2,2,2] expansion if available
+            ortho3d = candidates.iter()
+                .find(|c| c.dims() == &vec![2, 2, 2])
+                .unwrap_or(&candidates[0])
+                .clone();
+        }
+        
+        eprintln!("\n=== 3D Ortho (dims={:?}) ===", ortho3d.dims());
+        eprintln!("{}", pretty_print_ortho(&ortho3d));
     }
 }

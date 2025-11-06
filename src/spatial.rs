@@ -102,6 +102,11 @@ pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
 
 pub fn capacity(dims: &[usize]) -> usize { dims.iter().product() }
 
+/// Get the location coordinates for each index position in the flat array
+pub fn get_index_to_location(dims: &[usize]) -> Vec<Vec<usize>> {
+    get_meta(dims).indices_in_order.clone()
+}
+
 fn apply_mapping(positions: &[Vec<usize>], mapping: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
     positions.iter().map(|pos| mapping[pos]).collect()
 }
