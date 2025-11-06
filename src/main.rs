@@ -106,6 +106,11 @@ fn main() -> Result<(), FoldError> {
         
         checkpoint_manager.save_checkpoint(&checkpoint)?;
         
+        // Delete the input file after successful checkpoint
+        if let Err(e) = fs::remove_file(file_path) {
+            eprintln!("Warning: Could not delete input file {:?}: {}", file_path, e);
+        }
+        
         // Final display for this file
         let current_interner = interner.as_ref().unwrap();
         display_status(

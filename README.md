@@ -53,9 +53,9 @@ Default: `./fold_state`
 
 ## Checkpointing
 
-Fold automatically saves checkpoints after processing each file. This allows you to:
+Fold automatically saves checkpoints after processing each file and every 100k orthos. This allows you to:
 - **Resume interrupted processing**: If the program is stopped (Ctrl+C, system crash, etc.), it will automatically resume from the last completed file when restarted
-- **Inspect progress**: Checkpoints are saved as human-readable JSON in `fold_state/checkpoint.json`
+- **Inspect progress**: Checkpoints are saved in binary format in `fold_state/checkpoint.bin`
 - **Monitor state**: Each checkpoint includes a timestamp showing when it was created
 
 The checkpoint includes:
@@ -63,35 +63,45 @@ The checkpoint includes:
 - All seen ortho IDs
 - Current optimal ortho
 - Frontier orthos for continuation
+- Processed count for resumption
 
-Checkpoints are automatically cleared after successful completion. If you want to restart from scratch, simply delete the `checkpoint.json` file.
+Checkpoints are automatically cleared after successful completion. If you want to restart from scratch, simply delete the `checkpoint.bin` file.
+
+**Note**: Input files are automatically deleted after being successfully processed and checkpointed, so the checkpoint is the only way to resume processing.
 
 ### Checkpoint timestamps in logs
 
-The program displays checkpoint timestamps in the logs:
+The program displays checkpoint timestamps in the display:
 ```
-✓ Checkpoint saved at 2025-11-06T00:27:16.680116869+00:00
-```
-
-When resuming from a checkpoint:
-```
-📦 Checkpoint found from 2025-11-06T00:27:16.680116869+00:00
-   Resuming from file index: 2
+Last checkpoint: 2025-11-06T00:27:16.680116869+00:00
 ```
 
 This helps you understand how much progress would be lost if the process is interrupted.
 
 ## Logging
 
-The program provides comprehensive logging:
-- **File progress**: Shows which file is being processed (e.g., "Processing file 3/5")
-- **Queue metrics**: Logs queue length every 1000 orthos processed in the worker loop
-- **State metrics**: Shows vocabulary size, seen orthos count, frontier size
-- **Redrawing output**: Screen clears between file updates for cleaner visualization
+The program provides comprehensive logging with a non-scrolling display:
+- **File progress**: Shows which file is being processed at the top (e.g., "File 3/5: filename.txt")
+- **State metrics**: Shows vocabulary size, seen orthos count, frontier size below the file info
+- **Worker progress**: Shows total orthos processed
+- **Non-scrolling output**: Screen clears and redraws in place for cleaner visualization
+- **Checkpoint timestamps**: Displays when last checkpoint was saved
 
-Example log output:
+The display format:
 ```
-[worker] Processed: 1000, Queue: 450, Seen: 1200, Frontier: 85
+╔══════════════════════════════════════════════════════════════════╗
+║ File 2/5: chapter2.txt                                           ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Interner version: 2
+Vocabulary size: 1523
+Total orthos generated: 45231
+Frontier size: 1842
+
+─── Worker Progress ───
+Processed: 45231
+
+Last checkpoint: 2025-11-06T01:47:12.070835822+00:00
 ```
 
 ## Architecture
