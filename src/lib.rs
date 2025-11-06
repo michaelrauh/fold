@@ -260,20 +260,7 @@ fn pretty_print_ortho(ortho: &Ortho) -> String {
     let dims_str = dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("×");
     let mut result = format!("dims=[{}] volume={} fullness={:.2}\n", dims_str, volume, fullness);
     
-    if dims.len() < 2 {
-        // 1D case - just print as a line
-        let payload_str = payload.iter()
-            .map(|p| match p {
-                Some(v) => format!("{:3}", v),
-                None => "  _".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        result.push_str(&format!("[{}]", payload_str));
-        return result;
-    }
-    
-    // For 2D+, organize by higher dimensions first
+    // Orthos are always at least 2D (base dims are [2,2])
     let rows = dims[0];
     let cols = dims[1];
     
