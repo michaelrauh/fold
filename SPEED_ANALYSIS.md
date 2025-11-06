@@ -185,6 +185,15 @@ Merge periodically:
 - Update optimal
 ```
 
+**Important Note on Impacted Frontiers:**
+When text is added (incrementing interner version), the system must identify frontier orthos that contain changed keys and rewind them to explore new completion paths. In a distributed setting, this requires **bidirectional reconciliation**:
+
+1. **Identify impacted orthos across all machines**: Each machine's frontier must be checked for orthos containing changed keys
+2. **Redistribute rewound orthos**: Rewound orthos may need to be processed on different machines than where the original ortho was
+3. **Coordinate version updates**: All machines must process the same interner version consistently
+
+This adds significant complexity to the merge/synchronization logic beyond simple frontier combination.
+
 ### 3.2 Performance Analysis
 
 **Expected Speedup:**
@@ -318,6 +327,56 @@ if seen_ids.insert(child_id) {  // Single operation
 }
 ```
 
+**Optimization F: Shrink Ortho Memory Footprint**
+```rust
+// Current Ortho structure (src/ortho.rs:8-14)
+pub struct Ortho {
+    version: usize,                    // 8 bytes - not needed for ID computation (except empty orthos)
+    dims: Vec<usize>,                  // 24 bytes + heap
+    payload: Vec<Option<usize>>,       // 24 bytes + heap with many Nones
+}
+
+// Problems:
+// 1. version field: 8 bytes per ortho, only used for empty ortho IDs
+//    - Non-empty orthos compute ID from dims+payload only (see compute_id)
+//    - Wasted 8 bytes × millions of orthos = tens of MB
+// 2. payload stores trailing Nones: Vec<Option<usize>> wastes space
+//    - Example: [Some(1), Some(2), None, None, None, None] (capacity=6, filled=2)
+//    - Could store [1, 2] with offset/length instead
+
+// Optimized structure:
+pub struct Ortho {
+    dims: Vec<usize>,
+    values: Vec<usize>,               // Only filled values, no Options
+    current_position: u16,            // Track insertion point (was computed by scanning)
+    // version removed - pass separately when needed for empty ortho creation
+}
+
+impl Ortho {
+    pub fn get_current_position(&self) -> usize { 
+        self.current_position as usize 
+    }
+    
+    pub fn payload(&self) -> impl Iterator<Item = Option<usize>> {
+        let capacity = spatial::capacity(&self.dims);
+        (0..capacity).map(|i| {
+            if i < self.current_position as usize {
+                Some(self.values[i])
+            } else {
+                None
+            }
+        })
+    }
+}
+
+// Memory savings per ortho:
+// - Remove version: -8 bytes
+// - Remove Options: -1 byte per None (for small orthos with many trailing Nones)
+// - Add current_position: +2 bytes
+// - Net savings: ~6-10 bytes per ortho, more for large sparse orthos
+// For 10M orthos: 60-100 MB saved
+```
+
 ### 4.2 Performance Analysis
 
 **Expected Speedup:**
@@ -326,8 +385,9 @@ if seen_ids.insert(child_id) {  // Single operation
 - **SmallVec optimization**: 5-10% (reduce heap allocations)
 - **Cache ID computation**: 5-10% (avoid redundant hashing)
 - **Optimize HashSet ops**: 3-5% (minor improvement)
+- **Shrink ortho footprint**: 5-10% (better cache locality, less memory bandwidth)
 
-**Combined**: ~40-60% speedup (optimizations compound)
+**Combined**: ~45-70% speedup (optimizations compound)
 
 ### 4.3 Implementation Complexity
 
@@ -339,6 +399,8 @@ if seen_ids.insert(child_id) {  // Single operation
 3. Change `Ortho` data structure to use SmallVec
 4. Add ID caching to Ortho (requires careful invalidation)
 5. Refactor to avoid double cloning
+6. Restructure Ortho to remove version field and use dense value storage
+7. Update all code that accesses payload to use new API
 
 **Dependencies:**
 - `smallvec` (already in deps)
@@ -348,13 +410,14 @@ if seen_ids.insert(child_id) {  // Single operation
 - Buffer reuse requires careful API design
 - SmallVec changes require updating serialization
 - ID caching adds memory overhead (8 bytes per ortho)
+- Ortho restructure requires updating all payload access code
 - Regression risk if not carefully tested
 
 ### 4.4 Decision Matrix
 
 | Criterion | Rating | Notes |
 |-----------|--------|-------|
-| **Performance Gain** | ⭐⭐⭐⭐ | 40-60% speedup, excellent ROI |
+| **Performance Gain** | ⭐⭐⭐⭐ | 45-70% speedup, excellent ROI |
 | **Implementation Complexity** | ⭐⭐⭐⭐ | Moderate - localized changes |
 | **Risk** | ⭐⭐⭐⭐ | Low - incremental, testable changes |
 | **Maintainability** | ⭐⭐⭐⭐ | Good - makes code more efficient |
@@ -515,22 +578,7 @@ if !will_produce_children(&ortho, &interner) {
 }
 ```
 
-**Optimization D: Hierarchical Frontier Processing**
-```rust
-// Process orthos in priority order (e.g., by volume potential)
-// Skip low-potential branches when optimal is already high
-
-struct PriorityQueue {
-    heap: BinaryHeap<(i64, Ortho)>,  // (negative_volume_bound, ortho)
-}
-
-// Only process orthos that could beat current optimal
-if estimated_max_volume(&ortho) <= current_optimal_volume {
-    continue;  // Prune this branch
-}
-```
-
-**Optimization E: Memoize Expensive Spatial Computations**
+**Optimization D: Memoize Expensive Spatial Computations**
 ```rust
 // Current: Thread-local cache for DimMeta (already implemented)
 // Additional: Cache get_requirements results for common patterns
@@ -556,10 +604,9 @@ fn get_requirements_cached(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
 - **Bloom filter**: 10-20% (faster seen checks, especially for large sets)
 - **Incremental interner**: 5-10% (reduce update overhead)
 - **Prune dead-ends**: 5-15% (avoid wasted computation)
-- **Priority processing**: Highly variable (0-50%+ depending on workload)
 - **Requirements caching**: 5-10% (reduce spatial computation)
 
-**Combined**: 25-50% speedup, highly workload-dependent
+**Combined**: 25-45% speedup, highly workload-dependent
 
 ### 6.3 Implementation Complexity
 
@@ -569,8 +616,7 @@ fn get_requirements_cached(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
 1. Integrate Bloom filter library
 2. Implement delta-based interner (complex change)
 3. Add early termination logic
-4. Implement priority queue with volume estimation
-5. Add LRU cache for requirements
+4. Add LRU cache for requirements
 
 **Dependencies:**
 - `bloomfilter` or `probabilistic-collections` crate
@@ -578,7 +624,6 @@ fn get_requirements_cached(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
 
 **Risks:**
 - Bloom filter false positives (need to tune size)
-- Priority queue may reorder results (affects checkpointing)
 - Pruning logic may skip valid paths if heuristic is wrong
 - Caching adds memory overhead
 
@@ -586,7 +631,7 @@ fn get_requirements_cached(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
 
 | Criterion | Rating | Notes |
 |-----------|--------|-------|
-| **Performance Gain** | ⭐⭐⭐⭐ | 25-50% speedup, workload-dependent |
+| **Performance Gain** | ⭐⭐⭐⭐ | 25-45% speedup, workload-dependent |
 | **Implementation Complexity** | ⭐⭐⭐⭐ | Moderate - some complex changes |
 | **Risk** | ⭐⭐⭐⭐ | Low-medium - mostly additive |
 | **Maintainability** | ⭐⭐⭐⭐ | Good - well-encapsulated changes |
@@ -693,8 +738,9 @@ Implement allocation elimination optimizations:
 2. ✅ Eliminate double cloning in worker loop (medium, 15-25% gain)
 3. ✅ Optimize HashSet operations (easy, 3-5% gain)
 4. ✅ Cache Ortho IDs (medium, 5-10% gain)
+5. ✅ Shrink Ortho footprint (medium, 5-10% gain - remove version field, use dense storage)
 
-**Expected Total Gain**: 30-50% speedup
+**Expected Total Gain**: 35-60% speedup
 **Risk**: Low
 **Effort**: Moderate
 
@@ -719,7 +765,7 @@ Implement batch-parallel processing:
 Implement selected algorithmic improvements:
 1. ✅ Bloom filter for seen IDs (fast reject, 10-20% gain)
 2. ✅ Early pruning of dead-end paths (5-15% gain)
-3. Consider priority queue if needed
+3. ✅ LRU caching for requirements (5-10% gain)
 
 **Expected Total Gain**: 15-30% (on top of previous phases)
 **Risk**: Low-Medium
@@ -740,11 +786,11 @@ Implement selected algorithmic improvements:
 | Phase | Optimization | Speedup | Cumulative | Time for 1M Orthos |
 |-------|--------------|---------|------------|-------------------|
 | Baseline | Current | 1.0x | 1.0x | 100 seconds |
-| Phase 1 | Code Opts | 1.4x | 1.4x | 71 seconds |
-| Phase 2 | Multithreading | 4.0x | 5.6x | 18 seconds |
-| Phase 3 | Algorithmic | 1.2x | 6.7x | 15 seconds |
+| Phase 1 | Code Opts | 1.5x | 1.5x | 67 seconds |
+| Phase 2 | Multithreading | 4.0x | 6.0x | 17 seconds |
+| Phase 3 | Algorithmic | 1.2x | 7.2x | 14 seconds |
 
-**Conservative Estimate**: 5-6x total speedup
+**Conservative Estimate**: 5-7x total speedup
 **Optimistic Estimate**: 8-10x total speedup
 
 ### 9.2 Resource Requirements
@@ -823,7 +869,7 @@ The fold worker loop offers significant optimization opportunities through a pha
 **Combined expected speedup: 5-10x** with reasonable implementation effort.
 
 **Recommended approach**:
-- Start with Phase 1 (1-2 weeks, 30-50% gain, low risk)
+- Start with Phase 1 (1-2 weeks, 35-60% gain, low risk)
 - Proceed to Phase 2 (2-4 weeks, 3-5x gain, medium risk)
 - Evaluate need for Phase 3 based on results
 
