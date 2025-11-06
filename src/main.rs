@@ -181,7 +181,7 @@ fn print_ortho_details(ortho: &Ortho, interner: &fold::interner::Interner) {
 fn clear_screen() {
     // ANSI escape code to clear screen and move cursor to top-left
     print!("\x1B[2J\x1B[1;1H");
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
 }
 
 fn log_header(msg: &str) {

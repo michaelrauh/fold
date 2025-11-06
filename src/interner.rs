@@ -125,7 +125,6 @@ impl<'de> serde::Deserialize<'de> for Interner {
                 let mut prefix_to_completions = HashMap::new();
                 for (prefix, completions) in prefix_vec {
                     let mut fbs = FixedBitSet::with_capacity(vocab_len);
-                    fbs.grow(vocab_len);
                     for idx in completions {
                         fbs.insert(idx);
                     }
