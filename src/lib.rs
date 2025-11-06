@@ -230,6 +230,11 @@ fn count_impacted_frontier_orthos(
     count
 }
 
+/// Calculate the volume of an ortho based on its dimensions
+fn calculate_volume(ortho: &Ortho) -> usize {
+    ortho.dims().iter().map(|d| d.saturating_sub(1)).product()
+}
+
 /// Calculate the fullness of an ortho (ratio of filled positions to total capacity)
 fn calculate_fullness(ortho: &Ortho) -> f64 {
     let filled_count = ortho.payload().iter().filter(|p| p.is_some()).count();
@@ -251,7 +256,7 @@ fn pretty_print_ortho(ortho: &Ortho) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let volume: usize = ortho.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let volume = calculate_volume(ortho);
     let fullness = calculate_fullness(ortho);
     format!("dims=[{}] volume={} fullness={:.2} payload=[{}]", dims, volume, fullness, payload_str)
 }
@@ -269,11 +274,11 @@ fn print_progress_update(processed_count: usize, optimal_ortho: &Option<Ortho>) 
 /// Update the optimal ortho if the new candidate is better
 /// Uses volume as primary criterion, fullness as tiebreak
 fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
-    let candidate_volume: usize = candidate.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let candidate_volume = calculate_volume(candidate);
     let candidate_fullness = calculate_fullness(candidate);
     
     let is_optimal = if let Some(current_optimal) = optimal_ortho.as_ref() {
-        let current_volume: usize = current_optimal.dims().iter().map(|d| d.saturating_sub(1)).product();
+        let current_volume = calculate_volume(current_optimal);
         let current_fullness = calculate_fullness(current_optimal);
         
         // Primary criterion: volume
@@ -644,7 +649,7 @@ mod follower_diff_tests {
         // Ortho 1: dims [2,2], payload [10, 20, None, None] - volume=1, fullness=0.5
         let ortho1 = Ortho::new(1).add(10, 1)[0].clone().add(20, 1)[0].clone();
         assert_eq!(ortho1.dims(), &vec![2, 2]);
-        let volume1: usize = ortho1.dims().iter().map(|d| d.saturating_sub(1)).product();
+        let volume1 = calculate_volume(&ortho1);
         assert_eq!(volume1, 1, "Volume should be (2-1)*(2-1) = 1");
         assert_eq!(calculate_fullness(&ortho1), 0.5, "Should be half full");
         
@@ -657,7 +662,7 @@ mod follower_diff_tests {
         // Ortho 2: dims [2,2], payload [10, 20, 30, None] - volume=1, fullness=0.75
         let ortho2 = ortho1.add(30, 1)[0].clone();
         assert_eq!(ortho2.dims(), &vec![2, 2]);
-        let volume2: usize = ortho2.dims().iter().map(|d| d.saturating_sub(1)).product();
+        let volume2 = calculate_volume(&ortho2);
         assert_eq!(volume2, 1, "Volume should still be 1");
         assert_eq!(calculate_fullness(&ortho2), 0.75, "Should be 3/4 full");
         
