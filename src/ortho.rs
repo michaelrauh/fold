@@ -3,8 +3,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use bincode::Encode;
 use bincode::Decode;
+use serde::{Deserialize, Serialize};
 
-#[derive(PartialEq, Debug, Clone, Encode, Decode)]
+#[derive(PartialEq, Debug, Clone, Encode, Decode, Serialize, Deserialize)]
 pub struct Ortho {
     version: usize,
     dims: Vec<usize>,

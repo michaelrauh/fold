@@ -1,9 +1,10 @@
 use crate::splitter::Splitter;
 use crate::error::FoldError;
 use fixedbitset::FixedBitSet;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Interner {
     version: usize,
     vocabulary: Vec<String>,
@@ -44,6 +45,103 @@ impl<Context> bincode::Decode<Context> for Interner {
             vocabulary,
             prefix_to_completions,
         })
+    }
+}
+
+// Custom Serialize/Deserialize for Interner (similar to bincode implementation)
+impl serde::Serialize for Interner {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Interner", 3)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("vocabulary", &self.vocabulary)?;
+        // Serialize prefix_to_completions as Vec<(Vec<usize>, Vec<usize>)>
+        let prefix_vec: Vec<(Vec<usize>, Vec<usize>)> = self.prefix_to_completions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.ones().collect()))
+            .collect();
+        state.serialize_field("prefix_to_completions", &prefix_vec)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Interner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field { Version, Vocabulary, PrefixToCompletions }
+
+        struct InternerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InternerVisitor {
+            type Value = Interner;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("struct Interner")
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<Interner, V::Error>
+            where
+                V: serde::de::MapAccess<'de>,
+            {
+                let mut version = None;
+                let mut vocabulary = None;
+                let mut prefix_vec: Option<Vec<(Vec<usize>, Vec<usize>)>> = None;
+
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Version => {
+                            if version.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version = Some(map.next_value()?);
+                        }
+                        Field::Vocabulary => {
+                            if vocabulary.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vocabulary"));
+                            }
+                            vocabulary = Some(map.next_value()?);
+                        }
+                        Field::PrefixToCompletions => {
+                            if prefix_vec.is_some() {
+                                return Err(serde::de::Error::duplicate_field("prefix_to_completions"));
+                            }
+                            prefix_vec = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let version = version.ok_or_else(|| serde::de::Error::missing_field("version"))?;
+                let vocabulary: Vec<String> = vocabulary.ok_or_else(|| serde::de::Error::missing_field("vocabulary"))?;
+                let prefix_vec = prefix_vec.ok_or_else(|| serde::de::Error::missing_field("prefix_to_completions"))?;
+
+                let vocab_len = vocabulary.len();
+                let mut prefix_to_completions = HashMap::new();
+                for (prefix, completions) in prefix_vec {
+                    let mut fbs = FixedBitSet::with_capacity(vocab_len);
+                    fbs.grow(vocab_len);
+                    for idx in completions {
+                        fbs.insert(idx);
+                    }
+                    prefix_to_completions.insert(prefix, fbs);
+                }
+
+                Ok(Interner {
+                    version,
+                    vocabulary,
+                    prefix_to_completions,
+                })
+            }
+        }
+
+        const FIELDS: &'static [&'static str] = &["version", "vocabulary", "prefix_to_completions"];
+        deserializer.deserialize_struct("Interner", FIELDS, InternerVisitor)
     }
 }
 

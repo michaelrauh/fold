@@ -341,3 +341,127 @@ fn test_impacted_frontier_orthos_contain_changed_keys() {
     // Impacted count should be meaningful and bounded
     assert!(impacted_count <= frontier_size, "Impacted frontier count should not exceed total frontier size");
 }
+
+#[test]
+fn test_checkpoint_save_and_restore() {
+    use fold::{Checkpoint, CheckpointManager};
+    use std::env;
+    
+    // Setup temp directory
+    let temp_dir = env::temp_dir().join("fold_checkpoint_integration_test");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    
+    let manager = CheckpointManager::new(&temp_dir).expect("Should create manager");
+    
+    // Create initial state
+    let mut seen_ids = HashSet::new();
+    let mut optimal_ortho: Option<Ortho> = None;
+    let mut frontier = HashSet::new();
+    let mut frontier_orthos_saved = HashMap::new();
+    
+    // Process first text
+    let (interner1, _, _, _) = fold::process_text(
+        "hello world",
+        None,
+        &mut seen_ids,
+        &mut optimal_ortho,
+        &mut frontier,
+        &mut frontier_orthos_saved
+    ).expect("process_text should succeed");
+    
+    let checkpoint1 = Checkpoint::new(
+        Some(0),
+        Some(interner1.clone()),
+        seen_ids.clone(),
+        optimal_ortho.clone(),
+        frontier.clone(),
+        frontier_orthos_saved.clone(),
+    );
+    
+    // Save checkpoint
+    manager.save_checkpoint(&checkpoint1).expect("Should save checkpoint");
+    assert!(manager.checkpoint_exists());
+    
+    // Load checkpoint
+    let loaded = manager.load_checkpoint().expect("Should load checkpoint");
+    assert!(loaded.is_some());
+    
+    let loaded_checkpoint = loaded.unwrap();
+    assert_eq!(loaded_checkpoint.last_completed_file_index, Some(0));
+    assert_eq!(loaded_checkpoint.seen_ids.len(), seen_ids.len());
+    assert_eq!(loaded_checkpoint.frontier.len(), frontier.len());
+    
+    // Verify interner was restored
+    assert!(loaded_checkpoint.interner.is_some());
+    let loaded_interner = loaded_checkpoint.interner.unwrap();
+    assert_eq!(loaded_interner.version(), interner1.version());
+    assert_eq!(loaded_interner.vocabulary().len(), interner1.vocabulary().len());
+    
+    // Clean up
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_checkpoint_continuation() {
+    use fold::{Checkpoint, CheckpointManager};
+    use std::env;
+    
+    // Setup temp directory
+    let temp_dir = env::temp_dir().join("fold_checkpoint_continuation_test");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    
+    let manager = CheckpointManager::new(&temp_dir).expect("Should create manager");
+    
+    // Create and save first checkpoint
+    let mut seen_ids = HashSet::new();
+    let mut optimal_ortho: Option<Ortho> = None;
+    let mut frontier = HashSet::new();
+    let mut frontier_orthos_saved = HashMap::new();
+    
+    let (interner1, _, _, _) = fold::process_text(
+        "first text",
+        None,
+        &mut seen_ids,
+        &mut optimal_ortho,
+        &mut frontier,
+        &mut frontier_orthos_saved
+    ).expect("process_text should succeed");
+    
+    let checkpoint1 = Checkpoint::new(
+        Some(0),
+        Some(interner1.clone()),
+        seen_ids.clone(),
+        optimal_ortho.clone(),
+        frontier.clone(),
+        frontier_orthos_saved.clone(),
+    );
+    
+    manager.save_checkpoint(&checkpoint1).expect("Should save checkpoint");
+    let initial_seen_count = seen_ids.len();
+    
+    // Load checkpoint and continue
+    let loaded = manager.load_checkpoint().expect("Should load checkpoint").unwrap();
+    
+    let mut seen_ids = loaded.seen_ids;
+    let mut optimal_ortho = loaded.optimal_ortho;
+    let mut frontier = loaded.frontier;
+    let mut frontier_orthos_saved = loaded.frontier_orthos_saved;
+    let interner = loaded.interner;
+    
+    // Process second text
+    let (interner2, _, _, _) = fold::process_text(
+        "second text",
+        interner,
+        &mut seen_ids,
+        &mut optimal_ortho,
+        &mut frontier,
+        &mut frontier_orthos_saved
+    ).expect("process_text should succeed");
+    
+    // Verify continuation
+    assert_eq!(interner2.version(), 2, "Should increment version");
+    assert!(seen_ids.len() >= initial_seen_count, "Should accumulate seen IDs");
+    
+    // Clean up
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

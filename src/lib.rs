@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod error;
 pub mod interner;
 pub mod ortho;
@@ -7,6 +8,7 @@ pub mod spatial;
 pub mod splitter;
 pub mod disk_backed_queue;
 
+pub use checkpoint::*;
 pub use error::*;
 pub use interner::*;
 pub use ortho_database::*;
@@ -71,8 +73,18 @@ pub fn process_text(
     }
     
     // Worker loop: process until queue is empty
+    let mut processed_count = 0;
+    let log_interval = 1000; // Log every 1000 orthos processed
+    
     while let Some(ortho) = work_queue.pop()? {
         let ortho_id = ortho.id();
+        processed_count += 1;
+        
+        // Periodic logging of queue state
+        if processed_count % log_interval == 0 {
+            eprintln!("[worker] Processed: {}, Queue: {}, Seen: {}, Frontier: {}", 
+                processed_count, work_queue.len(), seen_ids.len(), frontier.len());
+        }
         
         // Get requirements for this ortho
         let (forbidden, required) = ortho.get_requirements();
