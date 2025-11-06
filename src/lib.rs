@@ -88,6 +88,7 @@ where
         // Checkpoint every 100k processed
         if processed_count % checkpoint_interval == 0 {
             checkpoint_fn(processed_count)?;
+            print_progress_update(processed_count, optimal_ortho);
         }
         
         // Get requirements for this ortho
@@ -229,12 +230,56 @@ fn count_impacted_frontier_orthos(
     count
 }
 
+/// Calculate the fullness of an ortho (ratio of filled positions to total capacity)
+fn calculate_fullness(ortho: &Ortho) -> f64 {
+    let filled_count = ortho.payload().iter().filter(|p| p.is_some()).count();
+    let total_capacity = ortho.payload().len();
+    if total_capacity == 0 {
+        0.0
+    } else {
+        filled_count as f64 / total_capacity as f64
+    }
+}
+
+/// Pretty print ortho geometry showing dims and payload
+fn pretty_print_ortho(ortho: &Ortho) -> String {
+    let dims = ortho.dims().iter().map(|d| d.to_string()).collect::<Vec<_>>().join("×");
+    let payload_str = ortho.payload().iter()
+        .map(|p| match p {
+            Some(v) => v.to_string(),
+            None => "_".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let volume: usize = ortho.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let fullness = calculate_fullness(ortho);
+    format!("dims=[{}] volume={} fullness={:.2} payload=[{}]", dims, volume, fullness, payload_str)
+}
+
+/// Print progress update every 100k cycles
+fn print_progress_update(processed_count: usize, optimal_ortho: &Option<Ortho>) {
+    eprintln!("Progress: {} orthos processed", processed_count);
+    if let Some(optimal) = optimal_ortho {
+        eprintln!("  Current optimal: {}", pretty_print_ortho(optimal));
+    } else {
+        eprintln!("  No optimal ortho yet");
+    }
+}
+
 /// Update the optimal ortho if the new candidate is better
+/// Uses volume as primary criterion, fullness as tiebreak
 fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
     let candidate_volume: usize = candidate.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let candidate_fullness = calculate_fullness(candidate);
+    
     let is_optimal = if let Some(current_optimal) = optimal_ortho.as_ref() {
         let current_volume: usize = current_optimal.dims().iter().map(|d| d.saturating_sub(1)).product();
-        candidate_volume > current_volume
+        let current_fullness = calculate_fullness(current_optimal);
+        
+        // Primary criterion: volume
+        // Tiebreak: fullness (higher fullness is better)
+        candidate_volume > current_volume || 
+        (candidate_volume == current_volume && candidate_fullness > current_fullness)
     } else {
         true
     };
@@ -563,5 +608,91 @@ mod follower_diff_tests {
         // Changed keys with compound prefix [0, 1] - both indices in ortho1
         let changed_keys = vec![vec![0, 1]];
         assert_eq!(count_impacted_frontier_orthos(&frontier_orthos, &changed_keys), 1);
+    }
+    
+    #[test]
+    fn test_fullness_calculation() {
+        // Test empty ortho
+        let empty = Ortho::new(1);
+        assert_eq!(calculate_fullness(&empty), 0.0, "Empty ortho should have 0.0 fullness");
+        
+        // Test partially filled ortho
+        let partial = empty.add(10, 1)[0].clone();
+        assert_eq!(calculate_fullness(&partial), 0.25, "1 of 4 filled should be 0.25 fullness");
+        
+        // Test more filled ortho
+        let more_filled = partial.add(20, 1)[0].clone();
+        assert_eq!(calculate_fullness(&more_filled), 0.5, "2 of 4 filled should be 0.5 fullness");
+        
+        // Test even more filled ortho
+        let even_more = more_filled.add(30, 1)[0].clone();
+        assert_eq!(calculate_fullness(&even_more), 0.75, "3 of 4 filled should be 0.75 fullness");
+        
+        // Adding a 4th element triggers expansion, so we get a bigger ortho
+        let expanded = even_more.add(40, 1)[0].clone();
+        // After expansion, capacity increases (e.g., to 6 for [3,2] or 8 for [2,2,2])
+        // So fullness will be less than 1.0
+        assert!(calculate_fullness(&expanded) < 1.0, "Expanded ortho won't be fully filled");
+        assert!(calculate_fullness(&expanded) > 0.5, "But should still be more than half filled");
+    }
+    
+    #[test]
+    fn test_optimal_with_fullness_tiebreak() {
+        let mut optimal: Option<Ortho> = None;
+        
+        // Create two orthos with same volume but different fullness
+        // Ortho 1: dims [2,2], payload [10, 20, None, None] - volume=1, fullness=0.5
+        let ortho1 = Ortho::new(1).add(10, 1)[0].clone().add(20, 1)[0].clone();
+        assert_eq!(ortho1.dims(), &vec![2, 2]);
+        let volume1: usize = ortho1.dims().iter().map(|d| d.saturating_sub(1)).product();
+        assert_eq!(volume1, 1, "Volume should be (2-1)*(2-1) = 1");
+        assert_eq!(calculate_fullness(&ortho1), 0.5, "Should be half full");
+        
+        // Set as optimal
+        update_optimal(&mut optimal, &ortho1);
+        assert!(optimal.is_some());
+        assert_eq!(optimal.as_ref().unwrap().id(), ortho1.id());
+        
+        // Create ortho2 with same volume but higher fullness
+        // Ortho 2: dims [2,2], payload [10, 20, 30, None] - volume=1, fullness=0.75
+        let ortho2 = ortho1.add(30, 1)[0].clone();
+        assert_eq!(ortho2.dims(), &vec![2, 2]);
+        let volume2: usize = ortho2.dims().iter().map(|d| d.saturating_sub(1)).product();
+        assert_eq!(volume2, 1, "Volume should still be 1");
+        assert_eq!(calculate_fullness(&ortho2), 0.75, "Should be 3/4 full");
+        
+        // Update optimal - should replace due to higher fullness (tiebreak)
+        update_optimal(&mut optimal, &ortho2);
+        assert_eq!(optimal.as_ref().unwrap().id(), ortho2.id(), "Should prefer higher fullness when volumes are equal");
+        
+        // Create ortho3 with lower fullness but same volume - should not replace
+        // We can't easily create another ortho with same dims and lower fullness than ortho2
+        // So let's test with ortho1 again - should not replace ortho2
+        update_optimal(&mut optimal, &ortho1);
+        assert_eq!(optimal.as_ref().unwrap().id(), ortho2.id(), "Should keep higher fullness ortho");
+    }
+    
+    #[test]
+    fn test_pretty_print_ortho() {
+        // Test empty ortho
+        let empty = Ortho::new(1);
+        let output = pretty_print_ortho(&empty);
+        assert!(output.contains("dims=[2×2]"), "Should show dims");
+        assert!(output.contains("volume=1"), "Should show volume");
+        assert!(output.contains("fullness=0.00"), "Should show fullness");
+        assert!(output.contains("payload=[_ _ _ _]"), "Should show empty payload");
+        
+        // Test partially filled ortho
+        let partial = empty.add(10, 1)[0].clone();
+        let output = pretty_print_ortho(&partial);
+        assert!(output.contains("dims=[2×2]"), "Should show dims");
+        assert!(output.contains("fullness=0.25"), "Should show 0.25 fullness");
+        assert!(output.contains("payload=[10 _ _ _]"), "Should show one value");
+        
+        // Test more filled ortho
+        let more = partial.add(20, 1)[0].clone();
+        let output = pretty_print_ortho(&more);
+        assert!(output.contains("fullness=0.50"), "Should show 0.50 fullness");
+        assert!(output.contains("payload=[10 20 _ _]"), "Should show two values");
     }
 }
