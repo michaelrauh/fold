@@ -17,7 +17,7 @@ fn main() {
         &mut optimal_ortho,
         &mut frontier,
         &mut frontier_orthos_saved
-    );
+    ).expect("process_text should succeed");
     println!("  Version: {}", interner1.version());
     println!("  Changed keys: {}", changed1);
     println!("  Frontier size: {}", frontier1);
@@ -35,7 +35,7 @@ fn main() {
         &mut optimal_ortho,
         &mut frontier,
         &mut frontier_orthos_saved
-    );
+    ).expect("process_text should succeed");
     println!("  Version: {}", interner2.version());
     println!("  Changed keys: {}", changed2);
     println!("  Frontier size: {}", frontier2);
