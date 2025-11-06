@@ -20,19 +20,15 @@ use ortho::Ortho;
 use std::env;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho.
-/// The checkpoint_fn callback is called every 100k orthos processed.
 /// Returns a tuple of (new_interner, changed_keys_count, frontier_size, impacted_frontier_count, total_processed).
-pub fn process_text<F>(
+pub fn process_text(
     text: &str,
     interner: Option<interner::Interner>,
     seen_ids: &mut HashSet<usize>,
     optimal_ortho: &mut Option<Ortho>,
     frontier: &mut HashSet<usize>,
     frontier_orthos_saved: &mut HashMap<usize, Ortho>,
-    mut checkpoint_fn: F,
 ) -> Result<(interner::Interner, usize, usize, usize, usize), FoldError>
-where
-    F: FnMut(usize) -> Result<(), FoldError>,
 {
     // Build or update interner and track changed keys
     let (current_interner, changed_keys, changed_keys_count) = if let Some(prev_interner) = interner {
@@ -68,18 +64,25 @@ where
     work_queue.push(seed_ortho)?;
     
     // Add rewound orthos to work queue, deduplicating by ID
+    let mut rewound_count = 0;
     for rewound_ortho in rewound_orthos {
         let rewound_id = rewound_ortho.id();
         // Only add if we haven't seen this ortho before
         if !seen_ids.contains(&rewound_id) {
             seen_ids.insert(rewound_id);
             work_queue.push(rewound_ortho)?;
+            rewound_count += 1;
         }
+    }
+    
+    if rewound_count > 0 {
+        eprintln!("[loader] Loaded {} frontier orthos into work queue", rewound_count);
     }
     
     // Worker loop: process until queue is empty
     let mut processed_count = 0;
     let checkpoint_interval = 100000; // Checkpoint every 100k orthos
+    let log_interval = 1000; // Log every 1k orthos
     
     while let Some(ortho) = work_queue.pop()? {
         let ortho_id = ortho.id();
@@ -87,8 +90,13 @@ where
         
         // Checkpoint every 100k processed
         if processed_count % checkpoint_interval == 0 {
-            checkpoint_fn(processed_count)?;
             print_progress_update(processed_count, optimal_ortho);
+        }
+        
+        // Log queue state every 1k processed
+        if processed_count % log_interval == 0 {
+            eprintln!("[worker] Processed: {}, Queue: {}, Seen: {}, Frontier: {}", 
+                processed_count, work_queue.len(), seen_ids.len(), frontier.len());
         }
         
         // Get requirements for this ortho
@@ -505,9 +513,6 @@ mod impacted_backtracking_tests {
         }
     }
 
-    // Helper for tests
-    fn no_op_checkpoint(_: usize) -> Result<(), FoldError> { Ok(()) }
-
     #[test]
     fn test_impacted_backtracking_integration() {
         // Test that rewound orthos are properly integrated into the work queue
@@ -524,7 +529,7 @@ mod impacted_backtracking_tests {
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        , no_op_checkpoint).expect("process_text should succeed");
+        ).expect("process_text should succeed");
         
         let baseline_seen_count = seen_ids.len();
         
@@ -536,7 +541,7 @@ mod impacted_backtracking_tests {
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        , no_op_checkpoint).expect("process_text should succeed");
+        ).expect("process_text should succeed");
         
         // Verify that changed keys were detected
         assert!(changed_count > 0, "Should have changed keys");
@@ -566,7 +571,7 @@ mod impacted_backtracking_tests {
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        , no_op_checkpoint).expect("process_text should succeed");
+        ).expect("process_text should succeed");
         
         let seen_after_first = seen_ids.clone();
         
@@ -578,7 +583,7 @@ mod impacted_backtracking_tests {
             &mut optimal_ortho,
             &mut frontier,
             &mut frontier_orthos_saved
-        , no_op_checkpoint).expect("process_text should succeed");
+        ).expect("process_text should succeed");
         
         // Should have detected changes
         assert!(changed_count > 0, "Should detect changed keys");

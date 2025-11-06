@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use fold::ortho::Ortho;
 
-fn no_op_checkpoint(_: usize) -> Result<(), fold::FoldError> { Ok(()) }
-
 fn main() {
     let mut seen_ids = HashSet::new();
     let mut optimal_ortho: Option<Ortho> = None;
@@ -18,8 +16,7 @@ fn main() {
         &mut seen_ids,
         &mut optimal_ortho,
         &mut frontier,
-        &mut frontier_orthos_saved,
-        no_op_checkpoint
+        &mut frontier_orthos_saved
     ).expect("process_text should succeed");
     println!("  Version: {}", interner1.version());
     println!("  Changed keys: {}", changed1);
@@ -38,8 +35,7 @@ fn main() {
         &mut seen_ids,
         &mut optimal_ortho,
         &mut frontier,
-        &mut frontier_orthos_saved,
-        no_op_checkpoint
+        &mut frontier_orthos_saved
     ).expect("process_text should succeed");
     println!("  Version: {}", interner2.version());
     println!("  Changed keys: {}", changed2);

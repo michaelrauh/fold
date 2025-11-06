@@ -2,7 +2,6 @@ use fold::ortho::Ortho;
 use fold::{CheckpointManager, Checkpoint, FoldError};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 fn main() -> Result<(), FoldError> {
@@ -75,20 +74,25 @@ fn main() -> Result<(), FoldError> {
         let text = fs::read_to_string(file_path)
             .map_err(|e| FoldError::Io(e))?;
         
+        // Count words in the file
+        let word_count = text.split_whitespace().count();
+        
         // Shared state for logging
         let file_info = format!("File {}/{}: {}", 
             file_idx + 1, input_files.len(), 
             file_path.file_name().unwrap().to_str().unwrap());
         
-        // Process text through worker loop with checkpoint callback
-        let checkpoint_fn = move |_processed: usize| -> Result<(), FoldError> {
-            // Checkpoints are saved after each file instead of during processing
-            // to avoid complex state management
-            Ok(())
-        };
+        eprintln!("\n{}", file_info);
+        eprintln!("  File size: {} words", word_count);
         
-        let (new_interner, _changed_keys_count, _frontier_size, _impacted_frontier_count, file_processed) = 
-            fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut frontier_orthos_saved, checkpoint_fn)?;
+        // Process text through worker loop
+        let (new_interner, changed_keys_count, _frontier_size, impacted_frontier_count, file_processed) = 
+            fold::process_text(&text, interner, &mut seen_ids, &mut optimal_ortho, &mut frontier, &mut frontier_orthos_saved)?;
+        
+        // Print interner stats
+        eprintln!("  Vocabulary size: {}", new_interner.vocabulary().len());
+        eprintln!("  Impacted keys: {}", changed_keys_count);
+        eprintln!("  Impacted frontier orthos: {}", impacted_frontier_count);
         
         interner = Some(new_interner);
         total_processed += file_processed;
@@ -111,16 +115,9 @@ fn main() -> Result<(), FoldError> {
             eprintln!("Warning: Could not delete input file {:?}: {}", file_path, e);
         }
         
-        // Final display for this file
-        let current_interner = interner.as_ref().unwrap();
-        display_status(
-            &file_info,
-            current_interner,
-            &seen_ids,
-            &frontier,
-            total_processed,
-            &checkpoint.timestamp,
-        );
+        // Print summary for this file
+        eprintln!("\n{} complete - Total orthos: {}, Frontier: {}", 
+            file_info, seen_ids.len(), frontier.len());
     }
     
     // Clear checkpoint after successful completion
@@ -138,39 +135,4 @@ fn main() -> Result<(), FoldError> {
     }
     
     Ok(())
-}
-
-fn display_status(
-    file_info: &str,
-    interner: &fold::interner::Interner,
-    seen_ids: &HashSet<usize>,
-    frontier: &HashSet<usize>,
-    processed: usize,
-    checkpoint_time: &str,
-) {
-    // Clear screen and redraw
-    print!("\x1B[2J\x1B[1;1H");
-    
-    // File info at top
-    println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║ {:<64} ║", file_info);
-    println!("╚══════════════════════════════════════════════════════════════════╝");
-    println!();
-    
-    // Key metrics
-    println!("Interner version: {}", interner.version());
-    println!("Vocabulary size: {}", interner.vocabulary().len());
-    println!("Total orthos generated: {}", seen_ids.len());
-    println!("Frontier size: {}", frontier.len());
-    println!();
-    
-    // Worker progress
-    println!("─── Worker Progress ───");
-    println!("Processed: {}", processed);
-    println!();
-    
-    // Checkpoint info
-    println!("Last checkpoint: {}", checkpoint_time);
-    
-    let _ = io::stdout().flush();
 }
