@@ -74,6 +74,12 @@ pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usi
 
 pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> { get_meta(dims).axis_positions.clone() }
 
+/// Convert a linear payload index to spatial coordinates
+pub fn index_to_coords(index: usize, dims: &[usize]) -> Vec<usize> {
+    let meta = get_meta(dims);
+    meta.index_to_location.get(&index).cloned().unwrap_or_else(|| vec![])
+}
+
 pub fn is_base(dims: &[usize]) -> bool { dims.iter().all(|&x| x == 2) }
 
 pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {

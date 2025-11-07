@@ -31,6 +31,12 @@ impl Ortho {
         let payload = vec![None; 4];
         Ortho { version, dims, payload }
     }
+    
+    /// Create an Ortho from raw parts. Used for testing.
+    pub fn from_raw(version: usize, dims: Vec<usize>, payload: Vec<Option<usize>>) -> Self {
+        Ortho { version, dims, payload }
+    }
+    
     pub fn id(&self) -> usize { Self::compute_id(self.version, &self.dims, &self.payload) }
     pub fn get_current_position(&self) -> usize { self.payload.iter().position(|x| x.is_none()).unwrap_or(self.payload.len()) }
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
@@ -50,12 +56,16 @@ impl Ortho {
                 return Self::expand(self, spatial::expand_over(&self.dims), value, version);
             }
         }
-        if insertion_index == 2 && self.dims.as_slice() == [2, 2] { // axis canonicalization step
+        // Axis canonicalization step at position 2 in base dims [2,2]
+        if insertion_index == 2 && self.dims.as_slice() == [2, 2] {
             let mut new_payload: Vec<Option<usize>> = self.payload.clone();
-            new_payload[insertion_index] = Some(value); // INSERT (bug fix)
+            new_payload[insertion_index] = Some(value);
             // Canonicalize axis token order (positions 1 & 2)
             if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
-                if second > third { new_payload[1] = Some(third); new_payload[2] = Some(second); }
+                if second > third {
+                    new_payload[1] = Some(third);
+                    new_payload[2] = Some(second);
+                }
             }
             return vec![Ortho { version, dims: self.dims.clone(), payload: new_payload }];
         }
@@ -72,12 +82,20 @@ impl Ortho {
         value: usize,
         version: usize,
     ) -> Vec<Ortho> {
+        // CRITICAL: First, create a fully-filled version of the parent ortho
+        // by inserting the value at the current insertion position.
+        // THEN reorganize that filled ortho to the new dimensions.
+        let insertion_index = ortho.payload.iter().position(|x| x.is_none()).unwrap_or(ortho.payload.len());
+        let mut filled_parent = ortho.payload.clone();
+        filled_parent[insertion_index] = Some(value);
+        
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
             let mut new_payload = vec![None; new_capacity];
-            for (i, &pos) in reorg.iter().enumerate() { new_payload[pos] = ortho.payload.get(i).cloned().flatten(); }
-            if let Some(insert_pos) = new_payload.iter().position(|x| x.is_none()) { new_payload[insert_pos] = Some(value); }
-            else if !new_payload.is_empty() { let last = new_payload.len() - 1; new_payload[last] = Some(value); }
+            // Reorganize the FULLY FILLED parent, not the partially filled one
+            for (i, &pos) in reorg.iter().enumerate() { 
+                new_payload[pos] = filled_parent.get(i).cloned().flatten(); 
+            }
             out.push(Ortho { version, dims: new_dims_vec, payload: new_payload });
         }
         out
@@ -148,6 +166,17 @@ impl Ortho {
         Ortho { version, dims: self.dims.clone(), payload: self.payload.clone() }
     }
     pub fn payload(&self) -> &Vec<Option<usize>> { &self.payload }
+    
+    /// Get the most recently inserted value (the value at the last filled position).
+    /// Returns None if the ortho is empty.
+    pub fn last_inserted(&self) -> Option<usize> {
+        let pos = self.get_current_position();
+        if pos == 0 {
+            None
+        } else {
+            self.payload[pos - 1]
+        }
+    }
 }
 
 #[cfg(test)]
@@ -346,7 +375,9 @@ mod tests {
                 Ortho {
                     version: 1,
                     dims: vec![2, 2, 2],
-                    payload: vec![Some(1), Some(2), Some(3), Some(4), None, None, None, None],
+                    // Fixed: token 4 is now at position 4 (where it was validated),
+                    // not position 3 (first empty slot after reorganization)
+                    payload: vec![Some(1), Some(2), Some(3), None, Some(4), None, None, None],
                 }
             ]
         );
@@ -386,10 +417,12 @@ mod tests {
                 Ortho {
                     version: 1,
                     dims: vec![2, 2, 2],
+                    // Fixed: token 15 goes to position 2 (where validated),
+                    // not position 1 (first empty after reorganization)
                     payload: vec![
                         Some(10),
-                        Some(15),
                         None,
+                        Some(15),
                         Some(20),
                         None,
                         None,

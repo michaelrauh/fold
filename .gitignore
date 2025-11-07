@@ -1,6 +1,7 @@
 /target
 *.txt
 .vscode/
+fold_state
 /interner_data
 
 # Added by cargo

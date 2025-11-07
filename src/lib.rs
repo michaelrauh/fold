@@ -5,23 +5,34 @@ pub mod ortho_database;
 pub mod queue;
 pub mod spatial;
 pub mod splitter;
+pub mod disk_queue;
+pub mod seen_tracker;
+pub mod tui;
 
 pub use error::*;
 pub use interner::*;
 pub use ortho_database::*;
 pub use queue::*;
+pub use seen_tracker::SeenTracker;
 
-use std::collections::{HashSet, VecDeque};
 use ortho::Ortho;
+use disk_queue::DiskQueue;
+use std::collections::HashSet;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho
-pub fn process_text(
+pub fn process_text<F>(
     text: &str,
     interner: Option<interner::Interner>,
-    seen_ids: &mut HashSet<usize>,
+    seen_ids: &mut SeenTracker,
     optimal_ortho: &mut Option<Ortho>,
-) -> interner::Interner {
+    ortho_storage: &mut DiskQueue,
+    mut metrics_callback: F,
+) -> Result<interner::Interner, FoldError>
+where
+    F: FnMut(usize, usize),  // (queue_length, total_seen)
+{
     // Build or update interner
+    let prev_interner = interner.clone();
     let current_interner = if let Some(prev_interner) = interner {
         prev_interner.add_text(text)
     } else {
@@ -30,13 +41,36 @@ pub fn process_text(
     
     let version = current_interner.version();
     
-    // Create seed ortho and work queue
-    let seed_ortho = Ortho::new(version);
-    let mut work_queue: VecDeque<Ortho> = VecDeque::new();
-    work_queue.push_back(seed_ortho);
+    // Create work queue with disk spillover
+    let mut work_queue = DiskQueue::new();
     
+    // Always seed the queue with a blank ortho
+    let seed_ortho = Ortho::new(version);
+    work_queue.push_back(seed_ortho)?;
+    
+    // Also add revisit points if we have a previous interner
+    if let Some(ref prev) = prev_interner {
+        let revisit_tokens = find_changed_tokens(prev, &current_interner);
+        if !revisit_tokens.is_empty() {
+            // Flush ortho_storage before reading to ensure all writes are visible
+            ortho_storage.flush()?;
+            let revisit_orthos = find_revisit_orthos(&revisit_tokens)?;
+            for ortho in revisit_orthos {
+                // Update version for new iteration
+                let updated_ortho = ortho.set_version(version);
+                work_queue.push_back(updated_ortho)?;
+            }
+        }
+    }
+    
+    let mut processed = 0;
     // Worker loop: process until queue is empty
-    while let Some(ortho) = work_queue.pop_front() {
+    while let Ok(Some(ortho)) = work_queue.pop_front() {
+        processed += 1;
+        if processed % 1_000 == 0 {
+            metrics_callback(work_queue.len(), seen_ids.len());
+        }
+        
         // Get requirements for this ortho
         let (forbidden, required) = ortho.get_requirements();
         
@@ -48,28 +82,41 @@ pub fn process_text(
             let children = ortho.add(completion, version);
             for child in children {
                 let child_id = child.id();
+                
                 // Only add to queue if never seen before
-                if !seen_ids.contains(&child_id) {
-                    seen_ids.insert(child_id);
+                if !seen_ids.contains(child_id)? {
+                    seen_ids.insert(child_id)?;
+                    
+                    // Save to persistent storage (for later revisiting)
+                    ortho_storage.push_back(child.clone())?;
                     
                     // Check if this child is optimal
                     update_optimal(optimal_ortho, &child);
                     
-                    work_queue.push_back(child);
+                    work_queue.push_back(child)?;
                 }
             }
         }
     }
     
-    current_interner
+    // Final metrics update
+    metrics_callback(work_queue.len(), seen_ids.len());
+    
+    Ok(current_interner)
 }
 
 /// Update the optimal ortho if the new candidate is better
 fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
     let candidate_volume: usize = candidate.dims().iter().map(|d| d.saturating_sub(1)).product();
+    let candidate_filled: usize = candidate.payload().iter().filter(|x| x.is_some()).count();
+    
     let is_optimal = if let Some(current_optimal) = optimal_ortho.as_ref() {
         let current_volume: usize = current_optimal.dims().iter().map(|d| d.saturating_sub(1)).product();
-        candidate_volume > current_volume
+        let current_filled: usize = current_optimal.payload().iter().filter(|x| x.is_some()).count();
+        
+        // First compare by volume, then by how filled they are
+        candidate_volume > current_volume || 
+        (candidate_volume == current_volume && candidate_filled > current_filled)
     } else {
         true
     };
@@ -77,6 +124,66 @@ fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
     if is_optimal {
         *optimal_ortho = Some(candidate.clone());
     }
+}
+
+/// Find tokens whose bitsets have changed between two interner versions
+fn find_changed_tokens(old_interner: &interner::Interner, new_interner: &interner::Interner) -> HashSet<usize> {
+    let mut changed = HashSet::new();
+    
+    // Get all unique prefix keys from both interners
+    let mut _all_prefixes: HashSet<Vec<usize>> = HashSet::new();
+    // We need to access prefix_to_completions - this requires adding a public method to Interner
+    // For now, we'll use a different approach: check each token index
+    
+    // Compare vocabulary - tokens that exist in old interner
+    let old_vocab_len = old_interner.vocabulary().len();
+    
+    for token_idx in 0..old_vocab_len {
+        // Check if this token's completion bitsets have changed
+        // We do this by checking if the token appears in different contexts
+        // For simplicity, check single-token prefixes
+        for prefix_idx in 0..old_vocab_len {
+            let prefix = vec![prefix_idx];
+            let old_completions = old_interner.completions_for_prefix(&prefix);
+            let new_completions = new_interner.completions_for_prefix(&prefix);
+            
+            match (old_completions, new_completions) {
+                (Some(old_bits), Some(new_bits)) => {
+                    // Compare bitsets (ignoring padding differences)
+                    let old_has = token_idx < old_bits.len() && old_bits.contains(token_idx);
+                    let new_has = token_idx < new_bits.len() && new_bits.contains(token_idx);
+                    
+                    if old_has != new_has {
+                        changed.insert(token_idx);
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    // Prefix exists in one but not the other
+                    changed.insert(token_idx);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    
+    changed
+}
+
+/// Find orthos from storage that have one of the changed tokens in their last_inserted position
+fn find_revisit_orthos(changed_tokens: &HashSet<usize>) -> Result<Vec<Ortho>, FoldError> {
+    let all_orthos = DiskQueue::read_all_from_storage()?;
+    let revisit_orthos: Vec<Ortho> = all_orthos
+        .into_iter()
+        .filter(|ortho| {
+            if let Some(last) = ortho.last_inserted() {
+                changed_tokens.contains(&last)
+            } else {
+                false
+            }
+        })
+        .collect();
+    
+    Ok(revisit_orthos)
 }
 
 #[cfg(test)]
