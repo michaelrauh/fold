@@ -27,7 +27,7 @@ pub fn process_text<F>(
     optimal_ortho: &mut Option<Ortho>,
     ortho_storage: &mut DiskQueue,
     mut metrics_callback: F,
-) -> Result<interner::Interner, FoldError>
+) -> Result<(interner::Interner, usize), FoldError>
 where
     F: FnMut(usize, usize),  // (queue_length, total_seen)
 {
@@ -44,9 +44,13 @@ where
     // Create work queue with disk spillover
     let mut work_queue = DiskQueue::new();
     
+    // Track how many orthos we seeded
+    let mut seeded_count = 0;
+    
     // Always seed the queue with a blank ortho
     let seed_ortho = Ortho::new(version);
     work_queue.push_back(seed_ortho)?;
+    seeded_count += 1;
     
     // Also add revisit points if we have a previous interner
     if let Some(ref prev) = prev_interner {
@@ -59,6 +63,7 @@ where
                 // Update version for new iteration
                 let updated_ortho = ortho.set_version(version);
                 work_queue.push_back(updated_ortho)?;
+                seeded_count += 1;
             }
         }
     }
@@ -102,7 +107,7 @@ where
     // Final metrics update
     metrics_callback(work_queue.len(), seen_ids.len());
     
-    Ok(current_interner)
+    Ok((current_interner, seeded_count))
 }
 
 /// Update the optimal ortho if the new candidate is better

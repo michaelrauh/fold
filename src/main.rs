@@ -85,17 +85,11 @@ fn main() -> Result<(), FoldError> {
         
         let word_count = text.split_whitespace().count();
         
-        // Update state for new file
-        {
-            let mut state_lock = state.lock().unwrap();
-            state_lock.start_file(file_idx + 1, word_count, 0);
-        }
-        
         // Process text through worker loop with metrics callback
         let state_clone = Arc::clone(&state);
         let quit_check = Arc::clone(&quit_flag);
         
-        interner = Some(fold::process_text(
+        let (new_interner, seeded_count) = fold::process_text(
             &text, 
             interner, 
             &mut seen_ids, 
@@ -108,7 +102,15 @@ fn main() -> Result<(), FoldError> {
                 let mut state_lock = state_clone.lock().unwrap();
                 state_lock.update_metrics(queue_len, total_found);
             }
-        )?);
+        )?;
+        
+        interner = Some(new_interner);
+        
+        // Update state for new file with the actual seeded count
+        {
+            let mut state_lock = state.lock().unwrap();
+            state_lock.start_file(file_idx + 1, word_count, seeded_count);
+        }
         
         // Update optimal ortho display
         if let Some(ref optimal) = optimal_ortho {
