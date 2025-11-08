@@ -85,23 +85,38 @@ fn main() -> Result<(), FoldError> {
         
         let word_count = text.split_whitespace().count();
         
+        // Build or update interner first (so we have it for the callback)
+        let prev_interner = interner.clone();
+        let current_interner = if let Some(prev_interner) = interner {
+            prev_interner.add_text(&text)
+        } else {
+            fold::interner::Interner::from_text(&text)
+        };
+        
         // Process text through worker loop with metrics callback
         let state_clone = Arc::clone(&state);
         let quit_check = Arc::clone(&quit_flag);
+        let interner_clone = current_interner.clone();
         
         let (new_interner, seeded_count) = fold::process_text(
             &text, 
-            interner, 
+            prev_interner, 
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
-            move |queue_len, total_found, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate| {
+            move |queue_len, total_found, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, optimal_ortho_ref| {
                 if quit_check.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
                 let mut state_lock = state_clone.lock().unwrap();
                 state_lock.update_metrics(queue_len, total_found);
                 state_lock.update_cache_stats(bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate);
+                
+                // Update optimal ortho display in real-time
+                if let Some(optimal) = optimal_ortho_ref {
+                    let ortho_display = format_ortho_display(optimal, &interner_clone);
+                    state_lock.set_optimal(ortho_display);
+                }
             }
         )?;
         
@@ -111,14 +126,6 @@ fn main() -> Result<(), FoldError> {
         {
             let mut state_lock = state.lock().unwrap();
             state_lock.start_file(file_idx + 1, word_count, seeded_count);
-        }
-        
-        // Update optimal ortho display
-        if let Some(ref optimal) = optimal_ortho {
-            let current_interner = interner.as_ref().unwrap();
-            let ortho_display = format_ortho_display(optimal, current_interner);
-            let mut state_lock = state.lock().unwrap();
-            state_lock.set_optimal(ortho_display);
         }
     }
     
