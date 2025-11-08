@@ -37,9 +37,9 @@ pub struct AppState {
     pub queue_memory_count: usize,
     pub queue_disk_count: usize,
     // Queue rate statistics (operations per second)
-    pub work_queue_push_rate: f64,
-    pub work_queue_pull_rate: f64,
-    pub results_queue_push_rate: f64,
+    pub work_queue_disk_write_rate: f64,
+    pub work_queue_disk_read_rate: f64,
+    pub results_queue_disk_write_rate: f64,
 }
 
 impl AppState {
@@ -63,9 +63,9 @@ impl AppState {
             disk_checks: 0,
             queue_memory_count: 0,
             queue_disk_count: 0,
-            work_queue_push_rate: 0.0,
-            work_queue_pull_rate: 0.0,
-            results_queue_push_rate: 0.0,
+            work_queue_disk_write_rate: 0.0,
+            work_queue_disk_read_rate: 0.0,
+            results_queue_disk_write_rate: 0.0,
         }
     }
 
@@ -118,15 +118,15 @@ impl AppState {
     
     pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, 
                               queue_mem: usize, queue_disk: usize,
-                              work_push_rate: f64, work_pull_rate: f64, results_push_rate: f64) {
+                              work_write_rate: f64, work_read_rate: f64, results_write_rate: f64) {
         self.bloom_hits = bloom_hits;
         self.bloom_misses = bloom_misses;
         self.disk_checks = disk_checks;
         self.queue_memory_count = queue_mem;
         self.queue_disk_count = queue_disk;
-        self.work_queue_push_rate = work_push_rate;
-        self.work_queue_pull_rate = work_pull_rate;
-        self.results_queue_push_rate = results_push_rate;
+        self.work_queue_disk_write_rate = work_write_rate;
+        self.work_queue_disk_read_rate = work_read_rate;
+        self.results_queue_disk_write_rate = results_write_rate;
     }
 }
 
@@ -266,12 +266,12 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format_human(state.queue_disk_count as f64)),
         ]),
         Line::from(vec![
-            Span::styled("Work Q Push: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_rate(state.work_queue_push_rate)),
-            Span::styled("  |  Work Q Pull: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_rate(state.work_queue_pull_rate)),
-            Span::styled("  |  Results Q Push: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_rate(state.results_queue_push_rate)),
+            Span::styled("Work Q Disk Write: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_rate(state.work_queue_disk_write_rate)),
+            Span::styled("  |  Work Q Disk Read: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_rate(state.work_queue_disk_read_rate)),
+            Span::styled("  |  Results Q Disk Write: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_rate(state.results_queue_disk_write_rate)),
         ]),
     ];
     

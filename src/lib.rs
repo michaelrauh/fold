@@ -29,7 +29,7 @@ pub fn process_text<F>(
     mut metrics_callback: F,
 ) -> Result<(interner::Interner, usize), FoldError>
 where
-    F: FnMut(usize, usize, usize, usize, usize, usize, usize, f64, f64, f64),  // (queue_length, total_seen, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push_rate, work_pull_rate, results_push_rate)
+    F: FnMut(usize, usize, usize, usize, usize, usize, usize, f64, f64, f64),  // (queue_length, total_seen, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate)
 {
     // Build or update interner
     let prev_interner = interner.clone();
@@ -75,9 +75,9 @@ where
         if processed % 1_000 == 0 {
             let (bloom_hits, bloom_misses, disk_checks) = seen_ids.get_stats();
             let (queue_mem, queue_disk) = work_queue.get_stats();
-            let (work_push_rate, work_pull_rate) = work_queue.get_rates();
-            let (results_push_rate, _) = ortho_storage.get_rates();
-            metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push_rate, work_pull_rate, results_push_rate);
+            let (work_disk_write_rate, work_disk_read_rate) = work_queue.get_rates();
+            let (results_disk_write_rate, _) = ortho_storage.get_rates();
+            metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate);
         }
         
         // Get requirements for this ortho
@@ -111,9 +111,9 @@ where
     // Final metrics update
     let (bloom_hits, bloom_misses, disk_checks) = seen_ids.get_stats();
     let (queue_mem, queue_disk) = work_queue.get_stats();
-    let (work_push_rate, work_pull_rate) = work_queue.get_rates();
-    let (results_push_rate, _) = ortho_storage.get_rates();
-    metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push_rate, work_pull_rate, results_push_rate);
+    let (work_disk_write_rate, work_disk_read_rate) = work_queue.get_rates();
+    let (results_disk_write_rate, _) = ortho_storage.get_rates();
+    metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate);
     
     Ok((current_interner, seeded_count))
 }

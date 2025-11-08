@@ -22,10 +22,10 @@ pub struct DiskQueue {
     disk_count: usize,
     /// Total items ever written to disk (for unique file naming)
     disk_generation: usize,
-    /// Count of pushes for rate calculation
-    push_count: u64,
-    /// Count of pulls for rate calculation
-    pull_count: u64,
+    /// Count of disk writes for rate calculation
+    disk_write_count: u64,
+    /// Count of disk reads for rate calculation
+    disk_read_count: u64,
     /// Time when tracking started (seconds since UNIX_EPOCH)
     start_time: u64,
 }
@@ -43,8 +43,8 @@ impl DiskQueue {
             disk_reader: None,
             disk_count: 0,
             disk_generation: 0,
-            push_count: 0,
-            pull_count: 0,
+            disk_write_count: 0,
+            disk_read_count: 0,
             start_time: now,
         }
     }
@@ -81,8 +81,8 @@ impl DiskQueue {
             disk_reader: None,
             disk_count: 0,
             disk_generation: 0,
-            push_count: 0,
-            pull_count: 0,
+            disk_write_count: 0,
+            disk_read_count: 0,
             start_time: now,
         };
         // Always write to disk for persistent storage
@@ -91,9 +91,6 @@ impl DiskQueue {
 
     /// Push an item to the back of the queue
     pub fn push_back(&mut self, ortho: Ortho) -> Result<(), FoldError> {
-        // Update push count
-        self.push_count += 1;
-        
         // If we're at capacity and have no disk file yet, create one
         if self.memory.len() >= MEMORY_THRESHOLD && self.disk_writer.is_none() {
             self.create_disk_file()?;
@@ -110,6 +107,7 @@ impl DiskQueue {
             writer.write_all(&encoded)
                 .map_err(|e| FoldError::Io(e))?;
             self.disk_count += 1;
+            self.disk_write_count += 1;  // Track actual disk write
         } else {
             // Still room in memory
             self.memory.push_back(ortho);
@@ -122,7 +120,6 @@ impl DiskQueue {
     pub fn pop_front(&mut self) -> Result<Option<Ortho>, FoldError> {
         // First try memory
         if let Some(ortho) = self.memory.pop_front() {
-            self.pull_count += 1;
             return Ok(Some(ortho));
         }
 
@@ -130,7 +127,6 @@ impl DiskQueue {
         if self.disk_count > 0 {
             self.load_from_disk()?;
             if let Some(ortho) = self.memory.pop_front() {
-                self.pull_count += 1;
                 return Ok(Some(ortho));
             } else {
                 return Ok(None);
@@ -156,7 +152,7 @@ impl DiskQueue {
         (self.memory.len(), self.disk_count)
     }
 
-    /// Get the push and pull rates (operations per second)
+    /// Get the disk write and read rates (operations per second)
     pub fn get_rates(&self) -> (f64, f64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -164,10 +160,10 @@ impl DiskQueue {
             .as_secs();
         let elapsed = (now - self.start_time).max(1) as f64; // Avoid division by zero
         
-        let push_rate = self.push_count as f64 / elapsed;
-        let pull_rate = self.pull_count as f64 / elapsed;
+        let write_rate = self.disk_write_count as f64 / elapsed;
+        let read_rate = self.disk_read_count as f64 / elapsed;
         
-        (push_rate, pull_rate)
+        (write_rate, read_rate)
     }
 
     /// Create a new disk file for spillover
@@ -220,6 +216,7 @@ impl DiskQueue {
         let reader = self.disk_reader.as_mut()
             .ok_or_else(|| FoldError::Queue("No disk reader".to_string()))?;
 
+        let mut items_read = 0;
         for _ in 0..batch_size {
             if self.disk_count == 0 {
                 break;
@@ -244,6 +241,12 @@ impl DiskQueue {
 
             self.memory.push_back(ortho);
             self.disk_count -= 1;
+            items_read += 1;
+        }
+
+        // Track actual disk reads (batch read counts as reads)
+        if items_read > 0 {
+            self.disk_read_count += items_read;
         }
 
         // If we've exhausted the disk, clean up
