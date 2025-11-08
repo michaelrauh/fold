@@ -39,13 +39,11 @@ where
         interner::Interner::from_text(text)
     };
     
-    let version = current_interner.version();
-    
     // Create work queue with disk spillover
     let mut work_queue = DiskQueue::new();
     
     // Always seed the queue with a blank ortho
-    let seed_ortho = Ortho::new(version);
+    let seed_ortho = Ortho::new();
     work_queue.push_back(seed_ortho)?;
     
     // Also add revisit points if we have a previous interner
@@ -56,9 +54,7 @@ where
             ortho_storage.flush()?;
             let revisit_orthos = find_revisit_orthos(&revisit_tokens)?;
             for ortho in revisit_orthos {
-                // Update version for new iteration
-                let updated_ortho = ortho.set_version(version);
-                work_queue.push_back(updated_ortho)?;
+                work_queue.push_back(ortho)?;
             }
         }
     }
@@ -79,7 +75,7 @@ where
         
         // Generate children
         for completion in completions {
-            let children = ortho.add(completion, version);
+            let children = ortho.add(completion);
             for child in children {
                 let child_id = child.id();
                 
@@ -207,8 +203,8 @@ mod follower_diff_tests {
     fn test_delta_intersection_adds_only_new() {
         let (low, high) = build_low_high("a b", "a c"); // low has a b; high adds a c
         // Construct ortho with single token 'a' (index 0)
-        let mut o = crate::ortho::Ortho::new(low.version());
-        o = o.add(0, low.version()).pop().unwrap();
+        let mut o = crate::ortho::Ortho::new();
+        o = o.add(0).pop().unwrap();
         let (forbidden, required) = o.get_requirements();
         assert!(forbidden.is_empty());
         assert_eq!(required, vec![vec![0]]);
@@ -224,8 +220,8 @@ mod follower_diff_tests {
     #[test]
     fn test_delta_union_intersection_logic() {
         let (low, high) = build_low_high("a b", "a c");
-        let mut o = crate::ortho::Ortho::new(low.version());
-        o = o.add(0, low.version()).pop().unwrap();
+        let mut o = crate::ortho::Ortho::new();
+        o = o.add(0).pop().unwrap();
         let (forbidden, required) = o.get_requirements();
         let low_set: std::collections::HashSet<usize> = low.intersect(&required, &forbidden).into_iter().collect();
         let high_set: std::collections::HashSet<usize> = high.intersect(&required, &forbidden).into_iter().collect();

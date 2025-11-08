@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn test_push_many_and_pop_one() {
         let mut dbq = MockQueue::new();
-        let orthos = vec![Ortho::new(1), Ortho::new(2)];
+        let orthos = vec![Ortho::new(), Ortho::new()];
         dbq.push_many(orthos.clone()).expect("queue connection failed");
         // Pop first
         let handle1 = dbq.consume_one_at_a_time_forever(|ortho| {

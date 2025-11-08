@@ -328,7 +328,7 @@ impl InternerHolderLike for InMemoryInternerHolder {
         };
         self.interners.insert(interner.version(), interner.clone());
         let version = interner.version();
-        let ortho_seed = crate::ortho::Ortho::new(version);
+        let ortho_seed = crate::ortho::Ortho::new();
         println!("[interner] Seeding workq with ortho: id={}, version={}, dims={:?}", ortho_seed.id(), version, ortho_seed.dims());
         workq.push_many(vec![ortho_seed])?;
         Ok(())

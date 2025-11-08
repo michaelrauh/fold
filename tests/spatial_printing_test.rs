@@ -53,10 +53,10 @@ fn test_ortho_spatial_layout_with_known_phrases() {
     // Token indices: do=0, i=1, not=2, know=3
     
     // Create an ortho and fill it
-    let mut ortho = Ortho::new(1);
-    ortho = ortho.add(0, 1)[0].clone(); // add "do"
-    ortho = ortho.add(1, 1)[0].clone(); // add "i"
-    ortho = ortho.add(1, 1)[0].clone(); // add "i" again
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(0)[0].clone(); // add "do"
+    ortho = ortho.add(1)[0].clone(); // add "i"
+    ortho = ortho.add(1)[0].clone(); // add "i" again
     
     // Now check the spatial coords
     let dims = ortho.dims();

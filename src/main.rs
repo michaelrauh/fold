@@ -162,8 +162,8 @@ fn format_ortho_display(ortho: &Ortho, interner: &fold::interner::Interner) -> S
     let filled: usize = ortho.payload().iter().filter(|x| x.is_some()).count();
     
     let mut result = format!(
-        "V:{} Dims:{:?} Vol:{} Fill:{}/{}\n",
-        ortho.version(), dims, volume, filled, ortho.payload().len()
+        "Dims:{:?} Vol:{} Fill:{}/{}\n",
+        dims, volume, filled, ortho.payload().len()
     );
     
     // Convert payload to tokens

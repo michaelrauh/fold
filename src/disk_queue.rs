@@ -337,8 +337,13 @@ mod tests {
     fn test_memory_only() {
         let mut queue = DiskQueue::new();
         
+        // Create unique orthos by adding different values
+        let mut orthos = Vec::new();
         for i in 0..100 {
-            let ortho = Ortho::new(i);
+            let mut ortho = Ortho::new();
+            // Add i to make each ortho unique
+            ortho = ortho.add(i)[0].clone();
+            orthos.push(ortho.clone());
             queue.push_back(ortho).unwrap();
         }
 
@@ -347,7 +352,7 @@ mod tests {
 
         for i in 0..100 {
             let ortho = queue.pop_front().unwrap().unwrap();
-            assert_eq!(ortho.version(), i);
+            assert_eq!(ortho.id(), orthos[i].id());
         }
 
         assert!(queue.is_empty());
@@ -358,8 +363,12 @@ mod tests {
         let mut queue = DiskQueue::new();
         
         // Add more than MEMORY_THRESHOLD items
+        let mut orthos = Vec::new();
         for i in 0..(MEMORY_THRESHOLD + 1000) {
-            let ortho = Ortho::new(i);
+            let mut ortho = Ortho::new();
+            // Add i to make each ortho unique
+            ortho = ortho.add(i)[0].clone();
+            orthos.push(ortho.clone());
             queue.push_back(ortho).unwrap();
         }
 
@@ -370,7 +379,7 @@ mod tests {
         // Pop all items and verify order
         for i in 0..(MEMORY_THRESHOLD + 1000) {
             let ortho = queue.pop_front().unwrap().unwrap();
-            assert_eq!(ortho.version(), i);
+            assert_eq!(ortho.id(), orthos[i].id());
         }
 
         assert!(queue.is_empty());
