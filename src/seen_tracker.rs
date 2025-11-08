@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 const BLOOM_SIZE: usize = 1_000_000_000; // 1 billion bits = ~119 MB
 const SHARD_COUNT: usize = 256; // Number of disk shards
-const MEMORY_CACHE_SIZE: usize = 100_000; // Keep recent IDs in memory per shard
+const MEMORY_CACHE_SIZE: usize = 10_000; // Keep recent IDs in memory per shard
 
 /// A probabilistic set that uses a bloom filter backed by sharded disk storage
 pub struct SeenTracker {

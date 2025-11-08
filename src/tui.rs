@@ -54,7 +54,7 @@ impl AppState {
         self.found_history.push((elapsed, total_found as f64));
         
         // Downsample history when it gets too large to keep memory bounded
-        const MAX_HISTORY_POINTS: usize = 10_000;
+        const MAX_HISTORY_POINTS: usize = 1_000;
         if self.queue_history.len() > MAX_HISTORY_POINTS {
             // Keep every other point to reduce by half
             self.queue_history = self.queue_history.iter()
