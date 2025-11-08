@@ -29,6 +29,12 @@ pub struct AppState {
     pub optimal_ortho: Option<String>,
     pub current_queue_length: usize,
     pub processing_complete: bool,
+    // Cache statistics
+    pub bloom_hits: usize,
+    pub bloom_misses: usize,
+    pub disk_checks: usize,
+    pub queue_memory_count: usize,
+    pub queue_disk_count: usize,
 }
 
 impl AppState {
@@ -47,6 +53,11 @@ impl AppState {
             optimal_ortho: None,
             current_queue_length: 0,
             processing_complete: false,
+            bloom_hits: 0,
+            bloom_misses: 0,
+            disk_checks: 0,
+            queue_memory_count: 0,
+            queue_disk_count: 0,
         }
     }
 
@@ -95,6 +106,14 @@ impl AppState {
     
     pub fn mark_complete(&mut self) {
         self.processing_complete = true;
+    }
+    
+    pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, queue_mem: usize, queue_disk: usize) {
+        self.bloom_hits = bloom_hits;
+        self.bloom_misses = bloom_misses;
+        self.disk_checks = disk_checks;
+        self.queue_memory_count = queue_mem;
+        self.queue_disk_count = queue_disk;
     }
 }
 
@@ -180,23 +199,45 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let hours = elapsed.as_secs() / 3600;
     let minutes = (elapsed.as_secs() % 3600) / 60;
     let seconds = elapsed.as_secs() % 60;
+    
+    // Calculate cache hit rates
+    let total_bloom_checks = state.bloom_hits + state.bloom_misses;
+    let bloom_hit_rate = if total_bloom_checks > 0 {
+        (state.bloom_hits as f64 / total_bloom_checks as f64) * 100.0
+    } else {
+        0.0
+    };
+    
+    let memory_hit_rate = if state.bloom_misses > 0 {
+        let memory_hits = state.bloom_misses - state.disk_checks;
+        (memory_hits as f64 / state.bloom_misses as f64) * 100.0
+    } else {
+        0.0
+    };
+    
+    let total_queue = state.queue_memory_count + state.queue_disk_count;
+    let queue_spill_rate = if total_queue > 0 {
+        (state.queue_disk_count as f64 / total_queue as f64) * 100.0
+    } else {
+        0.0
+    };
 
     let mut stats_text = vec![
         Line::from(vec![
             Span::styled("File: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{}/{}", state.current_file, state.total_files)),
-            Span::styled("  |  Total Found: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_human(state.total_found as f64)),
             Span::styled("  |  Runtime: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:02}:{:02}:{:02}", hours, minutes, seconds)),
+            Span::styled("  |  Seeded: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_human(state.seeded_count as f64)),
         ]),
         Line::from(vec![
-            Span::styled("Seeded: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_human(state.seeded_count as f64)),
-            Span::styled("  |  Input Words: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_human(state.input_word_count as f64)),
-            Span::styled("  |  Queue Length: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_human(state.current_queue_length as f64)),
+            Span::styled("Bloom Hit: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:.1}%", bloom_hit_rate)),
+            Span::styled("  |  Shard Cache Hit: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:.1}%", memory_hit_rate)),
+            Span::styled("  |  Queue Spill: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:.1}%", queue_spill_rate)),
         ]),
     ];
     

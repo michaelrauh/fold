@@ -122,6 +122,11 @@ impl DiskQueue {
         self.memory.len() + self.disk_count
     }
 
+    /// Get statistics about memory vs disk usage
+    pub fn get_stats(&self) -> (usize, usize) {
+        (self.memory.len(), self.disk_count)
+    }
+
     /// Create a new disk file for spillover
     fn create_disk_file(&mut self) -> Result<(), FoldError> {
         let state_dir = std::env::var("FOLD_STATE_DIR")
