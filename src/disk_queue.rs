@@ -1,6 +1,7 @@
 use crate::ortho::Ortho;
 use crate::FoldError;
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Read};
 use std::path::PathBuf;
@@ -21,6 +22,10 @@ pub struct DiskQueue {
     disk_count: usize,
     /// Total items ever written to disk (for unique file naming)
     disk_generation: usize,
+    /// Time of last push (seconds since UNIX_EPOCH)
+    last_push_time: Option<u64>,
+    /// Time of last pull (seconds since UNIX_EPOCH)
+    last_pull_time: Option<u64>,
 }
 
 impl DiskQueue {
@@ -32,11 +37,14 @@ impl DiskQueue {
             disk_reader: None,
             disk_count: 0,
             disk_generation: 0,
+            last_push_time: None,
+            last_pull_time: None,
         }
     }
 
     /// Create a DiskQueue that writes to a persistent storage file (for ortho logging)
     pub fn new_persistent() -> Result<Self, FoldError> {
+    // (fields above are only in struct, not here)
         let state_dir = std::env::var("FOLD_STATE_DIR")
             .unwrap_or_else(|_| "./fold_state".to_string());
         let storage_path = PathBuf::from(&state_dir).join("ortho_storage.bin");
@@ -47,7 +55,7 @@ impl DiskQueue {
                 .map_err(|e| FoldError::Io(e))?;
         }
 
-        // Open file for appending
+    // Open file for appending
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -61,14 +69,17 @@ impl DiskQueue {
             disk_reader: None,
             disk_count: 0,
             disk_generation: 0,
+            last_push_time: None,
+            last_pull_time: None,
         };
-
         // Always write to disk for persistent storage
         Ok(queue)
     }
 
     /// Push an item to the back of the queue
     pub fn push_back(&mut self, ortho: Ortho) -> Result<(), FoldError> {
+    // Update last push time
+    self.last_push_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
         // If we're at capacity and have no disk file yet, create one
         if self.memory.len() >= MEMORY_THRESHOLD && self.disk_writer.is_none() {
             self.create_disk_file()?;
@@ -78,14 +89,12 @@ impl DiskQueue {
         if let Some(ref mut writer) = self.disk_writer {
             let encoded = bincode::encode_to_vec(&ortho, bincode::config::standard())
                 .map_err(|e| FoldError::Serialization(Box::new(e)))?;
-            
             // Write length prefix then data
             let len = encoded.len() as u32;
             writer.write_all(&len.to_le_bytes())
                 .map_err(|e| FoldError::Io(e))?;
             writer.write_all(&encoded)
                 .map_err(|e| FoldError::Io(e))?;
-            
             self.disk_count += 1;
         } else {
             // Still room in memory
@@ -99,13 +108,19 @@ impl DiskQueue {
     pub fn pop_front(&mut self) -> Result<Option<Ortho>, FoldError> {
         // First try memory
         if let Some(ortho) = self.memory.pop_front() {
+            self.last_pull_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
             return Ok(Some(ortho));
         }
 
         // If memory is empty, try to load from disk
         if self.disk_count > 0 {
             self.load_from_disk()?;
-            return Ok(self.memory.pop_front());
+            if let Some(ortho) = self.memory.pop_front() {
+                self.last_pull_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+                return Ok(Some(ortho));
+            } else {
+                return Ok(None);
+            }
         }
 
         // Queue is empty
@@ -125,6 +140,11 @@ impl DiskQueue {
     /// Get statistics about memory vs disk usage
     pub fn get_stats(&self) -> (usize, usize) {
         (self.memory.len(), self.disk_count)
+    }
+
+    /// Get the last push and pull times (seconds since UNIX_EPOCH)
+    pub fn get_times(&self) -> (Option<u64>, Option<u64>) {
+        (self.last_push_time, self.last_pull_time)
     }
 
     /// Create a new disk file for spillover
@@ -323,6 +343,7 @@ mod tests {
     #[test]
     fn test_memory_only() {
         let mut queue = DiskQueue::new();
+    
         
         for i in 0..100 {
             let ortho = Ortho::new(i);

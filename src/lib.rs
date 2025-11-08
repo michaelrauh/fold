@@ -29,7 +29,7 @@ pub fn process_text<F>(
     mut metrics_callback: F,
 ) -> Result<(interner::Interner, usize), FoldError>
 where
-    F: FnMut(usize, usize, usize, usize, usize, usize, usize),  // (queue_length, total_seen, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk)
+    F: FnMut(usize, usize, usize, usize, usize, usize, usize, Option<u64>, Option<u64>, Option<u64>),  // (queue_length, total_seen, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_queue_push, work_queue_pull, results_queue_push)
 {
     // Build or update interner
     let prev_interner = interner.clone();
@@ -75,7 +75,9 @@ where
         if processed % 1_000 == 0 {
             let (bloom_hits, bloom_misses, disk_checks) = seen_ids.get_stats();
             let (queue_mem, queue_disk) = work_queue.get_stats();
-            metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk);
+            let (work_push, work_pull) = work_queue.get_times();
+            let (results_push, _) = ortho_storage.get_times();
+            metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push, work_pull, results_push);
         }
         
         // Get requirements for this ortho
@@ -109,7 +111,9 @@ where
     // Final metrics update
     let (bloom_hits, bloom_misses, disk_checks) = seen_ids.get_stats();
     let (queue_mem, queue_disk) = work_queue.get_stats();
-    metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk);
+    let (work_push, work_pull) = work_queue.get_times();
+    let (results_push, _) = ortho_storage.get_times();
+    metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push, work_pull, results_push);
     
     Ok((current_interner, seeded_count))
 }

@@ -33,8 +33,13 @@ pub struct AppState {
     pub bloom_hits: usize,
     pub bloom_misses: usize,
     pub disk_checks: usize,
+    // Queue statistics
     pub queue_memory_count: usize,
     pub queue_disk_count: usize,
+    // Queue timing statistics (seconds since UNIX_EPOCH)
+    pub work_queue_last_push: Option<u64>,
+    pub work_queue_last_pull: Option<u64>,
+    pub results_queue_last_push: Option<u64>,
 }
 
 impl AppState {
@@ -58,6 +63,9 @@ impl AppState {
             disk_checks: 0,
             queue_memory_count: 0,
             queue_disk_count: 0,
+            work_queue_last_push: None,
+            work_queue_last_pull: None,
+            results_queue_last_push: None,
         }
     }
 
@@ -108,12 +116,17 @@ impl AppState {
         self.processing_complete = true;
     }
     
-    pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, queue_mem: usize, queue_disk: usize) {
+    pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, 
+                              queue_mem: usize, queue_disk: usize,
+                              work_queue_push: Option<u64>, work_queue_pull: Option<u64>, results_queue_push: Option<u64>) {
         self.bloom_hits = bloom_hits;
         self.bloom_misses = bloom_misses;
         self.disk_checks = disk_checks;
         self.queue_memory_count = queue_mem;
         self.queue_disk_count = queue_disk;
+        self.work_queue_last_push = work_queue_push;
+        self.work_queue_last_pull = work_queue_pull;
+        self.results_queue_last_push = results_queue_push;
     }
 }
 
@@ -215,12 +228,18 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         0.0
     };
     
-    let total_queue = state.queue_memory_count + state.queue_disk_count;
-    let queue_spill_rate = if total_queue > 0 {
-        (state.queue_disk_count as f64 / total_queue as f64) * 100.0
-    } else {
-        0.0
-    };
+    // Calculate time since last queue operations
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    let work_push_elapsed = state.work_queue_last_push.map(|t| now - t);
+    let work_pull_elapsed = state.work_queue_last_pull.map(|t| now - t);
+    let results_push_elapsed = state.results_queue_last_push.map(|t| now - t);
+    
+    // Get RAM usage
+    let ram_percent = get_ram_usage_percent();
 
     let mut stats_text = vec![
         Line::from(vec![
@@ -230,14 +249,28 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format!("{:02}:{:02}:{:02}", hours, minutes, seconds)),
             Span::styled("  |  Seeded: ", Style::default().fg(Color::Cyan)),
             Span::raw(format_human(state.seeded_count as f64)),
+            Span::styled("  |  RAM: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:.1}%", ram_percent)),
         ]),
         Line::from(vec![
             Span::styled("Bloom Hit: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:.1}%", bloom_hit_rate)),
             Span::styled("  |  Shard Cache Hit: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:.1}%", memory_hit_rate)),
-            Span::styled("  |  Queue Spill: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{:.1}%", queue_spill_rate)),
+        ]),
+        Line::from(vec![
+            Span::styled("Queue Mem: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_human(state.queue_memory_count as f64)),
+            Span::styled("  |  Queue Disk: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_human(state.queue_disk_count as f64)),
+        ]),
+        Line::from(vec![
+            Span::styled("Work Q Push: ", Style::default().fg(Color::Cyan)),
+            Span::raw(work_push_elapsed.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "N/A".to_string())),
+            Span::styled("  |  Work Q Pull: ", Style::default().fg(Color::Cyan)),
+            Span::raw(work_pull_elapsed.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "N/A".to_string())),
+            Span::styled("  |  Results Q Push: ", Style::default().fg(Color::Cyan)),
+            Span::raw(results_push_elapsed.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "N/A".to_string())),
         ]),
     ];
     
@@ -459,4 +492,44 @@ fn render_optimal(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) 
         .style(Style::default().fg(Color::White));
 
     f.render_widget(paragraph, area);
+}
+
+fn get_ram_usage_percent() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        
+        if let Ok(file) = File::open("/proc/meminfo") {
+            let reader = BufReader::new(file);
+            let mut total_kb = 0u64;
+            let mut available_kb = 0u64;
+            
+            for line in reader.lines().flatten() {
+                if line.starts_with("MemTotal:") {
+                    total_kb = line.split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                } else if line.starts_with("MemAvailable:") {
+                    available_kb = line.split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+            
+            if total_kb > 0 {
+                let used_kb = total_kb.saturating_sub(available_kb);
+                return (used_kb as f64 / total_kb as f64) * 100.0;
+            }
+        }
+        return 0.0;
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        // For non-Linux systems, return 0.0
+        0.0
+    }
 }
