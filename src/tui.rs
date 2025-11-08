@@ -267,7 +267,9 @@ fn render_charts(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
 
 fn render_optimal(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let text = if let Some(ref ortho) = state.optimal_ortho {
-        vec![Line::from(Span::raw(ortho.clone()))]
+        ortho.lines()
+            .map(|line| Line::from(Span::raw(line.to_string())))
+            .collect::<Vec<_>>()
     } else {
         vec![Line::from(Span::styled(
             "No optimal ortho yet",
