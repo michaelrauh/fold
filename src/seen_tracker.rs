@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Read};
 use std::path::PathBuf;
 
-const BLOOM_SIZE: usize = 1_000_000_000; // 1 billion bits = ~119 MB
+const BLOOM_SIZE: usize = 4_000_000_000; // 4 billion bits = ~476 MB
 const SHARD_COUNT: usize = 256; // Number of disk shards
 const MEMORY_CACHE_SIZE: usize = 10_000; // Keep recent IDs in memory per shard
 

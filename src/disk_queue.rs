@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Read};
 use std::path::PathBuf;
 
-const MEMORY_THRESHOLD: usize = 1_000;
+const MEMORY_THRESHOLD: usize = 10_000;
 
 /// A queue that keeps items in memory up to MEMORY_THRESHOLD, then spills to disk
 pub struct DiskQueue {
