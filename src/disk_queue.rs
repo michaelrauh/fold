@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Read};
 use std::path::PathBuf;
 
-const MEMORY_THRESHOLD: usize = 10_000;
+const MEMORY_THRESHOLD: usize = 50_000; // Keep 50K orthos in memory before spilling to disk (~10MB, was 10K)
 
 /// A queue that keeps items in memory up to MEMORY_THRESHOLD, then spills to disk
 pub struct DiskQueue {
@@ -22,14 +22,20 @@ pub struct DiskQueue {
     disk_count: usize,
     /// Total items ever written to disk (for unique file naming)
     disk_generation: usize,
-    /// Time of last push (seconds since UNIX_EPOCH)
-    last_push_time: Option<u64>,
-    /// Time of last pull (seconds since UNIX_EPOCH)
-    last_pull_time: Option<u64>,
+    /// Count of pushes for rate calculation
+    push_count: u64,
+    /// Count of pulls for rate calculation
+    pull_count: u64,
+    /// Time when tracking started (seconds since UNIX_EPOCH)
+    start_time: u64,
 }
 
 impl DiskQueue {
     pub fn new() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         DiskQueue {
             memory: VecDeque::new(),
             disk_file: None,
@@ -37,8 +43,9 @@ impl DiskQueue {
             disk_reader: None,
             disk_count: 0,
             disk_generation: 0,
-            last_push_time: None,
-            last_pull_time: None,
+            push_count: 0,
+            pull_count: 0,
+            start_time: now,
         }
     }
 
@@ -62,6 +69,11 @@ impl DiskQueue {
             .open(&storage_path)
             .map_err(|e| FoldError::Io(e))?;
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
         let queue = DiskQueue {
             memory: VecDeque::new(),
             disk_file: Some(storage_path),
@@ -69,8 +81,9 @@ impl DiskQueue {
             disk_reader: None,
             disk_count: 0,
             disk_generation: 0,
-            last_push_time: None,
-            last_pull_time: None,
+            push_count: 0,
+            pull_count: 0,
+            start_time: now,
         };
         // Always write to disk for persistent storage
         Ok(queue)
@@ -78,8 +91,9 @@ impl DiskQueue {
 
     /// Push an item to the back of the queue
     pub fn push_back(&mut self, ortho: Ortho) -> Result<(), FoldError> {
-    // Update last push time
-    self.last_push_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+        // Update push count
+        self.push_count += 1;
+        
         // If we're at capacity and have no disk file yet, create one
         if self.memory.len() >= MEMORY_THRESHOLD && self.disk_writer.is_none() {
             self.create_disk_file()?;
@@ -108,7 +122,7 @@ impl DiskQueue {
     pub fn pop_front(&mut self) -> Result<Option<Ortho>, FoldError> {
         // First try memory
         if let Some(ortho) = self.memory.pop_front() {
-            self.last_pull_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+            self.pull_count += 1;
             return Ok(Some(ortho));
         }
 
@@ -116,7 +130,7 @@ impl DiskQueue {
         if self.disk_count > 0 {
             self.load_from_disk()?;
             if let Some(ortho) = self.memory.pop_front() {
-                self.last_pull_time = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+                self.pull_count += 1;
                 return Ok(Some(ortho));
             } else {
                 return Ok(None);
@@ -142,9 +156,18 @@ impl DiskQueue {
         (self.memory.len(), self.disk_count)
     }
 
-    /// Get the last push and pull times (seconds since UNIX_EPOCH)
-    pub fn get_times(&self) -> (Option<u64>, Option<u64>) {
-        (self.last_push_time, self.last_pull_time)
+    /// Get the push and pull rates (operations per second)
+    pub fn get_rates(&self) -> (f64, f64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let elapsed = (now - self.start_time).max(1) as f64; // Avoid division by zero
+        
+        let push_rate = self.push_count as f64 / elapsed;
+        let pull_rate = self.pull_count as f64 / elapsed;
+        
+        (push_rate, pull_rate)
     }
 
     /// Create a new disk file for spillover

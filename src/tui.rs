@@ -36,10 +36,10 @@ pub struct AppState {
     // Queue statistics
     pub queue_memory_count: usize,
     pub queue_disk_count: usize,
-    // Queue timing statistics (seconds since UNIX_EPOCH)
-    pub work_queue_last_push: Option<u64>,
-    pub work_queue_last_pull: Option<u64>,
-    pub results_queue_last_push: Option<u64>,
+    // Queue rate statistics (operations per second)
+    pub work_queue_push_rate: f64,
+    pub work_queue_pull_rate: f64,
+    pub results_queue_push_rate: f64,
 }
 
 impl AppState {
@@ -63,9 +63,9 @@ impl AppState {
             disk_checks: 0,
             queue_memory_count: 0,
             queue_disk_count: 0,
-            work_queue_last_push: None,
-            work_queue_last_pull: None,
-            results_queue_last_push: None,
+            work_queue_push_rate: 0.0,
+            work_queue_pull_rate: 0.0,
+            results_queue_push_rate: 0.0,
         }
     }
 
@@ -118,15 +118,15 @@ impl AppState {
     
     pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, 
                               queue_mem: usize, queue_disk: usize,
-                              work_queue_push: Option<u64>, work_queue_pull: Option<u64>, results_queue_push: Option<u64>) {
+                              work_push_rate: f64, work_pull_rate: f64, results_push_rate: f64) {
         self.bloom_hits = bloom_hits;
         self.bloom_misses = bloom_misses;
         self.disk_checks = disk_checks;
         self.queue_memory_count = queue_mem;
         self.queue_disk_count = queue_disk;
-        self.work_queue_last_push = work_queue_push;
-        self.work_queue_last_pull = work_queue_pull;
-        self.results_queue_last_push = results_queue_push;
+        self.work_queue_push_rate = work_push_rate;
+        self.work_queue_pull_rate = work_pull_rate;
+        self.results_queue_push_rate = results_push_rate;
     }
 }
 
@@ -228,15 +228,16 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         0.0
     };
     
-    // Calculate time since last queue operations
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    
-    let work_push_elapsed = state.work_queue_last_push.map(|t| now - t);
-    let work_pull_elapsed = state.work_queue_last_pull.map(|t| now - t);
-    let results_push_elapsed = state.results_queue_last_push.map(|t| now - t);
+    // Format queue rates for display
+    let format_rate = |rate: f64| -> String {
+        if rate < 1.0 {
+            format!("{:.2}/s", rate)
+        } else if rate < 1000.0 {
+            format!("{:.1}/s", rate)
+        } else {
+            format!("{:.1}K/s", rate / 1000.0)
+        }
+    };
     
     // Get RAM usage
     let ram_percent = get_ram_usage_percent();
@@ -266,11 +267,11 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         ]),
         Line::from(vec![
             Span::styled("Work Q Push: ", Style::default().fg(Color::Cyan)),
-            Span::raw(work_push_elapsed.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "N/A".to_string())),
+            Span::raw(format_rate(state.work_queue_push_rate)),
             Span::styled("  |  Work Q Pull: ", Style::default().fg(Color::Cyan)),
-            Span::raw(work_pull_elapsed.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "N/A".to_string())),
+            Span::raw(format_rate(state.work_queue_pull_rate)),
             Span::styled("  |  Results Q Push: ", Style::default().fg(Color::Cyan)),
-            Span::raw(results_push_elapsed.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "N/A".to_string())),
+            Span::raw(format_rate(state.results_queue_push_rate)),
         ]),
     ];
     

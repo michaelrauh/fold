@@ -95,13 +95,13 @@ fn main() -> Result<(), FoldError> {
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
-            move |queue_len, total_found, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push, work_pull, results_push| {
+            move |queue_len, total_found, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push_rate, work_pull_rate, results_push_rate| {
                 if quit_check.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
                 let mut state_lock = state_clone.lock().unwrap();
                 state_lock.update_metrics(queue_len, total_found);
-                state_lock.update_cache_stats(bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push, work_pull, results_push);
+                state_lock.update_cache_stats(bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_push_rate, work_pull_rate, results_push_rate);
             }
         )?;
         
