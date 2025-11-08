@@ -13,7 +13,7 @@ echo "=== Deploying fold to DigitalOcean ==="
 
 # Configuration
 DROPLET_NAME="fold-runner-$(date +%s)"
-DROPLET_SIZE="s-2vcpu-4gb"  # 2 vCPU, 4GB RAM to avoid OOM
+DROPLET_SIZE="s-2vcpu-8gb-amd"  # 2 vCPU, 8GB RAM ($42/mo)
 DROPLET_IMAGE="ubuntu-22-04-x64"
 DROPLET_REGION="nyc1"
 SSH_KEY_ID="43081865"  # ed25519 key
