@@ -53,7 +53,19 @@ impl AppState {
         self.queue_history.push((elapsed, queue_len as f64));
         self.found_history.push((elapsed, total_found as f64));
         
-        // Keep all history for all-time view (no limit)
+        // Downsample history when it gets too large to keep memory bounded
+        const MAX_HISTORY_POINTS: usize = 10_000;
+        if self.queue_history.len() > MAX_HISTORY_POINTS {
+            // Keep every other point to reduce by half
+            self.queue_history = self.queue_history.iter()
+                .step_by(2)
+                .copied()
+                .collect();
+            self.found_history = self.found_history.iter()
+                .step_by(2)
+                .copied()
+                .collect();
+        }
     }
 
     pub fn start_file(&mut self, file_num: usize, word_count: usize, seeded: usize) {
