@@ -1,23 +1,32 @@
 #!/bin/bash
 # stage.sh - Split a file by delimiter and move chunks to input folder
 #
-# Usage: ./stage.sh <input_file> <delimiter> [min_length] [state_dir]
+# Usage: ./stage.sh <input_file> <delimiter> [min_length] [state_dir] [--no-prompt]
 #   input_file  - Path to the file to split
 #   delimiter   - Word or phrase to split on (e.g., "chapter", "CHAPTER")
 #   min_length  - Optional: Minimum length in characters to keep chunk (default: 0, keep all)
 #   state_dir   - Optional: State directory path (default: ./fold_state)
+#   --no-prompt - Optional: Skip interactive prompts (keeps original file)
 #
 # Chunks smaller than min_length are automatically deleted to filter out junk.
 #
-# Example: ./stage.sh book.txt "CHAPTER" 50000 ./fold_state
+# Example: ./stage.sh book.txt "CHAPTER" 50000 ./fold_state --no-prompt
 
-set -e
+set -ex
 
 # Parse arguments
 INPUT_FILE="${1:-}"
 DELIMITER="${2:-}"
 MIN_LENGTH="${3:-0}"
 STATE_DIR="${4:-./fold_state}"
+NO_PROMPT=false
+
+# Check for --no-prompt flag in any position
+for arg in "$@"; do
+    if [ "$arg" = "--no-prompt" ]; then
+        NO_PROMPT=true
+    fi
+done
 
 INPUT_DIR="${STATE_DIR}/input"
 
@@ -136,13 +145,17 @@ echo "[stage] $REMAINING_FILES files ready for processing in $INPUT_DIR"
 echo ""
 
 # Optionally delete the input file
-read -p "[stage] Delete original file $INPUT_FILE? (y/N) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    rm "$INPUT_FILE"
-    echo "[stage] Deleted original file: $INPUT_FILE"
+if [ "$NO_PROMPT" = true ]; then
+    echo "[stage] Original file kept: $INPUT_FILE (--no-prompt mode)"
 else
-    echo "[stage] Original file kept: $INPUT_FILE"
+    read -p "[stage] Delete original file $INPUT_FILE? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm "$INPUT_FILE"
+        echo "[stage] Deleted original file: $INPUT_FILE"
+    else
+        echo "[stage] Original file kept: $INPUT_FILE"
+    fi
 fi
 
 echo "[stage] Done!"
