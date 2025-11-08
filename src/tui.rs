@@ -22,8 +22,10 @@ pub struct AppState {
     pub seeded_count: usize,
     pub input_word_count: usize,
     pub start_time: Instant,
-    pub queue_history: Vec<(f64, f64)>,  // (time_secs, queue_length)
-    pub found_history: Vec<(f64, f64)>,  // (time_secs, total_found)
+    pub queue_history_recent: Vec<(f64, f64)>,  // Recent: last 1000 points, no downsampling
+    pub found_history_recent: Vec<(f64, f64)>,  // Recent: last 1000 points, no downsampling
+    pub queue_history_alltime: Vec<(f64, f64)>, // All-time: progressively downsampled
+    pub found_history_alltime: Vec<(f64, f64)>, // All-time: progressively downsampled
     pub optimal_ortho: Option<String>,
     pub current_queue_length: usize,
     pub processing_complete: bool,
@@ -38,8 +40,10 @@ impl AppState {
             seeded_count: 0,
             input_word_count: 0,
             start_time: Instant::now(),
-            queue_history: Vec::new(),
-            found_history: Vec::new(),
+            queue_history_recent: Vec::new(),
+            found_history_recent: Vec::new(),
+            queue_history_alltime: Vec::new(),
+            found_history_alltime: Vec::new(),
             optimal_ortho: None,
             current_queue_length: 0,
             processing_complete: false,
@@ -50,18 +54,29 @@ impl AppState {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         self.current_queue_length = queue_len;
         self.total_found = total_found;
-        self.queue_history.push((elapsed, queue_len as f64));
-        self.found_history.push((elapsed, total_found as f64));
         
-        // Downsample history when it gets too large to keep memory bounded
-        const MAX_HISTORY_POINTS: usize = 1_000;
-        if self.queue_history.len() > MAX_HISTORY_POINTS {
-            // Keep every other point to reduce by half
-            self.queue_history = self.queue_history.iter()
+        let queue_point = (elapsed, queue_len as f64);
+        let found_point = (elapsed, total_found as f64);
+        
+        // Update recent history: rolling window of last 1000 points
+        self.queue_history_recent.push(queue_point);
+        self.found_history_recent.push(found_point);
+        if self.queue_history_recent.len() > 1000 {
+            self.queue_history_recent.remove(0);
+            self.found_history_recent.remove(0);
+        }
+        
+        // Update all-time history: progressively downsample to keep around 1000 points
+        self.queue_history_alltime.push(queue_point);
+        self.found_history_alltime.push(found_point);
+        
+        if self.queue_history_alltime.len() > 1000 {
+            // Downsample: keep every other point
+            self.queue_history_alltime = self.queue_history_alltime.iter()
                 .step_by(2)
                 .copied()
                 .collect();
-            self.found_history = self.found_history.iter()
+            self.found_history_alltime = self.found_history_alltime.iter()
                 .step_by(2)
                 .copied()
                 .collect();
@@ -236,30 +251,32 @@ fn render_charts(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
 }
 
 fn render_queue_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState, recent_only: bool) {
-    if state.queue_history.is_empty() {
+    let queue_data = if recent_only {
+        &state.queue_history_recent
+    } else {
+        &state.queue_history_alltime
+    };
+    
+    if queue_data.is_empty() {
         return;
     }
     
-    let queue_data: Vec<(f64, f64)> = if recent_only {
-        // Show last 1000 points for recent view (no downsampling)
-        let start_idx = state.queue_history.len().saturating_sub(1000);
-        state.queue_history[start_idx..].to_vec()
+    // For recent: use the data as-is (already the last 1000 points, no downsampling)
+    // For all-time: use the data as-is (already downsampled progressively)
+    let queue_data: Vec<(f64, f64)> = queue_data.clone();
+    
+    // For Y-axis: use range from the displayed data
+    let min_queue = queue_data.iter().map(|(_, q)| *q).fold(f64::INFINITY, f64::min);
+    let max_queue = queue_data.iter().map(|(_, q)| *q).fold(0.0f64, f64::max);
+    
+    // For recent view, scale to actual data range; for all-time, start from 0
+    let (y_min, y_max) = if recent_only {
+        (min_queue * 0.95, max_queue * 1.05) // Add 5% padding
     } else {
-        // For all-time view, downsample to 500-1000 points evenly spaced
-        let total_points = state.queue_history.len();
-        if total_points <= 1000 {
-            state.queue_history.clone()
-        } else {
-            // Take evenly spaced points to get approximately 500-1000 points
-            let step = (total_points / 500).max(1);
-            state.queue_history.iter()
-                .step_by(step)
-                .copied()
-                .collect()
-        }
+        (0.0, max_queue)
     };
     
-    let max_queue = queue_data.iter().map(|(_, q)| *q).fold(0.0f64, f64::max);
+    // For X-axis: use the time range from the displayed data
     let min_time = queue_data.first().map(|(t, _)| *t).unwrap_or(0.0);
     let max_time = queue_data.last().map(|(t, _)| *t).unwrap_or(1.0);
 
@@ -296,10 +313,10 @@ fn render_queue_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppSta
             Axis::default()
                 .title("Queue")
                 .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, max_queue])
+                .bounds([y_min, y_max])
                 .labels(vec![
-                    Span::raw("0"),
-                    Span::raw(format_human(max_queue)),
+                    Span::raw(format_human(y_min)),
+                    Span::raw(format_human(y_max)),
                 ]),
         );
 
@@ -307,30 +324,32 @@ fn render_queue_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppSta
 }
 
 fn render_found_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState, recent_only: bool) {
-    if state.found_history.is_empty() {
+    let found_data = if recent_only {
+        &state.found_history_recent
+    } else {
+        &state.found_history_alltime
+    };
+    
+    if found_data.is_empty() {
         return;
     }
     
-    let found_data: Vec<(f64, f64)> = if recent_only {
-        // Show last 1000 points for recent view (no downsampling)
-        let start_idx = state.found_history.len().saturating_sub(1000);
-        state.found_history[start_idx..].to_vec()
+    // For recent: use the data as-is (already the last 1000 points, no downsampling)
+    // For all-time: use the data as-is (already downsampled progressively)
+    let found_data: Vec<(f64, f64)> = found_data.clone();
+    
+    // For Y-axis: use range from the displayed data
+    let min_found = found_data.iter().map(|(_, f)| *f).fold(f64::INFINITY, f64::min);
+    let max_found = found_data.iter().map(|(_, f)| *f).fold(0.0f64, f64::max);
+    
+    // For recent view, scale to actual data range; for all-time, start from 0
+    let (y_min, y_max) = if recent_only {
+        (min_found * 0.95, max_found * 1.05) // Add 5% padding
     } else {
-        // For all-time view, downsample to 500-1000 points evenly spaced
-        let total_points = state.found_history.len();
-        if total_points <= 1000 {
-            state.found_history.clone()
-        } else {
-            // Take evenly spaced points to get approximately 500-1000 points
-            let step = (total_points / 500).max(1);
-            state.found_history.iter()
-                .step_by(step)
-                .copied()
-                .collect()
-        }
+        (0.0, max_found)
     };
     
-    let max_found = found_data.iter().map(|(_, f)| *f).fold(0.0f64, f64::max);
+    // For X-axis: use the time range from the displayed data
     let min_time = found_data.first().map(|(t, _)| *t).unwrap_or(0.0);
     let max_time = found_data.last().map(|(t, _)| *t).unwrap_or(1.0);
 
@@ -367,10 +386,10 @@ fn render_found_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppSta
             Axis::default()
                 .title("Found")
                 .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, max_found])
+                .bounds([y_min, y_max])
                 .labels(vec![
-                    Span::raw("0"),
-                    Span::raw(format_human(max_found)),
+                    Span::raw(format_human(y_min)),
+                    Span::raw(format_human(y_max)),
                 ]),
         );
 
