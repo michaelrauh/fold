@@ -22,10 +22,14 @@ pub struct DiskQueue {
     disk_count: usize,
     /// Total items ever written to disk (for unique file naming)
     disk_generation: usize,
-    /// Count of disk writes for rate calculation
+    /// Count of disk writes for rate calculation (individual items written)
     disk_write_count: u64,
-    /// Count of disk reads for rate calculation
+    /// Count of disk reads for rate calculation (batch load operations)
     disk_read_count: u64,
+    /// Count of times we transitioned from memory-only to disk-backed (spillover events)
+    spillover_events: u64,
+    /// Peak number of items that have been on disk simultaneously
+    peak_disk_count: usize,
     /// Time when tracking started (seconds since UNIX_EPOCH)
     start_time: u64,
 }
@@ -45,6 +49,8 @@ impl DiskQueue {
             disk_generation: 0,
             disk_write_count: 0,
             disk_read_count: 0,
+            spillover_events: 0,
+            peak_disk_count: 0,
             start_time: now,
         }
     }
@@ -83,6 +89,8 @@ impl DiskQueue {
             disk_generation: 0,
             disk_write_count: 0,
             disk_read_count: 0,
+            spillover_events: 0,
+            peak_disk_count: 0,
             start_time: now,
         };
         // Always write to disk for persistent storage
@@ -94,6 +102,7 @@ impl DiskQueue {
         // If we're at capacity and have no disk file yet, create one
         if self.memory.len() >= MEMORY_THRESHOLD && self.disk_writer.is_none() {
             self.create_disk_file()?;
+            self.spillover_events += 1;  // Track spillover event
         }
 
         // If we have a disk file, write to it
@@ -107,7 +116,12 @@ impl DiskQueue {
             writer.write_all(&encoded)
                 .map_err(|e| FoldError::Io(e))?;
             self.disk_count += 1;
-            self.disk_write_count += 1;  // Track actual disk write
+            self.disk_write_count += 1;  // Track individual item written
+            
+            // Track peak disk usage
+            if self.disk_count > self.peak_disk_count {
+                self.peak_disk_count = self.disk_count;
+            }
         } else {
             // Still room in memory
             self.memory.push_back(ortho);
@@ -152,7 +166,15 @@ impl DiskQueue {
         (self.memory.len(), self.disk_count)
     }
 
-    /// Get the disk write and read rates (operations per second)
+    /// Get buffer tuning statistics: (spillover_events, peak_disk_count, disk_read_batches)
+    /// - spillover_events: How many times we transitioned from memory-only to disk-backed
+    /// - peak_disk_count: Maximum number of items on disk at once
+    /// - disk_read_batches: Number of batch read operations from disk
+    pub fn get_buffer_stats(&self) -> (u64, usize, u64) {
+        (self.spillover_events, self.peak_disk_count, self.disk_read_count)
+    }
+
+    /// Get the disk write and read rates (I/O operations per second)
     pub fn get_rates(&self) -> (f64, f64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -244,9 +266,9 @@ impl DiskQueue {
             items_read += 1;
         }
 
-        // Track actual disk reads (batch read counts as reads)
+        // Track actual disk I/O operations: one batch read = one I/O event
         if items_read > 0 {
-            self.disk_read_count += items_read;
+            self.disk_read_count += 1;
         }
 
         // If we've exhausted the disk, clean up

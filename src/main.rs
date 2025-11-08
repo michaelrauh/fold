@@ -104,13 +104,13 @@ fn main() -> Result<(), FoldError> {
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
-            move |queue_len, total_found, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, optimal_ortho_ref| {
+            move |queue_len, total_found, bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, work_spillover, work_peak, results_spillover, results_peak, optimal_ortho_ref| {
                 if quit_check.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
                 let mut state_lock = state_clone.lock().unwrap();
                 state_lock.update_metrics(queue_len, total_found);
-                state_lock.update_cache_stats(bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate);
+                state_lock.update_cache_stats(bloom_hits, bloom_misses, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, work_spillover, work_peak, results_spillover, results_peak);
                 
                 // Update optimal ortho display in real-time
                 if let Some(optimal) = optimal_ortho_ref {

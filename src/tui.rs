@@ -40,6 +40,11 @@ pub struct AppState {
     pub work_queue_disk_write_rate: f64,
     pub work_queue_disk_read_rate: f64,
     pub results_queue_disk_write_rate: f64,
+    // Buffer tuning statistics
+    pub work_queue_spillover_events: u64,
+    pub work_queue_peak_disk: usize,
+    pub results_queue_spillover_events: u64,
+    pub results_queue_peak_disk: usize,
 }
 
 impl AppState {
@@ -66,6 +71,10 @@ impl AppState {
             work_queue_disk_write_rate: 0.0,
             work_queue_disk_read_rate: 0.0,
             results_queue_disk_write_rate: 0.0,
+            work_queue_spillover_events: 0,
+            work_queue_peak_disk: 0,
+            results_queue_spillover_events: 0,
+            results_queue_peak_disk: 0,
         }
     }
 
@@ -118,7 +127,8 @@ impl AppState {
     
     pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, 
                               queue_mem: usize, queue_disk: usize,
-                              work_write_rate: f64, work_read_rate: f64, results_write_rate: f64) {
+                              work_write_rate: f64, work_read_rate: f64, results_write_rate: f64,
+                              work_spillover: u64, work_peak: usize, results_spillover: u64, results_peak: usize) {
         self.bloom_hits = bloom_hits;
         self.bloom_misses = bloom_misses;
         self.disk_checks = disk_checks;
@@ -127,6 +137,10 @@ impl AppState {
         self.work_queue_disk_write_rate = work_write_rate;
         self.work_queue_disk_read_rate = work_read_rate;
         self.results_queue_disk_write_rate = results_write_rate;
+        self.work_queue_spillover_events = work_spillover;
+        self.work_queue_peak_disk = work_peak;
+        self.results_queue_spillover_events = results_spillover;
+        self.results_queue_peak_disk = results_peak;
     }
 }
 
@@ -264,6 +278,16 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format_human(state.queue_memory_count as f64)),
             Span::styled("  |  Queue Disk: ", Style::default().fg(Color::Cyan)),
             Span::raw(format_human(state.queue_disk_count as f64)),
+        ]),
+        Line::from(vec![
+            Span::styled("Work Q Spillovers: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}", state.work_queue_spillover_events)),
+            Span::styled("  |  Peak Disk: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_human(state.work_queue_peak_disk as f64)),
+            Span::styled("  |  Results Spillovers: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}", state.results_queue_spillover_events)),
+            Span::styled("  Peak: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_human(state.results_queue_peak_disk as f64)),
         ]),
         Line::from(vec![
             Span::styled("Work Q Disk Write: ", Style::default().fg(Color::Cyan)),
