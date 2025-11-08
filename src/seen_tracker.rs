@@ -5,9 +5,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Read};
 use std::path::PathBuf;
 
-const BLOOM_SIZE: usize = 4_000_000_000; // 4 billion bits = ~476 MB
+const BLOOM_SIZE: usize = 16_000_000_000; // 16 billion bits = ~1.9 GB (increased from 4B for lower false positive rate)
 const SHARD_COUNT: usize = 256; // Number of disk shards
-const MEMORY_CACHE_SIZE: usize = 10_000; // Keep recent IDs in memory per shard
+const MEMORY_CACHE_SIZE: usize = 100_000; // Keep recent IDs in memory per shard (was 10k, increased for better cache hit rate)
 
 /// A probabilistic set that uses a bloom filter backed by sharded disk storage
 pub struct SeenTracker {
