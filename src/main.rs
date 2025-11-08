@@ -94,6 +94,8 @@ fn main() -> Result<(), FoldError> {
         // Process text through worker loop with metrics callback
         let state_clone = Arc::clone(&state);
         let quit_check = Arc::clone(&quit_flag);
+        let checkpoint_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checkpoint_check = Arc::clone(&checkpoint_needed);
         
         interner = Some(fold::process_text(
             &text, 
@@ -101,14 +103,29 @@ fn main() -> Result<(), FoldError> {
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
-            move |queue_len, total_found| {
+            move |queue_len, total_found, orthos_processed| {
                 if quit_check.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
                 let mut state_lock = state_clone.lock().unwrap();
                 state_lock.update_metrics(queue_len, total_found);
+                state_lock.orthos_processed = orthos_processed;
+                
+                // Signal checkpoint needed every 10k orthos
+                if orthos_processed > 0 && orthos_processed % 10_000 == 0 {
+                    checkpoint_check.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         )?);
+        
+        // Perform checkpoint if needed
+        if checkpoint_needed.load(std::sync::atomic::Ordering::Relaxed) {
+            seen_ids.save()?;
+            ortho_storage.flush()?;
+            let mut state_lock = state.lock().unwrap();
+            state_lock.checkpoint();
+            checkpoint_needed.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         
         // Update optimal ortho display
         if let Some(ref optimal) = optimal_ortho {
@@ -116,6 +133,11 @@ fn main() -> Result<(), FoldError> {
             let ortho_display = format_ortho_display(optimal, current_interner);
             let mut state_lock = state.lock().unwrap();
             state_lock.set_optimal(ortho_display);
+        }
+        
+        // Delete the completed input file
+        if let Err(e) = fs::remove_file(file_path) {
+            eprintln!("Warning: Failed to delete input file {:?}: {}", file_path, e);
         }
     }
     

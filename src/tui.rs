@@ -26,21 +26,26 @@ pub struct AppState {
     pub found_history: Vec<(f64, f64)>,  // (time_secs, total_found)
     pub optimal_ortho: Option<String>,
     pub current_queue_length: usize,
+    pub last_checkpoint_time: Instant,
+    pub orthos_processed: usize,
 }
 
 impl AppState {
     pub fn new(total_files: usize) -> Self {
+        let now = Instant::now();
         Self {
             current_file: 0,
             total_files,
             total_found: 0,
             seeded_count: 0,
             input_word_count: 0,
-            start_time: Instant::now(),
+            start_time: now,
             queue_history: Vec::new(),
             found_history: Vec::new(),
             optimal_ortho: None,
             current_queue_length: 0,
+            last_checkpoint_time: now,
+            orthos_processed: 0,
         }
     }
 
@@ -66,6 +71,19 @@ impl AppState {
 
     pub fn set_optimal(&mut self, ortho_display: String) {
         self.optimal_ortho = Some(ortho_display);
+    }
+
+    pub fn checkpoint(&mut self) {
+        self.last_checkpoint_time = Instant::now();
+        self.orthos_processed = 0;
+    }
+
+    pub fn increment_orthos_processed(&mut self) {
+        self.orthos_processed += 1;
+    }
+
+    pub fn seconds_since_checkpoint(&self) -> u64 {
+        self.last_checkpoint_time.elapsed().as_secs()
     }
 }
 
@@ -94,7 +112,7 @@ impl TuiApp {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(6),  // Stats
+                    Constraint::Length(7),  // Stats (increased for extra line)
                     Constraint::Min(10),    // Charts
                     Constraint::Length(10),  // Optimal ortho (increased for table)
                 ])
@@ -138,6 +156,7 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let hours = elapsed.as_secs() / 3600;
     let minutes = (elapsed.as_secs() % 3600) / 60;
     let seconds = elapsed.as_secs() % 60;
+    let since_checkpoint = state.seconds_since_checkpoint();
 
     let stats_text = vec![
         Line::from(vec![
@@ -155,6 +174,12 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format!("{}", state.input_word_count)),
             Span::styled("  |  Queue Length: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{}", state.current_queue_length)),
+        ]),
+        Line::from(vec![
+            Span::styled("Orthos Processed: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}", state.orthos_processed)),
+            Span::styled("  |  Since Checkpoint: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}s", since_checkpoint)),
         ]),
     ];
 
@@ -267,7 +292,10 @@ fn render_charts(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
 
 fn render_optimal(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let text = if let Some(ref ortho) = state.optimal_ortho {
-        vec![Line::from(Span::raw(ortho.clone()))]
+        // Split the ortho string into multiple lines
+        ortho.lines()
+            .map(|line| Line::from(Span::raw(line.to_string())))
+            .collect()
     } else {
         vec![Line::from(Span::styled(
             "No optimal ortho yet",

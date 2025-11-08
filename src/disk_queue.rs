@@ -187,8 +187,14 @@ impl DiskQueue {
 
             // Read data
             let mut buffer = vec![0u8; len];
-            reader.read_exact(&mut buffer)
-                .map_err(|e| FoldError::Io(e))?;
+            match reader.read_exact(&mut buffer) {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Incomplete record at end of file - stop reading
+                    break;
+                },
+                Err(e) => return Err(FoldError::Io(e)),
+            }
 
             // Deserialize
             let (ortho, _): (Ortho, _) = bincode::decode_from_slice(&buffer, bincode::config::standard())
@@ -253,8 +259,14 @@ impl DiskQueue {
 
             // Read data
             let mut buffer = vec![0u8; len];
-            reader.read_exact(&mut buffer)
-                .map_err(|e| FoldError::Io(e))?;
+            match reader.read_exact(&mut buffer) {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Incomplete record at end of file - stop reading
+                    break;
+                },
+                Err(e) => return Err(FoldError::Io(e)),
+            }
 
             // Deserialize
             let (ortho, _): (Ortho, _) = bincode::decode_from_slice(&buffer, bincode::config::standard())
@@ -292,8 +304,14 @@ impl DiskQueue {
 
             // Skip the data
             let mut buffer = vec![0u8; len];
-            reader.read_exact(&mut buffer)
-                .map_err(|e| FoldError::Io(e))?;
+            match reader.read_exact(&mut buffer) {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Incomplete record at end of file - stop reading
+                    break;
+                },
+                Err(e) => return Err(FoldError::Io(e)),
+            }
 
             count += 1;
         }

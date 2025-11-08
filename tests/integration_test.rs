@@ -21,7 +21,7 @@ fn test_simple_worker_loop() {
     let mut ortho_storage = DiskQueue::new(); // Use in-memory queue for tests
     
     // Act
-    let interner = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap();
+    let interner = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap();
     
     // Assert
     assert_eq!(interner.version(), 1, "Should create version 1");
@@ -40,7 +40,7 @@ fn test_multiple_file_processing() {
     
     // Act
     for text in texts {
-        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap());
+        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap());
     }
     
     // Assert
@@ -59,7 +59,7 @@ fn test_optimal_ortho_tracking() {
     let mut ortho_storage = DiskQueue::new(); // Use in-memory queue for tests
     
     // Act
-    let _interner = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap();
+    let _interner = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap();
     
     // Assert
     let optimal = optimal_ortho.expect("Should have an optimal ortho");
@@ -81,7 +81,7 @@ fn test_end_to_end_run_pattern() {
     
     // Act
     for text in texts {
-        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap());
+        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap());
     }
     
     // Assert
@@ -103,9 +103,9 @@ fn test_interner_version_increments() {
     let mut ortho_storage = DiskQueue::new(); // Use in-memory queue for tests
     
     // Act
-    let interner1 = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap();
-    let interner2 = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap();
-    let interner3 = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap();
+    let interner1 = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap();
+    let interner2 = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap();
+    let interner3 = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap();
     
     // Assert
     assert_eq!(interner3.version(), 3, "Should have version 3 after processing 3 texts");
@@ -122,7 +122,7 @@ fn test_seen_ids_accumulate() {
     
     // Act
     for text in texts {
-        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_| {}).unwrap());
+        interner = Some(fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_| {}).unwrap());
     }
     
     // Assert

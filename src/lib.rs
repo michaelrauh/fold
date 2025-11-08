@@ -29,7 +29,7 @@ pub fn process_text<F>(
     mut metrics_callback: F,
 ) -> Result<interner::Interner, FoldError>
 where
-    F: FnMut(usize, usize),  // (queue_length, total_seen)
+    F: FnMut(usize, usize, usize),  // (queue_length, total_seen, orthos_processed)
 {
     // Build or update interner
     let prev_interner = interner.clone();
@@ -68,7 +68,7 @@ where
     while let Ok(Some(ortho)) = work_queue.pop_front() {
         processed += 1;
         if processed % 1_000 == 0 {
-            metrics_callback(work_queue.len(), seen_ids.len());
+            metrics_callback(work_queue.len(), seen_ids.len(), processed);
         }
         
         // Get requirements for this ortho
@@ -100,7 +100,7 @@ where
     }
     
     // Final metrics update
-    metrics_callback(work_queue.len(), seen_ids.len());
+    metrics_callback(work_queue.len(), seen_ids.len(), processed);
     
     Ok(current_interner)
 }
