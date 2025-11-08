@@ -119,8 +119,16 @@ fn main() -> Result<(), FoldError> {
         }
     }
     
-    // Signal TUI thread to quit
-    quit_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Mark processing as complete
+    {
+        let mut state_lock = state.lock().unwrap();
+        state_lock.mark_complete();
+    }
+    
+    // Keep TUI running until user quits (press 'q')
+    while !quit_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
+    }
     
     // Wait for TUI thread to finish
     let _ = tui_handle.join();

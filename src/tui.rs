@@ -26,6 +26,7 @@ pub struct AppState {
     pub found_history: Vec<(f64, f64)>,  // (time_secs, total_found)
     pub optimal_ortho: Option<String>,
     pub current_queue_length: usize,
+    pub processing_complete: bool,
 }
 
 impl AppState {
@@ -41,6 +42,7 @@ impl AppState {
             found_history: Vec::new(),
             optimal_ortho: None,
             current_queue_length: 0,
+            processing_complete: false,
         }
     }
 
@@ -66,6 +68,10 @@ impl AppState {
 
     pub fn set_optimal(&mut self, ortho_display: String) {
         self.optimal_ortho = Some(ortho_display);
+    }
+    
+    pub fn mark_complete(&mut self) {
+        self.processing_complete = true;
     }
 }
 
@@ -139,7 +145,7 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let minutes = (elapsed.as_secs() % 3600) / 60;
     let seconds = elapsed.as_secs() % 60;
 
-    let stats_text = vec![
+    let mut stats_text = vec![
         Line::from(vec![
             Span::styled("File: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{}/{}", state.current_file, state.total_files)),
@@ -157,6 +163,13 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format!("{}", state.current_queue_length)),
         ]),
     ];
+    
+    if state.processing_complete {
+        stats_text.push(Line::from(vec![
+            Span::styled("STATUS: ", Style::default().fg(Color::Green)),
+            Span::styled("COMPLETE - Press 'q' to quit", Style::default().fg(Color::Green)),
+        ]));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
