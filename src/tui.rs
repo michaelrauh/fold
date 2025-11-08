@@ -53,11 +53,7 @@ impl AppState {
         self.queue_history.push((elapsed, queue_len as f64));
         self.found_history.push((elapsed, total_found as f64));
         
-        // Keep only last 1000 points to avoid memory bloat
-        if self.queue_history.len() > 1000 {
-            self.queue_history.remove(0);
-            self.found_history.remove(0);
-        }
+        // Keep all history for all-time view (no limit)
     }
 
     pub fn start_file(&mut self, file_num: usize, word_count: usize, seeded: usize) {
@@ -139,6 +135,19 @@ impl Drop for TuiApp {
     }
 }
 
+/// Format a number in human-readable format (K, M, B style)
+fn format_human(num: f64) -> String {
+    if num >= 1_000_000_000.0 {
+        format!("{:.1}B", num / 1_000_000_000.0)
+    } else if num >= 1_000_000.0 {
+        format!("{:.1}M", num / 1_000_000.0)
+    } else if num >= 1_000.0 {
+        format!("{:.1}K", num / 1_000.0)
+    } else {
+        format!("{:.0}", num)
+    }
+}
+
 fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let elapsed = state.start_time.elapsed();
     let hours = elapsed.as_secs() / 3600;
@@ -150,17 +159,17 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::styled("File: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{}/{}", state.current_file, state.total_files)),
             Span::styled("  |  Total Found: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{}", state.total_found)),
+            Span::raw(format_human(state.total_found as f64)),
             Span::styled("  |  Runtime: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:02}:{:02}:{:02}", hours, minutes, seconds)),
         ]),
         Line::from(vec![
             Span::styled("Seeded: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{}", state.seeded_count)),
+            Span::raw(format_human(state.seeded_count as f64)),
             Span::styled("  |  Input Words: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{}", state.input_word_count)),
+            Span::raw(format_human(state.input_word_count as f64)),
             Span::styled("  |  Queue Length: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{}", state.current_queue_length)),
+            Span::raw(format_human(state.current_queue_length as f64)),
         ]),
     ];
     
@@ -184,98 +193,176 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
 }
 
 fn render_charts(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let chart_chunks = Layout::default()
-        .direction(Direction::Horizontal)
+    // Split into two rows: Recent (top) and All-time (bottom)
+    let row_chunks = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+    
+    // Split each row into two columns: Queue (left) and Found (right)
+    let recent_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_chunks[0]);
+    
+    let alltime_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(row_chunks[1]);
 
-    // Queue length chart
-    if !state.queue_history.is_empty() {
-        let queue_data: Vec<(f64, f64)> = state.queue_history.clone();
-        let max_queue = queue_data.iter().map(|(_, q)| *q).fold(0.0f64, f64::max);
-        let min_time = queue_data.first().map(|(t, _)| *t).unwrap_or(0.0);
-        let max_time = queue_data.last().map(|(t, _)| *t).unwrap_or(1.0);
+    // Render recent queue chart (top-left)
+    render_queue_chart(f, recent_chunks[0], state, true);
+    
+    // Render recent found chart (top-right)
+    render_found_chart(f, recent_chunks[1], state, true);
+    
+    // Render all-time queue chart (bottom-left)
+    render_queue_chart(f, alltime_chunks[0], state, false);
+    
+    // Render all-time found chart (bottom-right)
+    render_found_chart(f, alltime_chunks[1], state, false);
+}
 
-        let dataset = Dataset::default()
-            .name("Queue")
-            .marker(symbols::Marker::Braille)
-            .style(Style::default().fg(Color::Yellow))
-            .data(&queue_data);
-
-        let chart = Chart::new(vec![dataset])
-            .block(
-                Block::default()
-                    .title("Queue Length Over Time")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::White)),
-            )
-            .x_axis(
-                Axis::default()
-                    .title("Time (s)")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([min_time, max_time])
-                    .labels(vec![
-                        Span::raw(format!("{:.0}", min_time)),
-                        Span::raw(format!("{:.0}", max_time)),
-                    ]),
-            )
-            .y_axis(
-                Axis::default()
-                    .title("Queue Length")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([0.0, max_queue])
-                    .labels(vec![
-                        Span::raw("0"),
-                        Span::raw(format!("{:.0}", max_queue)),
-                    ]),
-            );
-
-        f.render_widget(chart, chart_chunks[0]);
+fn render_queue_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState, recent_only: bool) {
+    if state.queue_history.is_empty() {
+        return;
     }
+    
+    let queue_data: Vec<(f64, f64)> = if recent_only {
+        // Show last 1000 points for recent view
+        let start_idx = state.queue_history.len().saturating_sub(1000);
+        state.queue_history[start_idx..].to_vec()
+    } else {
+        // For all-time view, downsample to ~2000 points max for performance
+        let total_points = state.queue_history.len();
+        if total_points <= 2000 {
+            state.queue_history.clone()
+        } else {
+            // Take every Nth point to get approximately 2000 points
+            let step = total_points / 2000;
+            state.queue_history.iter()
+                .step_by(step.max(1))
+                .copied()
+                .collect()
+        }
+    };
+    
+    let max_queue = queue_data.iter().map(|(_, q)| *q).fold(0.0f64, f64::max);
+    let min_time = queue_data.first().map(|(t, _)| *t).unwrap_or(0.0);
+    let max_time = queue_data.last().map(|(t, _)| *t).unwrap_or(1.0);
 
-    // Total found chart
-    if !state.found_history.is_empty() {
-        let found_data: Vec<(f64, f64)> = state.found_history.clone();
-        let max_found = found_data.iter().map(|(_, f)| *f).fold(0.0f64, f64::max);
-        let min_time = found_data.first().map(|(t, _)| *t).unwrap_or(0.0);
-        let max_time = found_data.last().map(|(t, _)| *t).unwrap_or(1.0);
+    let dataset = Dataset::default()
+        .name("Queue")
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(Color::Yellow))
+        .data(&queue_data);
 
-        let dataset = Dataset::default()
-            .name("Found")
-            .marker(symbols::Marker::Braille)
-            .style(Style::default().fg(Color::Green))
-            .data(&found_data);
+    let title = if recent_only {
+        "Queue Length (Recent)"
+    } else {
+        "Queue Length (All Time)"
+    };
 
-        let chart = Chart::new(vec![dataset])
-            .block(
-                Block::default()
-                    .title("Total Found Over Time")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::White)),
-            )
-            .x_axis(
-                Axis::default()
-                    .title("Time (s)")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([min_time, max_time])
-                    .labels(vec![
-                        Span::raw(format!("{:.0}", min_time)),
-                        Span::raw(format!("{:.0}", max_time)),
-                    ]),
-            )
-            .y_axis(
-                Axis::default()
-                    .title("Total Found")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([0.0, max_found])
-                    .labels(vec![
-                        Span::raw("0"),
-                        Span::raw(format!("{:.0}", max_found)),
-                    ]),
-            );
+    let chart = Chart::new(vec![dataset])
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::White)),
+        )
+        .x_axis(
+            Axis::default()
+                .title("Time (s)")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([min_time, max_time])
+                .labels(vec![
+                    Span::raw(format!("{:.0}", min_time)),
+                    Span::raw(format!("{:.0}", max_time)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("Queue")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, max_queue])
+                .labels(vec![
+                    Span::raw("0"),
+                    Span::raw(format_human(max_queue)),
+                ]),
+        );
 
-        f.render_widget(chart, chart_chunks[1]);
+    f.render_widget(chart, area);
+}
+
+fn render_found_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState, recent_only: bool) {
+    if state.found_history.is_empty() {
+        return;
     }
+    
+    let found_data: Vec<(f64, f64)> = if recent_only {
+        // Show last 1000 points for recent view
+        let start_idx = state.found_history.len().saturating_sub(1000);
+        state.found_history[start_idx..].to_vec()
+    } else {
+        // For all-time view, downsample to ~2000 points max for performance
+        let total_points = state.found_history.len();
+        if total_points <= 2000 {
+            state.found_history.clone()
+        } else {
+            // Take every Nth point to get approximately 2000 points
+            let step = total_points / 2000;
+            state.found_history.iter()
+                .step_by(step.max(1))
+                .copied()
+                .collect()
+        }
+    };
+    
+    let max_found = found_data.iter().map(|(_, f)| *f).fold(0.0f64, f64::max);
+    let min_time = found_data.first().map(|(t, _)| *t).unwrap_or(0.0);
+    let max_time = found_data.last().map(|(t, _)| *t).unwrap_or(1.0);
+
+    let dataset = Dataset::default()
+        .name("Found")
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(Color::Green))
+        .data(&found_data);
+
+    let title = if recent_only {
+        "Total Found (Recent)"
+    } else {
+        "Total Found (All Time)"
+    };
+
+    let chart = Chart::new(vec![dataset])
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::White)),
+        )
+        .x_axis(
+            Axis::default()
+                .title("Time (s)")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([min_time, max_time])
+                .labels(vec![
+                    Span::raw(format!("{:.0}", min_time)),
+                    Span::raw(format!("{:.0}", max_time)),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("Found")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, max_found])
+                .labels(vec![
+                    Span::raw("0"),
+                    Span::raw(format_human(max_found)),
+                ]),
+        );
+
+    f.render_widget(chart, area);
 }
 
 fn render_optimal(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
