@@ -241,19 +241,19 @@ fn render_queue_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppSta
     }
     
     let queue_data: Vec<(f64, f64)> = if recent_only {
-        // Show last 1000 points for recent view
+        // Show last 1000 points for recent view (no downsampling)
         let start_idx = state.queue_history.len().saturating_sub(1000);
         state.queue_history[start_idx..].to_vec()
     } else {
-        // For all-time view, downsample to ~2000 points max for performance
+        // For all-time view, downsample to 500-1000 points evenly spaced
         let total_points = state.queue_history.len();
-        if total_points <= 2000 {
+        if total_points <= 1000 {
             state.queue_history.clone()
         } else {
-            // Take every Nth point to get approximately 2000 points
-            let step = total_points / 2000;
+            // Take evenly spaced points to get approximately 500-1000 points
+            let step = (total_points / 500).max(1);
             state.queue_history.iter()
-                .step_by(step.max(1))
+                .step_by(step)
                 .copied()
                 .collect()
         }
@@ -312,19 +312,19 @@ fn render_found_chart(f: &mut Frame, area: ratatui::layout::Rect, state: &AppSta
     }
     
     let found_data: Vec<(f64, f64)> = if recent_only {
-        // Show last 1000 points for recent view
+        // Show last 1000 points for recent view (no downsampling)
         let start_idx = state.found_history.len().saturating_sub(1000);
         state.found_history[start_idx..].to_vec()
     } else {
-        // For all-time view, downsample to ~2000 points max for performance
+        // For all-time view, downsample to 500-1000 points evenly spaced
         let total_points = state.found_history.len();
-        if total_points <= 2000 {
+        if total_points <= 1000 {
             state.found_history.clone()
         } else {
-            // Take every Nth point to get approximately 2000 points
-            let step = total_points / 2000;
+            // Take evenly spaced points to get approximately 500-1000 points
+            let step = (total_points / 500).max(1);
             state.found_history.iter()
-                .step_by(step.max(1))
+                .step_by(step)
                 .copied()
                 .collect()
         }
