@@ -12,6 +12,11 @@ fn create_test_tracker() -> SeenTracker {
     SeenTracker::new_with_dir(temp_dir).unwrap()
 }
 
+// Helper for test callbacks - accepts all 21 parameters but does nothing
+fn noop_callback(_q: usize, _s: usize, _bh: usize, _bm: usize, _dc: usize, _qm: usize, _qd: usize, 
+                  _wwr: f64, _wrr: f64, _rwr: f64, _ws: u64, _wp: usize, _wst: f64, 
+                  _wl: u64, _wlt: f64, _rs: u64, _rp: usize, _rst: f64, _rl: u64, _rlt: f64, _o: &Option<Ortho>) {}
+
 #[test]
 fn test_simple_worker_loop() {
     // Arrange
@@ -21,7 +26,7 @@ fn test_simple_worker_loop() {
     let mut ortho_storage = DiskQueue::new(); // Use in-memory queue for tests
     
     // Act
-    let (interner, _seeded) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
+    let (interner, _seeded) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     // Assert
     assert_eq!(interner.version(), 1, "Should create version 1");
@@ -40,7 +45,7 @@ fn test_multiple_file_processing() {
     
     // Act
     for text in texts {
-        let (new_interner, _seeded) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
+        let (new_interner, _seeded) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
         interner = Some(new_interner);
     }
     
@@ -60,7 +65,7 @@ fn test_optimal_ortho_tracking() {
     let mut ortho_storage = DiskQueue::new(); // Use in-memory queue for tests
     
     // Act
-    let (_interner, _seeded) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
+    let (_interner, _seeded) = fold::process_text(text, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     // Assert
     let optimal = optimal_ortho.expect("Should have an optimal ortho");
@@ -82,7 +87,7 @@ fn test_end_to_end_run_pattern() {
     
     // Act
     for text in texts {
-        let (new_interner, _seeded) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
+        let (new_interner, _seeded) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
         interner = Some(new_interner);
     }
     
@@ -105,9 +110,9 @@ fn test_interner_version_increments() {
     let mut ortho_storage = DiskQueue::new(); // Use in-memory queue for tests
     
     // Act
-    let (interner1, _) = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
-    let (interner2, _) = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
-    let (interner3, _) = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
+    let (interner1, _) = fold::process_text("first text", None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let (interner2, _) = fold::process_text("second text", Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let (interner3, _) = fold::process_text("third text", Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     // Assert
     assert_eq!(interner3.version(), 3, "Should have version 3 after processing 3 texts");
@@ -124,7 +129,7 @@ fn test_seen_ids_accumulate() {
     
     // Act
     for text in texts {
-        let (new_interner, _seeded) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, |_,_,_,_,_,_,_,_,_,_| {}).unwrap();
+        let (new_interner, _seeded) = fold::process_text(text, interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
         interner = Some(new_interner);
     }
     

@@ -30,6 +30,12 @@ pub struct DiskQueue {
     spillover_events: u64,
     /// Peak number of items that have been on disk simultaneously
     peak_disk_count: usize,
+    /// Timestamp of last spillover event (seconds since UNIX_EPOCH)
+    last_spillover_time: u64,
+    /// Count of times we had to load from disk (disk read events)
+    disk_load_events: u64,
+    /// Timestamp of last disk load event (seconds since UNIX_EPOCH)
+    last_disk_load_time: u64,
     /// Time when tracking started (seconds since UNIX_EPOCH)
     start_time: u64,
 }
@@ -51,6 +57,9 @@ impl DiskQueue {
             disk_read_count: 0,
             spillover_events: 0,
             peak_disk_count: 0,
+            last_spillover_time: 0,
+            disk_load_events: 0,
+            last_disk_load_time: 0,
             start_time: now,
         }
     }
@@ -91,6 +100,9 @@ impl DiskQueue {
             disk_read_count: 0,
             spillover_events: 0,
             peak_disk_count: 0,
+            last_spillover_time: 0,
+            disk_load_events: 0,
+            last_disk_load_time: 0,
             start_time: now,
         };
         // Always write to disk for persistent storage
@@ -103,6 +115,13 @@ impl DiskQueue {
         if self.memory.len() >= MEMORY_THRESHOLD && self.disk_writer.is_none() {
             self.create_disk_file()?;
             self.spillover_events += 1;  // Track spillover event
+            
+            // Record timestamp of this spillover
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.last_spillover_time = now;
         }
 
         // If we have a disk file, write to it
@@ -166,12 +185,32 @@ impl DiskQueue {
         (self.memory.len(), self.disk_count)
     }
 
-    /// Get buffer tuning statistics: (spillover_events, peak_disk_count, disk_read_batches)
+    /// Get buffer tuning statistics: (spillover_events, peak_disk_count, disk_read_batches, seconds_since_last_spillover, disk_load_events, seconds_since_last_load)
     /// - spillover_events: How many times we transitioned from memory-only to disk-backed
     /// - peak_disk_count: Maximum number of items on disk at once
     /// - disk_read_batches: Number of batch read operations from disk
-    pub fn get_buffer_stats(&self) -> (u64, usize, u64) {
-        (self.spillover_events, self.peak_disk_count, self.disk_read_count)
+    /// - seconds_since_last_spillover: Time since last spillover (0.0 if never spilled)
+    /// - disk_load_events: How many times we had to load from disk
+    /// - seconds_since_last_load: Time since last disk load (0.0 if never loaded)
+    pub fn get_buffer_stats(&self) -> (u64, usize, u64, f64, u64, f64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let seconds_since_spillover = if self.last_spillover_time > 0 {
+            (now - self.last_spillover_time) as f64
+        } else {
+            0.0  // Never spilled
+        };
+        
+        let seconds_since_load = if self.last_disk_load_time > 0 {
+            (now - self.last_disk_load_time) as f64
+        } else {
+            0.0  // Never loaded from disk
+        };
+        
+        (self.spillover_events, self.peak_disk_count, self.disk_read_count, seconds_since_spillover, self.disk_load_events, seconds_since_load)
     }
 
     /// Get the disk write and read rates (I/O operations per second)
@@ -220,6 +259,14 @@ impl DiskQueue {
 
     /// Load a batch of items from disk into memory
     fn load_from_disk(&mut self) -> Result<(), FoldError> {
+        // Track that we're performing a disk load operation
+        self.disk_load_events += 1;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.last_disk_load_time = now;
+        
         // If we don't have a reader yet, create one
         if self.disk_reader.is_none() && self.disk_file.is_some() {
             // Flush and close writer

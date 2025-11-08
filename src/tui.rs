@@ -43,8 +43,16 @@ pub struct AppState {
     // Buffer tuning statistics
     pub work_queue_spillover_events: u64,
     pub work_queue_peak_disk: usize,
+    pub work_queue_seconds_since_spillover: f64,
+    pub work_queue_load_events: u64,
+    pub work_queue_seconds_since_load: f64,
     pub results_queue_spillover_events: u64,
     pub results_queue_peak_disk: usize,
+    pub results_queue_seconds_since_spillover: f64,
+    pub results_queue_load_events: u64,
+    pub results_queue_seconds_since_load: f64,
+    // File processing timing
+    pub last_file_start_time: Option<Instant>,
 }
 
 impl AppState {
@@ -73,8 +81,15 @@ impl AppState {
             results_queue_disk_write_rate: 0.0,
             work_queue_spillover_events: 0,
             work_queue_peak_disk: 0,
+            work_queue_seconds_since_spillover: 0.0,
+            work_queue_load_events: 0,
+            work_queue_seconds_since_load: 0.0,
             results_queue_spillover_events: 0,
             results_queue_peak_disk: 0,
+            results_queue_seconds_since_spillover: 0.0,
+            results_queue_load_events: 0,
+            results_queue_seconds_since_load: 0.0,
+            last_file_start_time: None,
         }
     }
 
@@ -115,6 +130,7 @@ impl AppState {
         self.current_file = file_num;
         self.input_word_count = word_count;
         self.seeded_count = seeded;
+        self.last_file_start_time = Some(Instant::now());
     }
 
     pub fn set_optimal(&mut self, ortho_display: String) {
@@ -128,7 +144,10 @@ impl AppState {
     pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, 
                               queue_mem: usize, queue_disk: usize,
                               work_write_rate: f64, work_read_rate: f64, results_write_rate: f64,
-                              work_spillover: u64, work_peak: usize, results_spillover: u64, results_peak: usize) {
+                              work_spillover: u64, work_peak: usize, work_spillover_time: f64,
+                              work_loads: u64, work_load_time: f64,
+                              results_spillover: u64, results_peak: usize, results_spillover_time: f64,
+                              results_loads: u64, results_load_time: f64) {
         self.bloom_hits = bloom_hits;
         self.bloom_misses = bloom_misses;
         self.disk_checks = disk_checks;
@@ -139,8 +158,14 @@ impl AppState {
         self.results_queue_disk_write_rate = results_write_rate;
         self.work_queue_spillover_events = work_spillover;
         self.work_queue_peak_disk = work_peak;
+        self.work_queue_seconds_since_spillover = work_spillover_time;
+        self.work_queue_load_events = work_loads;
+        self.work_queue_seconds_since_load = work_load_time;
         self.results_queue_spillover_events = results_spillover;
         self.results_queue_peak_disk = results_peak;
+        self.results_queue_seconds_since_spillover = results_spillover_time;
+        self.results_queue_load_events = results_loads;
+        self.results_queue_seconds_since_load = results_load_time;
     }
 }
 
@@ -221,6 +246,21 @@ fn format_human(num: f64) -> String {
     }
 }
 
+/// Format time in seconds as a human-readable "time ago" string
+fn format_time_ago(seconds: f64) -> String {
+    if seconds == 0.0 {
+        "never".to_string()
+    } else if seconds < 60.0 {
+        format!("{:.0}s ago", seconds)
+    } else if seconds < 3600.0 {
+        let minutes = seconds / 60.0;
+        format!("{:.1}m ago", minutes)
+    } else {
+        let hours = seconds / 3600.0;
+        format!("{:.1}h ago", hours)
+    }
+}
+
 fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let elapsed = state.start_time.elapsed();
     let hours = elapsed.as_secs() / 3600;
@@ -255,6 +295,13 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     
     // Get RAM usage
     let ram_percent = get_ram_usage_percent();
+    
+    // Calculate time since last file started
+    let time_since_last_file = if let Some(last_start) = state.last_file_start_time {
+        last_start.elapsed().as_secs_f64()
+    } else {
+        0.0
+    };
 
     let mut stats_text = vec![
         Line::from(vec![
@@ -262,13 +309,15 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format!("{}/{}", state.current_file, state.total_files)),
             Span::styled("  |  Runtime: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:02}:{:02}:{:02}", hours, minutes, seconds)),
-            Span::styled("  |  Seeded: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format_human(state.seeded_count as f64)),
+            Span::styled("  |  Last File: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_time_ago(time_since_last_file)),
             Span::styled("  |  RAM: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:.1}%", ram_percent)),
         ]),
         Line::from(vec![
-            Span::styled("Bloom Hit: ", Style::default().fg(Color::Cyan)),
+            Span::styled("Seeded: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format_human(state.seeded_count as f64)),
+            Span::styled("  |  Bloom Hit: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:.1}%", bloom_hit_rate)),
             Span::styled("  |  Shard Cache Hit: ", Style::default().fg(Color::Cyan)),
             Span::raw(format!("{:.1}%", memory_hit_rate)),
@@ -280,13 +329,19 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             Span::raw(format_human(state.queue_disk_count as f64)),
         ]),
         Line::from(vec![
-            Span::styled("Work Q Spillovers: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{}", state.work_queue_spillover_events)),
+            Span::styled("Work Q Writes: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{} (last: {})", state.work_queue_spillover_events, format_time_ago(state.work_queue_seconds_since_spillover))),
+            Span::styled("  |  Reads: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{} (last: {})", state.work_queue_load_events, format_time_ago(state.work_queue_seconds_since_load))),
             Span::styled("  |  Peak Disk: ", Style::default().fg(Color::Cyan)),
             Span::raw(format_human(state.work_queue_peak_disk as f64)),
-            Span::styled("  |  Results Spillovers: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{}", state.results_queue_spillover_events)),
-            Span::styled("  Peak: ", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("Results Q Writes: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{} (last: {})", state.results_queue_spillover_events, format_time_ago(state.results_queue_seconds_since_spillover))),
+            Span::styled("  |  Reads: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{} (last: {})", state.results_queue_load_events, format_time_ago(state.results_queue_seconds_since_load))),
+            Span::styled("  |  Peak Disk: ", Style::default().fg(Color::Cyan)),
             Span::raw(format_human(state.results_queue_peak_disk as f64)),
         ]),
         Line::from(vec![
