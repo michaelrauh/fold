@@ -165,36 +165,54 @@ fn test_seen_ids_accumulate() {
 
 #[test]
 fn test_revisit_seeding_count() {
-    // This test verifies that when processing a second file with new vocabulary,
-    // the seeded count includes orthos from the first file that need revisiting
+    // This test verifies that when processing a second file with new phrase patterns,
+    // orthos from the first file get revisited if their last token now has new completions
     
     // Arrange
     let mut seen_ids = create_test_tracker();
     let mut optimal_ortho: Option<Ortho> = None;
     let mut ortho_storage = DiskQueue::new_persistent().unwrap();
     
-    // First file: "cat dog"
-    let text1 = "cat dog";
+    // First file: "the cat" - creates phrases where "the" is followed by "cat"
+    let text1 = "the cat";
     let interner1 = Arc::new(fold::interner::Interner::from_text(text1));
+    println!("Interner 1: version {}, vocab: {:?}", interner1.version(), interner1.vocabulary());
+    
     let seeded1 = fold::process_text(interner1.clone(), None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     println!("File 1 seeded: {}", seeded1);
-    println!("File 1 ortho_storage len after: {}", ortho_storage.len());
+    let ortho_count_after_file1 = ortho_storage.len();
+    println!("File 1 ortho_storage len: {}", ortho_count_after_file1);
     assert_eq!(seeded1, 1, "First file should seed just the blank ortho");
+    assert!(ortho_count_after_file1 > 0, "File 1 should have created some orthos");
     
-    // Second file: "cab dab" (shares prefixes 'c' and 'd' with first file words)
-    let text2 = "cab dab";
+    // Second file: "the dog" - adds new phrase where "the" is also followed by "dog"
+    // This means token "the" now has a NEW completion option
+    let text2 = "the dog";
     let interner2 = Arc::new(Arc::unwrap_or_clone(interner1.clone()).add_text(text2));
-    let seeded2 = fold::process_text(interner2.clone(), Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    println!("\nInterner 2: version {}, vocab: {:?}", interner2.version(), interner2.vocabulary());
     
-    println!("File 2 seeded: {}", seeded2);
-    println!("Interner1 version: {}, Interner2 version: {}", 1, interner2.version());
+    // Check what completions "the" has in each interner
+    let the_token = 0; // "the" should be token 0
+    println!("\nCompletions for 'the' (token {}):", the_token);
+    let prefix = vec![the_token];
+    if let Some(completions1) = interner1.completions_for_prefix(&prefix) {
+        println!("  Interner1: {:?}", completions1.ones().collect::<Vec<_>>());
+    }
+    if let Some(completions2) = interner2.completions_for_prefix(&prefix) {
+        println!("  Interner2: {:?}", completions2.ones().collect::<Vec<_>>());
+    }
     
-    // Assert: Second file should seed the blank ortho (1) PLUS orthos that have changed tokens in their last_inserted position
-    // "cab" and "dab" are new tokens. If any ortho from file 1 ended with "c" or "d" prefix tokens, they'll be revisited
-    assert!(seeded2 >= 1, "Second file should seed at least the blank ortho, got {}", seeded2);
-    // With actual revisit logic: orthos ending with tokens whose bitsets changed get revisited
-    println!("Seeded {} orthos for file 2 (1 blank + {} revisited)", seeded2, seeded2 - 1);
+    let seeded2 = fold::process_text(interner2.clone(), Some(interner1.clone()), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    
+    println!("\nFile 2 seeded: {}", seeded2);
+    
+    // The key test: since "the" (token 1) has new completions in interner2,
+    // and file 1 created orthos, at least one should have ended with "the" and been revisited
+    // So seeded2 should be > 1 (1 blank + revisited orthos)
+    assert!(seeded2 > 1, 
+            "File 2 should revisit some orthos since 'the' has new completions. Expected > 1, got {}", 
+            seeded2);
 }
 
 

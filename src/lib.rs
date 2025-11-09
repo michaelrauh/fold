@@ -148,30 +148,31 @@ fn find_changed_tokens(old_interner: &interner::Interner, new_interner: &interne
     }
     
     // Also check existing tokens whose completion bitsets have changed
-    for token_idx in 0..old_vocab_len {
-        // Check if this token's completion bitsets have changed
-        // For simplicity, check single-token prefixes
-        for prefix_idx in 0..old_vocab_len {
-            let prefix = vec![prefix_idx];
-            let old_completions = old_interner.completions_for_prefix(&prefix);
-            let new_completions = new_interner.completions_for_prefix(&prefix);
-            
-            match (old_completions, new_completions) {
-                (Some(old_bits), Some(new_bits)) => {
-                    // Compare bitsets (ignoring padding differences)
-                    let old_has = token_idx < old_bits.len() && old_bits.contains(token_idx);
-                    let new_has = token_idx < new_bits.len() && new_bits.contains(token_idx);
-                    
-                    if old_has != new_has {
-                        changed.insert(token_idx);
-                    }
+    // If a prefix token now has NEW completions, mark that PREFIX token as changed
+    for prefix_idx in 0..old_vocab_len {
+        let prefix = vec![prefix_idx];
+        let old_completions = old_interner.completions_for_prefix(&prefix);
+        let new_completions = new_interner.completions_for_prefix(&prefix);
+        
+        match (old_completions, new_completions) {
+            (Some(old_bits), Some(new_bits)) => {
+                // Check if new_bits has ANY completions that old_bits didn't have
+                // Ignore padding - only care about actual new completions
+                let has_new_completions = (0..new_vocab_len).any(|completion_idx| {
+                    let new_has = new_bits.contains(completion_idx);
+                    let old_has = completion_idx < old_bits.len() && old_bits.contains(completion_idx);
+                    new_has && !old_has
+                });
+                
+                if has_new_completions {
+                    changed.insert(prefix_idx);  // Mark the PREFIX token as changed
                 }
-                (Some(_), None) | (None, Some(_)) => {
-                    // Prefix exists in one but not the other
-                    changed.insert(token_idx);
-                }
-                (None, None) => {}
             }
+            (None, Some(_)) => {
+                // This prefix now has completions when it didn't before
+                changed.insert(prefix_idx);
+            }
+            (Some(_), None) | (None, None) => {}
         }
     }
     
