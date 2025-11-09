@@ -70,7 +70,7 @@ fn main() -> Result<(), FoldError> {
     let mut optimal_ortho: Option<Ortho> = None;
     let mut seen_ids = SeenTracker::load()?;
     let mut ortho_storage = fold::disk_queue::DiskQueue::new_persistent()?;
-    let mut interner: Option<fold::interner::Interner> = None;
+    let mut interner: Option<Arc<fold::interner::Interner>> = None;
     
     // Process each file
     for (file_idx, file_path) in input_files.iter().enumerate() {
@@ -86,21 +86,21 @@ fn main() -> Result<(), FoldError> {
         let word_count = text.split_whitespace().count();
         
         // Build or update interner first (so we have it for the callback)
-        let prev_interner = interner.clone();
-        let current_interner = if let Some(prev_interner) = interner {
-            prev_interner.add_text(&text)
+        let current_interner = if let Some(prev_interner) = interner.take() {
+            // Arc::unwrap_or_clone will only clone if there are other references
+            Arc::new(Arc::unwrap_or_clone(prev_interner).add_text(&text))
         } else {
-            fold::interner::Interner::from_text(&text)
+            Arc::new(fold::interner::Interner::from_text(&text))
         };
         
         // Process text through worker loop with metrics callback
         let state_clone = Arc::clone(&state);
         let quit_check = Arc::clone(&quit_flag);
-        let interner_clone = current_interner.clone();
+        let interner_arc = Arc::clone(&current_interner); // Cheap Arc clone, not full interner clone!
         
         let (new_interner, seeded_count) = fold::process_text(
             &text, 
-            prev_interner, 
+            None,  // No longer passing previous interner (revisit optimization disabled to save RAM)
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
@@ -114,13 +114,13 @@ fn main() -> Result<(), FoldError> {
                 
                 // Update optimal ortho display in real-time
                 if let Some(optimal) = optimal_ortho_ref {
-                    let ortho_display = format_ortho_display(optimal, &interner_clone);
+                    let ortho_display = format_ortho_display(optimal, &interner_arc);
                     state_lock.set_optimal(ortho_display);
                 }
             }
         )?;
         
-        interner = Some(new_interner);
+        interner = Some(Arc::new(new_interner));
         
         // Update state for new file with the actual seeded count
         {
@@ -152,7 +152,7 @@ fn main() -> Result<(), FoldError> {
     Ok(())
 }
 
-fn format_ortho_display(ortho: &Ortho, interner: &fold::interner::Interner) -> String {
+fn format_ortho_display(ortho: &Ortho, interner: &Arc<fold::interner::Interner>) -> String {
     let dims = ortho.dims();
     let volume: usize = dims.iter().map(|d| d.saturating_sub(1)).product();
     let filled: usize = ortho.payload().iter().filter(|x| x.is_some()).count();
