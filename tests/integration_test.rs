@@ -28,7 +28,7 @@ fn test_simple_worker_loop() {
     
     // Act
     let interner = Arc::new(fold::interner::Interner::from_text(text));
-    let _seeded = fold::process_text(interner.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let _seeded = fold::process_text(interner.clone(), None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     // Assert
     assert_eq!(interner.version(), 1, "Should create version 1");
@@ -47,12 +47,13 @@ fn test_multiple_file_processing() {
     
     // Act
     for text in texts {
+        let prev_interner = interner.clone();
         let current_interner = if let Some(prev) = interner {
             Arc::new(Arc::unwrap_or_clone(prev).add_text(text))
         } else {
             Arc::new(fold::interner::Interner::from_text(text))
         };
-        let _seeded = fold::process_text(current_interner.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+        let _seeded = fold::process_text(current_interner.clone(), prev_interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
         interner = Some(current_interner);
     }
     
@@ -73,7 +74,7 @@ fn test_optimal_ortho_tracking() {
     
     // Act
     let interner = Arc::new(fold::interner::Interner::from_text(text));
-    let _seeded = fold::process_text(interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let _seeded = fold::process_text(interner, None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     // Assert
     // Just verify that we tracked some optimal ortho
@@ -94,12 +95,13 @@ fn test_multiple_texts_accumulate_vocabulary() {
     
     // Act
     for text in texts {
+        let prev_interner = interner.clone();
         let current_interner = if let Some(prev) = interner {
             Arc::new(Arc::unwrap_or_clone(prev).add_text(text))
         } else {
             Arc::new(fold::interner::Interner::from_text(text))
         };
-        let _seeded = fold::process_text(current_interner.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+        let _seeded = fold::process_text(current_interner.clone(), prev_interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
         interner = Some(current_interner);
     }
     
@@ -123,13 +125,13 @@ fn test_interner_version_increments() {
     
     // Act
     let interner1 = Arc::new(fold::interner::Interner::from_text("first text"));
-    let _ = fold::process_text(interner1.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let _ = fold::process_text(interner1.clone(), None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
-    let interner2 = Arc::new(Arc::unwrap_or_clone(interner1).add_text("second text"));
-    let _ = fold::process_text(interner2.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let interner2 = Arc::new(Arc::unwrap_or_clone(interner1.clone()).add_text("second text"));
+    let _ = fold::process_text(interner2.clone(), Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
-    let interner3 = Arc::new(Arc::unwrap_or_clone(interner2).add_text("third text"));
-    let _ = fold::process_text(interner3.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    let interner3 = Arc::new(Arc::unwrap_or_clone(interner2.clone()).add_text("third text"));
+    let _ = fold::process_text(interner3.clone(), Some(interner2), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
     
     // Assert
     assert_eq!(interner3.version(), 3, "Should have version 3 after processing 3 texts");
@@ -146,12 +148,13 @@ fn test_seen_ids_accumulate() {
     
     // Act
     for text in texts {
+        let prev_interner = interner.clone();
         let current_interner = if let Some(prev) = interner {
             Arc::new(Arc::unwrap_or_clone(prev).add_text(text))
         } else {
             Arc::new(fold::interner::Interner::from_text(text))
         };
-        let _seeded = fold::process_text(current_interner.clone(), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+        let _seeded = fold::process_text(current_interner.clone(), prev_interner, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
         interner = Some(current_interner);
     }
     

@@ -22,8 +22,10 @@ use std::sync::Arc;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho
 /// Expects the interner to already be updated with the current text
+/// If previous_interner is provided, will seed the queue with orthos that need revisiting
 pub fn process_text<F>(
     current_interner: Arc<interner::Interner>,
+    previous_interner: Option<Arc<interner::Interner>>,
     seen_ids: &mut SeenTracker,
     optimal_ortho: &mut Option<Ortho>,
     ortho_storage: &mut DiskQueue,
@@ -45,10 +47,20 @@ where
     work_queue.push_back(seed_ortho)?;
     seeded_count += 1;
     
-    // Also add revisit points if we have a previous interner (need to re-read from disk)
-    // Note: We need the *previous* version of the interner to find changed tokens,
-    // but we already consumed it above. For now, skip revisit optimization when interner exists.
-    // TODO: Fix this properly by not consuming the interner or using a different approach
+    // Also add revisit points if we have a previous interner
+    if let Some(prev_interner) = previous_interner {
+        // Find tokens that changed between versions
+        let changed_tokens = find_changed_tokens(&prev_interner, &current_interner);
+        
+        // Find orthos that need revisiting
+        let revisit_orthos = find_revisit_orthos(&changed_tokens)?;
+        
+        // Seed them into the queue
+        for ortho in revisit_orthos {
+            work_queue.push_back(ortho)?;
+            seeded_count += 1;
+        }
+    }
     
     let mut processed = 0;
     // Worker loop: process until queue is empty

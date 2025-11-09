@@ -86,8 +86,8 @@ fn main() -> Result<(), FoldError> {
         let word_count = text.split_whitespace().count();
         
         // Build the new interner first (outside process_text)
-        let current_interner = if let Some(prev_arc) = interner.take() {
-            Arc::unwrap_or_clone(prev_arc).add_text(&text)
+        let current_interner = if let Some(prev_arc) = interner.as_ref() {
+            Arc::unwrap_or_clone(Arc::clone(prev_arc)).add_text(&text)
         } else {
             fold::interner::Interner::from_text(&text)
         };
@@ -102,6 +102,7 @@ fn main() -> Result<(), FoldError> {
         
         let seeded_count = fold::process_text(
             Arc::clone(&current_interner_arc),  // Pass Arc<Interner> 
+            interner.clone(),                    // Pass previous interner for revisit seeding
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
