@@ -85,22 +85,23 @@ fn main() -> Result<(), FoldError> {
         
         let word_count = text.split_whitespace().count();
         
-        // Build or update interner first (so we have it for the callback)
-        let current_interner = if let Some(prev_interner) = interner.take() {
-            // Arc::unwrap_or_clone will only clone if there are other references
-            Arc::new(Arc::unwrap_or_clone(prev_interner).add_text(&text))
+        // Build the new interner first (outside process_text)
+        let current_interner = if let Some(prev_arc) = interner.take() {
+            Arc::unwrap_or_clone(prev_arc).add_text(&text)
         } else {
-            Arc::new(fold::interner::Interner::from_text(&text))
+            fold::interner::Interner::from_text(&text)
         };
+        let current_interner_arc = Arc::new(current_interner);
+        
+        // Clone Arc for callback (cheap - just reference count increment)
+        let interner_for_callback = Arc::clone(&current_interner_arc);
         
         // Process text through worker loop with metrics callback
         let state_clone = Arc::clone(&state);
         let quit_check = Arc::clone(&quit_flag);
-        let interner_arc = Arc::clone(&current_interner); // Cheap Arc clone, not full interner clone!
         
-        let (new_interner, seeded_count) = fold::process_text(
-            &text, 
-            None,  // No longer passing previous interner (revisit optimization disabled to save RAM)
+        let seeded_count = fold::process_text(
+            Arc::clone(&current_interner_arc),  // Pass Arc<Interner> 
             &mut seen_ids, 
             &mut optimal_ortho, 
             &mut ortho_storage,
@@ -112,15 +113,16 @@ fn main() -> Result<(), FoldError> {
                 state_lock.update_metrics(queue_len, total_found);
                 state_lock.update_cache_stats(bloom_hits, bloom_misses, bloom_false_positives, shard_cache_hits, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, work_spillover, work_peak, work_spillover_time, work_loads, work_load_time, results_spillover, results_peak, results_spillover_time, results_loads, results_load_time);
                 
-                // Update optimal ortho display in real-time
+                // Update optimal ortho display in real-time using captured interner Arc
                 if let Some(optimal) = optimal_ortho_ref {
-                    let ortho_display = format_ortho_display(optimal, &interner_arc);
+                    let ortho_display = format_ortho_display(optimal, &interner_for_callback);
                     state_lock.set_optimal(ortho_display);
                 }
             }
         )?;
         
-        interner = Some(Arc::new(new_interner));
+        // Store the interner for next iteration
+        interner = Some(current_interner_arc);
         
         // Update state for new file with the actual seeded count
         {

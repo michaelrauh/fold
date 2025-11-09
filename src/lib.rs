@@ -18,26 +18,20 @@ pub use seen_tracker::SeenTracker;
 use ortho::Ortho;
 use disk_queue::DiskQueue;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Process a single text through the worker loop, updating the interner and tracking optimal ortho
+/// Expects the interner to already be updated with the current text
 pub fn process_text<F>(
-    text: &str,
-    interner: Option<interner::Interner>,
+    current_interner: Arc<interner::Interner>,
     seen_ids: &mut SeenTracker,
     optimal_ortho: &mut Option<Ortho>,
     ortho_storage: &mut DiskQueue,
     mut metrics_callback: F,
-) -> Result<(interner::Interner, usize), FoldError>
+) -> Result<usize, FoldError>
 where
     F: FnMut(usize, usize, usize, usize, usize, usize, usize, usize, usize, f64, f64, f64, u64, usize, f64, u64, f64, u64, usize, f64, u64, f64, &Option<Ortho>),  // (queue_length, total_seen, bloom_hits, bloom_misses, bloom_false_positives, shard_cache_hits, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, work_spillover, work_peak, work_spillover_time, work_loads, work_load_time, results_spillover, results_peak, results_spillover_time, results_loads, results_load_time, optimal_ortho)
 {
-    // Build or update interner
-    let current_interner = if let Some(prev_interner) = interner {
-        prev_interner.add_text(text)
-    } else {
-        interner::Interner::from_text(text)
-    };
-    
     let version = current_interner.version();
     
     // Create work queue with disk spillover
@@ -107,7 +101,7 @@ where
     let (results_spillover, results_peak, _, results_spillover_time, results_loads, results_load_time) = ortho_storage.get_buffer_stats();
     metrics_callback(work_queue.len(), seen_ids.len(), bloom_hits, bloom_misses, bloom_false_positives, shard_cache_hits, disk_checks, queue_mem, queue_disk, work_disk_write_rate, work_disk_read_rate, results_disk_write_rate, work_spillover, work_peak, work_spillover_time, work_loads, work_load_time, results_spillover, results_peak, results_spillover_time, results_loads, results_load_time, optimal_ortho);
     
-    Ok((current_interner, seeded_count))
+    Ok(seeded_count)
 }
 
 /// Update the optimal ortho if the new candidate is better
