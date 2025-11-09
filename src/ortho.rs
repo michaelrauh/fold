@@ -661,11 +661,6 @@ mod tests {
         // should correctly place all values including the new one
         let expanded = ortho.add(25, 1);
         
-        println!("Number of expanded orthos: {}", expanded.len());
-        for (i, o) in expanded.iter().enumerate() {
-            println!("  Ortho {}: dims={:?}, payload={:?}", i, o.dims(), o.payload());
-        }
-        
         // Check the [2,2,2] expansion where the bug manifests
         let up_ortho = expanded.iter().find(|o| o.dims() == &vec![2, 2, 2]).expect("Should have [2,2,2] expansion");
         let payload = up_ortho.payload();
