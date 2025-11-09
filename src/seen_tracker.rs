@@ -5,9 +5,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write, Read};
 use std::path::PathBuf;
 
-const BLOOM_SIZE: usize = 16_000_000_000; // 16 billion bits = ~1.9 GB (increased from 4B for lower false positive rate)
+const BLOOM_SIZE: usize = 64_000_000_000; // 64 billion bits = ~7.5 GB (increased for 100M+ item workload)
 const SHARD_COUNT: usize = 256; // Number of disk shards
-const MEMORY_CACHE_SIZE: usize = 100_000; // Keep recent IDs in memory per shard (was 10k, increased for better cache hit rate)
+const MEMORY_CACHE_SIZE: usize = 500_000; // Keep recent IDs in memory per shard (128M total = ~1GB RAM)
 
 /// A probabilistic set that uses a bloom filter backed by sharded disk storage
 pub struct SeenTracker {
@@ -20,9 +20,11 @@ pub struct SeenTracker {
     /// Dirty flags for shards that need to be written
     dirty_shards: Vec<bool>,
     /// Statistics
-    bloom_hits: usize,      // Bloom filter said "definitely not"
-    bloom_misses: usize,    // Bloom filter said "maybe" - had to check disk/memory
-    disk_checks: usize,     // Actually had to read from disk
+    bloom_hits: usize,           // Bloom filter said "definitely not" (correct negative)
+    bloom_misses: usize,         // Bloom filter said "maybe" - had to check disk/memory
+    bloom_false_positives: usize, // Bloom said "maybe" but item was actually NEW (false positive)
+    shard_cache_hits: usize,     // Found in shard memory cache (avoided disk)
+    disk_checks: usize,          // Actually had to read from disk
 }
 
 impl SeenTracker {
@@ -54,6 +56,8 @@ impl SeenTracker {
             dirty_shards,
             bloom_hits: 0,
             bloom_misses: 0,
+            bloom_false_positives: 0,
+            shard_cache_hits: 0,
             disk_checks: 0,
         })
     }
@@ -152,12 +156,20 @@ impl SeenTracker {
         
         // Check memory cache first
         if self.memory_cache[shard_id].contains(&id) {
+            self.shard_cache_hits += 1;
             return Ok(true);
         }
 
         // Check disk
         self.disk_checks += 1;
-        self.contains_on_disk(shard_id, id)
+        let found_on_disk = self.contains_on_disk(shard_id, id)?;
+        
+        // If not found on disk, this was a bloom false positive
+        if !found_on_disk {
+            self.bloom_false_positives += 1;
+        }
+        
+        Ok(found_on_disk)
     }
 
     /// Insert an ID into the tracker
@@ -192,8 +204,9 @@ impl SeenTracker {
     }
 
     /// Get bloom filter statistics
-    pub fn get_stats(&self) -> (usize, usize, usize) {
-        (self.bloom_hits, self.bloom_misses, self.disk_checks)
+    /// Returns: (bloom_hits, bloom_misses, bloom_false_positives, shard_cache_hits, disk_checks)
+    pub fn get_stats(&self) -> (usize, usize, usize, usize, usize) {
+        (self.bloom_hits, self.bloom_misses, self.bloom_false_positives, self.shard_cache_hits, self.disk_checks)
     }
 
 

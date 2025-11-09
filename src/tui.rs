@@ -32,6 +32,8 @@ pub struct AppState {
     // Cache statistics
     pub bloom_hits: usize,
     pub bloom_misses: usize,
+    pub bloom_false_positives: usize,
+    pub shard_cache_hits: usize,
     pub disk_checks: usize,
     // Queue statistics
     pub queue_memory_count: usize,
@@ -73,6 +75,8 @@ impl AppState {
             processing_complete: false,
             bloom_hits: 0,
             bloom_misses: 0,
+            bloom_false_positives: 0,
+            shard_cache_hits: 0,
             disk_checks: 0,
             queue_memory_count: 0,
             queue_disk_count: 0,
@@ -141,7 +145,7 @@ impl AppState {
         self.processing_complete = true;
     }
     
-    pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, disk_checks: usize, 
+    pub fn update_cache_stats(&mut self, bloom_hits: usize, bloom_misses: usize, bloom_false_positives: usize, shard_cache_hits: usize, disk_checks: usize, 
                               queue_mem: usize, queue_disk: usize,
                               work_write_rate: f64, work_read_rate: f64, results_write_rate: f64,
                               work_spillover: u64, work_peak: usize, work_spillover_time: f64,
@@ -150,6 +154,8 @@ impl AppState {
                               results_loads: u64, results_load_time: f64) {
         self.bloom_hits = bloom_hits;
         self.bloom_misses = bloom_misses;
+        self.bloom_false_positives = bloom_false_positives;
+        self.shard_cache_hits = shard_cache_hits;
         self.disk_checks = disk_checks;
         self.queue_memory_count = queue_mem;
         self.queue_disk_count = queue_disk;
@@ -268,16 +274,16 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let seconds = elapsed.as_secs() % 60;
     
     // Calculate cache hit rates
-    let total_bloom_checks = state.bloom_hits + state.bloom_misses;
-    let bloom_hit_rate = if total_bloom_checks > 0 {
-        (state.bloom_hits as f64 / total_bloom_checks as f64) * 100.0
+    // Bloom False Positive Rate: % of bloom "maybes" that were actually new items
+    let bloom_fp_rate = if state.bloom_misses > 0 {
+        (state.bloom_false_positives as f64 / state.bloom_misses as f64) * 100.0
     } else {
         0.0
     };
     
-    let memory_hit_rate = if state.bloom_misses > 0 {
-        let memory_hits = state.bloom_misses - state.disk_checks;
-        (memory_hits as f64 / state.bloom_misses as f64) * 100.0
+    // Shard Cache Hit Rate: % of bloom misses that hit the in-memory cache (avoiding disk)
+    let shard_cache_hit_rate = if state.bloom_misses > 0 {
+        (state.shard_cache_hits as f64 / state.bloom_misses as f64) * 100.0
     } else {
         0.0
     };
@@ -317,10 +323,10 @@ fn render_stats(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("Seeded: ", Style::default().fg(Color::Cyan)),
             Span::raw(format_human(state.seeded_count as f64)),
-            Span::styled("  |  Bloom Hit: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{:.1}%", bloom_hit_rate)),
+            Span::styled("  |  Bloom FP Rate: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:.1}%", bloom_fp_rate)),
             Span::styled("  |  Shard Cache Hit: ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("{:.1}%", memory_hit_rate)),
+            Span::raw(format!("{:.1}%", shard_cache_hit_rate)),
         ]),
         Line::from(vec![
             Span::styled("Queue Mem: ", Style::default().fg(Color::Cyan)),

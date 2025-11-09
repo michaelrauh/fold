@@ -12,8 +12,8 @@ fn create_test_tracker() -> SeenTracker {
     SeenTracker::new_with_dir(temp_dir).unwrap()
 }
 
-// Helper for test callbacks - accepts all 21 parameters but does nothing
-fn noop_callback(_q: usize, _s: usize, _bh: usize, _bm: usize, _dc: usize, _qm: usize, _qd: usize, 
+// Helper for test callbacks - accepts all 23 parameters but does nothing
+fn noop_callback(_q: usize, _s: usize, _bh: usize, _bm: usize, _bfp: usize, _sch: usize, _dc: usize, _qm: usize, _qd: usize, 
                   _wwr: f64, _wrr: f64, _rwr: f64, _ws: u64, _wp: usize, _wst: f64, 
                   _wl: u64, _wlt: f64, _rs: u64, _rp: usize, _rst: f64, _rl: u64, _rlt: f64, _o: &Option<Ortho>) {}
 
