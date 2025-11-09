@@ -150,9 +150,6 @@ impl Ortho {
             .collect()
     }
     pub fn dims(&self) -> &Vec<usize> { &self.dims }
-    pub(crate) fn set_version(&self, version: usize) -> Ortho {
-        Ortho { version, dims: self.dims.clone(), payload: self.payload.clone() }
-    }
     pub fn payload(&self) -> &Vec<Option<usize>> { &self.payload }
 }
 

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use rustc_hash::FxHashMap; // use concrete name
 
 // Consolidated metadata per dims
+#[allow(dead_code)]
 struct DimMeta {
     indices_in_order: Vec<Vec<usize>>,            // ordering of indices
     axis_positions: Vec<usize>,                   // axis positions (1..=len)

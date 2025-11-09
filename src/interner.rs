@@ -1,5 +1,4 @@
 use crate::splitter::Splitter;
-use crate::error::FoldError;
 use fixedbitset::FixedBitSet;
 use std::collections::HashMap;
 
@@ -71,7 +70,7 @@ impl Interner {
 
     pub fn add_text(&self, text: &str) -> Self {
         if text.trim().is_empty() {
-            let mut interner = Interner {
+            let interner = Interner {
                 version: self.version + 1,
                 vocabulary: self.vocabulary.clone(),
                 prefix_to_completions: self.prefix_to_completions.clone(),
@@ -210,6 +209,7 @@ impl Interner {
                     ONCE.call_once(|| {
                         eprintln!("[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)", prefix);
                     });
+                    #[allow(unused_assignments)]
                     if first { /* intersection stays empty */ first = false; }
                     else { result.set_range(.., false); }
                     break;
