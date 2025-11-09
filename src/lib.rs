@@ -48,18 +48,15 @@ where
     seeded_count += 1;
     
     // Also add revisit points if we have a previous interner
+    // Stream through ortho_storage, checking each ortho and seeding impacted ones
     if let Some(prev_interner) = previous_interner {
         // Find tokens that changed between versions
         let changed_tokens = find_changed_tokens(&prev_interner, &current_interner);
         
-        // Find orthos that need revisiting
-        let revisit_orthos = find_revisit_orthos(&changed_tokens)?;
-        
-        // Seed them into the queue
-        for ortho in revisit_orthos {
-            work_queue.push_back(ortho)?;
-            seeded_count += 1;
-        }
+        // Stream through ortho storage: pop each, check if impacted, optionally seed to work queue,
+        // and push to new storage (no RAM spike - disk naturally backs it)
+        let revisit_count = stream_revisit_orthos(&changed_tokens, ortho_storage, &mut work_queue)?;
+        seeded_count += revisit_count;
     }
     
     let mut processed = 0;
@@ -180,21 +177,40 @@ fn find_changed_tokens(old_interner: &interner::Interner, new_interner: &interne
     changed
 }
 
-/// Find orthos from storage that have one of the changed tokens in their last_inserted position
-fn find_revisit_orthos(changed_tokens: &HashSet<usize>) -> Result<Vec<Ortho>, FoldError> {
-    let all_orthos = DiskQueue::read_all_from_storage()?;
-    let revisit_orthos: Vec<Ortho> = all_orthos
-        .into_iter()
-        .filter(|ortho| {
-            if let Some(last) = ortho.last_inserted() {
-                changed_tokens.contains(&last)
-            } else {
-                false
-            }
-        })
-        .collect();
+/// Stream through ortho storage, checking each for changed tokens
+/// Pops from ortho_storage, optionally pushes to work_queue if impacted,
+/// and always pushes to new_storage to preserve all orthos
+fn stream_revisit_orthos(
+    changed_tokens: &HashSet<usize>,
+    ortho_storage: &mut DiskQueue,
+    work_queue: &mut DiskQueue,
+) -> Result<usize, FoldError> {
+    let mut seeded_count = 0;
+    let mut new_storage = DiskQueue::new_persistent()?;
     
-    Ok(revisit_orthos)
+    // Stream through all orthos: pop, check, optionally seed to work queue, push to new storage
+    while let Ok(Some(ortho)) = ortho_storage.pop_front() {
+        // Check if this ortho is impacted by changed tokens
+        let should_revisit = if let Some(last) = ortho.last_inserted() {
+            changed_tokens.contains(&last)
+        } else {
+            false
+        };
+        
+        // If impacted, seed it into the work queue
+        if should_revisit {
+            work_queue.push_back(ortho.clone())?;
+            seeded_count += 1;
+        }
+        
+        // Always preserve the ortho in new storage
+        new_storage.push_back(ortho)?;
+    }
+    
+    // Replace old storage with new storage (swap the disk files)
+    *ortho_storage = new_storage;
+    
+    Ok(seeded_count)
 }
 
 #[cfg(test)]
