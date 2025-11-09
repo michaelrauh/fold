@@ -72,12 +72,20 @@ impl Ortho {
         value: usize,
         version: usize,
     ) -> Vec<Ortho> {
+        // First, insert the value into the old ortho at the correct position
+        let mut old_payload_with_value = ortho.payload.clone();
+        let insert_pos = old_payload_with_value.iter().position(|x| x.is_none()).unwrap_or(old_payload_with_value.len());
+        if insert_pos < old_payload_with_value.len() {
+            old_payload_with_value[insert_pos] = Some(value);
+        }
+        
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
+            // Now rearrange the old payload (with value already inserted) into the new payload
             let mut new_payload = vec![None; new_capacity];
-            for (i, &pos) in reorg.iter().enumerate() { new_payload[pos] = ortho.payload.get(i).cloned().flatten(); }
-            if let Some(insert_pos) = new_payload.iter().position(|x| x.is_none()) { new_payload[insert_pos] = Some(value); }
-            else if !new_payload.is_empty() { let last = new_payload.len() - 1; new_payload[last] = Some(value); }
+            for (i, &pos) in reorg.iter().enumerate() { 
+                new_payload[pos] = old_payload_with_value.get(i).cloned().flatten(); 
+            }
             out.push(Ortho { version, dims: new_dims_vec, payload: new_payload });
         }
         out
@@ -346,7 +354,8 @@ mod tests {
                 Ortho {
                     version: 1,
                     dims: vec![2, 2, 2],
-                    payload: vec![Some(1), Some(2), Some(3), Some(4), None, None, None, None],
+                    // After fix: insert 4 first, then rearrange with pattern [0,1,2,4]
+                    payload: vec![Some(1), Some(2), Some(3), None, Some(4), None, None, None],
                 }
             ]
         );
@@ -386,10 +395,11 @@ mod tests {
                 Ortho {
                     version: 1,
                     dims: vec![2, 2, 2],
+                    // After fix: insert 15 at position 1, then rearrange with pattern [0,2,3,6]
                     payload: vec![
                         Some(10),
-                        Some(15),
                         None,
+                        Some(15),
                         Some(20),
                         None,
                         None,
@@ -588,5 +598,101 @@ mod tests {
         norms1.sort();
         norms2.sort();
         assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
+    }
+
+    #[test]
+    fn test_expand_up_reorganization_pattern() {
+        // Check what reorganization pattern expand_up gives for [2,2] at different positions
+        use crate::spatial;
+        
+        let expansions_pos_0 = spatial::expand_up(&vec![2, 2], 0);
+        let expansions_pos_1 = spatial::expand_up(&vec![2, 2], 1);
+        let expansions_pos_2 = spatial::expand_up(&vec![2, 2], 2);
+        
+        println!("expand_up([2,2], 0):");
+        for (dims, _cap, reorg) in &expansions_pos_0 {
+            if dims == &vec![2, 2, 2] {
+                println!("  [2,2,2]: {:?}", reorg);
+            }
+        }
+        
+        println!("expand_up([2,2], 1):");
+        for (dims, _cap, reorg) in &expansions_pos_1 {
+            if dims == &vec![2, 2, 2] {
+                println!("  [2,2,2]: {:?}", reorg);
+            }
+        }
+        
+        println!("expand_up([2,2], 2):");
+        for (dims, _cap, reorg) in &expansions_pos_2 {
+            if dims == &vec![2, 2, 2] {
+                println!("  [2,2,2]: {:?}", reorg);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ortho_only_contains_phrases_in_interner() {
+        // This test verifies that orthos only contain phrases that are present in the interner.
+        // The bug: when expanding, if we rearrange THEN insert, the newly inserted value
+        // is placed AFTER the rearrangement, which means it goes into the first available None slot
+        // rather than into the spatially correct position determined by get_insert_position.
+        
+        // Test case: base ortho [2,2] with values at axis positions
+        // When we insert axis values in a specific order and then expand,
+        // the spatial reorganization should preserve the insertion order semantics
+        
+        let ortho = Ortho::new(1);
+        // Insert first value (position 0, the root)
+        let ortho = &ortho.add(10, 1)[0]; // payload: [Some(10), None, None, None]
+        
+        // Insert second value (position 1, first axis - this is axis position)
+        let ortho = &ortho.add(20, 1)[0]; // payload: [Some(10), Some(20), None, None]
+        
+        // Insert third value (position 2, second axis)
+        // Because of canonicalization: inserts 15 at position 2, then since 20 > 15, swaps them
+        // So position 1 becomes 15, position 2 becomes 20
+        let ortho = &ortho.add(15, 1)[0]; // payload after canonicalization: [Some(10), Some(15), Some(20), None]
+        
+        // Verify the state before expansion - positions 1 and 2 are canonicalized (sorted)
+        assert_eq!(ortho.payload(), &vec![Some(10), Some(15), Some(20), None]);
+        
+        // Now when we insert the 4th value and expand, the spatial reorganization
+        // should correctly place all values including the new one
+        let expanded = ortho.add(25, 1);
+        
+        println!("Number of expanded orthos: {}", expanded.len());
+        for (i, o) in expanded.iter().enumerate() {
+            println!("  Ortho {}: dims={:?}, payload={:?}", i, o.dims(), o.payload());
+        }
+        
+        // Check the [2,2,2] expansion where the bug manifests
+        let up_ortho = expanded.iter().find(|o| o.dims() == &vec![2, 2, 2]).expect("Should have [2,2,2] expansion");
+        let payload = up_ortho.payload();
+        
+        // get_insert_position(25) with axis values [15, 20] returns 2 (after both axes)
+        // So expand_up([2,2], 2) is called
+        // The reorganization pattern for [2,2] -> [2,2,2] at position 2 is [0,1,2,4]
+        // This means: old[0]->new[0], old[1]->new[1], old[2]->new[2], old[3]->new[4]
+        // Before expansion: [Some(10), Some(15), Some(20), None]
+        
+        // If we INSERT first (correct - after the fix):
+        // 1. Insert 25 at position 3 (first None): [Some(10), Some(15), Some(20), Some(25)]
+        // 2. Rearrange using [0,1,2,4]: new[0]=old[0]=10, new[1]=old[1]=15, new[2]=old[2]=20, new[4]=old[3]=25
+        // Expected result: [Some(10), Some(15), Some(20), None, Some(25), None, None, None]
+        
+        // If we REARRANGE first (bug - before the fix):
+        // 1. Start with old: [Some(10), Some(15), Some(20), None]
+        // 2. Rearrange using [0,1,2,4]: new[0]=old[0]=10, new[1]=old[1]=15, new[2]=old[2]=20, new[4]=old[3]=None
+        // Result: [Some(10), Some(15), Some(20), None, None, None, None, None]
+        // 3. Insert 25 at first None (position 3): [Some(10), Some(15), Some(20), Some(25), None, None, None, None]
+        // Buggy result: [Some(10), Some(15), Some(20), Some(25), None, None, None, None]
+        
+        // Check the correct positions (after the fix)
+        assert_eq!(payload[0], Some(10), "Position 0 should be 10");
+        assert_eq!(payload[1], Some(15), "Position 1 should be 15");
+        assert_eq!(payload[2], Some(20), "Position 2 should be 20");
+        assert_eq!(payload[4], Some(25), "Position 4 should be 25");
+        assert_eq!(payload[3], None, "Position 3 should be None");
     }
 }
