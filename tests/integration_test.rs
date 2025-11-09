@@ -162,3 +162,36 @@ fn test_seen_ids_accumulate() {
     // Seen IDs should accumulate across all files
     assert!(seen_ids.len() > 0, "Should track orthos across all files");
 }
+
+#[test]
+fn test_revisit_seeding_count() {
+    // This test verifies that when processing a second file with new vocabulary,
+    // the seeded count includes orthos from the first file that need revisiting
+    
+    // Arrange
+    let mut seen_ids = create_test_tracker();
+    let mut optimal_ortho: Option<Ortho> = None;
+    let mut ortho_storage = DiskQueue::new_persistent().unwrap();
+    
+    // First file: "cat dog"
+    let text1 = "cat dog";
+    let interner1 = Arc::new(fold::interner::Interner::from_text(text1));
+    let seeded1 = fold::process_text(interner1.clone(), None, &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    
+    println!("File 1 seeded: {}", seeded1);
+    println!("File 1 ortho_storage len after: {}", ortho_storage.len());
+    assert_eq!(seeded1, 1, "First file should seed just the blank ortho");
+    
+    // Second file: "cab dab" (shares prefixes 'c' and 'd' with first file words)
+    let text2 = "cab dab";
+    let interner2 = Arc::new(Arc::unwrap_or_clone(interner1.clone()).add_text(text2));
+    let seeded2 = fold::process_text(interner2.clone(), Some(interner1), &mut seen_ids, &mut optimal_ortho, &mut ortho_storage, noop_callback).unwrap();
+    
+    println!("File 2 seeded: {}", seeded2);
+    println!("Interner1 version: {}, Interner2 version: {}", 1, interner2.version());
+    
+    // Assert: Second file should seed the blank ortho (1) PLUS orthos from first file that could use new tokens
+    // "cab" and "dab" are new tokens that share prefixes with "cat" and "dog"
+    assert!(seeded2 > 1, "Second file should seed blank ortho plus revisit orthos from first file, got {}", seeded2);
+}
+

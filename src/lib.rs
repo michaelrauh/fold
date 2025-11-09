@@ -138,17 +138,18 @@ fn update_optimal(optimal_ortho: &mut Option<Ortho>, candidate: &Ortho) {
 fn find_changed_tokens(old_interner: &interner::Interner, new_interner: &interner::Interner) -> HashSet<usize> {
     let mut changed = HashSet::new();
     
-    // Get all unique prefix keys from both interners
-    let mut _all_prefixes: HashSet<Vec<usize>> = HashSet::new();
-    // We need to access prefix_to_completions - this requires adding a public method to Interner
-    // For now, we'll use a different approach: check each token index
-    
-    // Compare vocabulary - tokens that exist in old interner
     let old_vocab_len = old_interner.vocabulary().len();
+    let new_vocab_len = new_interner.vocabulary().len();
     
+    // ALL new tokens are considered "changed" - they didn't exist before
+    // This allows existing orthos to be revisited with new vocabulary
+    for token_idx in old_vocab_len..new_vocab_len {
+        changed.insert(token_idx);
+    }
+    
+    // Also check existing tokens whose completion bitsets have changed
     for token_idx in 0..old_vocab_len {
         // Check if this token's completion bitsets have changed
-        // We do this by checking if the token appears in different contexts
         // For simplicity, check single-token prefixes
         for prefix_idx in 0..old_vocab_len {
             let prefix = vec![prefix_idx];
@@ -188,14 +189,16 @@ fn stream_revisit_orthos(
     let mut seeded_count = 0;
     let mut new_storage = DiskQueue::new_persistent()?;
     
+    // If there are changed tokens, ALL non-full orthos could potentially benefit
+    // from the new vocabulary, so we revisit them all
+    let has_changes = !changed_tokens.is_empty();
+    
     // Stream through all orthos: pop, check, optionally seed to work queue, push to new storage
     while let Ok(Some(ortho)) = ortho_storage.pop_front() {
-        // Check if this ortho is impacted by changed tokens
-        let should_revisit = if let Some(last) = ortho.last_inserted() {
-            changed_tokens.contains(&last)
-        } else {
-            false
-        };
+        // Revisit non-full orthos when there are new tokens
+        // Full orthos can't accept new tokens, so skip them
+        let is_full = ortho.get_current_position() >= ortho.payload().len();
+        let should_revisit = has_changes && !is_full;
         
         // If impacted, seed it into the work queue
         if should_revisit {
