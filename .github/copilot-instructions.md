@@ -4,6 +4,47 @@
 
 Fold is a text processing system that generates and optimizes ortho structures from text input. It builds interner vocabularies and generates ortho structures through iterative expansion, tracking optimal configurations based on volume calculation.
 
+## Core Directives
+
+### Style Principles
+
+1. **High reading level functional style is preferred**
+   - Prefer non-mutation unless there is a large performance hit
+   - Use functional patterns and immutable data structures where practical
+
+2. **Avoid comments - code should self-document**
+   - Write clear, expressive code that explains itself
+   - Use descriptive names for functions, variables, and types
+   - Only add comments when absolutely necessary to explain complex algorithms
+
+3. **Do not use "defensive programming" or "harden" methods**
+   - Look at the call pattern and support the actual calls and behavior in the current program
+   - This limits complexity and avoids unnecessary validation code
+   - Focus on what the code actually does, not what it might do
+
+4. **Practice a TDD style**
+   - If there is a bug, prove it with a failing test first
+   - If there is new behavior needed, add a test for it first
+   - Let tests drive the design and implementation
+
+### Project Principles
+
+1. **Performance critical application**
+   - Prefer small simple structures
+   - Avoid lots of clones and unnecessary data shuffles
+   - Be mindful of allocation overhead
+
+2. **Disk usage is mandatory**
+   - Keeping everything in memory is impossible
+   - Design with disk-backed storage from the start
+   - Use streaming patterns over loading entire datasets
+
+3. **Correct by construction**
+   - Results and intermediates should be correct by construction
+   - Do not make junk and then check for it or delete it
+   - Just create it in the correct configuration from the beginning
+   - Avoid generate-and-filter patterns
+
 ## Architecture
 
 ### Core Components
