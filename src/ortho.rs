@@ -72,12 +72,18 @@ impl Ortho {
         value: usize,
         version: usize,
     ) -> Vec<Ortho> {
+        // First, insert the value into the old ortho at the correct position
+        let mut old_payload_with_value = ortho.payload.clone();
+        let insert_pos = old_payload_with_value.iter().position(|x| x.is_none()).unwrap();
+        old_payload_with_value[insert_pos] = Some(value);
+        
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
+            // Now rearrange the old payload (with value already inserted) into the new payload
             let mut new_payload = vec![None; new_capacity];
-            for (i, &pos) in reorg.iter().enumerate() { new_payload[pos] = ortho.payload.get(i).cloned().flatten(); }
-            if let Some(insert_pos) = new_payload.iter().position(|x| x.is_none()) { new_payload[insert_pos] = Some(value); }
-            else if !new_payload.is_empty() { let last = new_payload.len() - 1; new_payload[last] = Some(value); }
+            for (i, &pos) in reorg.iter().enumerate() { 
+                new_payload[pos] = old_payload_with_value.get(i).cloned().flatten(); 
+            }
             out.push(Ortho { version, dims: new_dims_vec, payload: new_payload });
         }
         out
@@ -346,7 +352,7 @@ mod tests {
                 Ortho {
                     version: 1,
                     dims: vec![2, 2, 2],
-                    payload: vec![Some(1), Some(2), Some(3), Some(4), None, None, None, None],
+                    payload: vec![Some(1), Some(2), Some(3), None, Some(4), None, None, None],
                 }
             ]
         );
@@ -388,8 +394,8 @@ mod tests {
                     dims: vec![2, 2, 2],
                     payload: vec![
                         Some(10),
-                        Some(15),
                         None,
+                        Some(15),
                         Some(20),
                         None,
                         None,
