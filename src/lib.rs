@@ -189,16 +189,14 @@ fn stream_revisit_orthos(
     let mut seeded_count = 0;
     let mut new_storage = DiskQueue::new_persistent()?;
     
-    // If there are changed tokens, ALL non-full orthos could potentially benefit
-    // from the new vocabulary, so we revisit them all
-    let has_changes = !changed_tokens.is_empty();
-    
     // Stream through all orthos: pop, check, optionally seed to work queue, push to new storage
     while let Ok(Some(ortho)) = ortho_storage.pop_front() {
-        // Revisit non-full orthos when there are new tokens
-        // Full orthos can't accept new tokens, so skip them
-        let is_full = ortho.get_current_position() >= ortho.payload().len();
-        let should_revisit = has_changes && !is_full;
+        // Check if this ortho has a changed token in its most advanced position (last_inserted)
+        let should_revisit = if let Some(last_token) = ortho.last_inserted() {
+            changed_tokens.contains(&last_token)
+        } else {
+            false
+        };
         
         // If impacted, seed it into the work queue
         if should_revisit {
