@@ -888,5 +888,18 @@ mod tests {
             payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8), Some(9), Some(10), Some(11), Some(12)],
         };
         println!("{}", ortho);
+        
+        println!("\n=== 2x2x2x2 Ortho (4D) ===");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2, 2, 2],
+            payload: vec![
+                Some(1), Some(2), Some(3), Some(4),
+                Some(5), Some(6), Some(7), Some(8),
+                Some(9), Some(10), Some(11), Some(12),
+                Some(13), Some(14), Some(15), Some(16)
+            ],
+        };
+        println!("{}", ortho);
     }
 }
