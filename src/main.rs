@@ -157,9 +157,6 @@ fn print_optimal(optimal: &Option<Ortho>, interner: &Interner) {
         println!("[fold] Dimensions: {:?}", ortho.dims());
         println!("[fold] Score: {}", ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>());
         
-        println!("[fold] Payload (indices): {:?}", ortho.payload());
-        
-        // Print the payload strings for reference
         let payload_strings: Vec<String> = ortho.payload()
             .iter()
             .map(|opt_idx| {
@@ -170,7 +167,6 @@ fn print_optimal(optimal: &Option<Ortho>, interner: &Interner) {
             .collect();
         println!("[fold] Payload (strings): {:?}", payload_strings);
         
-        // Pretty print the ortho geometry
         println!("[fold] Geometry:");
         for line in format!("{}", ortho).lines() {
             println!("[fold]   {}", line);
