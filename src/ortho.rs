@@ -1,6 +1,7 @@
 use crate::spatial;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::fmt;
 use bincode::Encode;
 use bincode::Decode;
 
@@ -143,6 +144,204 @@ impl Ortho {
     }
     pub fn dims(&self) -> &Vec<usize> { &self.dims }
     pub fn payload(&self) -> &Vec<Option<usize>> { &self.payload }
+    
+    // Get linear index from coordinates using spatial ordering
+    fn get_index_at_coord(&self, coord: &[usize]) -> Option<usize> {
+        let meta = spatial_helper::get_meta(self.dims.as_slice());
+        meta.location_to_index.get(coord).copied()
+    }
+}
+
+// Helper function to access spatial module internals
+mod spatial_helper {
+    use rustc_hash::FxHashMap;
+    
+    pub struct Meta {
+        pub location_to_index: FxHashMap<Vec<usize>, usize>,
+    }
+    
+    pub fn get_meta(dims: &[usize]) -> Meta {
+        // Recompute the spatial ordering
+        let indices_in_order = indices_in_order_compute(dims);
+        let location_to_index: FxHashMap<Vec<usize>, usize> = indices_in_order
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, loc)| (loc, i))
+            .collect();
+        Meta {
+            location_to_index,
+        }
+    }
+    
+    fn index_array(dims: &[usize]) -> Vec<Vec<usize>> {
+        cartesian_product(dims.iter().map(|x| (0..*x).collect()).collect())
+    }
+    
+    fn indices_in_order_compute(dims: &[usize]) -> Vec<Vec<usize>> {
+        order_by_distance(index_array(dims))
+    }
+    
+    fn order_by_distance(indices: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+        let mut sorted = indices;
+        sorted.sort_by(|a, b| {
+            match a.iter().sum::<usize>().cmp(&b.iter().sum()) {
+                std::cmp::Ordering::Less => std::cmp::Ordering::Less,
+                std::cmp::Ordering::Equal => {
+                    for (x, y) in a.iter().zip(b) {
+                        if x > y {
+                            return std::cmp::Ordering::Greater;
+                        }
+                        if x < y {
+                            return std::cmp::Ordering::Less;
+                        }
+                    }
+                    unreachable!("Duplicate indices impossible")
+                }
+                std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
+            }
+        });
+        sorted
+    }
+    
+    fn partial_cartesian<T: Clone>(a: Vec<Vec<T>>, b: Vec<T>) -> Vec<Vec<T>> {
+        a.into_iter()
+            .flat_map(|xs| {
+                b.iter()
+                    .cloned()
+                    .map(|y| {
+                        let mut vec = xs.clone();
+                        vec.push(y);
+                        vec
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+    
+    fn cartesian_product<T: Clone>(lists: Vec<Vec<T>>) -> Vec<Vec<T>> {
+        match lists.split_first() {
+            Some((first, rest)) => {
+                let init: Vec<Vec<T>> = first.iter().cloned().map(|n| vec![n]).collect();
+                rest.iter()
+                    .cloned()
+                    .fold(init, |vec, list| partial_cartesian(vec, list))
+            }
+            None => vec![],
+        }
+    }
+}
+
+impl fmt::Display for Ortho {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Orthos are at least 2D
+        if self.dims.len() < 2 {
+            return write!(f, "Invalid ortho: dimensions < 2");
+        }
+        
+        // Get the last two dimensions for the 2D display
+        let rows = self.dims[self.dims.len() - 2];
+        let cols = self.dims[self.dims.len() - 1];
+        
+        // For higher dimensions, we'll tile 2D slices
+        if self.dims.len() == 2 {
+            // Simple 2D case
+            self.format_2d_slice(f, &[], rows, cols)
+        } else {
+            // Higher dimensions: tile 2D slices
+            self.format_tiled(f, rows, cols)
+        }
+    }
+}
+
+impl Ortho {
+    fn format_2d_slice(&self, f: &mut fmt::Formatter<'_>, prefix: &[usize], rows: usize, cols: usize) -> fmt::Result {
+        // Find the maximum width needed for display
+        let max_width = self.payload.iter()
+            .filter_map(|opt| opt.as_ref())
+            .map(|v| format!("{}", v).len())
+            .max()
+            .unwrap_or(1)
+            .max(4); // At least 4 characters for "None"
+        
+        // Print the 2D slice
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut coords = prefix.to_vec();
+                coords.push(row);
+                coords.push(col);
+                
+                if col > 0 {
+                    write!(f, " ")?;
+                }
+                
+                if let Some(linear_idx) = self.get_index_at_coord(&coords) {
+                    if linear_idx < self.payload.len() {
+                        match self.payload[linear_idx] {
+                            Some(val) => write!(f, "{:>width$}", val, width = max_width)?,
+                            None => write!(f, "{:>width$}", "·", width = max_width)?,
+                        }
+                    } else {
+                        write!(f, "{:>width$}", "?", width = max_width)?;
+                    }
+                } else {
+                    write!(f, "{:>width$}", "?", width = max_width)?;
+                }
+            }
+            if row < rows - 1 {
+                writeln!(f)?;
+            }
+        }
+        Ok(())
+    }
+    
+    fn format_tiled(&self, f: &mut fmt::Formatter<'_>, rows: usize, cols: usize) -> fmt::Result {
+        // For dimensions beyond 2D, we create tiles
+        let higher_dims = &self.dims[..self.dims.len() - 2];
+        
+        // Generate all tile coordinates
+        let mut tile_coords = Vec::new();
+        self.generate_tile_coords(higher_dims, &mut vec![], &mut tile_coords);
+        
+        for (tile_idx, coords) in tile_coords.iter().enumerate() {
+            if tile_idx > 0 {
+                writeln!(f)?;
+                writeln!(f)?;
+            }
+            
+            // Print which slice we're showing
+            write!(f, "[")?;
+            for (i, axis_names) in ["dim0", "dim1", "dim2", "dim3", "dim4", "dim5", "dim6", "dim7"]
+                .iter()
+                .take(coords.len())
+                .enumerate()
+            {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}={}", axis_names, coords[i])?;
+            }
+            writeln!(f, "]")?;
+            
+            self.format_2d_slice(f, coords, rows, cols)?;
+        }
+        
+        Ok(())
+    }
+    
+    fn generate_tile_coords(&self, dims: &[usize], current: &mut Vec<usize>, results: &mut Vec<Vec<usize>>) {
+        if current.len() == dims.len() {
+            results.push(current.clone());
+            return;
+        }
+        
+        let dim_idx = current.len();
+        for i in 0..dims[dim_idx] {
+            current.push(i);
+            self.generate_tile_coords(dims, current, results);
+            current.pop();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,5 +782,111 @@ mod tests {
         norms1.sort();
         norms2.sort();
         assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
+    }
+    
+    #[test]
+    fn test_display_2d_simple() {
+        // Test a simple 2x2 ortho
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2],
+            payload: vec![Some(1), Some(2), Some(3), Some(4)],
+        };
+        let display_str = format!("{}", ortho);
+        // Should display as a 2x2 grid
+        assert!(display_str.contains("1"));
+        assert!(display_str.contains("2"));
+        assert!(display_str.contains("3"));
+        assert!(display_str.contains("4"));
+    }
+    
+    #[test]
+    fn test_display_2d_with_nones() {
+        // Test a 2x2 ortho with some None values
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2],
+            payload: vec![Some(10), Some(20), None, None],
+        };
+        let display_str = format!("{}", ortho);
+        assert!(display_str.contains("10"));
+        assert!(display_str.contains("20"));
+        // None values should display as dots
+        assert!(display_str.contains("·"));
+    }
+    
+    #[test]
+    fn test_display_3x2() {
+        // Test a 3x2 ortho
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![3, 2],
+            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), None],
+        };
+        let display_str = format!("{}", ortho);
+        assert!(display_str.contains("1"));
+        assert!(display_str.contains("5"));
+        // Should have 3 rows
+        let lines: Vec<&str> = display_str.lines().collect();
+        assert_eq!(lines.len(), 3);
+    }
+    
+    #[test]
+    fn test_display_3d_tiled() {
+        // Test a 2x2x2 ortho (3D)
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2, 2],
+            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), None],
+        };
+        let display_str = format!("{}", ortho);
+        
+        // Should have tile labels
+        assert!(display_str.contains("dim0"));
+        
+        // Should contain all values
+        for i in 1..=7 {
+            assert!(display_str.contains(&i.to_string()));
+        }
+        
+        // Should have multiple tiles separated by blank lines
+        assert!(display_str.contains("[dim0=0]") || display_str.contains("dim0=0"));
+        assert!(display_str.contains("[dim0=1]") || display_str.contains("dim0=1"));
+    }
+    
+    #[test]
+    fn test_display_visual_output() {
+        // This test is for visual verification
+        println!("\n=== 2x2 Ortho ===");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2],
+            payload: vec![Some(10), Some(20), Some(30), None],
+        };
+        println!("{}", ortho);
+        
+        println!("\n=== 3x2 Ortho ===");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![3, 2],
+            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+        };
+        println!("{}", ortho);
+        
+        println!("\n=== 2x2x2 Ortho (3D) ===");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2, 2],
+            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8)],
+        };
+        println!("{}", ortho);
+        
+        println!("\n=== 2x3x2 Ortho (3D with different sizes) ===");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 3, 2],
+            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), Some(8), Some(9), Some(10), Some(11), Some(12)],
+        };
+        println!("{}", ortho);
     }
 }
