@@ -6,12 +6,11 @@ use rustc_hash::FxHashMap; // use concrete name
 
 // Consolidated metadata per dims
 struct DimMeta {
-    indices_in_order: Vec<Vec<usize>>,            // ordering of indices
-    axis_positions: Vec<usize>,                   // axis positions (1..=len)
-    impacted_phrase_locations: Vec<Vec<Vec<usize>>>, // per location impacted phrases
-    diagonals: Vec<Vec<usize>>,                   // per location diagonals
+    indices_in_order: Vec<Vec<usize>>,
+    axis_positions: Vec<usize>,
+    impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
+    diagonals: Vec<Vec<usize>>,
     location_to_index: FxHashMap<Vec<usize>, usize>,
-    index_to_location: FxHashMap<usize, Vec<usize>>, // index -> location coord
 }
 
 impl DimMeta {
@@ -37,7 +36,6 @@ impl DimMeta {
             impacted_phrase_locations,
             diagonals,
             location_to_index,
-            index_to_location,
         }
     }
 }

@@ -51,13 +51,13 @@ fn main() -> Result<(), FoldError> {
         let seed_id = seed_ortho.id();
         println!("[fold] Seeding with ortho id={}, version={}", seed_id, version);
         
-        work_queue.push_back(seed_ortho.clone());
         seen_orthos.insert(seed_id, ());
         
-        // Check if seed is optimal
-        let (new_best, new_score) = update_best(global_best, global_best_score, seed_ortho);
+        let (new_best, new_score) = update_best(global_best, global_best_score, seed_ortho.clone());
         global_best = new_best;
         global_best_score = new_score;
+        
+        work_queue.push_back(seed_ortho);
         
         // Process work queue until empty
         let mut processed_count = 0;
@@ -82,11 +82,9 @@ fn main() -> Result<(), FoldError> {
                 for child in children {
                     let child_id = child.id();
                     
-                    // Only process if never seen before
                     if !seen_orthos.contains_key(&child_id) {
                         seen_orthos.insert(child_id, ());
                         
-                        // Check for optimality as we create it
                         let (new_best, new_score) = update_best(global_best, global_best_score, child.clone());
                         global_best = new_best;
                         global_best_score = new_score;
@@ -100,13 +98,11 @@ fn main() -> Result<(), FoldError> {
         println!("[fold] Finished processing file");
         println!("[fold] Total orthos generated: {}", seen_orthos.len());
         
-        // Print optimal ortho for this file
         print_optimal(&global_best, current_interner);
     }
     
     println!("\n[fold] All files processed");
     
-    // Print final optimal
     if let Some(final_interner) = interner {
         println!("\n[fold] ===== FINAL OPTIMAL ORTHO =====");
         print_optimal(&global_best, &final_interner);
