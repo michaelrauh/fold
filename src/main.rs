@@ -21,6 +21,7 @@ fn main() -> Result<(), FoldError> {
     
     let mut interner: Option<Interner> = None;
     let mut global_best: Option<Ortho> = None;
+    let mut global_best_score: usize = 0;
     
     for file_path in files {
         println!("\n[fold] Processing file: {}", file_path);
@@ -54,7 +55,9 @@ fn main() -> Result<(), FoldError> {
         seen_orthos.insert(seed_id, ());
         
         // Check if seed is optimal
-        global_best = update_best(global_best, seed_ortho);
+        let (new_best, new_score) = update_best(global_best, global_best_score, seed_ortho);
+        global_best = new_best;
+        global_best_score = new_score;
         
         // Process work queue until empty
         let mut processed_count = 0;
@@ -84,7 +87,9 @@ fn main() -> Result<(), FoldError> {
                         seen_orthos.insert(child_id, ());
                         
                         // Check for optimality as we create it
-                        global_best = update_best(global_best, child.clone());
+                        let (new_best, new_score) = update_best(global_best, global_best_score, child.clone());
+                        global_best = new_best;
+                        global_best_score = new_score;
                         
                         work_queue.push_back(child);
                     }
@@ -133,17 +138,16 @@ fn get_input_files(input_dir: &str) -> Result<Vec<String>, FoldError> {
     Ok(files)
 }
 
-fn update_best(current_best: Option<Ortho>, candidate: Ortho) -> Option<Ortho> {
+fn update_best(current_best: Option<Ortho>, current_best_score: usize, candidate: Ortho) -> (Option<Ortho>, usize) {
     let candidate_score = candidate.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
     
     match current_best {
-        None => Some(candidate),
+        None => (Some(candidate), candidate_score),
         Some(best) => {
-            let best_score = best.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
-            if candidate_score > best_score {
-                Some(candidate)
+            if candidate_score > current_best_score {
+                (Some(candidate), candidate_score)
             } else {
-                Some(best)
+                (Some(best), current_best_score)
             }
         }
     }
