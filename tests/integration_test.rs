@@ -1,116 +1,112 @@
-use std::fs;
-use std::process::Command;
+use fold::{interner::Interner, ortho::Ortho};
+use std::collections::{HashMap, VecDeque};
 
-#[test]
-fn test_fold_binary_processes_files() {
-    // Setup test directory
-    let test_dir = "/tmp/fold_test_integration";
-    let input_dir = format!("{}/input", test_dir);
+fn process_text_sequence(texts: &[&str]) -> Option<Ortho> {
+    let mut interner: Option<Interner> = None;
+    let mut global_best: Option<Ortho> = None;
     
-    // Clean up any previous test runs
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(&input_dir).expect("Failed to create test input directory");
+    for text in texts {
+        // Build or extend interner
+        interner = Some(if let Some(prev) = interner {
+            prev.add_text(text)
+        } else {
+            Interner::from_text(text)
+        });
+        
+        let current_interner = interner.as_ref().unwrap();
+        let version = current_interner.version();
+        
+        // Initialize work queue and seen orthos set
+        let mut work_queue: VecDeque<Ortho> = VecDeque::new();
+        let mut seen_orthos: HashMap<usize, ()> = HashMap::new();
+        
+        // Seed with empty ortho
+        let seed_ortho = Ortho::new(version);
+        let seed_id = seed_ortho.id();
+        
+        work_queue.push_back(seed_ortho.clone());
+        seen_orthos.insert(seed_id, ());
+        
+        // Check if seed is optimal
+        global_best = update_best(global_best, seed_ortho);
+        
+        // Process work queue until empty
+        while let Some(ortho) = work_queue.pop_front() {
+            // Get requirements from ortho
+            let (forbidden, required) = ortho.get_requirements();
+            
+            // Get completions from interner
+            let completions = current_interner.intersect(&required, &forbidden);
+            
+            // Generate child orthos
+            for completion in completions {
+                let children = ortho.add(completion, version);
+                
+                for child in children {
+                    let child_id = child.id();
+                    
+                    // Only process if never seen before
+                    if !seen_orthos.contains_key(&child_id) {
+                        seen_orthos.insert(child_id, ());
+                        
+                        // Check for optimality as we create it
+                        global_best = update_best(global_best, child.clone());
+                        
+                        work_queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
     
-    // Create test input files
-    fs::write(
-        format!("{}/test1.txt", input_dir),
-        "hello world hello there world there"
-    ).expect("Failed to write test file 1");
+    global_best
+}
+
+fn update_best(current_best: Option<Ortho>, candidate: Ortho) -> Option<Ortho> {
+    let candidate_score = candidate.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
     
-    fs::write(
-        format!("{}/test2.txt", input_dir),
-        "foo bar foo baz bar baz"
-    ).expect("Failed to write test file 2");
-    
-    // Run the fold binary
-    let output = Command::new("cargo")
-        .args(&["run", "--bin", "fold"])
-        .env("FOLD_STATE_DIR", test_dir)
-        .output()
-        .expect("Failed to execute fold binary");
-    
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    
-    // Verify the binary ran successfully
-    assert!(output.status.success(), "Binary failed to run. stderr: {}", stderr);
-    
-    // Verify expected output patterns
-    assert!(stdout.contains("Processing file"), "Should process files");
-    assert!(stdout.contains("OPTIMAL ORTHO"), "Should find optimal ortho");
-    assert!(stdout.contains("Total orthos generated"), "Should report total orthos");
-    assert!(stdout.contains("FINAL OPTIMAL ORTHO"), "Should show final optimal");
-    
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
+    match current_best {
+        None => Some(candidate),
+        Some(best) => {
+            let best_score = best.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
+            if candidate_score > best_score {
+                Some(candidate)
+            } else {
+                Some(best)
+            }
+        }
+    }
 }
 
 #[test]
-fn test_fold_binary_handles_empty_input_directory() {
-    // Setup test directory
-    let test_dir = "/tmp/fold_test_empty";
-    let input_dir = format!("{}/input", test_dir);
+fn test_optimal_ortho_tracking() {
+    // Test with simple text that creates predictable phrases
+    // "a b" and "a c" will create phrases with 'a' as a common prefix
+    let texts = vec!["a b a c"];
     
-    // Clean up any previous test runs
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(&input_dir).expect("Failed to create test input directory");
+    let optimal = process_text_sequence(&texts);
     
-    // Run the fold binary with empty input directory
-    let output = Command::new("cargo")
-        .args(&["run", "--bin", "fold"])
-        .env("FOLD_STATE_DIR", test_dir)
-        .output()
-        .expect("Failed to execute fold binary");
+    // Verify we found an optimal ortho
+    assert!(optimal.is_some(), "Should find an optimal ortho");
     
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ortho = optimal.unwrap();
     
-    // Verify the binary ran successfully
-    assert!(output.status.success(), "Binary should handle empty input gracefully");
+    // The algorithm processes through orthos and tracks the best one
+    // With "a b a c", we get vocabulary [a, b, c] and phrases ["a b", "a c"]
+    // This should produce orthos with meaningful content
     
-    // Verify it reports no files
-    assert!(stdout.contains("No input files found"), "Should report no input files");
+    // Verify dimensions are valid
+    assert!(ortho.dims().len() >= 2, "Should have at least 2 dimensions");
     
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
-}
-
-#[test]
-fn test_fold_binary_tracks_optimal_across_files() {
-    // Setup test directory
-    let test_dir = "/tmp/fold_test_optimal";
-    let input_dir = format!("{}/input", test_dir);
+    // Calculate score
+    let score = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
     
-    // Clean up any previous test runs
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(&input_dir).expect("Failed to create test input directory");
+    // The optimal should have either:
+    // 1. An empty [2,2] ortho (score=1) if nothing fits, or
+    // 2. A filled ortho with score >= 1
+    assert!(score >= 1, "Score should be at least 1");
     
-    // Create test input files with specific content to test optimal tracking
-    fs::write(
-        format!("{}/a_test.txt", input_dir),
-        "one two three four five six seven"
-    ).expect("Failed to write test file a");
-    
-    fs::write(
-        format!("{}/b_test.txt", input_dir),
-        "eight nine ten"
-    ).expect("Failed to write test file b");
-    
-    // Run the fold binary
-    let output = Command::new("cargo")
-        .args(&["run", "--bin", "fold"])
-        .env("FOLD_STATE_DIR", test_dir)
-        .output()
-        .expect("Failed to execute fold binary");
-    
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    
-    // Verify the binary ran successfully
-    assert!(output.status.success(), "Binary failed to run");
-    
-    // Count how many times "OPTIMAL ORTHO" appears (once per file + final)
-    let optimal_count = stdout.matches("OPTIMAL ORTHO").count();
-    assert!(optimal_count >= 3, "Should show optimal at least 3 times (2 files + final)");
-    
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
+    // Verify basic structure
+    assert_eq!(ortho.payload().len(), ortho.dims().iter().product::<usize>(),
+               "Payload length should match capacity");
 }

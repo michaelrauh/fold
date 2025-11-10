@@ -1,14 +1,11 @@
 use fold::{interner::Interner, ortho::Ortho, FoldError};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::Path;
 
 fn main() -> Result<(), FoldError> {
-    let state_dir = std::env::var("FOLD_STATE_DIR").unwrap_or_else(|_| "./fold_state".to_string());
-    let input_dir = format!("{}/input", state_dir);
+    let input_dir = "./fold_state/input";
     
     println!("[fold] Starting fold processing");
-    println!("[fold] State directory: {}", state_dir);
     println!("[fold] Input directory: {}", input_dir);
     
     // Get all files from input directory, sorted
@@ -44,9 +41,9 @@ fn main() -> Result<(), FoldError> {
         println!("[fold] Interner version: {}", version);
         println!("[fold] Vocabulary size: {}", current_interner.vocabulary().len());
         
-        // Initialize work queue and ortho database
+        // Initialize work queue and seen orthos set
         let mut work_queue: VecDeque<Ortho> = VecDeque::new();
-        let mut seen_orthos: HashMap<usize, Ortho> = HashMap::new();
+        let mut seen_orthos: HashMap<usize, ()> = HashMap::new();
         
         // Seed with empty ortho
         let seed_ortho = Ortho::new(version);
@@ -54,7 +51,10 @@ fn main() -> Result<(), FoldError> {
         println!("[fold] Seeding with ortho id={}, version={}", seed_id, version);
         
         work_queue.push_back(seed_ortho.clone());
-        seen_orthos.insert(seed_id, seed_ortho);
+        seen_orthos.insert(seed_id, ());
+        
+        // Check if seed is optimal
+        global_best = update_best(global_best, seed_ortho);
         
         // Process work queue until empty
         let mut processed_count = 0;
@@ -62,7 +62,7 @@ fn main() -> Result<(), FoldError> {
             processed_count += 1;
             
             if processed_count % 1000 == 0 {
-                println!("[fold] Processed {} orthos, queue size: {}, total orthos: {}", 
+                println!("[fold] Processed {} orthos, queue size: {}, seen: {}", 
                          processed_count, work_queue.len(), seen_orthos.len());
             }
             
@@ -81,7 +81,11 @@ fn main() -> Result<(), FoldError> {
                     
                     // Only process if never seen before
                     if !seen_orthos.contains_key(&child_id) {
-                        seen_orthos.insert(child_id, child.clone());
+                        seen_orthos.insert(child_id, ());
+                        
+                        // Check for optimality as we create it
+                        global_best = update_best(global_best, child.clone());
+                        
                         work_queue.push_back(child);
                     }
                 }
@@ -91,25 +95,8 @@ fn main() -> Result<(), FoldError> {
         println!("[fold] Finished processing file");
         println!("[fold] Total orthos generated: {}", seen_orthos.len());
         
-        // Find and print optimal ortho for this file
-        let optimal = get_optimal(&seen_orthos);
-        
-        // Update global best
-        if let Some(current_optimal) = &optimal {
-            let should_update = if let Some(ref best) = global_best {
-                let current_score = current_optimal.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
-                let best_score = best.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
-                current_score > best_score
-            } else {
-                true
-            };
-            
-            if should_update {
-                global_best = Some(current_optimal.clone());
-            }
-        }
-        
-        print_optimal(&optimal, current_interner);
+        // Print optimal ortho for this file
+        print_optimal(&global_best, current_interner);
     }
     
     println!("\n[fold] All files processed");
@@ -124,7 +111,7 @@ fn main() -> Result<(), FoldError> {
 }
 
 fn get_input_files(input_dir: &str) -> Result<Vec<String>, FoldError> {
-    let path = Path::new(input_dir);
+    let path = std::path::Path::new(input_dir);
     
     if !path.exists() {
         return Ok(Vec::new());
@@ -146,10 +133,20 @@ fn get_input_files(input_dir: &str) -> Result<Vec<String>, FoldError> {
     Ok(files)
 }
 
-fn get_optimal(orthos: &HashMap<usize, Ortho>) -> Option<Ortho> {
-    orthos.values()
-        .max_by_key(|o| o.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>())
-        .cloned()
+fn update_best(current_best: Option<Ortho>, candidate: Ortho) -> Option<Ortho> {
+    let candidate_score = candidate.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
+    
+    match current_best {
+        None => Some(candidate),
+        Some(best) => {
+            let best_score = best.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
+            if candidate_score > best_score {
+                Some(candidate)
+            } else {
+                Some(best)
+            }
+        }
+    }
 }
 
 fn print_optimal(optimal: &Option<Ortho>, interner: &Interner) {
