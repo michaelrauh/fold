@@ -53,6 +53,17 @@ cargo test
 cargo build --release
 ```
 
+### Code Style Guidelines
+
+This project follows specific coding principles for performance and clarity:
+
+1. **Functional Style Preferred**: Use non-mutating operations where performance allows
+2. **Self-Documenting Code**: Avoid comments; let code express intent through clear naming
+3. **Support Actual Usage**: Avoid defensive programming; implement what the call patterns require
+4. **Memory Critical**: Minimize cloning and unnecessary allocations; orthos are 80-900+ bytes each
+5. **Test-Driven Development**: Write failing tests first, then implement fixes
+6. **Disk-Backed Operations**: Design with streaming/disk storage from the start
+
 ## Architecture
 
 - **Interner**: Manages vocabulary and phrase completion mappings
