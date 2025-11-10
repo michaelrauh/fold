@@ -1,6 +1,7 @@
 use crate::spatial;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::fmt;
 use bincode::Encode;
 use bincode::Decode;
 
@@ -143,6 +144,108 @@ impl Ortho {
     }
     pub fn dims(&self) -> &Vec<usize> { &self.dims }
     pub fn payload(&self) -> &Vec<Option<usize>> { &self.payload }
+    
+    fn get_index_at_coord(&self, coord: &[usize]) -> Option<usize> {
+        spatial::get_location_to_index(self.dims.as_slice()).get(coord).copied()
+    }
+}
+
+pub struct OrthoDisplay<'a> {
+    ortho: &'a Ortho,
+    interner: &'a crate::interner::Interner,
+}
+
+impl<'a> OrthoDisplay<'a> {
+    pub fn new(ortho: &'a Ortho, interner: &'a crate::interner::Interner) -> Self {
+        Self { ortho, interner }
+    }
+}
+
+impl<'a> fmt::Display for OrthoDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows = self.ortho.dims[self.ortho.dims.len() - 2];
+        let cols = self.ortho.dims[self.ortho.dims.len() - 1];
+        let higher_dims = &self.ortho.dims[..self.ortho.dims.len() - 2];
+        
+        let max_width = self.ortho.payload.iter()
+            .filter_map(|&opt| opt)
+            .map(|token_id| self.interner.string_for_index(token_id).len())
+            .max()
+            .unwrap_or(1)
+            .max(4);
+        
+        let format_cell = |token_id: Option<usize>| -> String {
+            token_id
+                .map(|id| format!("{:>width$}", self.interner.string_for_index(id), width = max_width))
+                .unwrap_or_else(|| format!("{:>width$}", "·", width = max_width))
+        };
+        
+        let format_2d_slice = |prefix: &[usize]| -> String {
+            (0..rows)
+                .map(|row| {
+                    (0..cols)
+                        .map(|col| {
+                            let coords: Vec<usize> = prefix.iter().copied().chain([row, col]).collect();
+                            self.ortho.get_index_at_coord(&coords)
+                                .filter(|&idx| idx < self.ortho.payload.len())
+                                .and_then(|idx| self.ortho.payload[idx])
+                                .map(|token_id| format_cell(Some(token_id)))
+                                .unwrap_or_else(|| format_cell(None))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        
+        if higher_dims.is_empty() {
+            return write!(f, "{}", format_2d_slice(&[]));
+        }
+        
+        let tile_coords = Ortho::generate_tile_coords(higher_dims);
+        
+        let output = tile_coords.iter()
+            .enumerate()
+            .map(|(tile_idx, coords)| {
+                let separator = if tile_idx > 0 { "\n\n" } else { "" };
+                let dims_str = coords.iter()
+                    .enumerate()
+                    .map(|(i, &val)| format!("dim{}={}", i, val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}[{}]\n{}", separator, dims_str, format_2d_slice(coords))
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        
+        write!(f, "{}", output)
+    }
+}
+
+impl Ortho {
+    pub fn display<'a>(&'a self, interner: &'a crate::interner::Interner) -> OrthoDisplay<'a> {
+        OrthoDisplay::new(self, interner)
+    }
+
+    fn generate_tile_coords(dims: &[usize]) -> Vec<Vec<usize>> {
+        if dims.is_empty() {
+            return vec![vec![]];
+        }
+        
+        let total: usize = dims.iter().product();
+        (0..total)
+            .map(|mut idx| {
+                let mut coord = Vec::with_capacity(dims.len());
+                for &dim_size in dims.iter().rev() {
+                    coord.push(idx % dim_size);
+                    idx /= dim_size;
+                }
+                coord.reverse();
+                coord
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -584,4 +687,57 @@ mod tests {
         norms2.sort();
         assert_eq!(norms1, norms2, "Canonicalization mismatch between axis insertion orders. norms1={:?} norms2={:?}", norms1, norms2);
     }
+    
+    #[test]
+    fn test_display_2d_simple() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("a b c d");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2],
+            payload: vec![Some(0), Some(1), Some(2), Some(3)],
+        };
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "   a    b\n   c    d");
+    }
+    
+    #[test]
+    fn test_display_2d_with_nones() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("hello world");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2],
+            payload: vec![Some(0), Some(1), None, None],
+        };
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "hello world\n    ·     ·");
+    }
+    
+    #[test]
+    fn test_display_3x2() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("a b c d e");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![3, 2],
+            payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), None],
+        };
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "   a    b\n   c    d\n   e    ·");
+    }
+    
+    #[test]
+    fn test_display_3d_tiled() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("a b c d e f g");
+        let ortho = Ortho {
+            version: 1,
+            dims: vec![2, 2, 2],
+            payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), None],
+        };
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "[dim0=0]\n   a    b\n   c    e\n\n[dim0=1]\n   d    f\n   g    ·");
+    }
 }
+

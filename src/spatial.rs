@@ -72,6 +72,8 @@ pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usi
 
 pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> { get_meta(dims).axis_positions.clone() }
 
+pub fn get_location_to_index(dims: &[usize]) -> FxHashMap<Vec<usize>, usize> { get_meta(dims).location_to_index.clone() }
+
 pub fn is_base(dims: &[usize]) -> bool { dims.iter().all(|&x| x == 2) }
 
 pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
