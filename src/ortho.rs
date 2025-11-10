@@ -154,31 +154,24 @@ impl fmt::Display for Ortho {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rows = self.dims[self.dims.len() - 2];
         let cols = self.dims[self.dims.len() - 1];
-        
-        // For higher dimensions, we'll tile 2D slices
-        if self.dims.len() == 2 {
-            // Simple 2D case
-            self.format_2d_slice(f, &[], rows, cols)
-        } else {
-            // Higher dimensions: tile 2D slices
-            self.format_tiled(f, rows, cols)
-        }
+        self.format_tiled(f, rows, cols)
     }
 }
 
 impl Ortho {
     fn format_2d_slice(&self, f: &mut fmt::Formatter<'_>, prefix: &[usize], rows: usize, cols: usize) -> fmt::Result {
-        // Find the maximum width needed for display
         let max_width = self.payload.iter()
             .filter_map(|opt| opt.as_ref())
             .map(|v| format!("{}", v).len())
             .max()
             .unwrap_or(1)
-            .max(4); // At least 4 characters for "None"
+            .max(4);
         
-        // Print the 2D slice
-        for row in 0..rows {
-            for col in 0..cols {
+        (0..rows).try_for_each(|row| {
+            if row > 0 {
+                writeln!(f)?;
+            }
+            (0..cols).try_for_each(|col| {
                 let mut coords = prefix.to_vec();
                 coords.push(row);
                 coords.push(col);
@@ -190,25 +183,25 @@ impl Ortho {
                 if let Some(linear_idx) = self.get_index_at_coord(&coords) {
                     if linear_idx < self.payload.len() {
                         match self.payload[linear_idx] {
-                            Some(val) => write!(f, "{:>width$}", val, width = max_width)?,
-                            None => write!(f, "{:>width$}", "·", width = max_width)?,
+                            Some(val) => write!(f, "{:>width$}", val, width = max_width),
+                            None => write!(f, "{:>width$}", "·", width = max_width),
                         }
                     } else {
-                        write!(f, "{:>width$}", "?", width = max_width)?;
+                        write!(f, "{:>width$}", "?", width = max_width)
                     }
                 } else {
-                    write!(f, "{:>width$}", "?", width = max_width)?;
+                    write!(f, "{:>width$}", "?", width = max_width)
                 }
-            }
-            if row < rows - 1 {
-                writeln!(f)?;
-            }
-        }
-        Ok(())
+            })
+        })
     }
     
     fn format_tiled(&self, f: &mut fmt::Formatter<'_>, rows: usize, cols: usize) -> fmt::Result {
         let higher_dims = &self.dims[..self.dims.len() - 2];
+        
+        if higher_dims.is_empty() {
+            return self.format_2d_slice(f, &[], rows, cols);
+        }
         
         let total_tiles: usize = higher_dims.iter().product();
         let mut tile_coords = Vec::with_capacity(total_tiles);
