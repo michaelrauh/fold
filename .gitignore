@@ -2,6 +2,7 @@
 *.txt
 .vscode/
 /interner_data
+/fold_state
 
 # Added by cargo
 #

@@ -2,8 +2,6 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum FoldError {
-    Database(postgres::Error),
-    Queue(String),
     Serialization(Box<bincode::error::EncodeError>),
     Deserialization(Box<bincode::error::DecodeError>),
     Io(std::io::Error),
@@ -14,8 +12,6 @@ pub enum FoldError {
 impl fmt::Display for FoldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FoldError::Database(e) => write!(f, "Database error: {}", e),
-            FoldError::Queue(e) => write!(f, "Queue error: {}", e),
             FoldError::Serialization(e) => write!(f, "Serialization error: {}", e),
             FoldError::Deserialization(e) => write!(f, "Deserialization error: {}", e),
             FoldError::Io(e) => write!(f, "IO error: {}", e),
@@ -26,18 +22,6 @@ impl fmt::Display for FoldError {
 }
 
 impl std::error::Error for FoldError {}
-
-impl From<postgres::Error> for FoldError {
-    fn from(err: postgres::Error) -> Self {
-        FoldError::Database(err)
-    }
-}
-
-impl From<amiquip::Error> for FoldError {
-    fn from(err: amiquip::Error) -> Self {
-        FoldError::Queue(err.to_string())
-    }
-}
 
 impl From<Box<bincode::error::EncodeError>> for FoldError {
     fn from(err: Box<bincode::error::EncodeError>) -> Self {
