@@ -20,8 +20,8 @@ fn main() -> Result<(), FoldError> {
     println!("[fold] Found {} file(s) to process", files.len());
     
     let mut interner: Option<Interner> = None;
-    let mut global_best: Option<Ortho> = None;
-    let mut global_best_score: usize = 0;
+    let mut global_best: Ortho = Ortho::new(0);
+    let mut global_best_score: usize;
     
     for file_path in files {
         println!("\n[fold] Processing file: {}", file_path);
@@ -52,10 +52,8 @@ fn main() -> Result<(), FoldError> {
         println!("[fold] Seeding with ortho id={}, version={}", seed_id, version);
         
         seen_orthos.insert(seed_id, ());
-        
-        let (new_best, new_score) = update_best(global_best, global_best_score, seed_ortho.clone());
-        global_best = new_best;
-        global_best_score = new_score;
+        global_best = seed_ortho.clone();
+        global_best_score = global_best.dims().iter().map(|x| x.saturating_sub(1)).product();
         
         work_queue.push_back(seed_ortho);
         
@@ -85,9 +83,11 @@ fn main() -> Result<(), FoldError> {
                     if !seen_orthos.contains_key(&child_id) {
                         seen_orthos.insert(child_id, ());
                         
-                        let (new_best, new_score) = update_best(global_best, global_best_score, child.clone());
-                        global_best = new_best;
-                        global_best_score = new_score;
+                        let candidate_score = child.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
+                        if candidate_score > global_best_score {
+                            global_best = child.clone();
+                            global_best_score = candidate_score;
+                        }
                         
                         work_queue.push_back(child);
                     }
@@ -134,36 +134,17 @@ fn get_input_files(input_dir: &str) -> Result<Vec<String>, FoldError> {
     Ok(files)
 }
 
-fn update_best(current_best: Option<Ortho>, current_best_score: usize, candidate: Ortho) -> (Option<Ortho>, usize) {
-    let candidate_score = candidate.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
+fn print_optimal(ortho: &Ortho, interner: &Interner) {
+    println!("\n[fold] ===== OPTIMAL ORTHO =====");
+    println!("[fold] Ortho ID: {}", ortho.id());
+    println!("[fold] Version: {}", ortho.version());
+    println!("[fold] Dimensions: {:?}", ortho.dims());
+    println!("[fold] Score: {}", ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>());
     
-    match current_best {
-        None => (Some(candidate), candidate_score),
-        Some(best) => {
-            if candidate_score > current_best_score {
-                (Some(candidate), candidate_score)
-            } else {
-                (Some(best), current_best_score)
-            }
-        }
+    println!("[fold] Geometry:");
+    for line in format!("{}", ortho.display(interner)).lines() {
+        println!("[fold]   {}", line);
     }
-}
-
-fn print_optimal(optimal: &Option<Ortho>, interner: &Interner) {
-    if let Some(ortho) = optimal {
-        println!("\n[fold] ===== OPTIMAL ORTHO =====");
-        println!("[fold] Ortho ID: {}", ortho.id());
-        println!("[fold] Version: {}", ortho.version());
-        println!("[fold] Dimensions: {:?}", ortho.dims());
-        println!("[fold] Score: {}", ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>());
-        
-        println!("[fold] Geometry:");
-        for line in format!("{}", ortho).lines() {
-            println!("[fold]   {}", line);
-        }
-        
-        println!("[fold] ========================\n");
-    } else {
-        println!("\n[fold] No optimal ortho found\n");
-    }
+    
+    println!("[fold] ========================\n");
 }

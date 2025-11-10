@@ -150,96 +150,101 @@ impl Ortho {
     }
 }
 
-impl fmt::Display for Ortho {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rows = self.dims[self.dims.len() - 2];
-        let cols = self.dims[self.dims.len() - 1];
-        self.format_tiled(f, rows, cols)
+pub struct OrthoDisplay<'a> {
+    ortho: &'a Ortho,
+    interner: &'a crate::interner::Interner,
+}
+
+impl<'a> OrthoDisplay<'a> {
+    pub fn new(ortho: &'a Ortho, interner: &'a crate::interner::Interner) -> Self {
+        Self { ortho, interner }
     }
 }
 
-impl Ortho {
-    fn format_2d_slice(&self, f: &mut fmt::Formatter<'_>, prefix: &[usize], rows: usize, cols: usize) -> fmt::Result {
-        let max_width = self.payload.iter()
-            .filter_map(|opt| opt.as_ref())
-            .map(|v| format!("{}", v).len())
+impl<'a> fmt::Display for OrthoDisplay<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows = self.ortho.dims[self.ortho.dims.len() - 2];
+        let cols = self.ortho.dims[self.ortho.dims.len() - 1];
+        let higher_dims = &self.ortho.dims[..self.ortho.dims.len() - 2];
+        
+        let max_width = self.ortho.payload.iter()
+            .filter_map(|&opt| opt)
+            .map(|token_id| self.interner.string_for_index(token_id).len())
             .max()
             .unwrap_or(1)
             .max(4);
         
-        (0..rows).try_for_each(|row| {
-            if row > 0 {
-                writeln!(f)?;
-            }
-            (0..cols).try_for_each(|col| {
-                let mut coords = prefix.to_vec();
-                coords.push(row);
-                coords.push(col);
-                
-                if col > 0 {
-                    write!(f, " ")?;
-                }
-                
-                if let Some(linear_idx) = self.get_index_at_coord(&coords) {
-                    if linear_idx < self.payload.len() {
-                        match self.payload[linear_idx] {
-                            Some(val) => write!(f, "{:>width$}", val, width = max_width),
-                            None => write!(f, "{:>width$}", "·", width = max_width),
-                        }
-                    } else {
-                        write!(f, "{:>width$}", "?", width = max_width)
-                    }
-                } else {
-                    write!(f, "{:>width$}", "?", width = max_width)
-                }
-            })
-        })
-    }
-    
-    fn format_tiled(&self, f: &mut fmt::Formatter<'_>, rows: usize, cols: usize) -> fmt::Result {
-        let higher_dims = &self.dims[..self.dims.len() - 2];
+        let format_cell = |token_id: Option<usize>| -> String {
+            token_id
+                .map(|id| format!("{:>width$}", self.interner.string_for_index(id), width = max_width))
+                .unwrap_or_else(|| format!("{:>width$}", "·", width = max_width))
+        };
+        
+        let format_2d_slice = |prefix: &[usize]| -> String {
+            (0..rows)
+                .map(|row| {
+                    (0..cols)
+                        .map(|col| {
+                            let coords: Vec<usize> = prefix.iter().copied().chain([row, col]).collect();
+                            self.ortho.get_index_at_coord(&coords)
+                                .filter(|&idx| idx < self.ortho.payload.len())
+                                .and_then(|idx| self.ortho.payload[idx])
+                                .map(|token_id| format_cell(Some(token_id)))
+                                .unwrap_or_else(|| format_cell(None))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         
         if higher_dims.is_empty() {
-            return self.format_2d_slice(f, &[], rows, cols);
+            return write!(f, "{}", format_2d_slice(&[]));
         }
         
-        let total_tiles: usize = higher_dims.iter().product();
-        let mut tile_coords = Vec::with_capacity(total_tiles);
-        self.generate_tile_coords(higher_dims, &mut vec![], &mut tile_coords);
+        let tile_coords = Ortho::generate_tile_coords(higher_dims);
         
-        for (tile_idx, coords) in tile_coords.iter().enumerate() {
-            if tile_idx > 0 {
-                writeln!(f)?;
-                writeln!(f)?;
-            }
-            
-            write!(f, "[")?;
-            for i in 0..coords.len() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(f, "dim{}={}", i, coords[i])?;
-            }
-            writeln!(f, "]")?;
-            
-            self.format_2d_slice(f, coords, rows, cols)?;
-        }
+        let output = tile_coords.iter()
+            .enumerate()
+            .map(|(tile_idx, coords)| {
+                let separator = if tile_idx > 0 { "\n\n" } else { "" };
+                let dims_str = coords.iter()
+                    .enumerate()
+                    .map(|(i, &val)| format!("dim{}={}", i, val))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}[{}]\n{}", separator, dims_str, format_2d_slice(coords))
+            })
+            .collect::<Vec<_>>()
+            .join("");
         
-        Ok(())
+        write!(f, "{}", output)
     }
-    
-    fn generate_tile_coords(&self, dims: &[usize], current: &mut Vec<usize>, results: &mut Vec<Vec<usize>>) {
-        if current.len() == dims.len() {
-            results.push(current.clone());
-            return;
+}
+
+impl Ortho {
+    pub fn display<'a>(&'a self, interner: &'a crate::interner::Interner) -> OrthoDisplay<'a> {
+        OrthoDisplay::new(self, interner)
+    }
+
+    fn generate_tile_coords(dims: &[usize]) -> Vec<Vec<usize>> {
+        if dims.is_empty() {
+            return vec![vec![]];
         }
         
-        let dim_idx = current.len();
-        for i in 0..dims[dim_idx] {
-            current.push(i);
-            self.generate_tile_coords(dims, current, results);
-            current.pop();
-        }
+        let total: usize = dims.iter().product();
+        (0..total)
+            .map(|mut idx| {
+                let mut coord = Vec::with_capacity(dims.len());
+                for &dim_size in dims.iter().rev() {
+                    coord.push(idx % dim_size);
+                    idx /= dim_size;
+                }
+                coord.reverse();
+                coord
+            })
+            .collect()
     }
 }
 
@@ -685,45 +690,54 @@ mod tests {
     
     #[test]
     fn test_display_2d_simple() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("a b c d");
         let ortho = Ortho {
             version: 1,
             dims: vec![2, 2],
-            payload: vec![Some(1), Some(2), Some(3), Some(4)],
+            payload: vec![Some(0), Some(1), Some(2), Some(3)],
         };
-        let display_str = format!("{}", ortho);
-        assert_eq!(display_str, "   1    2\n   3    4");
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "   a    b\n   c    d");
     }
     
     #[test]
     fn test_display_2d_with_nones() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("hello world");
         let ortho = Ortho {
             version: 1,
             dims: vec![2, 2],
-            payload: vec![Some(10), Some(20), None, None],
+            payload: vec![Some(0), Some(1), None, None],
         };
-        let display_str = format!("{}", ortho);
-        assert_eq!(display_str, "  10   20\n   ·    ·");
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "hello world\n    ·     ·");
     }
     
     #[test]
     fn test_display_3x2() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("a b c d e");
         let ortho = Ortho {
             version: 1,
             dims: vec![3, 2],
-            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), None],
+            payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), None],
         };
-        let display_str = format!("{}", ortho);
-        assert_eq!(display_str, "   1    2\n   3    4\n   5    ·");
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "   a    b\n   c    d\n   e    ·");
     }
     
     #[test]
     fn test_display_3d_tiled() {
+        use crate::interner::Interner;
+        let interner = Interner::from_text("a b c d e f g");
         let ortho = Ortho {
             version: 1,
             dims: vec![2, 2, 2],
-            payload: vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), None],
+            payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), None],
         };
-        let display_str = format!("{}", ortho);
-        assert_eq!(display_str, "[dim0=0]\n   1    2\n   3    5\n\n[dim0=1]\n   4    6\n   7    ·");
+        let display_str = format!("{}", ortho.display(&interner));
+        assert_eq!(display_str, "[dim0=0]\n   a    b\n   c    e\n\n[dim0=1]\n   d    f\n   g    ·");
     }
 }
+
