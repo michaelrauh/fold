@@ -129,7 +129,7 @@ function process_root(tree):
 Compaction is an orthogonal optimization that can be applied to either linear or hierarchical processing.
 
 **Core Concept:**
-An ortho A "falls wholly inside" another ortho B if all cells filled in A are also filled in B with the same values, and B has additional filled cells. When this occurs, A is redundant and can be removed from the results queue.
+An ortho A "falls wholly inside" another ortho B if all cells filled in A are also filled in B with the same values, and B has additional filled cells. When this occurs, A is **truly removed** from the results queue - deleted from disk and memory. Recovery happens through deterministic reconstruction by subtracting pieces from the containing ortho.
 
 **Detection Algorithm:**
 ```
@@ -147,52 +147,76 @@ function is_contained(ortho_a, ortho_b):
 
 function compact_results(results_queue):
     compacted = []
+    removed_count = 0
     for ortho in results_queue:
         is_redundant = false
         for other in compacted:
             if is_contained(ortho, other):
                 is_redundant = true
+                removed_count += 1
                 break
         if not is_redundant:
             # Also check if ortho subsumes any existing orthos
+            newly_redundant = [o for o in compacted if is_contained(o, ortho)]
+            removed_count += len(newly_redundant)
             compacted = [o for o in compacted if not is_contained(o, ortho)]
             compacted.append(ortho)
+    
+    # Truly delete removed orthos from disk and memory
+    delete_from_disk(removed_count)
     return compacted
 ```
 
-**Reconstruction on Interner Change:**
-When the interner changes and impacted keys are identified, contained orthos must be reconstructed because new vocabulary might enable new expansions:
+**Deterministic Reconstruction by Subtraction:**
+When the interner changes, contained orthos are reconstructed by deterministically removing filled cells from their parent orthos:
 
 ```
-function reconstruct_contained_orthos(compacted_results, interner):
-    # Maintain a containment map: child_id -> parent_id
-    containment_map = load_from_disk("containment_map.bin")
+function reconstruct_by_subtraction(parent_ortho, cells_to_remove):
+    # Create a partial ortho by subtracting specific filled cells
+    # This generates all possible sub-orthos that were contained
+    reconstructed = []
     
-    # For each impacted key, find all contained orthos that reference it
-    for impacted_key in get_impacted_keys():
-        for (child_id, parent_id) in containment_map:
-            child_ortho = reconstruct_from_parent(parent_id, child_id)
-            if child_ortho.references(impacted_key):
-                work_queue.push(child_ortho)
+    for subset in power_set(parent_ortho.filled_cells()):
+        if subset == parent_ortho.filled_cells():
+            continue  # Skip the parent itself
+        
+        child_ortho = Ortho::new_with_cells(subset)
+        reconstructed.append(child_ortho)
+    
+    return reconstructed
+
+function reconstruct_on_interner_change(compacted_results, interner, impacted_keys):
+    # For each compacted ortho that references impacted keys
+    for parent_ortho in compacted_results:
+        if parent_ortho.references_any(impacted_keys):
+            # Deterministically generate all sub-orthos
+            sub_orthos = reconstruct_by_subtraction(parent_ortho, parent_ortho.filled_cells())
+            
+            # Re-process sub-orthos with new interner
+            for sub_ortho in sub_orthos:
+                if sub_ortho.references_any(impacted_keys):
+                    work_queue.push(sub_ortho)
 ```
 
 **Storage Requirements:**
 - Compacted results queue: Significantly smaller (typically 10-30% of original)
-- Containment map: Maps removed ortho IDs to their containing parent IDs (~16 bytes per contained ortho)
-- Total savings: 70-90% reduction in result queue size, with small overhead for containment tracking
+- NO containment map needed - reconstruction is deterministic through subtraction
+- Total savings: 70-90% reduction in result queue size with no additional storage overhead
 
 **Trade-offs:**
 - **Benefit**: Dramatically reduced result queue size (memory + disk)
 - **Benefit**: Fewer orthos to scan when finding impacted keys
 - **Benefit**: Faster checkpoint save/load (less data)
+- **Benefit**: No containment map storage overhead
 - **Cost**: Compaction algorithm is O(N²) in worst case (all orthos compared)
-- **Cost**: Containment map storage and maintenance
-- **Cost**: Reconstruction overhead when interner changes (but amortized across many changes)
+- **Cost**: Reconstruction generates power set of filled cells (exponential, but limited by ortho size)
+- **Cost**: Reconstruction overhead when interner changes (but only for impacted orthos)
 
 **Implementation Notes:**
 - Compaction can be run periodically (e.g., every 10k orthos generated) rather than continuously
 - Can use spatial heuristics to optimize containment checks (orthos with different dimensions cannot contain each other)
-- Containment map can be lazily persisted to disk (in-memory until checkpoint)
+- Reconstruction is expensive but infrequent (only on interner changes affecting specific keys)
+- Power set generation is bounded by ortho payload size (~10-50 filled cells typically)
 
 ## Necessary Implementation Steps
 
@@ -324,18 +348,29 @@ This is why merged interners enable new ortho expansions that weren't possible i
 
 #### 1.3 Result Set Merging
 
-Merging result sets from multiple subtrees requires careful deduplication to ensure no ortho appears multiple times in the final result set, while preserving all unique orthos.
+Merging result sets from multiple subtrees requires careful handling because orthos from different subtrees have **incompatible token encodings**. Each subtree's interner assigns different numeric IDs to tokens (e.g., one maps ID 1 to "the", another maps ID 1 to "is").
 
-**Algorithm Overview:**
+**The Encoding Problem:**
 
-1. **Global Deduplication**: Use a unified seen tracker (bloom filter + hash shards) spanning all subtrees
-2. **Streaming Merge**: Stream orthos from each child result queue, checking against seen tracker
-3. **Optimal Tracking**: Track the best ortho encountered during merge
+```rust
+// Subtree A interner:
+vocabulary: ["the", "cat", "sat"] // "the" = 0, "cat" = 1, "sat" = 2
 
-**Detailed Implementation:**
+// Subtree B interner:
+vocabulary: ["is", "the", "dog"] // "is" = 0, "the" = 1, "dog" = 2
+
+// Ortho from subtree A: payload = [Some(0), Some(1)] means "the cat"
+// Ortho from subtree B: payload = [Some(0), Some(1)] means "is the"
+// Same payload values, completely different meanings!
+```
+
+**Solution: Remap Before Merging:**
+
+Orthos must be remapped to the merged interner's token space before deduplication:
 
 ```rust
 pub struct ResultMerger {
+    merged_interner: Interner,
     seen_tracker: SeenTracker,
     merged_results: DiskBackedQueue<Ortho>,
     current_best: Option<Ortho>,
@@ -343,46 +378,59 @@ pub struct ResultMerger {
 }
 
 impl ResultMerger {
-    pub fn merge(result_sets: Vec<DiskBackedQueue<Ortho>>, memory_config: &MemoryConfig) 
-        -> Result<Self, FoldError> {
+    pub fn merge(
+        child_results: Vec<(DiskBackedQueue<Ortho>, Interner)>,
+        merged_interner: Interner,
+        memory_config: &MemoryConfig
+    ) -> Result<Self, FoldError> {
         
-        // Initialize merged structures with appropriate capacity
-        let estimated_total = result_sets.iter().map(|q| q.len()).sum();
+        // Build remapping tables for each child interner
+        let remapping_tables: Vec<HashMap<usize, usize>> = child_results.iter()
+            .map(|(_, child_interner)| {
+                build_remapping_table(child_interner, &merged_interner)
+            })
+            .collect();
+        
+        let estimated_total = child_results.iter().map(|(q, _)| q.len()).sum();
         let seen_tracker = SeenTracker::with_config(
-            estimated_total * 3,  // 3x for growth headroom
+            estimated_total * 3,
             memory_config.num_shards,
             memory_config.max_shards_in_memory
         );
         let merged_results = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
         
         let mut merger = ResultMerger {
+            merged_interner,
             seen_tracker,
             merged_results,
             current_best: None,
             current_best_score: (0, 0),
         };
         
-        // Stream through each result set
-        for mut result_set in result_sets {
+        // Stream through each result set with remapping
+        for ((mut result_set, child_interner), remap_table) in 
+            child_results.into_iter().zip(remapping_tables.iter()) {
+            
             println!("[merge] Processing result set with {} orthos", result_set.len());
             let mut added = 0;
             let mut duplicates = 0;
             
             while let Some(ortho) = result_set.pop()? {
-                let id = ortho.id();
+                // CRITICAL: Remap ortho to merged interner's token space
+                let remapped_ortho = remap_ortho(&ortho, remap_table, merged_interner.version());
+                let id = remapped_ortho.id();
                 
-                // Bloom filter + shard check for deduplication
+                // Now deduplication is correct
                 if !merger.seen_tracker.contains(&id) {
                     merger.seen_tracker.insert(id);
                     
-                    // Track optimal during merge
-                    let score = calculate_score(&ortho);
+                    let score = calculate_score(&remapped_ortho);
                     if score > merger.current_best_score {
-                        merger.current_best = Some(ortho.clone());
+                        merger.current_best = Some(remapped_ortho.clone());
                         merger.current_best_score = score;
                     }
                     
-                    merger.merged_results.push(ortho)?;
+                    merger.merged_results.push(remapped_ortho)?;
                     added += 1;
                 } else {
                     duplicates += 1;
@@ -395,29 +443,60 @@ impl ResultMerger {
         println!("[merge] Final merged result set: {} unique orthos", merger.merged_results.len());
         Ok(merger)
     }
+}
+
+// Build a mapping from child interner token IDs to merged interner token IDs
+fn build_remapping_table(child_interner: &Interner, merged_interner: &Interner) 
+    -> HashMap<usize, usize> {
+    let mut remap = HashMap::new();
     
-    pub fn into_results(self) -> (DiskBackedQueue<Ortho>, Option<Ortho>, SeenTracker) {
-        (self.merged_results, self.current_best, self.seen_tracker)
+    for (child_idx, word) in child_interner.vocabulary().iter().enumerate() {
+        // Find this word's index in the merged vocabulary
+        if let Some(merged_idx) = merged_interner.vocabulary().iter().position(|w| w == word) {
+            remap.insert(child_idx, merged_idx);
+        }
     }
+    
+    remap
+}
+
+// Remap an ortho's payload from child token space to merged token space
+fn remap_ortho(ortho: &Ortho, remap_table: &HashMap<usize, usize>, new_version: usize) 
+    -> Ortho {
+    let mut new_payload = ortho.payload().clone();
+    
+    for cell in new_payload.iter_mut() {
+        if let Some(token_id) = cell {
+            *token_id = remap_table[token_id];
+        }
+    }
+    
+    Ortho::new_with_payload(ortho.dims().clone(), new_payload, new_version)
 }
 ```
 
 **Performance Characteristics:**
 
-- **Time Complexity**: O(R₁ + R₂ + ... + Rₙ) where R is result count per subtree, assuming O(1) hash lookups
-- **Space Complexity**: O(R_total) for bloom filter and disk-backed shards
-- **Typical Cost**: For 4 subtrees with 100K results each, 400K total, deduplication might find 20-40% duplicates
-  - Merge time: ~5-10 seconds (disk I/O dominated)
-  - Memory: ~100MB for bloom filter + hot shards
+- **Time Complexity**: O(R₁ + R₂ + ... + Rₙ) × O(P) where R is result count per subtree, P is avg payload size for remapping
+- **Space Complexity**: O(R_total) for bloom filter and disk-backed shards, O(V_merged) for remapping tables
+- **Remapping Cost**: Each ortho must have its payload remapped (O(P) per ortho, where P = filled cells)
+- **Typical Cost**: For 4 subtrees with 225M results each (890M total), scaled appropriately:
+  - Remapping time: ~10-20 minutes (touching every ortho's payload)
+  - Merge time: ~30-60 minutes (disk I/O dominated, handling ~890M orthos)
+  - Memory: ~2-4 GB for bloom filter + hot shards (scaled for 890M orthos)
+
+**Critical Correctness Constraint:**
+
+Without remapping, merge would be incorrect - orthos with identical payloads but different meanings would be incorrectly deduplicated. Remapping ensures token IDs are consistent across the merged interner's vocabulary before deduplication.
 
 **Deduplication Effectiveness:**
 
 The degree of duplication between subtrees depends on:
-1. **Text similarity**: More similar text → more duplicate orthos
-2. **Vocabulary overlap**: Shared vocabulary → shared orthos
+1. **Text similarity**: More similar text → more duplicate orthos (after remapping)
+2. **Vocabulary overlap**: Shared vocabulary → more orthos map to same values
 3. **Seed ortho**: All subtrees start with same seed → guaranteed duplication of early expansions
 
-**Expected duplication rates:**
+**Expected duplication rates (after remapping):**
 - Independent texts (e.g., different books): 5-15% duplicates
 - Related texts (e.g., chapters of same book): 20-40% duplicates
 - Highly similar texts: 40-60% duplicates
@@ -885,7 +964,7 @@ This section provides detailed analysis of where each approach spends computatio
    - Identify impacted keys: O(V_new) to compare vocabularies/prefixes
    - Scan all results: O(R) to check each ortho's requirement phrases
    - Requeue impacted orthos: O(I) where I = impacted count
-   - **Typical**: ~2-10 seconds per file (scanning 100K-1M orthos)
+   - **Typical**: ~20-180 seconds per file (scanning 10M-890M orthos, scales linearly)
 
 4. **Forming Completions (Interner Operations)**: 5-10% of total time
    - Build interner from text: O(T) where T = text size
@@ -896,33 +975,33 @@ This section provides detailed analysis of where each approach spends computatio
 
 5. **Checkpoint Save/Load**: <5% of total time
    - Serialize interner: O(V + P) typically 10-50ms
-   - Flush results queue: O(R) typically 100-500ms
-   - Rebuild seen tracker: O(R) typically 1-5 seconds on load
-   - **Typical**: 2-10 seconds per checkpoint
+   - Flush results queue: O(R) typically minutes for 890M orthos
+   - Rebuild seen tracker: O(R) typically minutes for 890M orthos
+   - **Typical**: 5-15 minutes per checkpoint at scale
 
-**Example: Processing 16 files, 1M total orthos, 50K vocabulary:**
-- BFS processing: ~70 minutes (70%)
-- Uniqueness checks: ~20 minutes (20%)
-- Finding impacted: ~8 file transitions × 5 sec = 40 seconds (<1%)
+**Example: Processing Short Book (~16 files, 890M total orthos, 50K vocabulary):**
+- BFS processing: ~1480 hours (~62 days at 1-5ms/ortho × 890M orthos) (70%)
+- Uniqueness checks: ~420 hours (~17.5 days at 100-200µs/ortho × 890M orthos) (20%)
+- Finding impacted: ~8 file transitions × 180 sec = 24 minutes (<1%)
 - Forming completions: ~16 files × 3 sec = 48 seconds (<1%)
-- Checkpointing: ~8 checkpoints × 5 sec = 40 seconds (<1%)
-- **Total: ~100 minutes**
+- Checkpointing: ~8 checkpoints × 10 min = 80 minutes (<1%)
+- **Total: ~2100 hours (~88 days) - highly parallelization-motivated!**
 
 **Disk Usage:**
 - Interner: 50-500 MB (depends on vocabulary size)
-- Results queue: R × 200-400 bytes (e.g., 1M orthos = 200-400 MB)
-- Seen tracker shards: R × 12 bytes on disk (e.g., 1M orthos = 12 MB)
-- Checkpoint backup: 2× results queue (400-800 MB)
-- **Total: ~1-2 GB for 1M orthos**
+- Results queue: R × 200-400 bytes (e.g., 890M orthos = 178-356 GB)
+- Seen tracker shards: R × 12 bytes on disk (e.g., 890M orthos = 10.7 GB)
+- Checkpoint backup: 2× results queue (356-712 GB)
+- **Total: ~550-1080 GB for 890M orthos**
 
-**RAM Usage (with dynamic configuration for 8GB machine):**
+**RAM Usage (with dynamic configuration for 64GB machine at scale):**
 - Interner: ~100-200 MB in memory
-- Work queue buffer: ~10K orthos × 300 bytes = 3 MB
-- Results queue buffer: ~10K orthos × 300 bytes = 3 MB
-- Bloom filter: 1M capacity × 2 bytes = 2 MB
-- Hot shards: ~64 shards × 100K entries × 12 bytes = 77 MB
-- Runtime overhead: ~20% = ~100 MB
-- **Total: ~300-400 MB peak**
+- Work queue buffer: ~50K orthos × 300 bytes = 15 MB
+- Results queue buffer: ~50K orthos × 300 bytes = 15 MB
+- Bloom filter: 2.7B capacity (890M × 3) × 2 bytes = 5.4 GB
+- Hot shards: ~1024 shards × 1M entries × 12 bytes = 12 GB
+- Runtime overhead: ~20% = ~4 GB
+- **Total: ~22 GB peak**
 
 ### Hierarchical Processing (Without Compaction)
 
@@ -942,63 +1021,64 @@ This section provides detailed analysis of where each approach spends computatio
    - **Total merge time**: ~15-60 seconds
 
 3. **Result Set Merging (Per Internal Node)**: 15-20% of total time
-   - Stream and deduplicate: O(R_total) hash operations
+   - Stream and deduplicate WITH REMAPPING: O(R_total × P) where P = payload size
    - Disk I/O to read child results: O(R_total × 300 bytes)
    - Bloom filter + shard checks: Same as linear per ortho
-   - **Typical**: ~5-15 seconds per internal node
-   - **Total merge time**: ~15-45 seconds
+   - **Typical**: ~30-90 minutes per internal node (890M orthos, remapping cost)
+   - **Total merge time**: ~90-270 minutes (3 internal nodes)
 
 4. **Uniqueness Checks**: 10-15% of total time
-   - Per-node bloom filters: Smaller, more efficient
+   - Per-node bloom filters: Smaller, more efficient per node
    - Final merge bloom: Same size as linear
    - Overall similar to linear but distributed
 
 5. **No Impacted Ortho Scanning**: 0% (advantage!)
    - Interners don't change within a subtree
    - No backtracking needed
-   - Saved time: ~40 seconds compared to linear
+   - Saved time: ~24 minutes compared to linear
 
-**Example: Same 16 files, 1M orthos workload:**
-- Leaf BFS (parallel 4×): ~70 min / 3.5 = ~20 minutes
-- Internal node BFS (3 nodes): ~15 minutes
-- Interner merging: ~1 minute
-- Result merging: ~1 minute
-- **Total: ~37 minutes (2.7× speedup over linear)**
+**Example: Same Short Book (~16 files, 890M orthos workload):**
+- Leaf BFS (parallel 4×): ~1480 hours / 3.5 = ~423 hours (~18 days)
+- Internal node BFS (3 nodes): ~265 hours (~11 days) 
+- Interner merging: ~60 seconds (3 nodes × 20s)
+- Result merging with remapping: ~270 minutes (~4.5 hours)
+- **Total: ~688 hours (~29 days) - 3× speedup over linear with 4× parallelization**
 
 **Disk Usage:**
-- Per-leaf results: ~250K orthos × 300 bytes = 75 MB × 4 = 300 MB
-- Per-internal results: Grows to final ~1M orthos = 300 MB
+- Per-leaf results: ~223M orthos × 300 bytes = 67 GB × 4 = 268 GB
+- Per-internal results: Grows to final ~890M orthos = 267 GB
 - Per-node interners: ~50-200 MB each, 7 nodes = 350-1400 MB
-- Merge buffers (transient): ~300 MB during merge operations
-- Checkpoint: All node states = ~2-4 GB
-- **Total: ~3-5 GB (2-3× linear)**
+- Merge buffers (transient): ~270 GB during merge operations
+- Checkpoint: All node states = ~800-1600 GB
+- **Total: ~1.6-3.2 TB (2-3× linear)**
 
-**RAM Usage (per node, with same 8GB machine):**
-- Can process 1-2 nodes in parallel (limited by RAM)
-- Per-node budget: ~2-4 GB
-- Leaf node peak: ~300 MB (smaller working set)
-- Internal node peak: ~1-2 GB (during merge)
-- **Bottleneck**: Internal node merging requires most RAM
+**RAM Usage (per node, with 64GB machine at scale):**
+- Can process 2-3 nodes in parallel (limited by RAM)
+- Per-node budget: ~20-30 GB
+- Leaf node peak: ~5 GB (smaller working set, ~223M orthos)
+- Internal node peak: ~22 GB (during merge with remapping)
+- **Bottleneck**: Internal node merging with remapping requires most RAM
 
 ### Hierarchical Processing WITH Compaction
 
-**Time Breakdown (for 16 files, 1M orthos, 70% compaction rate):**
+**Time Breakdown (for Short Book, 890M orthos, 70% compaction rate):**
 
 1. **BFS Work Queue Processing**: 55-65% (same as without compaction)
 
 2. **Compaction (Periodic)**: 5-10% of total time
-   - Run every 10K orthos: ~100 compaction runs per leaf
+   - Run every 10K orthos: ~22,300 compaction runs per leaf (223M / 10K)
    - O(N²) comparison in worst case, but spatial heuristics help
    - **Typical**: ~50-200ms per compaction run
-   - **Total**: ~5-20 seconds per leaf
+   - **Total**: ~1-4 hours per leaf
 
 3. **Interner Merging**: 8-12% of total time
    - Faster due to smaller result sets to process
-   - **Typical**: ~3-15 seconds per internal node
+   - **Typical**: ~10-30 seconds per internal node
 
-4. **Result Set Merging**: 5-8% of total time
+4. **Result Set Merging with Remapping**: 5-8% of total time
    - Only 30% of orthos to merge (70% were compacted)
-   - **Typical**: ~2-5 seconds per internal node
+   - 267M orthos after compaction instead of 890M
+   - **Typical**: ~60-120 minutes per internal node
    - **Speedup**: 3× faster than without compaction
 
 5. **Reconstruction (On Interner Change)**: <1% in hierarchical
@@ -1068,19 +1148,26 @@ This section provides detailed analysis of where each approach spends computatio
 
 ### Summary Table
 
+**For Short Book Scale (890M orthos):**
+
 | Approach | Time | Disk | RAM | Best For |
 |----------|------|------|-----|----------|
-| Linear | 100 min | 1-2 GB | 300-400 MB | Simplicity, correctness |
-| Linear + Compaction | 85 min | 300-1200 MB | 200-300 MB | Memory-constrained, moderate datasets |
-| Hierarchical | 37 min | 3-5 GB | 2-4 GB | Large datasets, parallelization |
-| Hierarchical + Compaction | 32 min | 1.5-2.5 GB | 1-2 GB | **Best overall**: Speed + efficiency |
+| Linear | ~88 days | 550-1080 GB | 22 GB | Correctness, simplicity (impractical at scale) |
+| Linear + Compaction | ~75 days | 165-325 GB | 7 GB | Memory-constrained (still slow) |
+| Hierarchical (4× parallel) | ~29 days | 1.6-3.2 TB | 22 GB/node | Parallelization (disk-heavy) |
+| Hierarchical + Compaction | ~25 days | 500-950 GB | 7 GB/node | Better disk usage |
+| Linear + Performance Tuning (6×) | ~15 days | 550-1080 GB | 22 GB | Single-machine optimization |
+| Hierarchical + Perf Tuning (3× speedup) | ~10 days | 1.6-3.2 TB | 22 GB/node | **Best time**: Parallel + optimized |
+| Hierarchical + Compaction + Perf Tuning | ~8 days | 500-950 GB | 7 GB/node | **Best overall**: Time + disk efficiency |
 
 **Key Insights:**
 
-1. **Hierarchical gains 2.7× speedup** primarily from parallelizing leaf processing and eliminating impacted ortho scanning
-2. **Compaction saves 70-90% disk space** with minimal time overhead (<15%)
-3. **Combined approach is optimal**: 3.1× faster than linear, similar disk usage
-4. **Linear + Compaction** is best incremental improvement: 15% faster, 50% less disk, simpler than hierarchical
+1. **Scale matters**: At 890M orthos, linear processing takes ~88 days - hierarchical parallelization becomes essential
+2. **Performance tuning is critical**: 3-6× speedup from code optimization alone
+3. **Compaction crucial for disk**: Saves 70% disk space (1TB → 300GB after compaction)
+4. **Hierarchical adds complexity**: Requires remapping during merge, 2-3× disk overhead during processing
+5. **Remapping cost is significant**: Touching every ortho's payload adds 10-30% to merge time
+6. **Combined approach best**: Hierarchical + Compaction + Performance Tuning reduces 88 days → 8 days
 
 ### Technical Considerations
 
@@ -1090,7 +1177,7 @@ This section provides detailed analysis of where each approach spends computatio
 - Memory per node = interner + work_queue + results_queue + tracker
 - Peak memory = max(simultaneous nodes) × per_node_memory
 - Can control via tree depth and parallel execution limit
-- With compaction: Can process 3-4 nodes in parallel instead of 1-2
+- With compaction: Can process 3-4 nodes in parallel instead of 1-2 (reduced memory per node)
 
 ### Correctness Guarantees
 
@@ -1116,55 +1203,304 @@ This section provides detailed analysis of where each approach spends computatio
 **Hierarchical + Compaction:**
 - ✅ Same as hierarchical
 - ✅ Per-node compaction reduces merge overhead
-- ⚠️  Containment relationships must be tracked per node and merged correctly
+- ⚠️  Compacted orthos must be remapped during merge (adds overhead)
+
+## Performance Tuning: Orthogonal Optimization
+
+Performance tuning is an orthogonal optimization strategy that can be applied to **any** of the above approaches (linear, hierarchical, compaction, or combinations).
+
+### Core Concept
+
+Rather than changing the algorithmic approach, performance tuning focuses on making the existing slow parts more efficient through:
+1. **Profiling-guided optimization**: Identify actual bottlenecks via profiling
+2. **Algorithmic micro-optimizations**: Replace slow operations with faster equivalents
+3. **Parallelization with Rayon**: Use data parallelism for CPU-bound operations
+
+### Profiling First
+
+Before optimizing, profile to find actual bottlenecks:
+
+```bash
+# Profile with perf
+cargo build --release
+perf record -g ./target/release/fold
+perf report
+
+# Profile with flamegraph
+cargo install flamegraph
+cargo flamegraph
+
+# Profile with criterion benchmarks
+cargo bench
+```
+
+**Common bottlenecks identified in profiling:**
+1. Interner intersection (40-50% of BFS time)
+2. Ortho ID computation (hashing) (10-15% of BFS time)
+3. Spatial transformations during expansion (15-20% of BFS time)
+4. Seen tracker lookups (10-15% of BFS time)
+
+### Optimization Strategies
+
+#### 1. Optimize Interner Intersection
+
+Current: O(num_prefixes × vocabulary_size) with FixedBitSet operations
+
+**Optimization A: Cache frequent intersections**
+```rust
+struct InternerWithCache {
+    interner: Interner,
+    intersection_cache: LruCache<(Vec<usize>, Vec<usize>), Vec<usize>>,
+}
+
+impl InternerWithCache {
+    fn intersect_cached(&mut self, required: &[Vec<usize>], forbidden: &[usize]) -> Vec<usize> {
+        let key = (required.to_vec(), forbidden.to_vec());
+        if let Some(cached) = self.intersection_cache.get(&key) {
+            return cached.clone();
+        }
+        
+        let result = self.interner.intersect(required, forbidden);
+        self.intersection_cache.put(key, result.clone());
+        result
+    }
+}
+```
+
+**Optimization B: Parallel intersection with Rayon**
+```rust
+use rayon::prelude::*;
+
+fn intersect_parallel(&self, required: &[Vec<usize>], forbidden: &[usize]) -> Vec<usize> {
+    let vocab_size = self.vocabulary.len();
+    
+    // Parallel check each completion candidate
+    (0..vocab_size)
+        .into_par_iter()
+        .filter(|&token| {
+            !forbidden.contains(&token) && 
+            required.iter().all(|prefix| self.is_valid_completion(prefix, token))
+        })
+        .collect()
+}
+```
+
+**Expected speedup**: 20-30% reduction in BFS time
+
+#### 2. Optimize Ortho ID Computation
+
+Current: Hash entire payload on every ortho creation
+
+**Optimization: Incremental hashing**
+```rust
+impl Ortho {
+    fn compute_id_incremental(parent_id: u64, new_value: usize, position: usize) -> usize {
+        // Use parent's hash as seed, only hash the delta
+        let mut hasher = DefaultHasher::new();
+        parent_id.hash(&mut hasher);
+        new_value.hash(&mut hasher);
+        position.hash(&mut hasher);
+        (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
+    }
+}
+```
+
+**Expected speedup**: 10-15% reduction in BFS time
+
+#### 3. Optimize Spatial Transformations
+
+Current: Generates all possible expansions, creating many temporary allocations
+
+**Optimization: Lazy expansion iterator**
+```rust
+struct LazyExpansionIterator {
+    ortho: Ortho,
+    expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
+    index: usize,
+}
+
+impl Iterator for LazyExpansionIterator {
+    type Item = Ortho;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.expansions.len() {
+            return None;
+        }
+        
+        let (new_dims, new_capacity, reorg) = &self.expansions[self.index];
+        self.index += 1;
+        
+        // Build ortho on demand, avoiding Vec allocations where possible
+        Some(self.ortho.expand_with(new_dims, *new_capacity, reorg))
+    }
+}
+```
+
+**Expected speedup**: 15-20% reduction in BFS time
+
+#### 4. Parallelize BFS Processing with Rayon
+
+**Optimization: Process work queue chunks in parallel**
+```rust
+use rayon::prelude::*;
+
+fn process_work_queue_parallel(
+    work_queue: &mut DiskBackedQueue<Ortho>,
+    interner: &Interner,
+    results: &mut DiskBackedQueue<Ortho>,
+    tracker: &mut SeenTracker,
+) -> Result<(), FoldError> {
+    
+    const CHUNK_SIZE: usize = 1000;
+    
+    loop {
+        // Pop a chunk of orthos
+        let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+        for _ in 0..CHUNK_SIZE {
+            if let Some(ortho) = work_queue.pop()? {
+                chunk.push(ortho);
+            } else {
+                break;
+            }
+        }
+        
+        if chunk.is_empty() {
+            break;
+        }
+        
+        // Process chunk in parallel
+        let new_orthos: Vec<Vec<Ortho>> = chunk.par_iter()
+            .map(|ortho| {
+                let (forbidden, required) = ortho.get_requirements();
+                let completions = interner.intersect(&required, &forbidden);
+                
+                completions.iter()
+                    .flat_map(|&completion| ortho.add(completion, interner.version()))
+                    .collect()
+            })
+            .collect();
+        
+        // Sequentially insert results (tracker is not thread-safe)
+        for orthos in new_orthos {
+            for ortho in orthos {
+                let id = ortho.id();
+                if !tracker.contains(&id) {
+                    tracker.insert(id);
+                    results.push(ortho.clone())?;
+                    work_queue.push(ortho)?;
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+```
+
+**Expected speedup**: 2-4× on multi-core machines (scales with core count)
+
+### Combined Impact
+
+Applying all optimizations:
+- Interner caching + parallelization: -20-30%
+- Incremental hashing: -10-15%
+- Lazy expansion: -15-20%
+- Parallel BFS: 2-4× (multi-core)
+
+**Total speedup: 3-6× on 8-core machine**
+
+### Implementation Priority
+
+1. **Profile first**: Don't optimize blindly
+2. **Start with Rayon parallelization**: Biggest win, smallest code change
+3. **Add intersection caching**: Next biggest win
+4. **Incremental hashing**: Medium win, moderate complexity
+5. **Lazy expansion**: Smallest win, highest complexity
+
+### Trade-offs
+
+**Benefits:**
+- Significant speedup (3-6×) without changing algorithm
+- Can combine with any other optimization (hierarchical, compaction)
+- Rayon makes parallelization easy (minimal code changes)
+
+**Costs:**
+- Profiling and benchmarking required
+- Incremental optimization increases code complexity
+- Parallel code harder to debug
+- Caching increases memory usage
+
+### When to Use Performance Tuning
+
+**Best combined with:**
+- Linear processing: Brings 88 days → 15-30 days
+- Hierarchical processing: Brings 29 days → 5-10 days
+- Either with compaction
+
+**Always do this AFTER** algorithmic decisions (linear vs hierarchical, with/without compaction) are made. Performance tuning is the final layer of optimization.
 
 ## Recommendation
 
 ### When to Use Linear (Current System)
 
 **Best for:**
-- Small to medium datasets (< 1M orthos)
+- Small datasets (< 10M orthos, ~1-2 days processing time)
 - When deterministic results are required
 - When correctness is paramount
 - When simplicity is valued
-- When disk space is limited
 - When debugging is frequent
 
 **Example scenarios:**
-- Processing a single book (10-20 files)
+- Processing small texts or experiments
 - Research/development work
 - Validation of algorithm correctness
-- Small production workloads
+- Prototyping
 
-### When to Consider Hierarchical Processing
+**Reality check:**
+- At 890M orthos (short book), linear takes ~88 days - **impractical**
+- Performance tuning can reduce to ~15 days, still slow
+- Linear alone is NOT viable for production at this scale
 
-**Best for:**
-- Large datasets (> 10M orthos)
-- When processing time is critical and 2-3× speedup justifies complexity
-- When partial results are useful (subtrees complete independently)
-- When parallelization infrastructure is available
-- When RAM per machine is limited but multiple machines available
-- When subtrees are logically independent
+### When to Use Hierarchical Processing
 
-**Example scenarios:**
-- Processing massive corpora (thousands of files)
-- Distributed processing across cluster
-- Real-time incremental processing (new files added to tree)
-- Fault-tolerant long-running jobs
+**ESSENTIAL for:**
+- Large datasets (> 100M orthos, e.g., short book = 890M orthos)
+- When linear would take weeks/months (anything > 10 days)
+- When parallelization infrastructure is available (multi-core or distributed)
+
+**Benefits at scale:**
+- 890M orthos: 88 days → 29 days (3× speedup with 4× parallelization)
+- With performance tuning: 29 days → 10 days
+- With compaction added: 10 days → 8 days
+
+**Critical considerations:**
+- **Remapping overhead**: Must remap every ortho during merge (10-30% overhead)
+- **Disk overhead**: 2-3× disk usage during processing (merge buffers)
+- **Correctness complexity**: Token ID remapping must be perfect
+- **Implementation effort**: ~3-5× more code than linear
 
 **Implementation recommendation:**
 - Start with proof-of-concept for small tree (depth 2, 4 leaves)
-- Validate correctness against linear version
-- Benchmark merge overhead carefully
-- Only proceed if 2-5× speedup is achieved in testing
+- Validate remapping correctness thoroughly
+- Benchmark merge overhead with remapping
+- Test on progressively larger datasets (1M → 10M → 100M → 890M orthos)
 
 ### When to Use Compaction
 
-**Best for:**
-- Any workload where disk space or memory is constrained
-- Moderate to large datasets (> 100K orthos)
-- When checkpoint save/load time is a bottleneck
-- When scanning for impacted orthos takes significant time
+**ESSENTIAL for:**
+- Any workload where disk space is constrained
+- Large datasets (> 100M orthos)
+- When checkpoint save/load time is bottleneck (hours at 890M orthos)
+
+**Benefits:**
+- 70-90% disk space reduction (1TB → 300GB)
+- 15-30% faster checkpoint operations
+- Faster impacted ortho scanning (fewer orthos to check)
+
+**Critical considerations:**
+- **Truly destructive**: Compacted orthos are DELETED from disk
+- **Reconstruction is expensive**: Power set generation on interner change
+- **Deterministic only**: Reconstruction by subtraction must be correct
 
 **Best combined with:**
 - Linear processing: Simple improvement, 15% faster, 50% less disk
@@ -1178,39 +1514,49 @@ This section provides detailed analysis of where each approach spends computatio
 
 ## Conclusion
 
-The analysis reveals four distinct optimization strategies, each with clear trade-offs:
+The analysis reveals that **scale dramatically changes the optimal approach**. At 890M orthos (short book scale):
 
-1. **Linear (Current)**: Simple, correct, deterministic. Best for most workloads.
-2. **Linear + Compaction**: 15% faster, 50% less disk. Low-hanging fruit for easy wins.
-3. **Hierarchical**: 2.7× faster via parallelization. Justified for large workloads.
-4. **Hierarchical + Compaction**: 3× faster, similar disk to linear. Optimal for very large workloads.
+1. **Linear (current)**: ~88 days - IMPRACTICAL
+2. **Linear + Performance Tuning**: ~15 days - Marginal, still slow
+3. **Linear + Compaction**: ~75 days - Saves disk but still too slow
+4. **Hierarchical**: ~29 days - Viable with parallelization (3× speedup)
+5. **Hierarchical + Performance Tuning**: ~10 days - Good (9× speedup)
+6. **Hierarchical + Compaction + Performance Tuning**: ~8 days - **Best** (11× speedup)
+
+**Key Findings:**
+
+1. **Hierarchical is ESSENTIAL at scale**: 890M orthos makes linear processing impractical (months)
+2. **Performance tuning is critical**: 3-6× speedup from code optimization
+3. **Compaction saves 70% disk**: 1TB → 300GB, essential for storage constraints
+4. **Remapping adds complexity**: Every ortho must be remapped during merge (non-trivial cost)
+5. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
 
 **Recommended Path Forward:**
 
-1. **Start with profiling**: Measure actual bottlenecks in current system on target workloads
-   - If disk space is the issue → implement compaction first
-   - If processing time is the issue → consider hierarchical
+1. **Start with performance tuning on linear**:
+   - Profile to find bottlenecks
+   - Implement Rayon parallelization (biggest win)
+   - Add intersection caching
+   - Measure: Can this get to acceptable time? (< 2 weeks)
 
-2. **Incremental implementation for hierarchical**:
-   - Phase 1: Implement tree builder (organize files, process linearly to test structure)
-   - Phase 2: Implement interner merge with comprehensive tests
-   - Phase 3: Implement result set merge with comprehensive tests
-   - Phase 4: Implement parallel leaf processing (validate deduplication)
-   - Phase 5: Implement internal node processing
-   - Phase 6: Validate results match linear version
-   - Phase 7: Add compaction after hierarchical is stable
+2. **If performance tuning insufficient, implement hierarchical**:
+   - Phase 1: Implement interner merge with token remapping
+   - Phase 2: Implement result merge with remapping validation
+   - Phase 3: Build tree structure and parallel leaf processing
+   - Phase 4: Implement internal node processing with merge
+   - Phase 5: **Critical**: Validate remapping correctness thoroughly
+   - Phase 6: Benchmark actual speedup on real data
 
-3. **Incremental implementation for compaction**:
-   - Phase 1: Implement containment detection algorithm
-   - Phase 2: Implement compaction during BFS processing
-   - Phase 3: Implement containment map persistence
-   - Phase 4: Implement reconstruction on interner change
-   - Phase 5: Validate no correctness loss vs. uncompacted
+3. **Add compaction after hierarchical is stable**:
+   - Phase 1: Implement true destructive compaction (delete from disk)
+   - Phase 2: Implement deterministic reconstruction by subtraction
+   - Phase 3: Validate no data loss
+   - Phase 4: Measure disk savings and reconstruction cost
 
-4. **Critical validation**:
-   - Run both approaches on same input
-   - Verify final optimal ortho matches (or understand why it differs)
-   - Verify no orthos are lost due to bugs
-   - Measure actual speedup and resource usage vs. predictions
+4. **Critical validation at each step**:
+   - Run on progressively larger datasets (1M → 10M → 100M → 890M)
+   - Validate ortho count matches expected
+   - Verify final optimal ortho is reasonable
+   - Measure actual time/disk/RAM vs. predictions
 
-The **compaction optimization is orthogonal** to the hierarchical vs. linear decision and provides benefits to both. The **hierarchical approach is a significant architectural change** that should only be undertaken with clear performance goals (2-5× speedup required) and rigorous validation. For most workloads, **linear + compaction** provides the best balance of simplicity, correctness, and performance improvement.
+The **hierarchical approach with remapping is complex but necessary** at scale. The current linear system cannot handle 890M orthos in reasonable time. Performance tuning helps but cannot overcome the fundamental sequential bottleneck. **Hierarchical + Compaction + Performance Tuning** reduces processing from 88 days to 8 days - a requirement, not an optimization.
