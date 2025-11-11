@@ -573,12 +573,8 @@ fn main() -> Result<(), FoldError> {
     let memory_config = MemoryConfig::calculate(0, 0);
     let processor = HierarchicalProcessor::new(memory_config);
     
-    // Choose processing mode
-    let result = if use_folding {
-        processor.process_with_folding(&tree, None)?
-    } else {
-        processor.process_tree(&tree)?
-    };
+    // Process the tree hierarchically
+    let result = processor.process_tree(&tree)?;
     
     println!("\n[fold] ===== FINAL OPTIMAL ORTHO =====");
     print_optimal(&result.optimal, &result.interner);
