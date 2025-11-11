@@ -862,6 +862,187 @@ impl HierarchicalCheckpoint {
    - Hard to estimate completion time
    - Resource usage varies by tree level
 
+## Extreme Hierarchical: Sentence-Level Binary Merge
+
+This section analyzes taking hierarchical processing to its extreme: treating each **sentence** as the smallest processing unit and performing a binary merge tree.
+
+### Concept
+
+The Fold splitter already splits text on punctuation (`.`, `?`, `;`, `!`, paragraph breaks). Instead of processing files, process individual sentences:
+
+```
+Sentence 1 → Orthos₁
+Sentence 2 → Orthos₂     } → Merge → Orthos₁₂
+Sentence 3 → Orthos₃
+Sentence 4 → Orthos₄     } → Merge → Orthos₃₄  } → Merge → Orthos₁₂₃₄
+...
+
+Binary tree depth: log₂(N) where N = sentence count
+```
+
+### Scale Analysis
+
+**For Short Book (16 files, 890M orthos):**
+
+Assume average book:
+- ~100K words
+- ~5K sentences (assuming ~20 words/sentence)
+- Binary tree depth: log₂(5000) ≈ 12-13 levels
+
+**Per-Sentence Processing:**
+- Each sentence is tiny (~20 words)
+- Interner per sentence: ~20 unique words, ~50-100 phrases
+- Orthos generated per sentence: ~100-1000 (MUCH smaller than 890M)
+- **Key insight**: Most orthos come from CROSS-SENTENCE phrase combinations
+
+### Resource Breakdown
+
+**Leaf Level (5K sentence nodes):**
+- Per-sentence BFS: ~1-10 seconds (tiny vocabulary, few orthos)
+- Total leaf processing: 5K × 5 sec = ~7 hours (massively parallel)
+
+**Merge Levels (12-13 levels up to root):**
+
+Level 1 (2.5K merges):
+- Each merge: 2 sentences → ~2K orthos → merge with remapping
+- Interner merge: ~40 words → ~80 words
+- Impacted ortho scanning: ~2K orthos (tiny!)
+- Per-merge time: ~5-30 seconds
+- Parallelizable: 2.5K merges can run in parallel
+
+Level 6 (halfway, ~78 merges):
+- Each merge: ~32 sentences → ~50K-500K orthos
+- Interner merge: ~500 words → ~600 words
+- Impacted ortho scanning: ~500K orthos
+- Per-merge time: ~30-300 seconds
+
+Level 12 (near root, ~2 merges):
+- Each merge: ~2500 sentences → ~200M-500M orthos
+- Interner merge: ~25K words → ~50K words
+- Impacted ortho scanning: ~500M orthos
+- Per-merge time: ~10-50 hours
+
+Level 13 (root merge):
+- Final merge: ~5K sentences → ~890M orthos
+- Interner merge: ~50K words (full vocabulary)
+- Impacted ortho scanning: ~890M orthos
+- Merge time: ~50-100 hours
+
+**Total Time Estimate:**
+- Leaf processing: ~7 hours (5K × 5 sec, parallel)
+- Level 1-6 merges: ~50 hours (small merges, mostly parallel)
+- Level 7-12 merges: ~200 hours (medium merges, less parallelism)
+- Level 13 root merge: ~100 hours (final merge)
+- **Total: ~357 hours (~15 days)**
+
+### Disk Usage
+
+**Challenge: Intermediate State Explosion**
+
+Each merge level generates new orthos:
+- Level 1: 2.5K × 2K orthos = 5M orthos (1.5 GB)
+- Level 6: 78 × 500K orthos = 39M orthos (12 GB)
+- Level 12: 2 × 500M orthos = 1B orthos (300 GB)
+- Level 13: 890M orthos final (267 GB)
+
+**Temporary disk for all levels:** ~600-800 GB (not counting cleanup)
+
+With cleanup (deleting child results after merge): ~300-400 GB peak
+
+### RAM Usage
+
+**Per-merge node:**
+- Level 1-6: ~100 MB - 1 GB (small merges)
+- Level 7-12: ~5-15 GB (medium merges)
+- Level 13: ~22 GB (root merge)
+
+**Parallelization bottleneck:**
+- Early levels: Can run 100s of merges in parallel (low RAM each)
+- Late levels: Limited to 2-4 merges in parallel (high RAM each)
+
+### Benefits of Sentence-Level Binary Merge
+
+1. **Maximum Granularity**
+   - Smallest possible processing unit (sentence)
+   - Maximum parallelization at leaf level (5K sentences can process simultaneously)
+   - Fine-grained progress tracking
+
+2. **Logarithmic Depth**
+   - Binary tree: log₂(N) levels (12-13 for 5K sentences)
+   - File-based tree: log₄(N) levels (6-7 for 16 files)
+   - More levels = more opportunities for parallelization
+
+3. **Smaller Merge Overhead**
+   - Early merges are tiny (seconds each)
+   - Impacted ortho scanning on small sets is fast
+   - Remapping overhead distributed across many small merges
+
+4. **Fault Tolerance**
+   - Failure in one sentence doesn't lose much work
+   - Can checkpoint at each merge level
+   - Resume from any level
+
+### Drawbacks of Sentence-Level Binary Merge
+
+1. **Merge Overhead Dominates**
+   - 12-13 merge levels vs 2-3 for file-based
+   - Each level requires remapping ALL orthos
+   - Impacted ortho scanning happens at EVERY level
+   - **Key problem**: The same 890M orthos get remapped 12-13 times instead of 2-3 times
+
+2. **Cumulative Remapping Cost**
+   - File-based: 890M orthos remapped 2-3 times = ~2.7B remap operations
+   - Sentence-based: Orthos remapped at EACH level up
+   - Effective remapping: ~5-8B remap operations (worse!)
+   - **Time penalty**: 2-3× more merge time than file-based
+
+3. **Implementation Complexity**
+   - Managing 5K leaf nodes vs 16 file nodes
+   - 12-13 merge levels vs 2-3 levels
+   - More complex scheduling and resource allocation
+   - More checkpoint states to manage
+
+4. **Diminishing Returns**
+   - Leaf processing is already tiny (7 hours vs 18 days for file-based)
+   - Bottleneck shifts entirely to merge operations
+   - More merge levels = MORE total merge time, not less
+
+5. **Memory Fragmentation**
+   - 5K tiny interners vs 16 medium interners
+   - More temporary merge states in flight
+   - Harder to pack into available RAM efficiently
+
+### Comparison: File-Based vs Sentence-Based
+
+| Aspect | File-Based (4-ary) | Sentence-Based (Binary) |
+|--------|-------------------|------------------------|
+| Leaf nodes | 16 files | 5K sentences |
+| Tree depth | 2-3 levels | 12-13 levels |
+| Leaf processing | ~18 days (parallel) | ~7 hours (parallel) |
+| Merge operations | ~8 hours | ~357 hours (15 days) |
+| Total time | ~29 days | ~15 days |
+| Remapping operations | ~2.7B | ~5-8B |
+| Impacted scans | 3 merge points | 13 merge points |
+| Implementation | Moderate | High complexity |
+| **Winner** | **Simplicity** | **Slight speedup** |
+
+### Analysis Conclusion
+
+**Sentence-level binary merge provides ~2× speedup (29 → 15 days) but:**
+
+1. **Marginal benefit**: 2× vs 3× from file-based hierarchical
+2. **High complexity**: 300× more nodes, 4× more merge levels
+3. **Merge-dominated**: 95% of time is merging, not processing
+4. **Remapping explosion**: 2-3× more remapping operations
+
+**Better approach**: Hybrid strategy
+- Use sentences for initial grouping (e.g., 100 sentences per leaf)
+- Binary merge in early levels (low overhead)
+- Switch to larger branching factor at higher levels
+- Balance parallelization vs merge overhead
+
+**Recommendation**: Sentence-level binary merge is NOT worth the complexity. File-based quaternary (4-way) tree provides better simplicity/performance trade-off. If more speedup needed, **performance tuning (3-6×)** and **higher branching factors** (8-way or 16-way tree) are more effective than going to sentence-level granularity.
+
 ## Final State Comparison
 
 ### Linear (Current State)
@@ -1032,17 +1213,22 @@ This section provides detailed analysis of where each approach spends computatio
    - Final merge bloom: Same size as linear
    - Overall similar to linear but distributed
 
-5. **No Impacted Ortho Scanning**: 0% (advantage!)
-   - Interners don't change within a subtree
-   - No backtracking needed
-   - Saved time: ~24 minutes compared to linear
+5. **Impacted Ortho Scanning (At Merge Points)**: 5-8% of total time
+   - **CORRECTION**: Hierarchical DOES require impacted ortho scanning
+   - When merging child results, interner changes (child interners → merged interner)
+   - Must scan child orthos to find those referencing changed keys
+   - However, scanning is localized per merge (not global)
+   - **Typical**: ~30-90 minutes per internal node merge (scanning 223M-890M orthos)
+   - **Advantage**: Can be parallelized across merge points
+   - Saved time vs linear: Parallelization, not elimination
 
 **Example: Same Short Book (~16 files, 890M orthos workload):**
 - Leaf BFS (parallel 4×): ~1480 hours / 3.5 = ~423 hours (~18 days)
 - Internal node BFS (3 nodes): ~265 hours (~11 days) 
 - Interner merging: ~60 seconds (3 nodes × 20s)
+- Impacted ortho scanning at merges: ~180 minutes (3 nodes × 60 min, can overlap with BFS)
 - Result merging with remapping: ~270 minutes (~4.5 hours)
-- **Total: ~688 hours (~29 days) - 3× speedup over linear with 4× parallelization**
+- **Total: ~695 hours (~29 days) - 3× speedup over linear with 4× parallelization**
 
 **Disk Usage:**
 - Per-leaf results: ~223M orthos × 300 bytes = 67 GB × 4 = 268 GB
@@ -1154,7 +1340,8 @@ This section provides detailed analysis of where each approach spends computatio
 |----------|------|------|-----|----------|
 | Linear | ~88 days | 550-1080 GB | 22 GB | Correctness, simplicity (impractical at scale) |
 | Linear + Compaction | ~75 days | 165-325 GB | 7 GB | Memory-constrained (still slow) |
-| Hierarchical (4× parallel) | ~29 days | 1.6-3.2 TB | 22 GB/node | Parallelization (disk-heavy) |
+| Hierarchical File-Based (4× parallel) | ~29 days | 1.6-3.2 TB | 22 GB/node | Parallelization (disk-heavy, **impacted scanning at merges**) |
+| Hierarchical Sentence-Based (binary) | ~15 days | 600-800 GB | 22 GB/node | Max parallelization (high merge overhead) |
 | Hierarchical + Compaction | ~25 days | 500-950 GB | 7 GB/node | Better disk usage |
 | Linear + Performance Tuning (6×) | ~15 days | 550-1080 GB | 22 GB | Single-machine optimization |
 | Hierarchical + Perf Tuning (3× speedup) | ~10 days | 1.6-3.2 TB | 22 GB/node | **Best time**: Parallel + optimized |
@@ -1167,7 +1354,9 @@ This section provides detailed analysis of where each approach spends computatio
 3. **Compaction crucial for disk**: Saves 70% disk space (1TB → 300GB after compaction)
 4. **Hierarchical adds complexity**: Requires remapping during merge, 2-3× disk overhead during processing
 5. **Remapping cost is significant**: Touching every ortho's payload adds 10-30% to merge time
-6. **Combined approach best**: Hierarchical + Compaction + Performance Tuning reduces 88 days → 8 days
+6. **Impacted scanning still needed**: Hierarchical must scan for impacted orthos at each merge point (not eliminated, just localized)
+7. **Sentence-level diminishing returns**: Binary merge on 5K sentences gives 2× speedup but 4× complexity over file-based
+8. **Combined approach best**: Hierarchical + Compaction + Performance Tuning reduces 88 days → 8 days
 
 ### Technical Considerations
 
@@ -1519,9 +1708,10 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 1. **Linear (current)**: ~88 days - IMPRACTICAL
 2. **Linear + Performance Tuning**: ~15 days - Marginal, still slow
 3. **Linear + Compaction**: ~75 days - Saves disk but still too slow
-4. **Hierarchical**: ~29 days - Viable with parallelization (3× speedup)
-5. **Hierarchical + Performance Tuning**: ~10 days - Good (9× speedup)
-6. **Hierarchical + Compaction + Performance Tuning**: ~8 days - **Best** (11× speedup)
+4. **Hierarchical File-Based**: ~29 days - Viable with parallelization (3× speedup, **still needs impacted scanning**)
+5. **Hierarchical Sentence-Based**: ~15 days - Max parallelization but high merge complexity
+6. **Hierarchical + Performance Tuning**: ~10 days - Good (9× speedup)
+7. **Hierarchical + Compaction + Performance Tuning**: ~8 days - **Best** (11× speedup)
 
 **Key Findings:**
 
@@ -1529,7 +1719,9 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 2. **Performance tuning is critical**: 3-6× speedup from code optimization
 3. **Compaction saves 70% disk**: 1TB → 300GB, essential for storage constraints
 4. **Remapping adds complexity**: Every ortho must be remapped during merge (non-trivial cost)
-5. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
+5. **Impacted scanning NOT eliminated**: Hierarchical still needs to scan for impacted orthos at merge points (localized but not eliminated)
+6. **Sentence-level has diminishing returns**: Binary merge on 5K sentences gives 2× speedup but 4× implementation complexity
+7. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
 
 **Recommended Path Forward:**
 
@@ -1539,13 +1731,15 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
    - Add intersection caching
    - Measure: Can this get to acceptable time? (< 2 weeks)
 
-2. **If performance tuning insufficient, implement hierarchical**:
+2. **If performance tuning insufficient, implement hierarchical (file-based)**:
    - Phase 1: Implement interner merge with token remapping
    - Phase 2: Implement result merge with remapping validation
-   - Phase 3: Build tree structure and parallel leaf processing
-   - Phase 4: Implement internal node processing with merge
-   - Phase 5: **Critical**: Validate remapping correctness thoroughly
-   - Phase 6: Benchmark actual speedup on real data
+   - Phase 3: Implement impacted ortho scanning at merge points
+   - Phase 4: Build tree structure and parallel leaf processing
+   - Phase 5: Implement internal node processing with merge
+   - Phase 6: **Critical**: Validate remapping correctness thoroughly
+   - Phase 7: Benchmark actual speedup on real data
+   - **Do NOT go to sentence-level** - diminishing returns for high complexity
 
 3. **Add compaction after hierarchical is stable**:
    - Phase 1: Implement true destructive compaction (delete from disk)
@@ -1558,5 +1752,6 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
    - Validate ortho count matches expected
    - Verify final optimal ortho is reasonable
    - Measure actual time/disk/RAM vs. predictions
+   - **Verify impacted scanning works correctly at merge points**
 
-The **hierarchical approach with remapping is complex but necessary** at scale. The current linear system cannot handle 890M orthos in reasonable time. Performance tuning helps but cannot overcome the fundamental sequential bottleneck. **Hierarchical + Compaction + Performance Tuning** reduces processing from 88 days to 8 days - a requirement, not an optimization.
+The **hierarchical approach with remapping is complex but necessary** at scale. The current linear system cannot handle 890M orthos in reasonable time. Performance tuning helps but cannot overcome the fundamental sequential bottleneck. **Hierarchical + Compaction + Performance Tuning** reduces processing from 88 days to 8 days - a requirement, not an optimization. Note that hierarchical does NOT eliminate impacted ortho scanning - it localizes it to merge points, which can be parallelized but still must be performed.
