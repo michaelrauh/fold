@@ -111,6 +111,11 @@ impl Ortho {
             .collect();
         (forbidden, required)
     }
+
+    pub fn get_requirement_phrases(&self) -> Vec<Vec<usize>> {
+        let (_forbidden, required) = self.get_requirements();
+        required
+    }
     pub fn version(&self) -> usize { self.version }
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
         let mut result = Vec::new();
@@ -738,6 +743,32 @@ mod tests {
         };
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "[dim0=0]\n   a    b\n   c    e\n\n[dim0=1]\n   d    f\n   g    ·");
+    }
+
+    #[test]
+    fn test_get_requirement_phrases() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10, 1)[0];
+        let ortho = &ortho.add(20, 1)[0];
+        
+        let phrases = ortho.get_requirement_phrases();
+        assert_eq!(phrases, vec![vec![10]]);
+        
+        let ortho = &ortho.add(30, 1)[0];
+        let ortho = &ortho.add(40, 1)[0];
+        let phrases = ortho.get_requirement_phrases();
+        assert_eq!(phrases, vec![vec![10, 30]]);
+    }
+
+    #[test]
+    fn test_get_requirement_phrases_expansion() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(1, 1)[0];
+        let ortho = &ortho.add(2, 1)[0];
+        let ortho = &ortho.add(3, 1)[0];
+        
+        let phrases = ortho.get_requirement_phrases();
+        assert_eq!(phrases, vec![vec![2], vec![3]]);
     }
 }
 

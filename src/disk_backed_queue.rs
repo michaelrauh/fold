@@ -126,6 +126,33 @@ impl DiskBackedQueue {
         self.disk_path.to_string_lossy().to_string()
     }
     
+    /// Scan all items in queue without consuming them
+    pub fn scan<F>(&self, mut f: F) -> Result<(), FoldError>
+    where
+        F: FnMut(&Ortho),
+    {
+        // Scan items in buffer
+        for ortho in &self.buffer {
+            f(ortho);
+        }
+        
+        // Scan items in disk files
+        for file_path in &self.disk_files {
+            let file = File::open(file_path).map_err(FoldError::Io)?;
+            let mut reader = BufReader::new(file);
+            let config = bincode::config::standard();
+            
+            loop {
+                match bincode::decode_from_std_read::<Ortho, _, _>(&mut reader, config) {
+                    Ok(ortho) => f(&ortho),
+                    Err(_) => break,
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
     pub fn flush(&mut self) -> Result<(), FoldError> {
         if self.buffer.is_empty() {
             return Ok(());

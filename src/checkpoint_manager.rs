@@ -1,4 +1,4 @@
-use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, seen_tracker::SeenTracker, FoldError};
+use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, memory_config::MemoryConfig, seen_tracker::SeenTracker, FoldError};
 use std::fs;
 use std::path::Path;
 
@@ -73,7 +73,8 @@ impl CheckpointManager {
     
     /// Load a checkpoint if it exists
     /// Reconstructs bloom filter and seen set from all results
-    pub fn load(&self) -> Result<Option<(Interner, DiskBackedQueue, SeenTracker)>, FoldError> {
+    /// Uses provided memory configuration for optimal sizing
+    pub fn load(&self, memory_config: &MemoryConfig) -> Result<Option<(Interner, DiskBackedQueue, SeenTracker)>, FoldError> {
         if !Path::new(&format!("{}/interner.bin", self.checkpoint_dir)).exists() {
             return Ok(None);
         }
@@ -105,28 +106,15 @@ impl CheckpointManager {
         }
         
         // Create temporary queue to consume
-        let mut temp_queue = DiskBackedQueue::new_from_path(&self.results_temp, 10000)?;
+        let mut temp_queue = DiskBackedQueue::new_from_path(&self.results_temp, memory_config.queue_buffer_size)?;
         let total_items = temp_queue.len();
         
         println!("[fold] Reconstructing bloom filter and seen set from {} results...", total_items);
         
-        // Calculate optimal bloom size and shard configuration based on result count
-        // Bloom: 3x the result count (room to grow before false positive rate degrades)
-        // Shards: target ~10K items per shard for good memory/disk balance
-        // Max in memory: keep 32 shards hot (~320K items max in memory)
-        let bloom_capacity = if total_items > 0 { 
-            (total_items * 3).max(1_000_000) 
-        } else { 
-            1_000_000 
-        };
-        
-        let num_shards = if total_items > 0 {
-            (total_items / 10_000).max(64)
-        } else {
-            64
-        };
-        
-        let max_shards_in_memory = 256;
+        // Use memory configuration
+        let bloom_capacity = memory_config.bloom_capacity;
+        let num_shards = memory_config.num_shards;
+        let max_shards_in_memory = memory_config.max_shards_in_memory;
         
         println!("[fold] Tracker config: bloom_capacity={}, num_shards={}, max_in_memory={}", 
                  bloom_capacity, num_shards, max_shards_in_memory);
@@ -140,7 +128,7 @@ impl CheckpointManager {
         }
         
         // Create new active results queue
-        let mut new_results = DiskBackedQueue::new_from_path(&self.results_path, 10000)?;
+        let mut new_results = DiskBackedQueue::new_from_path(&self.results_path, memory_config.queue_buffer_size)?;
         
         // Consume temp queue: rebuild bloom filter and seen set from ALL results
         let mut consumed = 0;
@@ -224,7 +212,8 @@ mod tests {
         assert!(checkpoint_results.exists());
         
         // LOAD PHASE - simulate restart
-        let result = manager.load().unwrap();
+        let memory_config = crate::memory_config::MemoryConfig::default_config();
+        let result = manager.load(&memory_config).unwrap();
         assert!(result.is_some());
         
         let (loaded_interner, loaded_results, mut loaded_tracker) = result.unwrap();
@@ -242,7 +231,8 @@ mod tests {
         let fold_state = temp_dir.path().join("fold_state");
         
         let manager = CheckpointManager::with_base_dir(&fold_state);
-        let result = manager.load().unwrap();
+        let memory_config = crate::memory_config::MemoryConfig::default_config();
+        let result = manager.load(&memory_config).unwrap();
         assert!(result.is_none());
     }
 
@@ -273,7 +263,8 @@ mod tests {
         manager.save(&interner, &mut results_queue).unwrap();
         
         // Load and verify bloom/seen are reconstructed from ALL results
-        let result = manager.load();
+        let memory_config = crate::memory_config::MemoryConfig::default_config();
+        let result = manager.load(&memory_config);
         assert!(result.is_ok(), "Load should succeed: {:?}", result.err());
         let loaded = result.unwrap();
         assert!(loaded.is_some(), "Checkpoint should exist");

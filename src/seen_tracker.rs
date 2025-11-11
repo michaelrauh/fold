@@ -66,7 +66,6 @@ impl Shard {
 /// and a sharded hashmap with LRU disk backing for memory efficiency
 pub struct SeenTracker {
     bloom: Bloom<usize>,
-    bloom_capacity: usize,
     
     // Sharding configuration
     num_shards: usize,
@@ -108,7 +107,6 @@ impl SeenTracker {
         
         Self {
             bloom,
-            bloom_capacity,
             num_shards,
             max_shards_in_memory,
             loaded_shards: Vec::new(),
