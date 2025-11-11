@@ -1043,6 +1043,206 @@ With cleanup (deleting child results after merge): ~300-400 GB peak
 
 **Recommendation**: Sentence-level binary merge is NOT worth the complexity. File-based quaternary (4-way) tree provides better simplicity/performance trade-off. If more speedup needed, **performance tuning (3-6×)** and **higher branching factors** (8-way or 16-way tree) are more effective than going to sentence-level granularity.
 
+## Work-Stealing Merge Strategy: Dynamic Load Balancing
+
+This section analyzes a dynamic merge strategy where parallel workers continuously check out and merge chunks from a shared pool, optimizing for load balancing.
+
+### Concept
+
+Instead of a static tree structure, use a work-stealing approach:
+1. Break text into sentence-level chunks (~5K chunks for short book)
+2. Put all chunks in a shared pool
+3. Run N parallel workers (N = number of CPU cores, e.g., 8)
+4. Each worker repeatedly:
+   - Check out the **smallest** chunk from the pool
+   - Check out the **largest** chunk from the pool
+   - Merge them (interner + results with remapping)
+   - Return merged chunk to pool
+5. Continue until only 1 chunk remains (final result)
+
+```
+Initial Pool: [S1, S2, S3, ..., S5000] (5K sentence chunks)
+
+Worker 1: checkout(smallest=S1, largest=S5000) → merge → return M1
+Worker 2: checkout(smallest=S2, largest=S4999) → merge → return M2
+...
+Worker 8: checkout(smallest=S8, largest=S4993) → merge → return M8
+
+Pool now: [S9, S10, ..., S4992, M1, M2, ..., M8]
+
+Workers continue until pool has 1 chunk...
+```
+
+### Why Smallest + Largest?
+
+**Load balancing heuristic:**
+- Smallest chunk: Fast to process, keeps worker busy
+- Largest chunk: Maximizes reduction in pool size
+- Combination: Balances throughput (many small merges) with progress (few large merges)
+
+### Resource Breakdown
+
+**For Short Book (5K sentences, 890M total orthos, 8-core machine):**
+
+**Initial Phase (pool size 5000 → 2500):**
+- Workers merge tiny chunks (100-1000 orthos each)
+- Very fast merges: ~5-30 seconds per merge
+- High parallelization: All 8 workers active
+- Time: ~2500 merges / 8 workers × 15 sec avg = ~1.3 hours
+
+**Middle Phase (pool size 2500 → 100):**
+- Chunks growing: 10K-1M orthos each
+- Medium merges: ~1-10 minutes per merge
+- Still good parallelization: 8 workers mostly active
+- Time: ~2400 merges / 8 workers × 5 min avg = ~25 hours
+
+**Late Phase (pool size 100 → 10):**
+- Large chunks: 10M-100M orthos each
+- Slow merges: ~1-10 hours per merge
+- Reduced parallelization: Fewer chunks available
+- Time: ~90 merges / 6 workers avg × 5 hours avg = ~75 hours
+
+**Final Phase (pool size 10 → 1):**
+- Huge chunks: 100M-890M orthos
+- Very slow merges: ~10-50 hours per merge
+- Low parallelization: Only 2-4 workers active
+- Time: ~9 merges / 2 workers avg × 30 hours avg = ~135 hours
+
+**Total Time: ~236 hours (~10 days)**
+
+### Disk Usage
+
+**Challenge: Pool Management**
+
+All chunks must be accessible in the pool:
+- Initial: 5K tiny chunks (~1.5 GB)
+- Middle: ~2.5K medium chunks (~150 GB)
+- Late: ~100 large chunks (~500 GB)
+- Final: ~10 huge chunks (~800 GB)
+
+**Peak disk usage**: ~800 GB (during late phase, before cleanup)
+
+With aggressive cleanup (delete source chunks after merge): ~400-500 GB working set
+
+### RAM Usage
+
+**Per-worker:**
+- Needs to load 2 chunks + perform merge
+- Peak: Largest chunk + medium chunk + merge buffer
+- Late phase: ~100M orthos × 2 + remapping = ~20-30 GB per active worker
+
+**Total RAM:**
+- Early phase: 8 workers × 1 GB = 8 GB
+- Middle phase: 8 workers × 5 GB = 40 GB
+- Late phase: 4 workers × 25 GB = 100 GB (bottleneck!)
+- Final phase: 2 workers × 40 GB = 80 GB
+
+**RAM bottleneck**: Late phase needs ~100 GB, exceeds typical machine capacity (64 GB)
+
+### Benefits of Work-Stealing
+
+1. **Dynamic Load Balancing**
+   - No pre-planning of tree structure needed
+   - Workers automatically balance themselves
+   - Fast workers get more work, slow workers don't block
+
+2. **Simplified Scheduling**
+   - No complex tree traversal logic
+   - Simple pool management with locks/channels
+   - Easy to implement with work-stealing queue
+
+3. **Fault Tolerance**
+   - Worker failure: Just restart worker, pool still has chunks
+   - No complex checkpoint/resume per tree level
+   - Simpler recovery logic
+
+4. **Optimal Pairing**
+   - Smallest + largest heuristic is effective
+   - Reduces pool size quickly (large merges)
+   - Maintains throughput (small merges)
+
+### Drawbacks of Work-Stealing
+
+1. **RAM Explosion in Late Phase**
+   - Late phase requires ~100 GB RAM for 4-6 workers
+   - Exceeds typical server capacity (64 GB)
+   - Must reduce parallelism → slower than expected
+   - **Critical bottleneck**
+
+2. **Contention on Pool**
+   - All 8 workers compete for pool access
+   - Locking/synchronization overhead
+   - Pool operations become bottleneck (not merge itself)
+   - Mitigated by lock-free queues but still overhead
+
+3. **Inefficient Late Merges**
+   - Smallest + largest creates imbalanced merges
+   - Small chunk (100M orthos) + large chunk (800M orthos) = 900M orthos
+   - Result is just slightly larger than input
+   - Could have merged two 450M chunks instead (more balanced)
+
+4. **More Total Merges**
+   - Work-stealing: ~5000 merges to get from 5K → 1
+   - Binary tree: ~5000 merges (same)
+   - File-based quaternary: ~21 merges (much fewer!)
+   - **More merges = more remapping overhead**
+
+5. **No Structural Optimization**
+   - Can't leverage sentence boundaries for better grouping
+   - Can't use topic clustering to reduce vocabulary overlap
+   - Just pairs smallest + largest, ignoring content
+
+### Comparison: Binary Tree vs Work-Stealing
+
+| Aspect | Binary Tree | Work-Stealing |
+|--------|------------|---------------|
+| Total merges | ~5000 | ~5000 |
+| Parallelization | Variable by level | Dynamic (better) |
+| RAM peak | ~22 GB | ~100 GB (worse!) |
+| Time | ~15 days | ~10 days |
+| Complexity | Static tree | Pool + workers |
+| Load balancing | Poor (level-locked) | Good (dynamic) |
+| Late phase | Predictable | RAM bottleneck |
+
+### Modified Work-Stealing: Size-Bounded
+
+**Fix the RAM problem**: Limit maximum chunk size in pool
+
+```
+Modified strategy:
+- If largest chunk > threshold (e.g., 100M orthos):
+  - Don't pair with smallest
+  - Pair two medium-sized chunks instead
+- This keeps RAM usage bounded
+```
+
+**With size-bounded strategy:**
+- Time: ~12 days (slightly slower due to more balanced merges)
+- RAM peak: ~40 GB (within typical server capacity)
+- More merges overall but manageable
+
+### Analysis Conclusion
+
+**Work-stealing provides ~4× speedup (29 → 10 days for pure work-stealing) but:**
+
+1. **RAM explosion**: Late phase needs ~100 GB RAM (impractical)
+2. **Size-bounded variant**: ~12 days with 40 GB RAM (practical)
+3. **Still many merges**: ~5000 merges vs 21 for file-based
+4. **Complexity**: Pool management, synchronization, size balancing
+
+**Comparison to alternatives:**
+- File-based quaternary: 29 days, 22 GB RAM, 21 merges - **Simple**
+- Sentence binary tree: 15 days, 22 GB RAM, 5000 merges - High complexity
+- Work-stealing pure: 10 days, 100 GB RAM, 5000 merges - **RAM impractical**
+- Work-stealing bounded: 12 days, 40 GB RAM, 6000 merges - Moderate complexity
+
+**Recommendation**: Work-stealing with size-bounded pairing provides good load balancing and ~2.4× speedup over file-based. However:
+- Still has 5000+ merges (vs 21 for file-based)
+- Requires careful pool management and RAM limits
+- **Better approach**: File-based + performance tuning (3-6×) = 10-5 days with simpler implementation
+
+Work-stealing is viable but **not recommended** - the implementation complexity and merge count overhead outweigh the load balancing benefits. File-based hierarchical with performance tuning provides similar or better speedup with far fewer merges and simpler code.
+
 ## Final State Comparison
 
 ### Linear (Current State)
@@ -1342,6 +1542,8 @@ This section provides detailed analysis of where each approach spends computatio
 | Linear + Compaction | ~75 days | 165-325 GB | 7 GB | Memory-constrained (still slow) |
 | Hierarchical File-Based (4× parallel) | ~29 days | 1.6-3.2 TB | 22 GB/node | Parallelization (disk-heavy, **impacted scanning at merges**) |
 | Hierarchical Sentence-Based (binary) | ~15 days | 600-800 GB | 22 GB/node | Max parallelization (high merge overhead) |
+| Work-Stealing (pure, 8 cores) | ~10 days | 400-800 GB | **100 GB** | Dynamic load balance (**RAM impractical**) |
+| Work-Stealing (size-bounded) | ~12 days | 400-800 GB | 40 GB | Load balance with RAM limits (high complexity) |
 | Hierarchical + Compaction | ~25 days | 500-950 GB | 7 GB/node | Better disk usage |
 | Linear + Performance Tuning (6×) | ~15 days | 550-1080 GB | 22 GB | Single-machine optimization |
 | Hierarchical + Perf Tuning (3× speedup) | ~10 days | 1.6-3.2 TB | 22 GB/node | **Best time**: Parallel + optimized |
@@ -1356,7 +1558,9 @@ This section provides detailed analysis of where each approach spends computatio
 5. **Remapping cost is significant**: Touching every ortho's payload adds 10-30% to merge time
 6. **Impacted scanning still needed**: Hierarchical must scan for impacted orthos at each merge point (not eliminated, just localized)
 7. **Sentence-level diminishing returns**: Binary merge on 5K sentences gives 2× speedup but 4× complexity over file-based
-8. **Combined approach best**: Hierarchical + Compaction + Performance Tuning reduces 88 days → 8 days
+8. **Work-stealing RAM bottleneck**: Pure work-stealing needs 100 GB RAM in late phase; size-bounded variant more practical but still complex
+9. **Merge count matters**: File-based (21 merges) << sentence/work-stealing (5000+ merges) → less remapping overhead
+10. **Combined approach best**: Hierarchical + Compaction + Performance Tuning reduces 88 days → 8 days
 
 ### Technical Considerations
 
@@ -1710,8 +1914,9 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 3. **Linear + Compaction**: ~75 days - Saves disk but still too slow
 4. **Hierarchical File-Based**: ~29 days - Viable with parallelization (3× speedup, **still needs impacted scanning**)
 5. **Hierarchical Sentence-Based**: ~15 days - Max parallelization but high merge complexity
-6. **Hierarchical + Performance Tuning**: ~10 days - Good (9× speedup)
-7. **Hierarchical + Compaction + Performance Tuning**: ~8 days - **Best** (11× speedup)
+6. **Work-Stealing (size-bounded)**: ~12 days - Good load balancing but 5000+ merges
+7. **Hierarchical + Performance Tuning**: ~10 days - Good (9× speedup)
+8. **Hierarchical + Compaction + Performance Tuning**: ~8 days - **Best** (11× speedup)
 
 **Key Findings:**
 
@@ -1721,7 +1926,9 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 4. **Remapping adds complexity**: Every ortho must be remapped during merge (non-trivial cost)
 5. **Impacted scanning NOT eliminated**: Hierarchical still needs to scan for impacted orthos at merge points (localized but not eliminated)
 6. **Sentence-level has diminishing returns**: Binary merge on 5K sentences gives 2× speedup but 4× implementation complexity
-7. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
+7. **Work-stealing has RAM bottleneck**: Pure work-stealing needs 100 GB RAM; size-bounded variant practical but 5000+ merges vs 21 for file-based
+8. **Merge count matters greatly**: File-based (21 merges) has far less remapping overhead than sentence/work-stealing (5000+ merges)
+9. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
 
 **Recommended Path Forward:**
 
@@ -1739,7 +1946,7 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
    - Phase 5: Implement internal node processing with merge
    - Phase 6: **Critical**: Validate remapping correctness thoroughly
    - Phase 7: Benchmark actual speedup on real data
-   - **Do NOT go to sentence-level** - diminishing returns for high complexity
+   - **Do NOT go to sentence-level or work-stealing** - diminishing returns, high complexity, many merges
 
 3. **Add compaction after hierarchical is stable**:
    - Phase 1: Implement true destructive compaction (delete from disk)
@@ -1754,4 +1961,6 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
    - Measure actual time/disk/RAM vs. predictions
    - **Verify impacted scanning works correctly at merge points**
 
-The **hierarchical approach with remapping is complex but necessary** at scale. The current linear system cannot handle 890M orthos in reasonable time. Performance tuning helps but cannot overcome the fundamental sequential bottleneck. **Hierarchical + Compaction + Performance Tuning** reduces processing from 88 days to 8 days - a requirement, not an optimization. Note that hierarchical does NOT eliminate impacted ortho scanning - it localizes it to merge points, which can be parallelized but still must be performed.
+The **hierarchical approach with remapping is complex but necessary** at scale. The current linear system cannot handle 890M orthos in reasonable time. Performance tuning helps but cannot overcome the fundamental sequential bottleneck. **Hierarchical + Compaction + Performance Tuning** reduces processing from 88 days to 8 days - a requirement, not an optimization. 
+
+Note that hierarchical does NOT eliminate impacted ortho scanning - it localizes it to merge points, which can be parallelized but still must be performed. Alternative strategies like sentence-level binary merge and work-stealing provide marginal additional speedup (2× at best) but with significant complexity increases: work-stealing requires 100 GB RAM or careful size-bounding, and both approaches require 5000+ merges vs 21 for file-based. The optimal balance is **file-based quaternary tree** with performance tuning and compaction.
