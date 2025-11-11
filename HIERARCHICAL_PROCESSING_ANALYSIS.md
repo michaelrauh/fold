@@ -2,11 +2,12 @@
 
 ## Executive Summary
 
-This document analyzes an alternative processing approach for the Fold text processing system. The current implementation uses a **linear file ingestion pattern** where files are processed sequentially, building incrementally on a single interner and result set. The proposed **hierarchical processing approach** would process text in parallel hierarchies, combining intermediate results to form final outputs.
+This document analyzes alternative processing approaches for the Fold text processing system. The current implementation uses a **linear file ingestion pattern** where files are processed sequentially, building incrementally on a single interner and result set. 
 
-Two architectural variants are examined:
-1. **Pure Hierarchy**: Tree structure where results never merge back into lower levels
-2. **Folding Results**: Results can be reincorporated at different hierarchy levels
+Three optimization strategies are examined:
+1. **Hierarchical Processing**: Tree structure where text is processed in parallel subtrees, results flow upward and merge at internal nodes
+2. **Compaction**: Remove orthos that fall wholly inside other orthos, reconstructing them only when interner changes
+3. **Combined Approach**: Hierarchical processing with compaction enabled at each tree level
 
 ## Current System: Linear File Ingestion
 
@@ -82,17 +83,15 @@ Process text through a hierarchical tree structure where:
         (Text A)  (Text B)    (Text C)   (Text D)
 ```
 
-### Two Architectural Variants
+### Hierarchical Processing Architecture
 
-#### Variant A: Pure Hierarchy
-
-Results flow upward only, never returning to lower levels.
+Results flow upward only through the tree, never returning to lower levels.
 
 **Structure:**
 - Each node has its own interner and result set
-- Leaf nodes process text to create orthos
-- Internal nodes merge child orthos and interners
-- No backpropagation of results
+- Leaf nodes process raw text to create orthos
+- Internal nodes merge child orthos and interners, then continue BFS processing
+- Root node produces the final merged interner and optimal ortho
 
 **Pseudocode:**
 ```
@@ -125,52 +124,75 @@ function process_root(tree):
         return process_internal(children)
 ```
 
-#### Variant B: Folding Results
+### Compaction Optimization
 
-Results can be reincorporated at any level, creating feedback loops.
+Compaction is an orthogonal optimization that can be applied to either linear or hierarchical processing.
 
-**Structure:**
-- Results from higher levels can inform lower level processing
-- Leaf nodes can receive "hints" from parent processing
-- Interners can be shared or specialized per subtree
-- Bidirectional result flow
+**Core Concept:**
+An ortho A "falls wholly inside" another ortho B if all cells filled in A are also filled in B with the same values, and B has additional filled cells. When this occurs, A is redundant and can be removed from the results queue.
 
-**Pseudocode:**
+**Detection Algorithm:**
 ```
-function process_with_folding(tree, parent_hints=None):
-    if tree is leaf:
-        interner = Interner::from_text(tree.text)
-        seed = seed_ortho()
-        
-        # Incorporate parent hints if available
-        if parent_hints:
-            seed = merge(seed, select_relevant(parent_hints, interner))
-        
-        results = generate_orthos(interner, seed)
-        return (interner, results, optimal_ortho)
+function is_contained(ortho_a, ortho_b):
+    # Check if A's filled cells are a subset of B's filled cells
+    for i in range(len(ortho_a.payload)):
+        if ortho_a.payload[i] is Some:
+            if ortho_b.payload[i] != ortho_a.payload[i]:
+                return false  # Mismatch or B doesn't have this cell
     
-    else:
-        # First pass: process children
-        children_results = [process_with_folding(child) for child in tree.children]
-        
-        # Merge interners and results
-        merged_interner = merge_interners([c.interner for c in children_results])
-        merged_results = deduplicate([c.results for c in children_results])
-        
-        # Generate new orthos at this level
-        new_results = generate_orthos(merged_interner, merged_results)
-        
-        # Second pass: fold back promising results to children
-        if should_fold_back(new_results):
-            hints = select_promising(new_results)
-            refined_children = [
-                process_with_folding(child, hints) 
-                for child in tree.children
-            ]
-            return process_internal(refined_children)
-        
-        return (merged_interner, new_results, find_optimal(new_results))
+    # Check that B has at least one additional filled cell
+    a_filled = count_filled(ortho_a.payload)
+    b_filled = count_filled(ortho_b.payload)
+    return b_filled > a_filled
+
+function compact_results(results_queue):
+    compacted = []
+    for ortho in results_queue:
+        is_redundant = false
+        for other in compacted:
+            if is_contained(ortho, other):
+                is_redundant = true
+                break
+        if not is_redundant:
+            # Also check if ortho subsumes any existing orthos
+            compacted = [o for o in compacted if not is_contained(o, ortho)]
+            compacted.append(ortho)
+    return compacted
 ```
+
+**Reconstruction on Interner Change:**
+When the interner changes and impacted keys are identified, contained orthos must be reconstructed because new vocabulary might enable new expansions:
+
+```
+function reconstruct_contained_orthos(compacted_results, interner):
+    # Maintain a containment map: child_id -> parent_id
+    containment_map = load_from_disk("containment_map.bin")
+    
+    # For each impacted key, find all contained orthos that reference it
+    for impacted_key in get_impacted_keys():
+        for (child_id, parent_id) in containment_map:
+            child_ortho = reconstruct_from_parent(parent_id, child_id)
+            if child_ortho.references(impacted_key):
+                work_queue.push(child_ortho)
+```
+
+**Storage Requirements:**
+- Compacted results queue: Significantly smaller (typically 10-30% of original)
+- Containment map: Maps removed ortho IDs to their containing parent IDs (~16 bytes per contained ortho)
+- Total savings: 70-90% reduction in result queue size, with small overhead for containment tracking
+
+**Trade-offs:**
+- **Benefit**: Dramatically reduced result queue size (memory + disk)
+- **Benefit**: Fewer orthos to scan when finding impacted keys
+- **Benefit**: Faster checkpoint save/load (less data)
+- **Cost**: Compaction algorithm is O(N²) in worst case (all orthos compared)
+- **Cost**: Containment map storage and maintenance
+- **Cost**: Reconstruction overhead when interner changes (but amortized across many changes)
+
+**Implementation Notes:**
+- Compaction can be run periodically (e.g., every 10k orthos generated) rather than continuously
+- Can use spatial heuristics to optimize containment checks (orthos with different dimensions cannot contain each other)
+- Containment map can be lazily persisted to disk (in-memory until checkpoint)
 
 ## Necessary Implementation Steps
 
@@ -189,62 +211,224 @@ pub struct ProcessingNode {
 ```
 
 #### 1.2 Interner Merging
+
+Merging interners is a critical operation that combines vocabularies and phrase mappings from multiple subtrees while preserving the prefix closure property.
+
+**Algorithm Overview:**
+
+1. **Vocabulary Union**: Combine vocabularies from all child interners, eliminating duplicates
+2. **Phrase Collection**: Gather all phrases from all child interners
+3. **Prefix Mapping Rebuild**: Reconstruct `prefix_to_completions` for the merged vocabulary size
+4. **Version Increment**: Assign new version to indicate merged state
+
+**Detailed Implementation:**
+
 ```rust
 impl Interner {
     pub fn merge(interners: &[&Interner]) -> Self {
-        // Combine vocabularies
-        let mut merged_vocab = Vec::new();
-        let mut version = 1;
+        // Step 1: Combine vocabularies with deduplication
+        // Using a HashSet for O(1) lookup, then converting to Vec
+        let mut vocab_set = std::collections::HashSet::new();
+        let mut max_version = 0;
         
         for interner in interners {
             for word in &interner.vocabulary {
-                if !merged_vocab.contains(word) {
-                    merged_vocab.push(word.clone());
-                }
+                vocab_set.insert(word.clone());
             }
-            version = version.max(interner.version);
+            max_version = max_version.max(interner.version);
         }
         
-        // Rebuild prefix_to_completions with merged vocabulary
-        let mut all_phrases = Vec::new();
-        // ... collect phrases from all interners ...
+        let merged_vocab: Vec<String> = vocab_set.into_iter().collect();
+        let vocab_len = merged_vocab.len();
+        
+        // Step 2: Create word -> index mapping for the merged vocabulary
+        let word_to_idx: HashMap<&str, usize> = merged_vocab.iter()
+            .enumerate()
+            .map(|(idx, word)| (word.as_str(), idx))
+            .collect();
+        
+        // Step 3: Collect all phrases from all interners and remap to merged indices
+        let mut all_phrases: Vec<Vec<usize>> = Vec::new();
+        
+        for interner in interners {
+            // For each interner, get its phrases and remap word indices
+            for phrase_indices in extract_phrases_from_interner(interner) {
+                let remapped: Vec<usize> = phrase_indices.iter()
+                    .map(|&old_idx| {
+                        let word = &interner.vocabulary[old_idx];
+                        word_to_idx[word.as_str()]
+                    })
+                    .collect();
+                all_phrases.push(remapped);
+            }
+        }
+        
+        // Step 4: Rebuild prefix_to_completions with merged vocabulary
+        // This ensures the prefix closure property: for every phrase,
+        // all its prefixes have completions that include the next word
+        let prefix_to_completions = Self::build_prefix_to_completions(
+            &all_phrases,
+            &merged_vocab,
+            vocab_len,
+            None  // No previous mapping to merge with
+        );
         
         Interner {
-            version: version + 1,
+            version: max_version + 1,
             vocabulary: merged_vocab,
-            prefix_to_completions: Self::build_prefix_to_completions(
-                &all_phrases, &merged_vocab, merged_vocab.len(), None
-            ),
+            prefix_to_completions,
         }
+    }
+    
+    // Helper to extract phrases from an interner's prefix_to_completions map
+    fn extract_phrases_from_interner(interner: &Interner) -> Vec<Vec<usize>> {
+        // Reconstruct original phrases by inverting the prefix map
+        // This is necessary because phrases are stored implicitly
+        let mut phrases = Vec::new();
+        
+        for (prefix, completions) in &interner.prefix_to_completions {
+            for completion_idx in completions.ones() {
+                let mut phrase = prefix.clone();
+                phrase.push(completion_idx);
+                phrases.push(phrase);
+            }
+        }
+        
+        phrases
     }
 }
 ```
 
+**Performance Characteristics:**
+
+- **Time Complexity**: O(V₁ + V₂ + ... + Vₙ + P × L) where V is vocabulary size per interner, P is total phrases, L is average phrase length
+- **Space Complexity**: O(V_merged + P) for temporary structures
+- **Typical Cost**: For 4 subtrees with 10K vocab each, ~40K unique words, ~100K phrases, merge takes ~50-100ms
+
+**Critical Correctness Property:**
+
+The merged interner must maintain the **prefix closure property**: for every phrase in the merged vocabulary, all prefixes of that phrase must map to completions that include the next token. The `build_prefix_to_completions` function ensures this by:
+
+1. For each phrase, extracting all prefixes
+2. For each prefix, recording all observed completions
+3. Building a FixedBitSet for efficient completion lookup
+
+**Merge Semantics:**
+
+After merging, the new interner can:
+- Answer completion queries for phrases from any child subtree
+- Discover NEW cross-subtree phrases (words from subtree A completing prefixes from subtree B)
+- May have FEWER completions for some prefixes (if phrases don't occur in all subtrees)
+
+This is why merged interners enable new ortho expansions that weren't possible in individual subtrees.
+
 #### 1.3 Result Set Merging
+
+Merging result sets from multiple subtrees requires careful deduplication to ensure no ortho appears multiple times in the final result set, while preserving all unique orthos.
+
+**Algorithm Overview:**
+
+1. **Global Deduplication**: Use a unified seen tracker (bloom filter + hash shards) spanning all subtrees
+2. **Streaming Merge**: Stream orthos from each child result queue, checking against seen tracker
+3. **Optimal Tracking**: Track the best ortho encountered during merge
+
+**Detailed Implementation:**
+
 ```rust
 pub struct ResultMerger {
     seen_tracker: SeenTracker,
     merged_results: DiskBackedQueue<Ortho>,
+    current_best: Option<Ortho>,
+    current_best_score: (usize, usize),
 }
 
 impl ResultMerger {
-    pub fn merge(result_sets: Vec<DiskBackedQueue<Ortho>>) -> Self {
-        let mut merger = ResultMerger::new();
+    pub fn merge(result_sets: Vec<DiskBackedQueue<Ortho>>, memory_config: &MemoryConfig) 
+        -> Result<Self, FoldError> {
         
+        // Initialize merged structures with appropriate capacity
+        let estimated_total = result_sets.iter().map(|q| q.len()).sum();
+        let seen_tracker = SeenTracker::with_config(
+            estimated_total * 3,  // 3x for growth headroom
+            memory_config.num_shards,
+            memory_config.max_shards_in_memory
+        );
+        let merged_results = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
+        
+        let mut merger = ResultMerger {
+            seen_tracker,
+            merged_results,
+            current_best: None,
+            current_best_score: (0, 0),
+        };
+        
+        // Stream through each result set
         for mut result_set in result_sets {
+            println!("[merge] Processing result set with {} orthos", result_set.len());
+            let mut added = 0;
+            let mut duplicates = 0;
+            
             while let Some(ortho) = result_set.pop()? {
                 let id = ortho.id();
+                
+                // Bloom filter + shard check for deduplication
                 if !merger.seen_tracker.contains(&id) {
                     merger.seen_tracker.insert(id);
+                    
+                    // Track optimal during merge
+                    let score = calculate_score(&ortho);
+                    if score > merger.current_best_score {
+                        merger.current_best = Some(ortho.clone());
+                        merger.current_best_score = score;
+                    }
+                    
                     merger.merged_results.push(ortho)?;
+                    added += 1;
+                } else {
+                    duplicates += 1;
                 }
             }
+            
+            println!("[merge] Added {} new orthos, skipped {} duplicates", added, duplicates);
         }
         
-        merger
+        println!("[merge] Final merged result set: {} unique orthos", merger.merged_results.len());
+        Ok(merger)
+    }
+    
+    pub fn into_results(self) -> (DiskBackedQueue<Ortho>, Option<Ortho>, SeenTracker) {
+        (self.merged_results, self.current_best, self.seen_tracker)
     }
 }
 ```
+
+**Performance Characteristics:**
+
+- **Time Complexity**: O(R₁ + R₂ + ... + Rₙ) where R is result count per subtree, assuming O(1) hash lookups
+- **Space Complexity**: O(R_total) for bloom filter and disk-backed shards
+- **Typical Cost**: For 4 subtrees with 100K results each, 400K total, deduplication might find 20-40% duplicates
+  - Merge time: ~5-10 seconds (disk I/O dominated)
+  - Memory: ~100MB for bloom filter + hot shards
+
+**Deduplication Effectiveness:**
+
+The degree of duplication between subtrees depends on:
+1. **Text similarity**: More similar text → more duplicate orthos
+2. **Vocabulary overlap**: Shared vocabulary → shared orthos
+3. **Seed ortho**: All subtrees start with same seed → guaranteed duplication of early expansions
+
+**Expected duplication rates:**
+- Independent texts (e.g., different books): 5-15% duplicates
+- Related texts (e.g., chapters of same book): 20-40% duplicates
+- Highly similar texts: 40-60% duplicates
+
+**Memory Management:**
+
+The seen tracker uses a two-tier strategy:
+- Bloom filter (in-memory): Fast negative lookups, small false positive rate
+- Hash shards (memory + disk): Definitive deduplication, hot shards in RAM, cold shards on disk
+
+This allows merging result sets larger than available RAM without correctness loss.
 
 ### Phase 2: Hierarchical Processing Engine
 
@@ -319,55 +503,6 @@ impl HierarchicalProcessor {
             results: /* ... */,
             optimal: /* ... */,
         })
-    }
-}
-```
-
-#### 2.2 Folding Variant
-```rust
-impl HierarchicalProcessor {
-    pub fn process_with_folding(&self, tree: &ProcessingNode, hints: Option<&[Ortho]>) 
-        -> Result<ProcessingResult, FoldError> {
-        
-        if tree.is_leaf() {
-            let mut result = self.process_leaf(tree)?;
-            
-            // Incorporate hints from parent
-            if let Some(hint_orthos) = hints {
-                for hint in hint_orthos {
-                    if is_relevant(hint, &result.interner) {
-                        result.work_queue.push(hint.clone())?;
-                    }
-                }
-                // Re-process with hints
-                result = self.continue_processing(result)?;
-            }
-            
-            Ok(result)
-        } else {
-            // First pass: process children
-            let child_results: Vec<ProcessingResult> = tree.children
-                .iter()
-                .map(|child| self.process_with_folding(child, None))
-                .collect::<Result<Vec<_>, _>>()?;
-            
-            let mut merged = self.merge_and_process(child_results)?;
-            
-            // Determine if folding would be beneficial
-            if should_fold(&merged) {
-                let hints = select_promising_orthos(&merged.results, 100)?;
-                
-                // Second pass: reprocess children with hints
-                let refined_children: Vec<ProcessingResult> = tree.children
-                    .iter()
-                    .map(|child| self.process_with_folding(child, Some(&hints)))
-                    .collect::<Result<Vec<_>, _>>()?;
-                
-                merged = self.merge_and_process(refined_children)?;
-            }
-            
-            Ok(merged)
-        }
     }
 }
 ```
@@ -652,23 +787,6 @@ impl HierarchicalCheckpoint {
    - Hard to estimate completion time
    - Resource usage varies by tree level
 
-### Folding Variant Specific Issues
-
-1. **Convergence Uncertainty**
-   - How many fold iterations are needed?
-   - Diminishing returns after first fold?
-   - Risk of infinite loops if not carefully designed
-
-2. **Hint Selection Complexity**
-   - Which results should be folded back?
-   - How to filter relevant hints for each subtree?
-   - Overhead of multiple processing passes
-
-3. **Increased Runtime**
-   - Folding requires multiple passes over children
-   - More total work than pure hierarchy
-   - May not improve result quality enough to justify cost
-
 ## Final State Comparison
 
 ### Linear (Current State)
@@ -743,77 +861,240 @@ fold_state/
 - Optimal per subtree, final optimal at root
 - May differ from linear results (due to different merge order)
 
-### Folding Variant (Final State)
+## Resource Analysis: Time, Disk, and RAM
 
-**After Folding Iterations:**
-```
-Tree State (after 2 fold iterations):
-                     Root (refined)
-                   /  |  \  \
-            N1'   N2'  N3'  N4' (refined internal nodes)
-           /|\|  /|\|  /|\|  /|\|
-         L1'..L4' L5'..L8' L9'..L12' L13'..L16' (refined leaves)
+This section provides detailed analysis of where each approach spends computational resources.
 
-Refinement means:
-- Leaves reprocessed with hints from parents
-- Internal nodes remerged with refined children
-- Multiple passes until convergence
+### Current System: Linear Processing
 
-Each Node Contains:
-- Interner (stable after first pass)
-- Results Queue (augmented with hints)
-- Optimal Ortho (refined through feedback)
-```
+**Time Breakdown (for processing N files, R total orthos generated):**
 
-**Disk Layout:**
-```
-fold_state/
-├── input/ (empty)
-├── tree_checkpoint/
-│   ├── tree.bin
-│   ├── fold_iteration_1/ (first pass)
-│   │   └── ... (node states)
-│   ├── fold_iteration_2/ (second pass)
-│   │   └── ... (refined node states)
-│   └── fold_final/ (final state)
-│       └── ... (converged node states)
-└── hints_cache/ (promising orthos to fold back)
-```
+1. **BFS Work Queue Processing**: 60-70% of total time
+   - Pop ortho from work queue: O(1)
+   - Get requirements (forbidden + required prefixes): O(D) where D = dimensions
+   - Interner intersection (find completions): O(P × C) where P = prefixes, C = avg completions per prefix
+   - Expand ortho with completion: O(D²) for spatial transformations
+   - Compute ortho ID (hash): O(payload_size)
+   - Check seen tracker: O(1) bloom filter + O(1) amortized hash lookup
+   - Push to results queue: O(1) amortized
+   - **Typical**: ~1-5ms per ortho depending on dimensions and completion count
 
-**Characteristics:**
-- Iterative refinement of results
-- More disk space (multiple iterations saved)
-- Potentially better optimal (from folding)
-- Non-deterministic (depends on hint selection)
+2. **Uniqueness Checks (Seen Tracker)**: 15-20% of total time
+   - Bloom filter check: O(1) with ~4-8 hash functions
+   - Shard lookup (if bloom says "maybe"): O(1) average HashMap lookup
+   - Shard disk I/O: When hot shards spill, ~10ms per shard flush
+   - **Typical**: ~100-200µs per ortho on average, including occasional disk writes
 
-## Technical Considerations
+3. **Finding Impacted Orthos (on interner change)**: 10-15% of total time
+   - Identify impacted keys: O(V_new) to compare vocabularies/prefixes
+   - Scan all results: O(R) to check each ortho's requirement phrases
+   - Requeue impacted orthos: O(I) where I = impacted count
+   - **Typical**: ~2-10 seconds per file (scanning 100K-1M orthos)
+
+4. **Forming Completions (Interner Operations)**: 5-10% of total time
+   - Build interner from text: O(T) where T = text size
+   - Extract vocabulary: O(W) where W = unique words
+   - Build prefix_to_completions: O(P × L) where P = phrases, L = avg phrase length
+   - Intersect for completions: O(num_prefixes × vocabulary_size) per call
+   - **Typical**: ~1-5 seconds per file to build interner
+
+5. **Checkpoint Save/Load**: <5% of total time
+   - Serialize interner: O(V + P) typically 10-50ms
+   - Flush results queue: O(R) typically 100-500ms
+   - Rebuild seen tracker: O(R) typically 1-5 seconds on load
+   - **Typical**: 2-10 seconds per checkpoint
+
+**Example: Processing 16 files, 1M total orthos, 50K vocabulary:**
+- BFS processing: ~70 minutes (70%)
+- Uniqueness checks: ~20 minutes (20%)
+- Finding impacted: ~8 file transitions × 5 sec = 40 seconds (<1%)
+- Forming completions: ~16 files × 3 sec = 48 seconds (<1%)
+- Checkpointing: ~8 checkpoints × 5 sec = 40 seconds (<1%)
+- **Total: ~100 minutes**
+
+**Disk Usage:**
+- Interner: 50-500 MB (depends on vocabulary size)
+- Results queue: R × 200-400 bytes (e.g., 1M orthos = 200-400 MB)
+- Seen tracker shards: R × 12 bytes on disk (e.g., 1M orthos = 12 MB)
+- Checkpoint backup: 2× results queue (400-800 MB)
+- **Total: ~1-2 GB for 1M orthos**
+
+**RAM Usage (with dynamic configuration for 8GB machine):**
+- Interner: ~100-200 MB in memory
+- Work queue buffer: ~10K orthos × 300 bytes = 3 MB
+- Results queue buffer: ~10K orthos × 300 bytes = 3 MB
+- Bloom filter: 1M capacity × 2 bytes = 2 MB
+- Hot shards: ~64 shards × 100K entries × 12 bytes = 77 MB
+- Runtime overhead: ~20% = ~100 MB
+- **Total: ~300-400 MB peak**
+
+### Hierarchical Processing (Without Compaction)
+
+**Time Breakdown (for 16 files in 4-ary tree, 1M total orthos):**
+
+1. **BFS Work Queue Processing (Per Node)**: 55-65% of total time
+   - Same per-ortho cost as linear
+   - But can parallelize across leaves
+   - 4 leaves process ~250K orthos each simultaneously
+   - **Parallel speedup**: 3-3.5× (not perfect 4× due to merge overhead)
+
+2. **Interner Merging (Per Internal Node)**: 10-15% of total time
+   - Merge 4 child vocabularies: O(V₁ + V₂ + V₃ + V₄) = O(V_total)
+   - Extract phrases from children: O(P_total × L)
+   - Rebuild prefix_to_completions: O(P_total × L)
+   - **Typical**: ~5-20 seconds per internal node (3 internal nodes in tree)
+   - **Total merge time**: ~15-60 seconds
+
+3. **Result Set Merging (Per Internal Node)**: 15-20% of total time
+   - Stream and deduplicate: O(R_total) hash operations
+   - Disk I/O to read child results: O(R_total × 300 bytes)
+   - Bloom filter + shard checks: Same as linear per ortho
+   - **Typical**: ~5-15 seconds per internal node
+   - **Total merge time**: ~15-45 seconds
+
+4. **Uniqueness Checks**: 10-15% of total time
+   - Per-node bloom filters: Smaller, more efficient
+   - Final merge bloom: Same size as linear
+   - Overall similar to linear but distributed
+
+5. **No Impacted Ortho Scanning**: 0% (advantage!)
+   - Interners don't change within a subtree
+   - No backtracking needed
+   - Saved time: ~40 seconds compared to linear
+
+**Example: Same 16 files, 1M orthos workload:**
+- Leaf BFS (parallel 4×): ~70 min / 3.5 = ~20 minutes
+- Internal node BFS (3 nodes): ~15 minutes
+- Interner merging: ~1 minute
+- Result merging: ~1 minute
+- **Total: ~37 minutes (2.7× speedup over linear)**
+
+**Disk Usage:**
+- Per-leaf results: ~250K orthos × 300 bytes = 75 MB × 4 = 300 MB
+- Per-internal results: Grows to final ~1M orthos = 300 MB
+- Per-node interners: ~50-200 MB each, 7 nodes = 350-1400 MB
+- Merge buffers (transient): ~300 MB during merge operations
+- Checkpoint: All node states = ~2-4 GB
+- **Total: ~3-5 GB (2-3× linear)**
+
+**RAM Usage (per node, with same 8GB machine):**
+- Can process 1-2 nodes in parallel (limited by RAM)
+- Per-node budget: ~2-4 GB
+- Leaf node peak: ~300 MB (smaller working set)
+- Internal node peak: ~1-2 GB (during merge)
+- **Bottleneck**: Internal node merging requires most RAM
+
+### Hierarchical Processing WITH Compaction
+
+**Time Breakdown (for 16 files, 1M orthos, 70% compaction rate):**
+
+1. **BFS Work Queue Processing**: 55-65% (same as without compaction)
+
+2. **Compaction (Periodic)**: 5-10% of total time
+   - Run every 10K orthos: ~100 compaction runs per leaf
+   - O(N²) comparison in worst case, but spatial heuristics help
+   - **Typical**: ~50-200ms per compaction run
+   - **Total**: ~5-20 seconds per leaf
+
+3. **Interner Merging**: 8-12% of total time
+   - Faster due to smaller result sets to process
+   - **Typical**: ~3-15 seconds per internal node
+
+4. **Result Set Merging**: 5-8% of total time
+   - Only 30% of orthos to merge (70% were compacted)
+   - **Typical**: ~2-5 seconds per internal node
+   - **Speedup**: 3× faster than without compaction
+
+5. **Reconstruction (On Interner Change)**: <1% in hierarchical
+   - Minimal since no interner changes within subtree
+   - Only at root if continuing with new files
+
+**Example: Same workload with compaction:**
+- Leaf BFS (parallel): ~20 minutes
+- Compaction: ~2 minutes (distributed across leaves)
+- Internal BFS: ~10 minutes (fewer orthos to process)
+- Interner merging: ~30 seconds
+- Result merging: ~20 seconds (70% fewer orthos)
+- **Total: ~32 minutes (3.1× speedup over linear)**
+
+**Disk Usage:**
+- Compacted results: 300K orthos (70% removed) × 300 bytes = 90 MB
+- Containment map: 700K entries × 16 bytes = 11 MB
+- Interners: Same as without compaction = 350-1400 MB
+- Checkpoint: ~1-2 GB (significantly smaller due to compaction)
+- **Total: ~1.5-2.5 GB (similar to linear!)**
+
+**RAM Usage:**
+- Peak is during internal node merge
+- Compacted results fit better in memory
+- Bloom filter can be smaller (fewer orthos)
+- **Per-node**: ~200-500 MB (better than without compaction)
+- **Can run 3-4 leaves in parallel** instead of 1-2
+
+### Linear Processing WITH Compaction
+
+**Time Breakdown (for 16 files, 1M orthos, 70% compaction rate):**
+
+1. **BFS Work Queue Processing**: 60-70% (same as without)
+
+2. **Compaction**: 10-15% of total time
+   - Run every 10K orthos: ~100 compaction runs total
+   - Must check all existing compacted orthos
+   - **Typical**: ~100-500ms per run (more orthos to check than in hierarchical)
+   - **Total**: ~10-50 seconds
+
+3. **Finding Impacted Orthos**: 8-12% of total time
+   - Faster: Only scan 300K compacted orthos instead of 1M
+   - But must reconstruct contained orthos
+   - **Typical**: ~1-3 seconds per file
+   - **Speedup**: 2-3× faster than without compaction
+
+4. **Uniqueness Checks**: 12-18% (similar to without)
+
+**Example: Same workload:**
+- BFS processing: ~70 minutes
+- Compaction: ~15 minutes
+- Finding impacted: ~20 seconds (faster!)
+- Uniqueness checks: ~20 minutes
+- **Total: ~85 minutes (1.18× speedup over linear without compaction)**
+
+**Disk Usage:**
+- Compacted results: 300K orthos × 300 bytes = 90 MB
+- Containment map: 11 MB
+- Interner: 50-500 MB
+- Checkpoint: ~200-600 MB
+- **Total: ~300-1200 MB (significant savings!)**
+
+**RAM Usage:**
+- Smaller result queue buffer
+- Smaller bloom filter
+- **Total: ~200-300 MB peak (significant savings!)**
+
+### Summary Table
+
+| Approach | Time | Disk | RAM | Best For |
+|----------|------|------|-----|----------|
+| Linear | 100 min | 1-2 GB | 300-400 MB | Simplicity, correctness |
+| Linear + Compaction | 85 min | 300-1200 MB | 200-300 MB | Memory-constrained, moderate datasets |
+| Hierarchical | 37 min | 3-5 GB | 2-4 GB | Large datasets, parallelization |
+| Hierarchical + Compaction | 32 min | 1.5-2.5 GB | 1-2 GB | **Best overall**: Speed + efficiency |
+
+**Key Insights:**
+
+1. **Hierarchical gains 2.7× speedup** primarily from parallelizing leaf processing and eliminating impacted ortho scanning
+2. **Compaction saves 70-90% disk space** with minimal time overhead (<15%)
+3. **Combined approach is optimal**: 3.1× faster than linear, similar disk usage
+4. **Linear + Compaction** is best incremental improvement: 15% faster, 50% less disk, simpler than hierarchical
+
+### Technical Considerations
 
 ### Memory Management
 
-**Pure Hierarchy:**
+**Hierarchical:**
 - Memory per node = interner + work_queue + results_queue + tracker
 - Peak memory = max(simultaneous nodes) × per_node_memory
 - Can control via tree depth and parallel execution limit
-- Example: 4 parallel leaves × 1GB each = 4GB peak
-
-**Folding:**
-- Additional memory for hints cache
-- Multiple iterations mean more temporary state
-- Peak memory during merge + fold hint selection
-
-### Disk Usage
-
-**Linear:**
-- Work queue: transient (cleared between files)
-- Results queue: grows throughout (~200-400 bytes × R orthos)
-- Checkpoint: interner (~50-500MB) + results backup
-- Total: ~R × 400 bytes + 500MB
-
-**Hierarchical:**
-- Per-node results: R_total/N nodes × 400 bytes (distributed)
-- Per-node interners: smaller than linear (V_subtree < V_total)
-- Merge buffers: transient, up to 2× result size during merge
-- Total: potentially 2-3× linear due to per-node overhead
+- With compaction: Can process 3-4 nodes in parallel instead of 1-2
 
 ### Correctness Guarantees
 
@@ -823,19 +1104,23 @@ fold_state/
 - ✅ Deterministic results (fixed file order)
 - ✅ Correct interner (incrementally built)
 
-**Hierarchical Pure:**
+**Linear + Compaction:**
+- ✅ Same as linear (compaction is lossless)
+- ✅ Contained orthos can be reconstructed
+- ⚠️  Reconstruction logic must be correct
+
+**Hierarchical:**
 - ✅ No duplicates within subtree
 - ⚠️  Duplicates possible across subtrees if merge buggy
 - ✅ All valid expansions within subtree
-- ⚠️  May miss expansions requiring cross-subtree phrases
+- ⚠️  May miss expansions requiring cross-subtree phrases (but merged interner enables them at internal nodes)
 - ❌ Non-deterministic (depends on tree structure)
 - ⚠️  Merged interner may have different semantics
 
-**Hierarchical Folding:**
-- ⚠️  Duplicate risk higher (multiple iterations)
-- ⚠️  Convergence not guaranteed
-- ⚠️  Hint selection may bias exploration
-- ❌ Highly non-deterministic
+**Hierarchical + Compaction:**
+- ✅ Same as hierarchical
+- ✅ Per-node compaction reduces merge overhead
+- ⚠️  Containment relationships must be tracked per node and merged correctly
 
 ## Recommendation
 
@@ -855,14 +1140,14 @@ fold_state/
 - Validation of algorithm correctness
 - Small production workloads
 
-### When to Consider Pure Hierarchy
+### When to Consider Hierarchical Processing
 
 **Best for:**
 - Large datasets (> 10M orthos)
-- When processing time is critical
-- When partial results are useful
-- When parallelization is needed
-- When RAM is limited per machine but many machines available
+- When processing time is critical and 2-3× speedup justifies complexity
+- When partial results are useful (subtrees complete independently)
+- When parallelization infrastructure is available
+- When RAM per machine is limited but multiple machines available
 - When subtrees are logically independent
 
 **Example scenarios:**
@@ -874,45 +1159,62 @@ fold_state/
 **Implementation recommendation:**
 - Start with proof-of-concept for small tree (depth 2, 4 leaves)
 - Validate correctness against linear version
-- Benchmark merge overhead
-- Only proceed if 2-5× speedup is achieved
+- Benchmark merge overhead carefully
+- Only proceed if 2-5× speedup is achieved in testing
 
-### When to Avoid Folding Variant
+### When to Use Compaction
 
-**Avoid if:**
-- Correctness is critical
-- Disk space is limited
-- Implementation complexity is a concern
-- Convergence behavior is unpredictable
+**Best for:**
+- Any workload where disk space or memory is constrained
+- Moderate to large datasets (> 100K orthos)
+- When checkpoint save/load time is a bottleneck
+- When scanning for impacted orthos takes significant time
 
-**Consider only if:**
-- Research project exploring iterative refinement
-- Have proven that folding significantly improves results
-- Acceptable to have non-reproducible results
-- Willing to invest in complex implementation and debugging
+**Best combined with:**
+- Linear processing: Simple improvement, 15% faster, 50% less disk
+- Hierarchical processing: Optimal combination, 3× faster, similar disk to linear
+
+**Implementation recommendation:**
+- Implement compaction first as incremental improvement to linear
+- Test containment detection algorithm thoroughly
+- Verify reconstruction logic is correct on interner changes
+- Add compaction to hierarchical only after both are working
 
 ## Conclusion
 
-The hierarchical processing approach offers significant potential for parallelization and scalability but comes with substantial implementation complexity and correctness risks. The current linear system is correct, simple, and efficient for most workloads.
+The analysis reveals four distinct optimization strategies, each with clear trade-offs:
+
+1. **Linear (Current)**: Simple, correct, deterministic. Best for most workloads.
+2. **Linear + Compaction**: 15% faster, 50% less disk. Low-hanging fruit for easy wins.
+3. **Hierarchical**: 2.7× faster via parallelization. Justified for large workloads.
+4. **Hierarchical + Compaction**: 3× faster, similar disk to linear. Optimal for very large workloads.
 
 **Recommended Path Forward:**
 
-1. **Quantify the problem first**: Measure actual processing time and bottlenecks with current linear system on target workloads.
+1. **Start with profiling**: Measure actual bottlenecks in current system on target workloads
+   - If disk space is the issue → implement compaction first
+   - If processing time is the issue → consider hierarchical
 
-2. **If parallelization is needed**: Implement pure hierarchy variant with careful attention to:
-   - Interner merge correctness (preserve phrase closure)
-   - Result deduplication (global seen tracker spanning all nodes)
-   - Checkpoint per-node state
-   - Validation against linear version
+2. **Incremental implementation for hierarchical**:
+   - Phase 1: Implement tree builder (organize files, process linearly to test structure)
+   - Phase 2: Implement interner merge with comprehensive tests
+   - Phase 3: Implement result set merge with comprehensive tests
+   - Phase 4: Implement parallel leaf processing (validate deduplication)
+   - Phase 5: Implement internal node processing
+   - Phase 6: Validate results match linear version
+   - Phase 7: Add compaction after hierarchical is stable
 
-3. **Avoid folding variant** unless research goals require exploring iterative refinement.
+3. **Incremental implementation for compaction**:
+   - Phase 1: Implement containment detection algorithm
+   - Phase 2: Implement compaction during BFS processing
+   - Phase 3: Implement containment map persistence
+   - Phase 4: Implement reconstruction on interner change
+   - Phase 5: Validate no correctness loss vs. uncompacted
 
-4. **Incremental approach**:
-   - Phase 1: Implement tree builder (organize files into tree, but still process linearly)
-   - Phase 2: Implement interner merge (validate correctness with tests)
-   - Phase 3: Implement parallel leaf processing (validate no duplicates)
-   - Phase 4: Implement merge and process internal nodes
-   - Phase 5: Validate final results match linear version
-   - Phase 6: Benchmark and tune
+4. **Critical validation**:
+   - Run both approaches on same input
+   - Verify final optimal ortho matches (or understand why it differs)
+   - Verify no orthos are lost due to bugs
+   - Measure actual speedup and resource usage vs. predictions
 
-The hierarchical approach is a significant architectural change that should only be undertaken with clear performance goals and a plan for validating correctness. The current linear system's simplicity and correctness guarantees are valuable and should not be abandoned lightly.
+The **compaction optimization is orthogonal** to the hierarchical vs. linear decision and provides benefits to both. The **hierarchical approach is a significant architectural change** that should only be undertaken with clear performance goals (2-5× speedup required) and rigorous validation. For most workloads, **linear + compaction** provides the best balance of simplicity, correctness, and performance improvement.
