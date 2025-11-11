@@ -1243,6 +1243,308 @@ Modified strategy:
 
 Work-stealing is viable but **not recommended** - the implementation complexity and merge count overhead outweigh the load balancing benefits. File-based hierarchical with performance tuning provides similar or better speedup with far fewer merges and simpler code.
 
+## Strategies to Avoid Remapping
+
+A critical bottleneck in hierarchical processing is **token remapping** - orthos store token IDs as indices into vocabulary, and merging interners changes these indices. This section explores strategies to avoid or minimize remapping overhead.
+
+### The Remapping Problem
+
+**Current architecture:**
+```rust
+// Ortho stores token IDs directly
+pub struct Ortho {
+    version: usize,
+    dims: Vec<usize>,
+    payload: Vec<Option<usize>>,  // Token IDs (vocabulary indices)
+}
+
+// Interner maps IDs to strings
+pub struct Interner {
+    version: usize,
+    vocabulary: Vec<String>,  // Position = token ID
+    prefix_to_completions: HashMap<Vec<usize>, FixedBitSet>,
+}
+```
+
+**Problem**: When merging two interners:
+- Interner A: vocabulary = ["the", "cat"] → IDs: "the"=0, "cat"=1
+- Interner B: vocabulary = ["dog", "the"] → IDs: "dog"=0, "the"=1
+- Merged: vocabulary = ["the", "cat", "dog"] → IDs: "the"=0, "cat"=1, "dog"=2
+
+Orthos from interner B have "the"=1, but merged has "the"=0 → **must remap every ortho**
+
+### Strategy 1: Global Canonical Vocabulary (Pre-Merge)
+
+**Concept**: Establish a global canonical vocabulary BEFORE any processing begins.
+
+**Implementation:**
+1. Scan all input text upfront
+2. Build complete vocabulary: `["the", "cat", "dog", "sat", ...]`
+3. Assign permanent IDs (sorted alphabetically or by frequency)
+4. ALL interners use same vocabulary (with subsets)
+5. Orthos created with canonical IDs from day one
+
+**Example:**
+```rust
+// Pre-scan all files
+let global_vocab = build_global_vocabulary(all_input_files);  // ~50K words
+let canonical_ids: HashMap<String, usize> = global_vocab.iter()
+    .enumerate()
+    .map(|(id, word)| (word.clone(), id))
+    .collect();
+
+// Each leaf interner uses subset of global vocab
+pub struct Interner {
+    vocabulary: Vec<String>,        // Still store for lookup
+    canonical_ids: Vec<usize>,      // Map local→canonical
+    prefix_to_completions: HashMap<Vec<usize>, FixedBitSet>,  // Use canonical IDs
+}
+
+// Orthos store canonical IDs - no remapping needed!
+```
+
+**Benefits:**
+- **Zero remapping overhead**: Orthos never need remapping
+- Merging is trivial: Union of FixedBitSets (prefix completions)
+- Deduplication works correctly across all subtrees
+- ~10-30% merge time reduction (eliminating remapping)
+
+**Drawbacks:**
+- **Upfront cost**: Must scan all text before processing (~5-15 minutes)
+- **Memory overhead**: Every interner stores full vocabulary (~50K words × 10 bytes = 500 KB per interner)
+- **Sparse FixedBitSets**: Most vocabulary unused in each subtree (wastes ~1-2 MB per interner)
+- **Lost opportunity**: Can't discover new words during processing (fixed vocabulary)
+
+**Analysis for short book (890M orthos):**
+- Upfront scan: ~10 minutes
+- Saved remapping time: ~270 minutes (was remapping 890M orthos)
+- Memory overhead: 7 nodes × 500 KB = 3.5 MB (negligible)
+- **Net benefit**: ~260 minutes saved (~4.3 hours)**
+
+**Trade-off**: Excellent for known corpus with fixed vocabulary. Poor for streaming/incremental processing.
+
+### Strategy 2: Stable Vocabulary Ordering (Append-Only)
+
+**Concept**: Use a consistent vocabulary ordering strategy that minimizes remapping.
+
+**Implementation:**
+1. Sort vocabulary alphabetically (or by frequency)
+2. When merging, APPEND new words to end (don't reorder)
+3. Only remap orthos that reference newly-added words
+
+**Example:**
+```rust
+fn merge_interners(interner_a: &Interner, interner_b: &Interner) -> Interner {
+    // Start with A's vocabulary (unchanged)
+    let mut merged_vocab = interner_a.vocabulary.clone();
+    let mut remapping_needed_b = HashMap::new();
+    
+    // Append B's new words
+    for (b_idx, b_word) in interner_b.vocabulary.iter().enumerate() {
+        if let Some(a_idx) = merged_vocab.iter().position(|w| w == b_word) {
+            // Word exists in A - B's orthos need remapping if b_idx != a_idx
+            if b_idx != a_idx {
+                remapping_needed_b.insert(b_idx, a_idx);
+            }
+        } else {
+            // New word - append to end
+            let new_idx = merged_vocab.len();
+            merged_vocab.push(b_word.clone());
+            remapping_needed_b.insert(b_idx, new_idx);
+        }
+    }
+    
+    // Only remap B's orthos (A's orthos unchanged!)
+    // And only cells that reference remapped IDs
+}
+```
+
+**Benefits:**
+- **Partial remapping**: Only one subtree's orthos need remapping (not both)
+- **Selective remapping**: Only cells with changed IDs need updating
+- **Reduced overhead**: ~50% reduction in remapping operations
+
+**Drawbacks:**
+- **Still requires remapping**: Not eliminated, just reduced
+- **Asymmetric**: Must choose which subtree to preserve (A vs B)
+- **Complexity**: Need tracking logic for which orthos/cells need remapping
+
+**Analysis for short book:**
+- Remapping reduced: 890M → 445M orthos (50% of orthos from one subtree)
+- Saved time: ~135 minutes
+- Implementation complexity: Medium (need selective remapping logic)
+
+**Trade-off**: Better than full remapping but still significant overhead.
+
+### Strategy 3: Indirection Layer (Token Registry)
+
+**Concept**: Separate token storage from vocabulary, using indirection.
+
+**Implementation:**
+```rust
+// Global token registry (shared across all interners)
+pub struct TokenRegistry {
+    string_to_token: HashMap<String, TokenId>,
+    token_to_string: HashMap<TokenId, String>,
+    next_token_id: TokenId,
+}
+
+type TokenId = u64;  // Unique across all interners
+
+pub struct Interner {
+    version: usize,
+    local_tokens: Vec<TokenId>,  // Subset of global tokens
+    prefix_to_completions: HashMap<Vec<TokenId>, FixedBitSet>,
+}
+
+pub struct Ortho {
+    version: usize,
+    dims: Vec<usize>,
+    payload: Vec<Option<TokenId>>,  // Global token IDs
+}
+```
+
+**Benefits:**
+- **Zero remapping**: Token IDs are globally unique
+- **Dynamic vocabulary**: Can add new words during processing
+- **Perfect deduplication**: Same word = same TokenId everywhere
+
+**Drawbacks:**
+- **Shared state**: TokenRegistry must be synchronized across workers
+- **Lock contention**: High-frequency lookups become bottleneck
+- **Memory overhead**: 64-bit TokenIds vs 32-bit indices (2× size)
+- **Serialization cost**: Must serialize/deserialize TokenRegistry
+
+**Analysis for short book:**
+- No remapping needed: Save ~270 minutes
+- Lock contention overhead: +50-100 minutes (8 workers competing)
+- Memory overhead: 890M orthos × 2 bytes = 1.78 GB additional
+- **Net benefit**: ~120-170 minutes (~2-3 hours)**
+
+**Trade-off**: Good for highly concurrent systems. Adds complexity and memory overhead.
+
+### Strategy 4: Content-Based Addressing (Hash-Based IDs)
+
+**Concept**: Use content hashes as token IDs instead of indices.
+
+**Implementation:**
+```rust
+type TokenId = u64;  // Hash of word content
+
+fn token_id_for_word(word: &str) -> TokenId {
+    let mut hasher = DefaultHasher::new();
+    word.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub struct Interner {
+    token_to_string: HashMap<TokenId, String>,  // For display only
+    prefix_to_completions: HashMap<Vec<TokenId>, FixedBitSet>,
+}
+
+pub struct Ortho {
+    payload: Vec<Option<TokenId>>,  // Content-based IDs
+}
+```
+
+**Benefits:**
+- **Zero remapping**: IDs based on content, not position
+- **No coordination**: Each interner independently generates same IDs
+- **Simple merging**: Just union HashMaps
+
+**Drawbacks:**
+- **Hash collisions**: Different words could have same hash (very rare but possible)
+- **No compression**: Can't use compact indices (0, 1, 2, ...) for FixedBitSet
+- **Larger structures**: HashMap instead of Vec for vocabulary
+- **Performance**: Hash lookups slower than array indexing
+
+**Analysis for short book:**
+- No remapping: Save ~270 minutes
+- Hash lookup overhead: +20-50 minutes (slower than array access)
+- Hash collision risk: ~0.001% with 50K vocabulary, 64-bit hashes
+- **Net benefit**: ~220-250 minutes (~3.5-4 hours)**
+
+**Trade-off**: Cleanest design but trades performance for simplicity.
+
+### Strategy 5: Lazy Remapping (On-Demand)
+
+**Concept**: Don't remap during merge. Remap lazily when orthos are accessed.
+
+**Implementation:**
+```rust
+pub struct Ortho {
+    version: usize,
+    dims: Vec<usize>,
+    payload: Vec<Option<usize>>,
+    source_interner_id: usize,  // Which interner created this ortho
+}
+
+pub struct MergedContext {
+    merged_interner: Interner,
+    remapping_tables: HashMap<usize, Vec<usize>>,  // source_id → mapping
+}
+
+impl Ortho {
+    fn get_canonical_payload(&self, context: &MergedContext) -> Vec<Option<usize>> {
+        if let Some(remap_table) = context.remapping_tables.get(&self.source_interner_id) {
+            self.payload.iter()
+                .map(|cell| cell.map(|id| remap_table[id]))
+                .collect()
+        } else {
+            self.payload.clone()  // Already canonical
+        }
+    }
+}
+```
+
+**Benefits:**
+- **Deferred cost**: Only remap when ortho is actually used
+- **Potential savings**: Orthos that get compacted never remapped
+
+**Drawbacks:**
+- **Complexity**: Every ortho access requires remapping check
+- **Still full cost**: Eventually all orthos accessed (no savings)
+- **Worse performance**: Remap repeatedly vs once
+- **Memory overhead**: Must store source_interner_id
+
+**Analysis**: NOT recommended - adds complexity with no benefit.
+
+### Comparison Table
+
+| Strategy | Remapping Cost | Implementation | Memory | Best For |
+|----------|---------------|----------------|--------|----------|
+| **Current (full remap)** | 270 min | Simple | Low | General purpose |
+| **Global canonical vocab** | 0 min | Medium | +3.5 MB | Fixed corpus |
+| **Stable ordering** | 135 min | Medium | Low | Reduce overhead |
+| **Indirection layer** | 0 min | High | +1.78 GB | High concurrency |
+| **Content-based IDs** | 0 min | Medium | Medium | Clean design |
+| **Lazy remapping** | 270 min+ | High | Medium | **AVOID** |
+
+### Recommendation
+
+**For file-based hierarchical (21 merges):**
+- **Use Strategy 1 (Global Canonical Vocab)** if vocabulary is known upfront
+  - 10 min upfront scan + 0 remapping = Save 260 minutes
+  - Best for batch processing of known corpus
+  - Simple to implement: One vocabulary build, all interners use it
+
+**For sentence/work-stealing (5000+ merges):**
+- **Use Strategy 4 (Content-Based IDs)** for simplicity
+  - Eliminates 5000× remapping operations
+  - Clean, no coordination needed
+  - Worth the hash lookup overhead given massive merge count
+
+**Current approach is acceptable** for file-based with low merge count (21 merges = ~8 min remapping overhead, not worth complexity)
+
+### Impact on Overall Performance
+
+**With Global Canonical Vocabulary on file-based hierarchical:**
+- Current: 29 days (includes 270 min remapping)
+- Optimized: 28.8 days (eliminates remapping)
+- **Benefit**: Marginal (~0.3% improvement)
+
+**Conclusion**: Remapping avoidance provides **minimal benefit for file-based hierarchical** (21 merges) but would be **critical for sentence/work-stealing** (5000+ merges). The **best overall strategy remains file-based hierarchical + performance tuning** rather than trying to optimize remapping for high-merge-count approaches.
+
 ## Final State Comparison
 
 ### Linear (Current State)
@@ -1924,11 +2226,13 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 2. **Performance tuning is critical**: 3-6× speedup from code optimization
 3. **Compaction saves 70% disk**: 1TB → 300GB, essential for storage constraints
 4. **Remapping adds complexity**: Every ortho must be remapped during merge (non-trivial cost)
-5. **Impacted scanning NOT eliminated**: Hierarchical still needs to scan for impacted orthos at merge points (localized but not eliminated)
-6. **Sentence-level has diminishing returns**: Binary merge on 5K sentences gives 2× speedup but 4× implementation complexity
-7. **Work-stealing has RAM bottleneck**: Pure work-stealing needs 100 GB RAM; size-bounded variant practical but 5000+ merges vs 21 for file-based
-8. **Merge count matters greatly**: File-based (21 merges) has far less remapping overhead than sentence/work-stealing (5000+ merges)
-9. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
+5. **Remapping can be avoided**: Global canonical vocabulary or content-based IDs eliminate remapping but add upfront/memory cost
+6. **Remapping avoidance has minimal benefit for file-based**: 21 merges = ~8 min remapping overhead (not worth complexity)
+7. **Impacted scanning NOT eliminated**: Hierarchical still needs to scan for impacted orthos at merge points (localized but not eliminated)
+8. **Sentence-level has diminishing returns**: Binary merge on 5K sentences gives 2× speedup but 4× implementation complexity
+9. **Work-stealing has RAM bottleneck**: Pure work-stealing needs 100 GB RAM; size-bounded variant practical but 5000+ merges vs 21 for file-based
+10. **Merge count matters greatly**: File-based (21 merges) has far less remapping overhead than sentence/work-stealing (5000+ merges)
+11. **Deterministic reconstruction required**: Compaction must truly delete orthos and reconstruct by subtraction
 
 **Recommended Path Forward:**
 
@@ -1940,6 +2244,7 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 
 2. **If performance tuning insufficient, implement hierarchical (file-based)**:
    - Phase 1: Implement interner merge with token remapping
+   - Phase 1a (optional): Consider global canonical vocabulary if corpus is known upfront (eliminates remapping)
    - Phase 2: Implement result merge with remapping validation
    - Phase 3: Implement impacted ortho scanning at merge points
    - Phase 4: Build tree structure and parallel leaf processing
@@ -1963,4 +2268,4 @@ The analysis reveals that **scale dramatically changes the optimal approach**. A
 
 The **hierarchical approach with remapping is complex but necessary** at scale. The current linear system cannot handle 890M orthos in reasonable time. Performance tuning helps but cannot overcome the fundamental sequential bottleneck. **Hierarchical + Compaction + Performance Tuning** reduces processing from 88 days to 8 days - a requirement, not an optimization. 
 
-Note that hierarchical does NOT eliminate impacted ortho scanning - it localizes it to merge points, which can be parallelized but still must be performed. Alternative strategies like sentence-level binary merge and work-stealing provide marginal additional speedup (2× at best) but with significant complexity increases: work-stealing requires 100 GB RAM or careful size-bounding, and both approaches require 5000+ merges vs 21 for file-based. The optimal balance is **file-based quaternary tree** with performance tuning and compaction.
+Note that hierarchical does NOT eliminate impacted ortho scanning - it localizes it to merge points, which can be parallelized but still must be performed. **Remapping can be avoided** through strategies like global canonical vocabulary (best for known corpus) or content-based token IDs (best for high merge counts), but for file-based hierarchical with only 21 merges, the remapping overhead (~8 minutes) is negligible and not worth the added complexity. Alternative strategies like sentence-level binary merge and work-stealing provide marginal additional speedup (2× at best) but with significant complexity increases: work-stealing requires 100 GB RAM or careful size-bounding, and both approaches require 5000+ merges vs 21 for file-based. The optimal balance is **file-based quaternary tree** with performance tuning and compaction.
