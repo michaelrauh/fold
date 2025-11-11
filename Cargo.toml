@@ -56,3 +56,18 @@ path = "benches/disk_queue_bench.rs"
 name = "seen_tracker_bench"
 harness = false
 path = "benches/seen_tracker_bench.rs"
+
+[[bench]]
+name = "expansion_detail_bench"
+harness = false
+path = "benches/expansion_detail_bench.rs"
+
+[[bench]]
+name = "impacted_ortho_bench"
+harness = false
+path = "benches/impacted_ortho_bench.rs"
+
+[[bench]]
+name = "checkpoint_detail_bench"
+harness = false
+path = "benches/checkpoint_detail_bench.rs"
