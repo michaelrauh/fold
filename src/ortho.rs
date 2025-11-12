@@ -13,25 +13,19 @@ pub struct Ortho {
 }
 
 impl Ortho {
-    fn compute_initial_id() -> usize {
-        // Initial empty ortho gets a fixed ID based on empty state
+    fn compute_id(dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> usize {
+        // Compute ID based on canonical state (dims + payload)
+        // This ensures path-independent IDs - orthos with same final state get same ID
         let mut hasher = FxHasher::default();
-        0usize.hash(&mut hasher); // seed for empty ortho
-        (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
-    }
-    
-    fn compute_incremental_id(parent_id: usize, added_value: usize) -> usize {
-        // Hash parent ID together with the added value for incremental computation
-        let mut hasher = FxHasher::default();
-        parent_id.hash(&mut hasher);
-        added_value.hash(&mut hasher);
+        dims.hash(&mut hasher);
+        payload.hash(&mut hasher);
         (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
     }
     
     pub fn new(_version: usize) -> Self {
         let dims = vec![2,2];
         let payload = vec![None; 4];
-        let id = Self::compute_initial_id();
+        let id = Self::compute_id(&dims, &payload);
         Ortho { id, dims, payload }
     }
     pub fn id(&self) -> usize { self.id }
@@ -40,19 +34,15 @@ impl Ortho {
         let insertion_index = self.get_current_position();
         let total_empty = self.payload.iter().filter(|x| x.is_none()).count();
         
-        // Compute new ID incrementally
-        let new_id = Self::compute_incremental_id(self.id, value);
-        
         if total_empty == 1 {
             if spatial::is_base(&self.dims) {
                 return Self::expand(
                     self,
                     spatial::expand_up(&self.dims, self.get_insert_position(value)),
                     value,
-                    new_id,
                 );
             } else {
-                return Self::expand(self, spatial::expand_over(&self.dims), value, new_id);
+                return Self::expand(self, spatial::expand_over(&self.dims), value);
             }
         }
         if insertion_index == 2 && self.dims.as_slice() == [2, 2] {
@@ -61,25 +51,26 @@ impl Ortho {
             if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
                 if second > third { new_payload[1] = Some(third); new_payload[2] = Some(second); }
             }
+            let new_id = Self::compute_id(&self.dims, &new_payload);
             return vec![Ortho { id: new_id, dims: self.dims.clone(), payload: new_payload }];
         }
         let len = self.payload.len();
         let mut new_payload: Vec<Option<usize>> = Vec::with_capacity(len);
         unsafe { new_payload.set_len(len); std::ptr::copy_nonoverlapping(self.payload.as_ptr(), new_payload.as_mut_ptr(), len); }
         if insertion_index < new_payload.len() { new_payload[insertion_index] = Some(value); }
+        let new_id = Self::compute_id(&self.dims, &new_payload);
         vec![Ortho { id: new_id, dims: self.dims.clone(), payload: new_payload }]
     }
     fn expand(
         ortho: &Ortho,
         expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
         value: usize,
-        base_id: usize,
     ) -> Vec<Ortho> {
         // Find insert position once
         let insert_pos = ortho.payload.iter().position(|x| x.is_none()).unwrap();
         
         let mut out = Vec::with_capacity(expansions.len());
-        for (idx, (new_dims_vec, new_capacity, reorg)) in expansions.into_iter().enumerate() {
+        for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
             let mut new_payload = vec![None; new_capacity];
             // Directly reorganize old payload, inserting value at the right position
             for (i, &pos) in reorg.iter().enumerate() {
@@ -89,8 +80,7 @@ impl Ortho {
                     new_payload[pos] = ortho.payload.get(i).cloned().flatten();
                 }
             }
-            // Each expansion variant gets a different ID based on its index
-            let new_id = Self::compute_incremental_id(base_id, idx);
+            let new_id = Self::compute_id(&new_dims_vec, &new_payload);
             out.push(Ortho { id: new_id, dims: new_dims_vec, payload: new_payload });
         }
         out
@@ -273,7 +263,8 @@ mod tests {
     #[test]
     fn test_new() {
         let ortho = Ortho::new(1);
-        assert_eq!(ortho.id, Ortho::compute_initial_id());
+        let expected_id = Ortho::compute_id(&vec![2,2], &vec![None, None, None, None]);
+        assert_eq!(ortho.id, expected_id);
         assert_eq!(ortho.dims, vec![2,2]);
         assert_eq!(ortho.payload, vec![None, None, None, None]);
     }
@@ -401,21 +392,26 @@ mod tests {
     }
 
     #[test]
-    fn test_add_order_dependent_ids() {
-        // With incremental ID computation, order of additions matters
+    fn test_add_path_independent_ids() {
+        // IDs should be based on canonical state, not addition path
         let ortho1 = Ortho::new(1);
         let ortho2 = Ortho::new(1);
         let ortho1 = &ortho1.add(1, 1)[0];
         let ortho2 = &ortho2.add(1, 1)[0];
         assert_eq!(ortho1.id(), ortho2.id()); // Same so far
-        let ortho1 = &ortho1.add(2, 1)[0];
-        let ortho2 = &ortho2.add(3, 1)[0];
-        assert_ne!(ortho1.id(), ortho2.id()); // Different values -> different IDs
-        let ortho1 = &ortho1.add(3, 1)[0];
-        let ortho2 = &ortho2.add(2, 1)[0];
-        // Even though payload is now [1,2,3], the order of additions was different
-        // so IDs will be different (incremental hashing is path-dependent)
-        assert_ne!(ortho1.id(), ortho2.id());
+        
+        // Add in different order
+        let ortho1 = &ortho1.add(20, 1)[0];  // [1, 20]
+        let ortho2 = &ortho2.add(30, 1)[0];  // [1, 30]
+        assert_ne!(ortho1.id(), ortho2.id()); // Different payloads -> different IDs
+        
+        // Complete with different order, but canonicalization makes them same
+        let ortho1 = &ortho1.add(30, 1)[0];  // [1, 20, 30] (already sorted)
+        let ortho2 = &ortho2.add(20, 1)[0];  // [1, 30, 20] -> [1, 20, 30] (canonicalized by swap)
+        
+        // After canonicalization, both have [Some(1), Some(20), Some(30), None]
+        assert_eq!(ortho1.payload(), ortho2.payload(), "Payloads should be same after canonicalization");
+        assert_eq!(ortho1.id(), ortho2.id(), "IDs should be same for same canonical state");
     }
 
     #[test]
@@ -547,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_id_incremental_behavior() {
+    fn test_id_path_independent_behavior() {
         // Test that empty orthos have the same ID (version parameter ignored)
         let ortho_1 = Ortho::new(1);
         let ortho_2 = Ortho::new(2);
@@ -573,12 +569,27 @@ mod tests {
         let ortho_add_10 = base.add(10, 1)[0].clone();
         let ortho_add_20 = base.add(20, 1)[0].clone();
         assert_ne!(ortho_add_10.id(), ortho_add_20.id(), "Different additions should create different IDs");
+        
+        // Test that orthos with same canonical state have same ID (path-independent)
+        // Canonicalization happens at position 2 for [2,2] dims
+        let ortho_path1 = Ortho::new(1);
+        let ortho_path1 = &ortho_path1.add(10, 1)[0];
+        let ortho_path1 = &ortho_path1.add(20, 1)[0];  // [10, 20, _, _]
+        let ortho_path1 = &ortho_path1.add(30, 1)[0];  // [10, 20, 30, _] - no swap needed
+        
+        let ortho_path2 = Ortho::new(1);
+        let ortho_path2 = &ortho_path2.add(10, 1)[0];
+        let ortho_path2 = &ortho_path2.add(30, 1)[0];  // [10, 30, _, _]
+        let ortho_path2 = &ortho_path2.add(20, 1)[0];  // [10, 30, 20, _] -> [10, 20, 30, _] (swapped!)
+        
+        // Both should end up as [Some(10), Some(20), Some(30), None] due to canonicalization swap
+        assert_eq!(ortho_path1.payload(), ortho_path2.payload(), "Should have same payload after canonicalization");
+        assert_eq!(ortho_path1.id(), ortho_path2.id(), "Should have same ID for same canonical state");
     }
 
     #[test]
     fn test_id_collision_for_different_payloads() {
-        use super::*;
-        // These are the payloads seen in the logs
+        // Test manually assigned IDs (used in deserialization)
         let ortho0 = Ortho {
             id: 1,
             dims: vec![2, 2],
@@ -618,9 +629,16 @@ mod tests {
             ortho5.id(),
         ];
         // All manually created with id:1, so all will have id 1
-        // This test is now invalid with incremental IDs
-        // Testing that manually constructed orthos all report their assigned ID
         assert_eq!(ids, vec![1, 1, 1, 1, 1, 1]);
+        
+        // But if we create them via add(), they should have different IDs
+        let base = Ortho::new(1);
+        let created0 = base.add(0, 1)[0].clone();
+        let created1 = base.add(1, 1)[0].clone();
+        let created2 = base.add(2, 1)[0].clone();
+        assert_ne!(created0.id(), created1.id());
+        assert_ne!(created1.id(), created2.id());
+        assert_ne!(created0.id(), created2.id());
     }
 
     #[test]
