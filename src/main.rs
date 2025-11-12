@@ -45,24 +45,17 @@ fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     (volume, fullness)
 }
 
-/// Check if an ortho has potential to generate any new (unseen) children.
-/// Returns true if at least one completion would generate a child not in the tracker.
-fn has_unseen_children(ortho: &Ortho, interner: &Interner, tracker: &mut SeenTracker) -> bool {
-    let (forbidden, required) = ortho.get_requirements();
-    let completions = interner.intersect(&required, &forbidden);
-    let version = ortho.version();
-    
-    // Check if any completion would produce an unseen child
-    for completion in completions {
-        let children = ortho.add(completion, version);
-        for child in children {
-            let child_id = child.id();
-            if !tracker.contains(&child_id) {
-                return true;
-            }
+/// Check if a specific completion from an ortho will produce any new (unseen) children.
+/// Returns true if at least one child from this completion is not in the tracker.
+/// This allows filtering at the completion (branch) level rather than just the leaf level.
+fn completion_has_unseen_children(ortho: &Ortho, completion: usize, version: usize, tracker: &mut SeenTracker) -> bool {
+    let children = ortho.add(completion, version);
+    for child in children {
+        let child_id = child.id();
+        if !tracker.contains(&child_id) {
+            return true;
         }
     }
-    
     false
 }
 
@@ -215,8 +208,14 @@ fn main() -> Result<(), FoldError> {
             // Get completions from interner
             let completions = current_interner.intersect(&required, &forbidden);
             
-            // Generate child orthos
+            // Generate child orthos, but only from completions that produce unseen children.
+            // This filters at the branch level, skipping entire branches that are exhausted.
             for completion in completions {
+                // Skip this completion if all its children are already seen (dead branch)
+                if !completion_has_unseen_children(&ortho, completion, version, &mut tracker) {
+                    continue;
+                }
+                
                 let children = ortho.add(completion, version);
                 
                 for child in children {
@@ -233,14 +232,7 @@ fn main() -> Result<(), FoldError> {
                         }
                         
                         all_results.push(child.clone())?;
-                        
-                        // Only queue if the child has potential to generate new descendants.
-                        // This prevents 100% duplication periods where the queue fills with
-                        // orthos whose children are all already seen. By checking ahead of time,
-                        // we avoid wasting CPU cycles processing orthos that produce only duplicates.
-                        if has_unseen_children(&child, current_interner, &mut tracker) {
-                            work_queue.push(child)?;
-                        }
+                        work_queue.push(child)?;
                     }
                 }
             }
@@ -375,7 +367,7 @@ mod tests {
     }
     
     #[test]
-    fn test_has_unseen_children_with_all_seen() {
+    fn test_completion_has_unseen_children_with_all_seen() {
         let interner = Interner::from_text("a b c");
         let mut tracker = SeenTracker::new(100);
         
@@ -383,22 +375,23 @@ mod tests {
         let ortho = Ortho::new(1);
         let ortho = ortho.add(0, 1).into_iter().next().unwrap(); // add token 'a'
         
-        // Mark all potential children as seen
+        // Get a completion and mark all its children as seen
         let (forbidden, required) = ortho.get_requirements();
         let completions = interner.intersect(&required, &forbidden);
-        for completion in completions {
+        
+        if let Some(&completion) = completions.first() {
             let children = ortho.add(completion, 1);
             for child in children {
                 tracker.insert(child.id());
             }
+            
+            // Now check that this completion has no unseen children
+            assert!(!completion_has_unseen_children(&ortho, completion, 1, &mut tracker));
         }
-        
-        // Now check that has_unseen_children returns false
-        assert!(!has_unseen_children(&ortho, &interner, &mut tracker));
     }
     
     #[test]
-    fn test_has_unseen_children_with_some_unseen() {
+    fn test_completion_has_unseen_children_with_some_unseen() {
         let interner = Interner::from_text("a b c");
         let mut tracker = SeenTracker::new(100);
         
@@ -406,9 +399,14 @@ mod tests {
         let ortho = Ortho::new(1);
         let ortho = ortho.add(0, 1).into_iter().next().unwrap(); // add token 'a'
         
-        // Don't mark any children as seen
-        // has_unseen_children should return true
-        assert!(has_unseen_children(&ortho, &interner, &mut tracker));
+        // Get a completion but don't mark any children as seen
+        let (forbidden, required) = ortho.get_requirements();
+        let completions = interner.intersect(&required, &forbidden);
+        
+        if let Some(&completion) = completions.first() {
+            // Should return true since none are marked as seen
+            assert!(completion_has_unseen_children(&ortho, completion, 1, &mut tracker));
+        }
     }
 }
 
