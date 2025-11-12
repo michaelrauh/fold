@@ -234,7 +234,10 @@ fn main() -> Result<(), FoldError> {
                         
                         all_results.push(child.clone())?;
                         
-                        // Only queue if the child has potential to generate new descendants
+                        // Only queue if the child has potential to generate new descendants.
+                        // This prevents 100% duplication periods where the queue fills with
+                        // orthos whose children are all already seen. By checking ahead of time,
+                        // we avoid wasting CPU cycles processing orthos that produce only duplicates.
                         if has_unseen_children(&child, current_interner, &mut tracker) {
                             work_queue.push(child)?;
                         }
