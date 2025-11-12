@@ -1,5 +1,5 @@
 use crate::spatial;
-use std::collections::hash_map::DefaultHasher;
+use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::fmt;
 use bincode::Encode;
@@ -15,11 +15,11 @@ pub struct Ortho {
 impl Ortho {
     fn compute_id(version: usize, dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> usize {
         if payload.iter().all(|x| x.is_none()) {
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = FxHasher::default();
             version.hash(&mut hasher);
             (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
         } else {
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = FxHasher::default();
             dims.hash(&mut hasher);
             payload.hash(&mut hasher);
             (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
@@ -67,15 +67,19 @@ impl Ortho {
         value: usize,
         version: usize,
     ) -> Vec<Ortho> {
-        let mut old_payload_with_value = ortho.payload.clone();
-        let insert_pos = old_payload_with_value.iter().position(|x| x.is_none()).unwrap();
-        old_payload_with_value[insert_pos] = Some(value);
+        // Find insert position once
+        let insert_pos = ortho.payload.iter().position(|x| x.is_none()).unwrap();
         
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
             let mut new_payload = vec![None; new_capacity];
-            for (i, &pos) in reorg.iter().enumerate() { 
-                new_payload[pos] = old_payload_with_value.get(i).cloned().flatten(); 
+            // Directly reorganize old payload, inserting value at the right position
+            for (i, &pos) in reorg.iter().enumerate() {
+                if i == insert_pos {
+                    new_payload[pos] = Some(value);
+                } else {
+                    new_payload[pos] = ortho.payload.get(i).cloned().flatten();
+                }
             }
             out.push(Ortho { version, dims: new_dims_vec, payload: new_payload });
         }

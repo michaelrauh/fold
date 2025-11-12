@@ -1,12 +1,12 @@
 use crate::splitter::Splitter;
 use fixedbitset::FixedBitSet;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Clone)]
 pub struct Interner {
     version: usize,
     vocabulary: Vec<String>,
-    prefix_to_completions: HashMap<Vec<usize>, FixedBitSet>,
+    prefix_to_completions: FxHashMap<Vec<usize>, FixedBitSet>,
 }
 
 // Custom Encode/Decode for Interner
@@ -28,7 +28,7 @@ impl<Context> bincode::Decode<Context> for Interner {
         let version = usize::decode(decoder)?;
         let vocabulary = Vec::<String>::decode(decoder)?;
         let prefix_vec = Vec::<(Vec<usize>, Vec<u32>)>::decode(decoder)?;
-        let mut prefix_to_completions = HashMap::new();
+        let mut prefix_to_completions = FxHashMap::default();
         let vocab_len = vocabulary.len();
         for (prefix, completions) in prefix_vec {
             let mut fbs = FixedBitSet::with_capacity(vocab_len);
@@ -109,15 +109,15 @@ impl Interner {
         phrases: &[Vec<String>],
         vocabulary: &[String],
         vocab_len: usize,
-        existing: Option<&HashMap<Vec<usize>, FixedBitSet>>,
-    ) -> HashMap<Vec<usize>, FixedBitSet> {
+        existing: Option<&FxHashMap<Vec<usize>, FixedBitSet>>,
+    ) -> FxHashMap<Vec<usize>, FixedBitSet> {
         let mut prefix_to_completions = match existing {
             Some(map) => {
                 let mut new_map = map.clone();
                 for bitset in new_map.values_mut() { bitset.grow(vocab_len); }
                 new_map
             }
-            None => HashMap::new(),
+            None => FxHashMap::default(),
         };
         for phrase in phrases {
             if phrase.len() < 2 { continue; }
