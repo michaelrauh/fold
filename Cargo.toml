@@ -71,3 +71,8 @@ path = "benches/impacted_ortho_bench.rs"
 name = "checkpoint_detail_bench"
 harness = false
 path = "benches/checkpoint_detail_bench.rs"
+
+[[bench]]
+name = "id_strategy_bench"
+harness = false
+path = "benches/id_strategy_bench.rs"

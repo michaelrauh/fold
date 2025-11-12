@@ -13,7 +13,7 @@ pub struct Ortho {
 }
 
 impl Ortho {
-    fn compute_id(dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> usize {
+    fn compute_id_full(dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> usize {
         // Compute ID based on canonical state (dims + payload)
         // This ensures path-independent IDs - orthos with same final state get same ID
         let mut hasher = FxHasher::default();
@@ -22,10 +22,19 @@ impl Ortho {
         (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
     }
     
+    fn compute_id_incremental(parent_id: usize, value: usize) -> usize {
+        // Incremental ID computation - hash parent ID with added value
+        // Only safe when NO reordering occurs
+        let mut hasher = FxHasher::default();
+        parent_id.hash(&mut hasher);
+        value.hash(&mut hasher);
+        (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
+    }
+    
     pub fn new(_version: usize) -> Self {
         let dims = vec![2,2];
         let payload = vec![None; 4];
-        let id = Self::compute_id(&dims, &payload);
+        let id = Self::compute_id_full(&dims, &payload);
         Ortho { id, dims, payload }
     }
     pub fn id(&self) -> usize { self.id }
@@ -46,19 +55,21 @@ impl Ortho {
             }
         }
         if insertion_index == 2 && self.dims.as_slice() == [2, 2] {
+            // REORDERING MAY HAPPEN HERE (swap) - use full ID computation
             let mut new_payload: Vec<Option<usize>> = self.payload.clone();
             new_payload[insertion_index] = Some(value);
             if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
                 if second > third { new_payload[1] = Some(third); new_payload[2] = Some(second); }
             }
-            let new_id = Self::compute_id(&self.dims, &new_payload);
+            let new_id = Self::compute_id_full(&self.dims, &new_payload);
             return vec![Ortho { id: new_id, dims: self.dims.clone(), payload: new_payload }];
         }
+        // NO REORDERING - use incremental ID computation (fast path)
         let len = self.payload.len();
         let mut new_payload: Vec<Option<usize>> = Vec::with_capacity(len);
         unsafe { new_payload.set_len(len); std::ptr::copy_nonoverlapping(self.payload.as_ptr(), new_payload.as_mut_ptr(), len); }
         if insertion_index < new_payload.len() { new_payload[insertion_index] = Some(value); }
-        let new_id = Self::compute_id(&self.dims, &new_payload);
+        let new_id = Self::compute_id_incremental(self.id, value);
         vec![Ortho { id: new_id, dims: self.dims.clone(), payload: new_payload }]
     }
     fn expand(
@@ -66,6 +77,7 @@ impl Ortho {
         expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
         value: usize,
     ) -> Vec<Ortho> {
+        // REORDERING HAPPENS HERE - use full ID computation
         // Find insert position once
         let insert_pos = ortho.payload.iter().position(|x| x.is_none()).unwrap();
         
@@ -80,7 +92,7 @@ impl Ortho {
                     new_payload[pos] = ortho.payload.get(i).cloned().flatten();
                 }
             }
-            let new_id = Self::compute_id(&new_dims_vec, &new_payload);
+            let new_id = Self::compute_id_full(&new_dims_vec, &new_payload);
             out.push(Ortho { id: new_id, dims: new_dims_vec, payload: new_payload });
         }
         out
@@ -263,7 +275,7 @@ mod tests {
     #[test]
     fn test_new() {
         let ortho = Ortho::new(1);
-        let expected_id = Ortho::compute_id(&vec![2,2], &vec![None, None, None, None]);
+        let expected_id = Ortho::compute_id_full(&vec![2,2], &vec![None, None, None, None]);
         assert_eq!(ortho.id, expected_id);
         assert_eq!(ortho.dims, vec![2,2]);
         assert_eq!(ortho.payload, vec![None, None, None, None]);
