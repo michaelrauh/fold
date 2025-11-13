@@ -8,11 +8,53 @@ fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     (volume, fullness)
 }
 
+fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+    // Scan in_process directory for any .txt files left from previous incomplete runs
+    // and move them back to input directory for reprocessing
+    let in_process_path = std::path::Path::new(in_process_dir);
+    
+    if !in_process_path.exists() {
+        return Ok(());
+    }
+    
+    let mut recovered_count = 0;
+    for entry in fs::read_dir(in_process_path).map_err(|e| FoldError::Io(e))? {
+        let entry = entry.map_err(|e| FoldError::Io(e))?;
+        let entry_path = entry.path();
+        
+        if entry_path.is_file() {
+            if let Some(ext) = entry_path.extension() {
+                if ext == "txt" {
+                    // Found abandoned .txt file, move it back to input
+                    let filename = entry_path.file_name().unwrap_or_default();
+                    let target_path = format!("{}/{}", input_dir, filename.to_str().unwrap_or("recovered"));
+                    fs::rename(&entry_path, &target_path).map_err(|e| FoldError::Io(e))?;
+                    println!("[fold] Recovered abandoned file: {:?} -> {}", filename, target_path);
+                    recovered_count += 1;
+                }
+            }
+        }
+    }
+    
+    if recovered_count > 0 {
+        println!("[fold] Recovered {} abandoned file(s) from previous run", recovered_count);
+    }
+    
+    Ok(())
+}
+
 fn main() -> Result<(), FoldError> {
     let input_dir = "./fold_state/input";
+    let in_process_dir = "./fold_state/in_process";
     
     println!("[fold] Starting fold processing");
     println!("[fold] Input directory: {}", input_dir);
+    
+    // Create in_process directory if it doesn't exist
+    fs::create_dir_all(in_process_dir).map_err(|e| FoldError::Io(e))?;
+    
+    // Recover any abandoned files from previous runs
+    recover_abandoned_files(input_dir, in_process_dir)?;
     
     // Process files one at a time until none remain
     loop {
@@ -29,7 +71,26 @@ fn main() -> Result<(), FoldError> {
         println!("[fold] Processing file: {}", file_path);
         println!("[fold] ========================================");
         
-        let text = fs::read_to_string(&file_path)
+        // Move file to in-process location to prevent other processes from picking it up
+        // This provides mutual exclusion for distributed/parallel processing
+        let filename = Path::new(&file_path).file_name().unwrap_or_default();
+        let in_process_path = format!("{}/{}", in_process_dir, filename.to_str().unwrap_or("temp"));
+        fs::rename(&file_path, &in_process_path).map_err(|e| FoldError::Io(e))?;
+        println!("[fold] Moved to in-process: {}", in_process_path);
+        
+        // Recovery strategies for processes that exit after beginning but before finishing:
+        // 1. Startup scan: On program start, check in_process directory for abandoned files
+        //    and move them back to input directory for reprocessing
+        // 2. Timestamp-based detection: Add .timestamp file alongside in-process file,
+        //    update periodically. If timestamp is stale (e.g., >1 hour old), consider abandoned
+        // 3. PID-based locking: Create .lock file with process ID, check if PID is still running
+        // 4. Heartbeat mechanism: Periodically update a heartbeat file; other processes can
+        //    detect stale heartbeats and reclaim abandoned work
+        // 5. Archive validation: Before considering work complete, verify archive integrity
+        //    and only then remove in-process file. If crash occurs, incomplete archives can be
+        //    detected and source files recovered from in_process directory
+        
+        let text = fs::read_to_string(&in_process_path)
             .map_err(|e| FoldError::Io(e))?;
         
         // Build interner from this file only
@@ -118,15 +179,15 @@ fn main() -> Result<(), FoldError> {
         
         print_optimal(&best_ortho, &interner);
         
-        // Create archive for this file
-        let archive_path = get_archive_path(&file_path);
+        // Create archive for this file (use in_process_path to get the correct location)
+        let archive_path = get_archive_path(&in_process_path);
         save_archive(&archive_path, &interner, &mut results, &results_path)?;
         
         println!("[fold] Archive saved: {}", archive_path);
         
-        // Delete the processed .txt file
-        fs::remove_file(&file_path).map_err(|e| FoldError::Io(e))?;
-        println!("[fold] Input file deleted");
+        // Delete the in-process .txt file
+        fs::remove_file(&in_process_path).map_err(|e| FoldError::Io(e))?;
+        println!("[fold] In-process file deleted");
     }
     
     println!("\n[fold] ========================================");

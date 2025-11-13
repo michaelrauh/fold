@@ -35,18 +35,24 @@ cargo run --release
 ```
 
 The program will:
+- Check `fold_state/in_process/` for any abandoned `.txt` files from previous runs and recover them
 - Loop through `fold_state/input/` to find `.txt` files
-- Process each `.txt` file independently (one at a time)
+- Move each `.txt` file to `fold_state/in_process/` before processing (prevents other processes from picking it up)
+- Process each file independently (one at a time)
 - Build a separate interner for each file
 - Generate and track orthos for each file
 - Print optimal ortho after each file
-- Save an archive directory (`.bin`) in the same location as the input file
-- Delete the input `.txt` file after successful archiving
+- Save an archive directory (`.bin`) in `fold_state/in_process/`
+- Delete the `.txt` file after successful archiving
 - Continue looping until no `.txt` files remain
 
 Each archive is a directory containing:
 - `interner.bin`: The interner built from that specific file
 - `results/`: DiskBackedQueue directory with all ortho results
+
+### Process Safety
+
+The program uses an in-process directory to ensure mutual exclusion when multiple instances run concurrently. Files are moved to `fold_state/in_process/` before processing, preventing race conditions. On startup, any abandoned `.txt` files in the in-process directory are automatically recovered and moved back to input for reprocessing.
 
 ## Development
 
