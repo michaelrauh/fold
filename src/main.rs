@@ -188,6 +188,10 @@ fn main() -> Result<(), FoldError> {
                          processed_count, work_queue.len(), tracker.len());
             }
             
+            if processed_count % 100000 == 0 {
+                print_optimal(&global_best, current_interner);
+            }
+            
             // Get requirements from ortho
             let (forbidden, required) = ortho.get_requirements();
             

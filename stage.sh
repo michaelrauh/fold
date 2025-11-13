@@ -113,11 +113,11 @@ if [ "$MIN_LENGTH" -gt 0 ]; then
     DELETED_COUNT=0
     for file in "$INPUT_DIR"/${BASENAME}_chunk_*.txt; do
         if [ -f "$file" ]; then
-            # Get file size in characters
-            FILE_SIZE=$(wc -c < "$file")
+            # Get file size in words
+            FILE_SIZE=$(wc -w < "$file")
             
             if [ "$FILE_SIZE" -lt "$MIN_LENGTH" ]; then
-                echo "[stage] Deleting small chunk: $(basename "$file") ($FILE_SIZE chars)"
+                echo "[stage] Deleting small chunk: $(basename "$file") ($FILE_SIZE words)"
                 rm "$file"
                 DELETED_COUNT=$((DELETED_COUNT + 1))
             fi
