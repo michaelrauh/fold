@@ -35,15 +35,16 @@ cargo run --release
 ```
 
 The program will:
-- Check `fold_state/in_process/` for any abandoned `.txt` files from previous runs and recover them
+- Check `fold_state/in_process/` for any abandoned `.txt` files or stale heartbeats from previous runs and recover them
 - Loop through `fold_state/input/` to find `.txt` files
 - Move each `.txt` file to `fold_state/in_process/` before processing (prevents other processes from picking it up)
+- Create a heartbeat file that is updated every 100,000 orthos processed
 - Process each file independently (one at a time)
 - Build a separate interner for each file
 - Generate and track orthos for each file
 - Print optimal ortho after each file
 - Save an archive directory (`.bin`) in `fold_state/in_process/`
-- Delete the `.txt` file after successful archiving
+- Delete the `.txt` file and heartbeat file after successful archiving
 - Continue looping until no `.txt` files remain
 
 Each archive is a directory containing:
@@ -52,7 +53,11 @@ Each archive is a directory containing:
 
 ### Process Safety
 
-The program uses an in-process directory to ensure mutual exclusion when multiple instances run concurrently. Files are moved to `fold_state/in_process/` before processing, preventing race conditions. On startup, any abandoned `.txt` files in the in-process directory are automatically recovered and moved back to input for reprocessing.
+The program uses an in-process directory to ensure mutual exclusion when multiple instances run concurrently. Files are moved to `fold_state/in_process/` before processing, preventing race conditions. 
+
+**Heartbeat Mechanism**: A heartbeat file is created for each processing job and updated every 100,000 orthos. On startup, the program checks for heartbeat files that haven't been updated for more than 10 minutes (grace period) and considers them stale. Files with stale heartbeats are automatically recovered and moved back to input for reprocessing.
+
+**Recovery**: On startup, any abandoned `.txt` files in the in-process directory are automatically recovered and moved back to input for reprocessing.
 
 ## Development
 
