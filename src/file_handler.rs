@@ -117,6 +117,49 @@ pub fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> 
     Ok(None)
 }
 
+pub fn find_archives(in_process_dir: &str) -> Result<Vec<(String, u64)>, FoldError> {
+    let path = std::path::Path::new(in_process_dir);
+    
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    
+    let mut archives = Vec::new();
+    
+    for entry in fs::read_dir(path).map_err(|e| FoldError::Io(e))? {
+        let entry = entry.map_err(|e| FoldError::Io(e))?;
+        let entry_path = entry.path();
+        
+        if entry_path.is_dir() {
+            if let Some(ext) = entry_path.extension() {
+                if ext == "bin" {
+                    // Get size of results directory
+                    let results_path = entry_path.join("results");
+                    if results_path.exists() && results_path.is_dir() {
+                        // Calculate total size of results directory
+                        let mut total_size = 0u64;
+                        if let Ok(entries) = fs::read_dir(&results_path) {
+                            for result_entry in entries {
+                                if let Ok(result_entry) = result_entry {
+                                    if let Ok(metadata) = result_entry.metadata() {
+                                        total_size += metadata.len();
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if let Some(path_str) = entry_path.to_str() {
+                            archives.push((path_str.to_string(), total_size));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(archives)
+}
+
 pub fn get_archive_path(input_file_path: &str) -> String {
     let path = Path::new(input_file_path);
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -143,6 +186,18 @@ pub fn save_archive(archive_path: &str, interner: &Interner, results: &mut DiskB
     fs::write(interner_path, interner_bytes).map_err(|e| FoldError::Io(e))?;
     
     Ok(())
+}
+
+pub fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
+    let interner_path = format!("{}/interner.bin", archive_path);
+    let interner_bytes = fs::read(&interner_path).map_err(|e| FoldError::Io(e))?;
+    let (interner, _): (Interner, usize) = 
+        bincode::decode_from_slice(&interner_bytes, bincode::config::standard())?;
+    Ok(interner)
+}
+
+pub fn get_results_path(archive_path: &str) -> String {
+    format!("{}/results", archive_path)
 }
 
 #[cfg(test)]
