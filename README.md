@@ -35,9 +35,16 @@ cargo run --release
 ```
 
 The program will:
-- Process each file in `fold_state/input/`
+- Process each file in `fold_state/input/` independently
+- Build a separate interner for each file
+- Generate and track orthos for each file
 - Print optimal ortho after each file
-- Print final optimal ortho at the end
+- Save an archive for each file in `fold_state/output/`
+- Delete input files after successful processing
+
+Each archive contains:
+- The interner built from that specific file
+- All ortho results generated from that file
 
 ## Development
 
