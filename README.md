@@ -35,16 +35,18 @@ cargo run --release
 ```
 
 The program will:
-- Process each file in `fold_state/input/` independently
+- Loop through `fold_state/input/` to find `.txt` files
+- Process each `.txt` file independently (one at a time)
 - Build a separate interner for each file
 - Generate and track orthos for each file
 - Print optimal ortho after each file
-- Save an archive for each file in `fold_state/output/`
-- Delete input files after successful processing
+- Save an archive directory (`.bin`) in the same location as the input file
+- Delete the input `.txt` file after successful archiving
+- Continue looping until no `.txt` files remain
 
-Each archive contains:
-- The interner built from that specific file
-- All ortho results generated from that file
+Each archive is a directory containing:
+- `interner.bin`: The interner built from that specific file
+- `results/`: DiskBackedQueue directory with all ortho results
 
 ## Development
 

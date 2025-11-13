@@ -1,6 +1,5 @@
 use fold::{disk_backed_queue::DiskBackedQueue, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
@@ -11,28 +10,21 @@ fn calculate_score(ortho: &Ortho) -> (usize, usize) {
 
 fn main() -> Result<(), FoldError> {
     let input_dir = "./fold_state/input";
-    let output_dir = "./fold_state/output";
     
     println!("[fold] Starting fold processing");
     println!("[fold] Input directory: {}", input_dir);
-    println!("[fold] Output directory: {}", output_dir);
     
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir).map_err(|e| FoldError::Io(e))?;
-    
-    // Get all files from input directory, sorted
-    let mut files = get_input_files(&input_dir)?;
-    files.sort();
-    
-    if files.is_empty() {
-        println!("[fold] No input files found in {}", input_dir);
-        return Ok(());
-    }
-    
-    println!("[fold] Found {} file(s) to process", files.len());
-    
-    // Process each file independently
-    for file_path in files {
+    // Process files one at a time until none remain
+    loop {
+        // Find next .txt file
+        let txt_file = find_next_txt_file(input_dir)?;
+        
+        if txt_file.is_none() {
+            println!("[fold] No more .txt files to process");
+            break;
+        }
+        
+        let file_path = txt_file.unwrap();
         println!("\n[fold] ========================================");
         println!("[fold] Processing file: {}", file_path);
         println!("[fold] ========================================");
@@ -127,17 +119,12 @@ fn main() -> Result<(), FoldError> {
         print_optimal(&best_ortho, &interner);
         
         // Create archive for this file
-        let archive_path = get_archive_path(&file_path, output_dir);
-        save_archive(&archive_path, &interner, &mut results)?;
+        let archive_path = get_archive_path(&file_path);
+        save_archive(&archive_path, &interner, &mut results, &results_path)?;
         
         println!("[fold] Archive saved: {}", archive_path);
         
-        // Clean up temporary results directory
-        if Path::new(&results_path).exists() {
-            fs::remove_dir_all(&results_path).map_err(|e| FoldError::Io(e))?;
-        }
-        
-        // Delete the processed file
+        // Delete the processed .txt file
         fs::remove_file(&file_path).map_err(|e| FoldError::Io(e))?;
         println!("[fold] Input file deleted");
     }
@@ -149,67 +136,57 @@ fn main() -> Result<(), FoldError> {
     Ok(())
 }
 
-fn get_input_files(input_dir: &str) -> Result<Vec<String>, FoldError> {
+fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> {
     let path = std::path::Path::new(input_dir);
     
     if !path.exists() {
-        return Ok(Vec::new());
+        fs::create_dir_all(path).map_err(|e| FoldError::Io(e))?;
+        return Ok(None);
     }
-    
-    let mut files = Vec::new();
     
     for entry in fs::read_dir(path).map_err(|e| FoldError::Io(e))? {
         let entry = entry.map_err(|e| FoldError::Io(e))?;
-        let path = entry.path();
+        let entry_path = entry.path();
         
-        if path.is_file() {
-            if let Some(path_str) = path.to_str() {
-                files.push(path_str.to_string());
+        if entry_path.is_file() {
+            if let Some(ext) = entry_path.extension() {
+                if ext == "txt" {
+                    if let Some(path_str) = entry_path.to_str() {
+                        return Ok(Some(path_str.to_string()));
+                    }
+                }
             }
         }
     }
     
-    Ok(files)
+    Ok(None)
 }
 
-fn get_archive_path(input_file_path: &str, output_dir: &str) -> String {
+fn get_archive_path(input_file_path: &str) -> String {
     let path = Path::new(input_file_path);
+    let parent = path.parent().unwrap_or(Path::new("."));
     let filename = path.file_stem().unwrap_or_default().to_str().unwrap_or("output");
-    format!("{}/{}.archive", output_dir, filename)
+    format!("{}/{}.bin", parent.display(), filename)
 }
 
-fn save_archive(archive_path: &str, interner: &Interner, results: &mut DiskBackedQueue) -> Result<(), FoldError> {
+fn save_archive(archive_path: &str, interner: &Interner, results: &mut DiskBackedQueue, results_path: &str) -> Result<(), FoldError> {
     // Flush results to ensure all are on disk
     results.flush()?;
     
-    // Create archive file
-    let archive_file = fs::File::create(archive_path).map_err(|e| FoldError::Io(e))?;
-    let mut writer = std::io::BufWriter::new(archive_file);
+    // Create archive directory
+    fs::create_dir_all(archive_path).map_err(|e| FoldError::Io(e))?;
     
-    // Encode interner first
+    // Move the DiskBackedQueue directory to the archive
+    let archive_results_path = format!("{}/results", archive_path);
+    if Path::new(results_path).exists() {
+        fs::rename(results_path, &archive_results_path).map_err(|e| FoldError::Io(e))?;
+    }
+    
+    // Write the interner to the archive folder
+    let interner_path = format!("{}/interner.bin", archive_path);
     let interner_bytes = bincode::encode_to_vec(interner, bincode::config::standard())?;
-    let interner_len = interner_bytes.len() as u64;
+    fs::write(interner_path, interner_bytes).map_err(|e| FoldError::Io(e))?;
     
-    // Write interner length (8 bytes) then interner data
-    writer.write_all(&interner_len.to_le_bytes()).map_err(|e| FoldError::Io(e))?;
-    writer.write_all(&interner_bytes).map_err(|e| FoldError::Io(e))?;
-    
-    // Write results count (8 bytes)
-    let results_count = results.len() as u64;
-    writer.write_all(&results_count.to_le_bytes()).map_err(|e| FoldError::Io(e))?;
-    
-    // Stream results from disk-backed queue to archive
-    let config = bincode::config::standard();
-    results.scan(|ortho| {
-        // Encode each ortho and write to archive
-        if let Ok(ortho_bytes) = bincode::encode_to_vec(ortho, config) {
-            let ortho_len = ortho_bytes.len() as u32;
-            let _ = writer.write_all(&ortho_len.to_le_bytes());
-            let _ = writer.write_all(&ortho_bytes);
-        }
-    })?;
-    
-    writer.flush().map_err(|e| FoldError::Io(e))?;
     Ok(())
 }
 
@@ -236,15 +213,14 @@ mod tests {
     #[test]
     fn test_get_archive_path() {
         let input = "./fold_state/input/test_chunk_0001.txt";
-        let output_dir = "./fold_state/output";
-        let archive_path = get_archive_path(input, output_dir);
-        assert_eq!(archive_path, "./fold_state/output/test_chunk_0001.archive");
+        let archive_path = get_archive_path(input);
+        assert_eq!(archive_path, "./fold_state/input/test_chunk_0001.bin");
     }
     
     #[test]
     fn test_save_and_load_archive() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let archive_path = temp_dir.path().join("test.archive");
+        let archive_path = temp_dir.path().join("test.bin");
         let results_path = temp_dir.path().join("test_results");
         
         let interner = Interner::from_text("hello world test");
@@ -259,53 +235,32 @@ mod tests {
         results.push(ortho2).unwrap();
         
         // Save archive
-        save_archive(archive_path.to_str().unwrap(), &interner, &mut results).unwrap();
+        save_archive(archive_path.to_str().unwrap(), &interner, &mut results, results_path.to_str().unwrap()).unwrap();
         
-        // Verify archive exists
+        // Verify archive directory exists
         assert!(archive_path.exists());
+        assert!(archive_path.is_dir());
         
-        // Load and verify the archive format
-        use std::io::Read;
-        let mut archive_file = fs::File::open(&archive_path).unwrap();
-        let mut reader = std::io::BufReader::new(archive_file);
+        // Verify interner.bin exists
+        let interner_path = archive_path.join("interner.bin");
+        assert!(interner_path.exists());
         
-        // Read interner length
-        let mut len_bytes = [0u8; 8];
-        reader.read_exact(&mut len_bytes).unwrap();
-        let interner_len = u64::from_le_bytes(len_bytes) as usize;
-        
-        // Read interner data
-        let mut interner_bytes = vec![0u8; interner_len];
-        reader.read_exact(&mut interner_bytes).unwrap();
+        // Load and verify interner
+        let interner_bytes = fs::read(&interner_path).unwrap();
         let (loaded_interner, _): (Interner, usize) = 
             bincode::decode_from_slice(&interner_bytes, bincode::config::standard()).unwrap();
         
         assert_eq!(loaded_interner.version(), interner.version());
         assert_eq!(loaded_interner.vocabulary().len(), interner.vocabulary().len());
         
-        // Read results count
-        reader.read_exact(&mut len_bytes).unwrap();
-        let results_count = u64::from_le_bytes(len_bytes);
-        assert_eq!(results_count, 2);
+        // Verify results directory was moved
+        let archive_results_path = archive_path.join("results");
+        assert!(archive_results_path.exists());
+        assert!(archive_results_path.is_dir());
         
-        // Read first ortho
-        let mut ortho_len_bytes = [0u8; 4];
-        reader.read_exact(&mut ortho_len_bytes).unwrap();
-        let ortho1_len = u32::from_le_bytes(ortho_len_bytes) as usize;
-        let mut ortho1_bytes = vec![0u8; ortho1_len];
-        reader.read_exact(&mut ortho1_bytes).unwrap();
-        let (loaded_ortho1, _): (Ortho, usize) = 
-            bincode::decode_from_slice(&ortho1_bytes, bincode::config::standard()).unwrap();
-        assert_eq!(loaded_ortho1.id(), id1);
-        
-        // Read second ortho
-        reader.read_exact(&mut ortho_len_bytes).unwrap();
-        let ortho2_len = u32::from_le_bytes(ortho_len_bytes) as usize;
-        let mut ortho2_bytes = vec![0u8; ortho2_len];
-        reader.read_exact(&mut ortho2_bytes).unwrap();
-        let (loaded_ortho2, _): (Ortho, usize) = 
-            bincode::decode_from_slice(&ortho2_bytes, bincode::config::standard()).unwrap();
-        assert_eq!(loaded_ortho2.id(), id2);
+        // Load results from the archive
+        let loaded_results = DiskBackedQueue::new_from_path(archive_results_path.to_str().unwrap(), 10).unwrap();
+        assert_eq!(loaded_results.len(), 2);
     }
     
     #[test]
