@@ -195,8 +195,9 @@ mod tests {
         let results_path = fold_state.join("results");
         let mut results_queue = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10).unwrap();
         
-        let ortho1 = Ortho::new(1);
-        let ortho2 = Ortho::new(2);
+        // Create orthos with different values to get different IDs
+        let ortho1 = Ortho::new(1).add(1, 1)[0].clone();
+        let ortho2 = Ortho::new(2).add(2, 1)[0].clone();
         let id1 = ortho1.id();
         let id2 = ortho2.id();
         
@@ -248,9 +249,10 @@ mod tests {
         let mut results_queue = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10).unwrap();
         
         // Add three orthos to results (bloom/seen will be reconstructed from these)
-        let ortho1 = Ortho::new(1);
-        let ortho2 = Ortho::new(2);
-        let ortho3 = Ortho::new(3);
+        // Create orthos with different values to get different IDs
+        let ortho1 = Ortho::new(1).add(1, 1)[0].clone();
+        let ortho2 = Ortho::new(2).add(2, 1)[0].clone();
+        let ortho3 = Ortho::new(3).add(3, 1)[0].clone();
         let id1 = ortho1.id();
         let id2 = ortho2.id();
         let id3 = ortho3.id();

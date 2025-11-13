@@ -273,7 +273,7 @@ fn print_optimal(ortho: &Ortho, interner: &Interner) {
     let (volume, fullness) = calculate_score(ortho);
     println!("\n[fold] ===== OPTIMAL ORTHO =====");
     println!("[fold] Ortho ID: {}", ortho.id());
-    println!("[fold] Version: {}", ortho.version());
+    println!("[fold] Interner Version: {}", interner.version());
     println!("[fold] Dimensions: {:?}", ortho.dims());
     println!("[fold] Score: (volume={}, fullness={})", volume, fullness);
     
@@ -310,7 +310,8 @@ mod tests {
             assert_eq!(queue.len(), 10);
             
             let first = queue.pop().unwrap().unwrap();
-            assert_eq!(first.version(), 1);
+            // Verify ortho has an ID (any non-negative value is valid)
+            let _ = first.id(); // Just verify we can get the ID
         }
     }
 
@@ -326,8 +327,8 @@ mod tests {
         let memory_config = MemoryConfig::default_config();
         let mut results_queue = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), memory_config.queue_buffer_size).unwrap();
         
-        let ortho1 = Ortho::new(1);
-        let ortho2 = Ortho::new(2);
+        let ortho1 = Ortho::new(1).add(1, 1)[0].clone();
+        let ortho2 = Ortho::new(2).add(2, 1)[0].clone();
         let id1 = ortho1.id();
         let id2 = ortho2.id();
         

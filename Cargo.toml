@@ -26,3 +26,53 @@ path = "benches/spatial_bench.rs"
 name = "ortho_bench"
 harness = false
 path = "benches/ortho_bench.rs"
+
+[[bench]]
+name = "end_to_end_bench"
+harness = false
+path = "benches/end_to_end_bench.rs"
+
+[[bench]]
+name = "main_loop_bench"
+harness = false
+path = "benches/main_loop_bench.rs"
+
+[[bench]]
+name = "interner_bench"
+harness = false
+path = "benches/interner_bench.rs"
+
+[[bench]]
+name = "splitter_bench"
+harness = false
+path = "benches/splitter_bench.rs"
+
+[[bench]]
+name = "disk_queue_bench"
+harness = false
+path = "benches/disk_queue_bench.rs"
+
+[[bench]]
+name = "seen_tracker_bench"
+harness = false
+path = "benches/seen_tracker_bench.rs"
+
+[[bench]]
+name = "expansion_detail_bench"
+harness = false
+path = "benches/expansion_detail_bench.rs"
+
+[[bench]]
+name = "impacted_ortho_bench"
+harness = false
+path = "benches/impacted_ortho_bench.rs"
+
+[[bench]]
+name = "checkpoint_detail_bench"
+harness = false
+path = "benches/checkpoint_detail_bench.rs"
+
+[[bench]]
+name = "id_strategy_bench"
+harness = false
+path = "benches/id_strategy_bench.rs"
