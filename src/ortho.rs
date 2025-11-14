@@ -30,6 +30,12 @@ impl Ortho {
         let payload = vec![None; 4];
         Ortho { version, dims, payload }
     }
+    
+    /// Create an Ortho from explicit components (for remapping)
+    pub fn from_parts(version: usize, dims: Vec<usize>, payload: Vec<Option<usize>>) -> Self {
+        Ortho { version, dims, payload }
+    }
+    
     pub fn id(&self) -> usize { Self::compute_id(self.version, &self.dims, &self.payload) }
     pub fn get_current_position(&self) -> usize { self.payload.iter().position(|x| x.is_none()).unwrap_or(self.payload.len()) }
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {

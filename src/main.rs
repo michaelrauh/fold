@@ -202,8 +202,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     let interner_a = file_handler::load_interner(archive_a_path)?;
     let interner_b = file_handler::load_interner(archive_b_path)?;
     
-    println!("[fold] Interner A: vocab size={}", interner_a.vocabulary().len());
-    println!("[fold] Interner B: vocab size={}", interner_b.vocabulary().len());
+    println!("[fold] Interner A: vocab size={}, version={}", 
+             interner_a.vocabulary().len(), interner_a.version());
+    println!("[fold] Interner B: vocab size={}, version={}", 
+             interner_b.vocabulary().len(), interner_b.version());
     
     // Find differences from a to b and from b to a
     let impacted_a = interner_a.impacted_keys(&interner_b);
@@ -212,12 +214,18 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     println!("[fold] Impacted keys in A: {}", impacted_a.len());
     println!("[fold] Impacted keys in B: {}", impacted_b.len());
     
-    // Create merged interner
-    let merged_interner = interner_a.add_text(&format!("{}", interner_b.vocabulary().join(" ")));
+    // Create merged interner by combining both vocabularies
+    let merged_interner = interner_a.add_text(&interner_b.vocabulary().join(" "));
     let new_version = merged_interner.version();
     
     println!("[fold] Merged interner: version={}, vocab size={}", 
              new_version, merged_interner.vocabulary().len());
+    
+    // Build vocabulary mapping for A and B
+    let vocab_map_a = build_vocab_mapping(interner_a.vocabulary(), merged_interner.vocabulary());
+    let vocab_map_b = build_vocab_mapping(interner_b.vocabulary(), merged_interner.vocabulary());
+    
+    println!("[fold] Vocab mappings created");
     
     // Calculate memory config
     let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
@@ -245,9 +253,50 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     
     println!("[fold] Remapping and finding impacted orthos from archives...");
     
-    // TODO: Stream through results from archive A, remap, check if impacted, add to queue
-    // TODO: Stream through results from archive B, remap, check if impacted, add to queue
-    // For now, this is a simplified version that just seeds with empty
+    // Stream through archive A results, remap and check if impacted
+    let results_a_path = file_handler::get_results_path(archive_a_path);
+    let results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
+    
+    let mut added_from_a = 0;
+    results_a.scan(|ortho| {
+        // Check if this ortho is impacted
+        if is_ortho_impacted(ortho, &impacted_a) {
+            // Remap the ortho to new vocabulary
+            if let Some(remapped) = remap_ortho(ortho, &vocab_map_a, new_version) {
+                let remapped_id = remapped.id();
+                if !tracker.contains(&remapped_id) {
+                    tracker.insert(remapped_id);
+                    let _ = work_queue.push(remapped);
+                    added_from_a += 1;
+                }
+            }
+        }
+    })?;
+    
+    println!("[fold] Added {} impacted orthos from archive A", added_from_a);
+    
+    // Stream through archive B results, remap and check if impacted
+    let results_b_path = file_handler::get_results_path(archive_b_path);
+    let results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
+    
+    let mut added_from_b = 0;
+    results_b.scan(|ortho| {
+        // Check if this ortho is impacted
+        if is_ortho_impacted(ortho, &impacted_b) {
+            // Remap the ortho to new vocabulary
+            if let Some(remapped) = remap_ortho(ortho, &vocab_map_b, new_version) {
+                let remapped_id = remapped.id();
+                if !tracker.contains(&remapped_id) {
+                    tracker.insert(remapped_id);
+                    let _ = work_queue.push(remapped);
+                    added_from_b += 1;
+                }
+            }
+        }
+    })?;
+    
+    println!("[fold] Added {} impacted orthos from archive B", added_from_b);
+    println!("[fold] Total orthos seeded: {}", 1 + added_from_a + added_from_b);
     
     println!("[fold] Processing merged ortho space...");
     
@@ -322,6 +371,46 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     }
     
     Ok(())
+}
+
+// Build a mapping from old vocabulary indices to new vocabulary indices
+fn build_vocab_mapping(old_vocab: &[String], new_vocab: &[String]) -> Vec<usize> {
+    old_vocab.iter().map(|word| {
+        new_vocab.iter().position(|w| w == word)
+            .expect("Word from old vocab must exist in new vocab")
+    }).collect()
+}
+
+// Check if an ortho uses any of the impacted keys
+fn is_ortho_impacted(ortho: &Ortho, impacted_keys: &[Vec<usize>]) -> bool {
+    if impacted_keys.is_empty() {
+        return false;
+    }
+    
+    // Get the requirement phrases from the ortho
+    let requirement_phrases = ortho.get_requirement_phrases();
+    
+    // Check if any requirement phrase matches an impacted key
+    for req_phrase in &requirement_phrases {
+        for impacted_key in impacted_keys {
+            if req_phrase == impacted_key {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
+// Remap an ortho's payload to use new vocabulary indices
+fn remap_ortho(ortho: &Ortho, vocab_map: &[usize], new_version: usize) -> Option<Ortho> {
+    // Remap payload: translate old vocab indices to new vocab indices
+    let new_payload: Vec<Option<usize>> = ortho.payload().iter().map(|opt_idx| {
+        opt_idx.map(|old_idx| vocab_map[old_idx])
+    }).collect();
+    
+    // Create new ortho with remapped payload
+    Some(Ortho::from_parts(new_version, ortho.dims().clone(), new_payload))
 }
 
 fn print_optimal(ortho: &Ortho, interner: &Interner) {
