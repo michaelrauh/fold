@@ -299,6 +299,57 @@ impl Interner {
         
         impacted
     }
+
+    pub fn merge(&self, other: &Interner) -> Self {
+        // Step 1: Build combined vocabulary
+        let mut vocabulary = self.vocabulary.clone();
+        for word in other.vocabulary() {
+            if !vocabulary.contains(word) {
+                vocabulary.push(word.to_string());
+            }
+        }
+        let new_vocab_len = vocabulary.len();
+        
+        // Step 2: Build vocabulary mapping for other interner (old index -> new index)
+        let mut other_vocab_map = Vec::with_capacity(other.vocabulary().len());
+        for word in other.vocabulary() {
+            let new_idx = vocabulary.iter().position(|v| v == word).unwrap();
+            other_vocab_map.push(new_idx);
+        }
+        
+        // Step 3: Start with self's prefix_to_completions, padded to new vocab length
+        let mut prefix_to_completions = HashMap::new();
+        for (prefix, bitset) in &self.prefix_to_completions {
+            let mut new_bitset = bitset.clone();
+            new_bitset.grow(new_vocab_len);
+            prefix_to_completions.insert(prefix.clone(), new_bitset);
+        }
+        
+        // Step 4: Add other's prefix_to_completions with remapped indices
+        for (old_prefix, old_bitset) in &other.prefix_to_completions {
+            // Remap the prefix keys
+            let new_prefix: Vec<usize> = old_prefix.iter().map(|&idx| other_vocab_map[idx]).collect();
+            
+            // Remap the completion bits
+            let entry = prefix_to_completions.entry(new_prefix).or_insert_with(|| {
+                let mut fbs = FixedBitSet::with_capacity(new_vocab_len);
+                fbs.grow(new_vocab_len);
+                fbs
+            });
+            
+            // Flip bits from other that aren't already set in self (union operation)
+            for old_idx in old_bitset.ones() {
+                let new_idx = other_vocab_map[old_idx];
+                entry.insert(new_idx);
+            }
+        }
+        
+        Interner {
+            version: self.version + 1,
+            vocabulary,
+            prefix_to_completions,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +455,49 @@ mod tests {
         let terminal = vec![0, 1]; // [a, b]
         let completions = interner.completions_for_prefix(&terminal);
         assert!(completions.is_some());
+    }
+
+    #[test]
+    fn test_merge_combines_vocabularies() {
+        let interner_a = Interner::from_text("a b");
+        let interner_b = Interner::from_text("c d");
+        let merged = interner_a.merge(&interner_b);
+        
+        assert_eq!(merged.vocabulary().len(), 4);
+        assert!(merged.vocabulary().contains(&"a".to_string()));
+        assert!(merged.vocabulary().contains(&"b".to_string()));
+        assert!(merged.vocabulary().contains(&"c".to_string()));
+        assert!(merged.vocabulary().contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn test_merge_increments_version() {
+        let interner_a = Interner::from_text("a b");
+        let interner_b = Interner::from_text("c d");
+        let merged = interner_a.merge(&interner_b);
+        
+        assert_eq!(merged.version(), 2);
+    }
+
+    #[test]
+    fn test_merge_preserves_completions() {
+        let interner_a = Interner::from_text("a b");
+        let interner_b = Interner::from_text("a c");
+        let merged = interner_a.merge(&interner_b);
+        
+        // Find index of 'a' in merged vocabulary
+        let a_idx = merged.vocabulary().iter().position(|v| v == "a").unwrap();
+        let b_idx = merged.vocabulary().iter().position(|v| v == "b").unwrap();
+        let c_idx = merged.vocabulary().iter().position(|v| v == "c").unwrap();
+        
+        // Check that prefix [a] has completions for both b and c
+        let prefix = vec![a_idx];
+        let completions = merged.completions_for_prefix(&prefix);
+        assert!(completions.is_some());
+        
+        let bitset = completions.unwrap();
+        assert!(bitset.contains(b_idx));
+        assert!(bitset.contains(c_idx));
     }
 }
 
