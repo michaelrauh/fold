@@ -1,4 +1,4 @@
-use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, FoldError};
+use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, ortho::Ortho, FoldError};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -167,7 +167,13 @@ pub fn get_archive_path(input_file_path: &str) -> String {
     format!("{}/{}.bin", parent.display(), filename)
 }
 
-pub fn save_archive(archive_path: &str, interner: &Interner, results: &mut DiskBackedQueue, results_path: &str) -> Result<(), FoldError> {
+pub fn save_archive(
+    archive_path: &str, 
+    interner: &Interner, 
+    results: &mut DiskBackedQueue, 
+    results_path: &str,
+    best_ortho: Option<&Ortho>
+) -> Result<(), FoldError> {
     // Flush results to ensure all are on disk
     results.flush()?;
     
@@ -185,7 +191,33 @@ pub fn save_archive(archive_path: &str, interner: &Interner, results: &mut DiskB
     let interner_bytes = bincode::encode_to_vec(interner, bincode::config::standard())?;
     fs::write(interner_path, interner_bytes).map_err(|e| FoldError::Io(e))?;
     
+    // Write the optimal ortho as text if provided
+    if let Some(ortho) = best_ortho {
+        let optimal_path = format!("{}/optimal.txt", archive_path);
+        let optimal_text = format_optimal_ortho(ortho, interner);
+        fs::write(optimal_path, optimal_text).map_err(|e| FoldError::Io(e))?;
+    }
+    
     Ok(())
+}
+
+fn format_optimal_ortho(ortho: &Ortho, interner: &Interner) -> String {
+    let volume = ortho.dims().iter().map(|&d| d - 1).product::<usize>();
+    let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
+    
+    let mut output = String::new();
+    output.push_str("===== OPTIMAL ORTHO =====\n");
+    output.push_str(&format!("Ortho ID: {}\n", ortho.id()));
+    output.push_str(&format!("Version: {}\n", ortho.version()));
+    output.push_str(&format!("Dimensions: {:?}\n", ortho.dims()));
+    output.push_str(&format!("Score: (volume={}, fullness={})\n", volume, fullness));
+    output.push_str("\nGeometry:\n");
+    
+    for line in format!("{}", ortho.display(interner)).lines() {
+        output.push_str(&format!("  {}\n", line));
+    }
+    
+    output
 }
 
 pub fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
@@ -224,11 +256,11 @@ mod tests {
         
         // Create a DiskBackedQueue and add orthos
         let mut results = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10).unwrap();
-        results.push(ortho1).unwrap();
+        results.push(ortho1.clone()).unwrap();
         results.push(ortho2).unwrap();
         
         // Save archive
-        save_archive(archive_path.to_str().unwrap(), &interner, &mut results, results_path.to_str().unwrap()).unwrap();
+        save_archive(archive_path.to_str().unwrap(), &interner, &mut results, results_path.to_str().unwrap(), Some(&ortho1)).unwrap();
         
         // Verify archive directory exists
         assert!(archive_path.exists());
