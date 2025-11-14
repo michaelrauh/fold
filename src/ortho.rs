@@ -31,11 +31,7 @@ impl Ortho {
         Ortho { version, dims, payload }
     }
     
-    /// Create an Ortho from explicit components (for remapping)
-    pub fn from_parts(version: usize, dims: Vec<usize>, payload: Vec<Option<usize>>) -> Self {
-        Ortho { version, dims, payload }
-    }
-    
+
     pub fn id(&self) -> usize { Self::compute_id(self.version, &self.dims, &self.payload) }
     pub fn get_current_position(&self) -> usize { self.payload.iter().position(|x| x.is_none()).unwrap_or(self.payload.len()) }
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
@@ -132,7 +128,11 @@ impl Ortho {
         }).collect();
         
         // Create new ortho with remapped payload
-        Some(Ortho::from_parts(new_version, self.dims.clone(), new_payload))
+        Some(Ortho {
+            version: new_version,
+            dims: self.dims.clone(),
+            payload: new_payload,
+        })
     }
     
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
