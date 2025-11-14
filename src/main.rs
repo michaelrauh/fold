@@ -1,6 +1,7 @@
 use fold::{disk_backed_queue::DiskBackedQueue, file_handler, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
@@ -77,16 +78,21 @@ fn main() -> Result<(), FoldError> {
 fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
     println!("[fold] Processing file: {}", file_path);
     
-    // Move file to in-process location to prevent other processes from picking it up
-    let filename = Path::new(&file_path).file_name().unwrap_or_default();
-    let in_process_path = format!("{}/{}", in_process_dir, filename.to_str().unwrap_or("temp"));
-    fs::rename(&file_path, &in_process_path).map_err(|e| FoldError::Io(e))?;
-    println!("[fold] Moved to in-process: {}", in_process_path);
+    // Create .txt.work folder in in_process directory
+    let filename = Path::new(&file_path).file_stem().unwrap_or_default();
+    let work_folder = format!("{}/{}.txt.work", in_process_dir, filename.to_str().unwrap_or("temp"));
+    fs::create_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
     
-    // Create heartbeat file for this processing job
-    let heartbeat_path = file_handler::create_heartbeat(&in_process_path)?;
+    // Move txt file to source.txt inside work folder
+    let source_txt_path = format!("{}/source.txt", work_folder);
+    fs::rename(&file_path, &source_txt_path).map_err(|e| FoldError::Io(e))?;
+    println!("[fold] Moved to work folder: {}", work_folder);
     
-    let text = fs::read_to_string(&in_process_path)
+    // Create heartbeat file inside work folder
+    let heartbeat_path = file_handler::create_heartbeat(&work_folder)?;
+    
+    // Read text from source.txt
+    let text = fs::read_to_string(&source_txt_path)
         .map_err(|e| FoldError::Io(e))?;
     
     // Build interner from this file only
@@ -105,7 +111,7 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     
     // Initialize results queue for this file (disk-backed to avoid OOM)
     let results_path = format!("./fold_state/results_{}", 
-        Path::new(&in_process_path).file_stem().unwrap_or_default().to_str().unwrap_or("temp"));
+        filename.to_str().unwrap_or("temp"));
     let mut results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
     
     // Initialize tracker for this file
@@ -178,23 +184,21 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     print_optimal(&best_ortho, &interner);
     
     // Create lineage tracking for this text file (just the filename)
-    let filename = Path::new(&in_process_path).file_stem().unwrap_or_default().to_str().unwrap_or("unknown");
-    let lineage = format!("\"{}\"", filename);
+    let lineage = format!("\"{}\"", filename.to_str().unwrap_or("unknown"));
     
-    // Create archive for this file (use in_process_path to get the correct location)
-    let archive_path = file_handler::get_archive_path(&in_process_path);
+    // Create timestamp-based archive name
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .as_secs();
+    let archive_path = format!("{}/archive_{}.bin", in_process_dir, timestamp);
     file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho), &lineage)?;
     
     println!("[fold] Archive saved: {}", archive_path);
     
-    // Delete the heartbeat file
-    if std::path::Path::new(&heartbeat_path).exists() {
-        fs::remove_file(&heartbeat_path).map_err(|e| FoldError::Io(e))?;
-    }
-    
-    // Delete the in-process .txt file
-    fs::remove_file(&in_process_path).map_err(|e| FoldError::Io(e))?;
-    println!("[fold] In-process file deleted");
+    // Delete the work folder (including heartbeat and source.txt)
+    fs::remove_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    println!("[fold] Work folder deleted");
     
     Ok(())
 }
@@ -396,11 +400,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     
     file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
     println!("[fold] Merged archive saved: {}", merged_archive_path);
-    
-    // Clean up heartbeat
-    if Path::new(&heartbeat_path).exists() {
-        fs::remove_file(&heartbeat_path).map_err(|e| FoldError::Io(e))?;
-    }
     
     // Delete the original archives
     if Path::new(archive_a_path).exists() {

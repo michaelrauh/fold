@@ -14,31 +14,39 @@ pub fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<
     
     let mut recovered_count = 0;
     
-    // Check for stale heartbeat files
+    // Check for folders with stale heartbeats in in_process
     for entry in fs::read_dir(in_process_path).map_err(|e| FoldError::Io(e))? {
         let entry = entry.map_err(|e| FoldError::Io(e))?;
         let entry_path = entry.path();
         
-        if entry_path.is_file() {
-            if let Some(ext) = entry_path.extension() {
-                // Check for stale heartbeat files
-                if ext == "heartbeat" {
-                    if is_heartbeat_stale(&entry_path)? {
-                        // Find corresponding .txt file and recover it
-                        let stem = entry_path.file_stem().unwrap_or_default();
-                        let txt_path = in_process_path.join(format!("{}.txt", stem.to_str().unwrap_or("")));
-                        
-                        if txt_path.exists() {
-                            let filename = txt_path.file_name().unwrap_or_default();
-                            let target_path = format!("{}/{}", input_dir, filename.to_str().unwrap_or("recovered"));
-                            fs::rename(&txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
-                            println!("[fold] Recovered file with stale heartbeat: {:?} -> {}", filename, target_path);
+        if entry_path.is_dir() {
+            let heartbeat_path = entry_path.join("heartbeat");
+            
+            // Check if this folder has a heartbeat file
+            if heartbeat_path.exists() && is_heartbeat_stale(&heartbeat_path)? {
+                // Check if this is a txt.work folder
+                let source_txt_path = entry_path.join("source.txt");
+                if source_txt_path.exists() {
+                    // Recover the txt.work folder back to input as a plain txt file
+                    if let Some(folder_name) = entry_path.file_name() {
+                        let folder_name_str = folder_name.to_str().unwrap_or("recovered");
+                        if folder_name_str.ends_with(".txt.work") {
+                            let base_name = &folder_name_str[..folder_name_str.len() - 9]; // Remove ".txt.work"
+                            let target_path = format!("{}/{}.txt", input_dir, base_name);
+                            fs::rename(&source_txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
+                            println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
+                            
+                            // Remove the abandoned work folder
+                            fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
                             recovered_count += 1;
                         }
-                        
-                        // Remove the stale heartbeat file
-                        fs::remove_file(&entry_path).map_err(|e| FoldError::Io(e))?;
                     }
+                }
+                // If it's an archive folder with stale heartbeat, just remove it
+                // (incomplete merge, will be retried)
+                else {
+                    println!("[fold] Removing incomplete archive with stale heartbeat: {:?}", entry_path);
+                    fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
                 }
             }
         }
@@ -73,12 +81,9 @@ pub fn touch_heartbeat(heartbeat_path: &str) -> Result<(), FoldError> {
     Ok(())
 }
 
-pub fn create_heartbeat(in_process_path: &str) -> Result<String, FoldError> {
-    let path = Path::new(in_process_path);
-    let stem = path.file_stem().unwrap_or_default();
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let heartbeat_path = format!("{}/{}.heartbeat", parent.display(), stem.to_str().unwrap_or("temp"));
-    
+pub fn create_heartbeat(work_folder_path: &str) -> Result<String, FoldError> {
+    // Heartbeat is now inside the work folder
+    let heartbeat_path = format!("{}/heartbeat", work_folder_path);
     touch_heartbeat(&heartbeat_path)?;
     Ok(heartbeat_path)
 }
@@ -95,6 +100,7 @@ pub fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> 
         let entry = entry.map_err(|e| FoldError::Io(e))?;
         let entry_path = entry.path();
         
+        // Look for plain .txt files in input directory
         if entry_path.is_file() {
             if let Some(ext) = entry_path.extension() {
                 if ext == "txt" {
@@ -123,25 +129,29 @@ pub fn find_archives(in_process_dir: &str) -> Result<Vec<(String, u64)>, FoldErr
         let entry_path = entry.path();
         
         if entry_path.is_dir() {
+            // Check if this is a .bin archive directory with heartbeat
             if let Some(ext) = entry_path.extension() {
                 if ext == "bin" {
-                    // Get size of results directory
-                    let results_path = entry_path.join("results");
-                    if results_path.exists() && results_path.is_dir() {
-                        // Calculate total size of results directory
-                        let mut total_size = 0u64;
-                        if let Ok(entries) = fs::read_dir(&results_path) {
-                            for result_entry in entries {
-                                if let Ok(result_entry) = result_entry {
-                                    if let Ok(metadata) = result_entry.metadata() {
-                                        total_size += metadata.len();
+                    let heartbeat_path = entry_path.join("heartbeat");
+                    if heartbeat_path.exists() {
+                        // Get size of results directory
+                        let results_path = entry_path.join("results");
+                        if results_path.exists() && results_path.is_dir() {
+                            // Calculate total size of results directory
+                            let mut total_size = 0u64;
+                            if let Ok(entries) = fs::read_dir(&results_path) {
+                                for result_entry in entries {
+                                    if let Ok(result_entry) = result_entry {
+                                        if let Ok(metadata) = result_entry.metadata() {
+                                            total_size += metadata.len();
+                                        }
                                     }
                                 }
                             }
-                        }
-                        
-                        if let Some(path_str) = entry_path.to_str() {
-                            archives.push((path_str.to_string(), total_size));
+                            
+                            if let Some(path_str) = entry_path.to_str() {
+                                archives.push((path_str.to_string(), total_size));
+                            }
                         }
                     }
                 }
@@ -194,6 +204,10 @@ pub fn save_archive(
     // Write the lineage tracking as S-expression
     let lineage_path = format!("{}/lineage.txt", archive_path);
     fs::write(lineage_path, lineage).map_err(|e| FoldError::Io(e))?;
+    
+    // Create heartbeat file in the archive
+    let heartbeat_path = format!("{}/heartbeat", archive_path);
+    touch_heartbeat(&heartbeat_path)?;
     
     Ok(())
 }
@@ -299,13 +313,14 @@ mod tests {
     #[test]
     fn test_heartbeat_creation() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let test_file = temp_dir.path().join("test.txt");
-        fs::write(&test_file, "test content").unwrap();
+        let work_folder = temp_dir.path().join("test.txt.work");
+        fs::create_dir_all(&work_folder).unwrap();
         
-        let heartbeat_path = create_heartbeat(test_file.to_str().unwrap()).unwrap();
+        let heartbeat_path = create_heartbeat(work_folder.to_str().unwrap()).unwrap();
         
-        // Verify heartbeat file was created
+        // Verify heartbeat file was created inside the folder
         assert!(Path::new(&heartbeat_path).exists());
+        assert_eq!(heartbeat_path, work_folder.join("heartbeat").to_str().unwrap());
         
         // Verify heartbeat file is not stale (freshly created)
         assert!(!is_heartbeat_stale(Path::new(&heartbeat_path)).unwrap());
