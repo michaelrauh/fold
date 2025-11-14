@@ -12,12 +12,19 @@ pub struct MemoryConfig {
 impl MemoryConfig {
     /// Calculate optimal memory configuration targeting 75% of system RAM
     /// 
+    /// Minimum requirements:
+    /// - Bloom filter: 0.1% false positive rate
+    /// - Queue buffer: 100k orthos minimum
+    /// - Shards in memory: 50% of total shards minimum
+    /// 
     /// Memory budget breakdown:
     /// - Interner: varies by vocabulary size (estimated from serialized size)
     /// - Queue buffers: 2 queues * buffer_size * ~200 bytes per ortho
-    /// - Bloom filter: ~1.44 bytes per item (optimal for 1% FPR)
+    /// - Bloom filter: ~4.8 bytes per item (optimal for 0.1% FPR)
     /// - Shards in memory: max_shards * avg_items_per_shard * 12 bytes (usize key + ())
     /// - Runtime overhead: ~20% reserve for working memory
+    /// 
+    /// Exits if minimum requirements cannot be met with available RAM.
     pub fn calculate(interner_bytes: usize, expected_results: usize) -> Self {
         let mut sys = System::new_all();
         sys.refresh_memory();
@@ -40,8 +47,8 @@ impl MemoryConfig {
         // Small orthos: ~80 bytes, large orthos: ~900 bytes, use 200 as middle estimate
         let bytes_per_ortho = 200;
         
-        // Bloom filter: ~1.44 bytes per item for 1% false positive rate
-        let bytes_per_bloom_item = 2; // Round up for safety
+        // Bloom filter: ~4.8 bytes per item for 0.1% false positive rate
+        let bytes_per_bloom_item = 5; // Round up for safety
         
         // Shard item: 12 bytes (usize key + () value + hashmap overhead)
         let bytes_per_shard_item = 12;
@@ -55,17 +62,6 @@ impl MemoryConfig {
         
         let bloom_memory = bloom_capacity * bytes_per_bloom_item;
         
-        // Calculate remaining memory after bloom filter
-        let remaining_after_bloom = available_for_caches.saturating_sub(bloom_memory);
-        
-        // Split remaining memory between queues (30%) and shards (70%)
-        let queue_memory = (remaining_after_bloom * 30) / 100;
-        let shard_memory = (remaining_after_bloom * 70) / 100;
-        
-        // Calculate queue buffer size (2 queues: work_queue and results_queue)
-        // Each queue has one buffer in memory
-        let queue_buffer_size = (queue_memory / (2 * bytes_per_ortho)).max(1000).min(100_000);
-        
         // Calculate shard configuration
         // Target ~10K items per shard for good disk I/O granularity
         let target_items_per_shard = 10_000;
@@ -75,9 +71,40 @@ impl MemoryConfig {
             64
         };
         
-        // Calculate how many shards we can keep in memory
+        // MINIMUM REQUIREMENTS CHECK
+        let min_queue_buffer = 100_000;
+        let min_queue_memory = 2 * min_queue_buffer * bytes_per_ortho; // 2 queues
+        let min_shards_in_memory = (num_shards + 1) / 2; // 50% of total shards
         let memory_per_shard = target_items_per_shard * bytes_per_shard_item;
-        let max_shards_in_memory = (shard_memory / memory_per_shard).max(16).min(num_shards);
+        let min_shard_memory = min_shards_in_memory * memory_per_shard;
+        
+        let min_required_memory = bloom_memory + min_queue_memory + min_shard_memory;
+        
+        if available_for_caches < min_required_memory {
+            eprintln!("\n[memory_config] ===== INSUFFICIENT MEMORY =====");
+            eprintln!("[memory_config] Available for caches: {} MB", available_for_caches / 1_048_576);
+            eprintln!("[memory_config] Minimum required:");
+            eprintln!("[memory_config]   - Bloom (0.1% FPR): {} MB", bloom_memory / 1_048_576);
+            eprintln!("[memory_config]   - Queue (100k min): {} MB", min_queue_memory / 1_048_576);
+            eprintln!("[memory_config]   - Shards (50% in mem): {} MB", min_shard_memory / 1_048_576);
+            eprintln!("[memory_config]   - Total minimum: {} MB", min_required_memory / 1_048_576);
+            eprintln!("[memory_config] ================================\n");
+            std::process::exit(1);
+        }
+        
+        // Calculate remaining memory after minimums
+        let remaining_after_minimums = available_for_caches.saturating_sub(bloom_memory + min_queue_memory);
+        
+        // Start with minimum shards in memory (50%)
+        let mut max_shards_in_memory = min_shards_in_memory;
+        
+        // Use remaining memory to tune up shards in memory if possible
+        let available_for_extra_shards = remaining_after_minimums.saturating_sub(min_shard_memory);
+        let extra_shards = available_for_extra_shards / memory_per_shard;
+        max_shards_in_memory = (max_shards_in_memory + extra_shards).min(num_shards);
+        
+        // Queue buffer size is fixed at minimum for consistency
+        let queue_buffer_size = min_queue_buffer;
         
         let config = Self {
             queue_buffer_size,
@@ -93,7 +120,7 @@ impl MemoryConfig {
     
     fn print_summary(&self, interner_bytes: usize, runtime_reserve: usize) {
         let bytes_per_ortho = 200;
-        let bytes_per_bloom_item = 2;
+        let bytes_per_bloom_item = 5; // 0.1% FPR
         let bytes_per_shard_item = 12;
         let target_items_per_shard = 10_000;
         
@@ -105,10 +132,12 @@ impl MemoryConfig {
         println!("\n[memory_config] ===== MEMORY CONFIGURATION =====");
         println!("[memory_config] Queue buffer size: {} orthos (~{} MB per queue)", 
                  self.queue_buffer_size, (self.queue_buffer_size * bytes_per_ortho) / 1_048_576);
-        println!("[memory_config] Bloom capacity: {} items (~{} MB)", 
+        println!("[memory_config] Bloom capacity: {} items (~{} MB, 0.1% FPR)", 
                  self.bloom_capacity, bloom_memory / 1_048_576);
-        println!("[memory_config] Shards: {} total, {} in memory (~{} MB)", 
-                 self.num_shards, self.max_shards_in_memory, shard_memory / 1_048_576);
+        println!("[memory_config] Shards: {} total, {} in memory ({:.1}%, ~{} MB)", 
+                 self.num_shards, self.max_shards_in_memory, 
+                 (self.max_shards_in_memory as f64 / self.num_shards as f64) * 100.0,
+                 shard_memory / 1_048_576);
         println!("[memory_config] Estimated total: {} MB", total_estimated / 1_048_576);
         println!("[memory_config] ================================\n");
     }
