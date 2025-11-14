@@ -186,15 +186,15 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     // Create lineage tracking for this text file (just the filename)
     let lineage = format!("\"{}\"", filename.to_str().unwrap_or("unknown"));
     
-    // Create timestamp-based archive name
+    // Create timestamp-based archive name in INPUT directory
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
         .as_secs();
-    let archive_path = format!("{}/archive_{}.bin", in_process_dir, timestamp);
+    let archive_path = format!("{}/archive_{}.bin", input_dir, timestamp);
     file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho), &lineage)?;
     
-    println!("[fold] Archive saved: {}", archive_path);
+    println!("[fold] Archive saved to input: {}", archive_path);
     
     // Delete the work folder (including heartbeat and source.txt)
     fs::remove_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
@@ -203,12 +203,21 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     Ok(())
 }
 
-fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &str) -> Result<(), FoldError> {
+fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+    // Move both archives from input to in_process for mutual exclusion
+    let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
+    let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
+    let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
+    let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
+    
+    println!("[fold] Moving archives to in_process for merging...");
+    fs::rename(archive_a_path, &work_a_path).map_err(FoldError::Io)?;
+    fs::rename(archive_b_path, &work_b_path).map_err(FoldError::Io)?;
     println!("[fold] Loading interners...");
     
-    // Load both interners
-    let interner_a = file_handler::load_interner(archive_a_path)?;
-    let interner_b = file_handler::load_interner(archive_b_path)?;
+    // Load both interners from work paths
+    let interner_a = file_handler::load_interner(&work_a_path)?;
+    let interner_b = file_handler::load_interner(&work_b_path)?;
     
     println!("[fold] Interner A: vocab size={}, version={}", 
              interner_a.vocabulary().len(), interner_a.version());
@@ -267,7 +276,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     
     // Process archive A results: remap ALL orthos to results
     // Add impacted orthos to work queue for further processing
-    let results_a_path = file_handler::get_results_path(archive_a_path);
+    let results_a_path = file_handler::get_results_path(&work_a_path);
     let mut results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
     
     let mut total_from_a = 0;
@@ -390,16 +399,16 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     
     println!("[fold] Merged lineage: {}", merged_lineage);
     
-    // Create merged archive with timestamp-based name to avoid long names
+    // Create merged archive with timestamp-based name in INPUT directory
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let merged_archive_path = format!("{}/archive_{}.bin", in_process_dir, timestamp);
+    let merged_archive_path = format!("{}/archive_{}.bin", input_dir, timestamp);
     
     file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
-    println!("[fold] Merged archive saved: {}", merged_archive_path);
+    println!("[fold] Merged archive saved to input: {}", merged_archive_path);
     
     // Delete the original archives
     if Path::new(archive_a_path).exists() {
