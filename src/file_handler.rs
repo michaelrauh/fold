@@ -172,7 +172,8 @@ pub fn save_archive(
     interner: &Interner, 
     results: &mut DiskBackedQueue, 
     results_path: &str,
-    best_ortho: Option<&Ortho>
+    best_ortho: Option<&Ortho>,
+    lineage: &str
 ) -> Result<(), FoldError> {
     // Flush results to ensure all are on disk
     results.flush()?;
@@ -197,6 +198,10 @@ pub fn save_archive(
         let optimal_text = format_optimal_ortho(ortho, interner);
         fs::write(optimal_path, optimal_text).map_err(|e| FoldError::Io(e))?;
     }
+    
+    // Write the lineage tracking as S-expression
+    let lineage_path = format!("{}/lineage.txt", archive_path);
+    fs::write(lineage_path, lineage).map_err(|e| FoldError::Io(e))?;
     
     Ok(())
 }
@@ -232,6 +237,11 @@ pub fn get_results_path(archive_path: &str) -> String {
     format!("{}/results", archive_path)
 }
 
+pub fn load_lineage(archive_path: &str) -> Result<String, FoldError> {
+    let lineage_path = format!("{}/lineage.txt", archive_path);
+    fs::read_to_string(&lineage_path).map_err(|e| FoldError::Io(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +270,7 @@ mod tests {
         results.push(ortho2).unwrap();
         
         // Save archive
-        save_archive(archive_path.to_str().unwrap(), &interner, &mut results, results_path.to_str().unwrap(), Some(&ortho1)).unwrap();
+        save_archive(archive_path.to_str().unwrap(), &interner, &mut results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"").unwrap();
         
         // Verify archive directory exists
         assert!(archive_path.exists());
@@ -286,6 +296,12 @@ mod tests {
         // Load results from the archive
         let loaded_results = DiskBackedQueue::new_from_path(archive_results_path.to_str().unwrap(), 10).unwrap();
         assert_eq!(loaded_results.len(), 2);
+        
+        // Verify lineage.txt exists and contains expected value
+        let lineage_path = archive_path.join("lineage.txt");
+        assert!(lineage_path.exists());
+        let lineage = fs::read_to_string(&lineage_path).unwrap();
+        assert_eq!(lineage, "\"test\"");
     }
     
     #[test]

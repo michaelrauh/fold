@@ -177,9 +177,13 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     
     print_optimal(&best_ortho, &interner);
     
+    // Create lineage tracking for this text file (just the filename)
+    let filename = Path::new(&in_process_path).file_stem().unwrap_or_default().to_str().unwrap_or("unknown");
+    let lineage = format!("\"{}\"", filename);
+    
     // Create archive for this file (use in_process_path to get the correct location)
     let archive_path = file_handler::get_archive_path(&in_process_path);
-    file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho))?;
+    file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho), &lineage)?;
     
     println!("[fold] Archive saved: {}", archive_path);
     
@@ -359,12 +363,19 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     println!("[fold] Merge complete. Total orthos: {}", merged_results.len());
     print_optimal(&best_ortho, &merged_interner);
     
+    // Load lineages from both archives and create merged lineage
+    let lineage_a = file_handler::load_lineage(archive_a_path)?;
+    let lineage_b = file_handler::load_lineage(archive_b_path)?;
+    let merged_lineage = format!("({} {})", lineage_a, lineage_b);
+    
+    println!("[fold] Merged lineage: {}", merged_lineage);
+    
     // Create merged archive
     let archive_name_a = Path::new(archive_a_path).file_stem().unwrap_or_default().to_str().unwrap_or("a");
     let archive_name_b = Path::new(archive_b_path).file_stem().unwrap_or_default().to_str().unwrap_or("b");
     let merged_archive_path = format!("{}/merged_{}_{}.bin", in_process_dir, archive_name_a, archive_name_b);
     
-    file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho))?;
+    file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
     println!("[fold] Merged archive saved: {}", merged_archive_path);
     
     // Clean up heartbeat

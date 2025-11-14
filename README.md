@@ -50,6 +50,8 @@ The program will:
 Each archive is a directory containing:
 - `interner.bin`: The interner built from that specific file
 - `results/`: DiskBackedQueue directory with all ortho results
+- `optimal.txt`: Formatted text of the optimal ortho (ID, version, dimensions, score, geometry)
+- `lineage.txt`: S-expression tracking which source TXT files contributed to this archive
 
 ### Process Safety
 
@@ -58,6 +60,20 @@ The program uses an in-process directory to ensure mutual exclusion when multipl
 **Heartbeat Mechanism**: A heartbeat file is created for each processing job and updated every 100,000 orthos. On startup, the program checks for heartbeat files that haven't been updated for more than 10 minutes (grace period) and considers them stale. Files with stale heartbeats are automatically recovered and moved back to input for reprocessing.
 
 **Recovery**: On startup, any abandoned `.txt` files in the in-process directory are automatically recovered and moved back to input for reprocessing.
+
+### Lineage Tracking
+
+Each archive includes a `lineage.txt` file containing an S-expression that tracks which source TXT files contributed to the archive through any merges. This provides complete provenance information showing the merge tree structure.
+
+**Examples:**
+- Single file archive: `"file1"` 
+- Simple merge: `("file1" "file2")` represents merging file1 and file2
+- Nested merges: `("file3" ("file1" "file2"))` represents (file1 + file2) then merged with file3
+- Deep nesting: `(("file1" "file2") ("file3" "file4"))` represents (file1 + file2) merged with (file3 + file4)
+
+The S-expression format makes it clear to distinguish between different merge orders like:
+- `(((a b) c) d)` - left-associative sequential merging
+- `((a b) (c d))` - balanced binary tree merging
 
 ## Development
 
