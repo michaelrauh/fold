@@ -253,47 +253,55 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     
     println!("[fold] Remapping and finding impacted orthos from archives...");
     
-    // Stream through archive A results, remap and check if impacted
+    // Process archive A results: remap and check if impacted
+    // All remapped orthos are added to merged_results FIRST
     let results_a_path = file_handler::get_results_path(archive_a_path);
-    let results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
+    let mut results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
     
     let mut added_from_a = 0;
-    results_a.scan(|ortho| {
+    while let Some(ortho) = results_a.pop()? {
         // Check if this ortho is impacted
-        if is_ortho_impacted(ortho, &impacted_a) {
+        if is_ortho_impacted(&ortho, &impacted_a) {
             // Remap the ortho to new vocabulary
-            if let Some(remapped) = remap_ortho(ortho, &vocab_map_a, new_version) {
+            if let Some(remapped) = remap_ortho(&ortho, &vocab_map_a, new_version) {
                 let remapped_id = remapped.id();
                 if !tracker.contains(&remapped_id) {
                     tracker.insert(remapped_id);
-                    let _ = work_queue.push(remapped);
+                    // Add to merged results first
+                    merged_results.push(remapped.clone())?;
+                    // Then add to work queue for further processing
+                    work_queue.push(remapped)?;
                     added_from_a += 1;
                 }
             }
         }
-    })?;
+    }
     
     println!("[fold] Added {} impacted orthos from archive A", added_from_a);
     
-    // Stream through archive B results, remap and check if impacted
+    // Process archive B results: remap and check if impacted
+    // All remapped orthos are added to merged_results FIRST
     let results_b_path = file_handler::get_results_path(archive_b_path);
-    let results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
+    let mut results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
     
     let mut added_from_b = 0;
-    results_b.scan(|ortho| {
+    while let Some(ortho) = results_b.pop()? {
         // Check if this ortho is impacted
-        if is_ortho_impacted(ortho, &impacted_b) {
+        if is_ortho_impacted(&ortho, &impacted_b) {
             // Remap the ortho to new vocabulary
-            if let Some(remapped) = remap_ortho(ortho, &vocab_map_b, new_version) {
+            if let Some(remapped) = remap_ortho(&ortho, &vocab_map_b, new_version) {
                 let remapped_id = remapped.id();
                 if !tracker.contains(&remapped_id) {
                     tracker.insert(remapped_id);
-                    let _ = work_queue.push(remapped);
+                    // Add to merged results first
+                    merged_results.push(remapped.clone())?;
+                    // Then add to work queue for further processing
+                    work_queue.push(remapped)?;
                     added_from_b += 1;
                 }
             }
         }
-    })?;
+    }
     
     println!("[fold] Added {} impacted orthos from archive B", added_from_b);
     println!("[fold] Total orthos seeded: {}", 1 + added_from_a + added_from_b);
