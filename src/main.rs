@@ -255,6 +255,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     let mut best_score = calculate_score(&best_ortho);
     work_queue.push(seed_ortho)?;
     
+    // Create heartbeat for merge operation early
+    let heartbeat_path = format!("{}/merge_{}.heartbeat", in_process_dir, std::process::id());
+    file_handler::touch_heartbeat(&heartbeat_path)?;
+    
     println!("[fold] Remapping and processing orthos from archives...");
     
     // Process archive A results: remap ALL orthos to results
@@ -266,13 +270,19 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     let mut impacted_from_a = 0;
     while let Some(ortho) = results_a.pop()? {
         // Remap the ortho to new vocabulary
-        if let Some(remapped) = remap_ortho(&ortho, &vocab_map_a, new_version) {
+        if let Some(remapped) = ortho.remap(&vocab_map_a, new_version) {
             let remapped_id = remapped.id();
             if !tracker.contains(&remapped_id) {
                 tracker.insert(remapped_id);
                 // Add ALL remapped orthos to merged results
                 merged_results.push(remapped.clone())?;
                 total_from_a += 1;
+                
+                // Log progress every 10k orthos and keep heartbeat fresh
+                if total_from_a % 10000 == 0 {
+                    println!("[fold] Remapping archive A: {} orthos processed", total_from_a);
+                    file_handler::touch_heartbeat(&heartbeat_path)?;
+                }
                 
                 // Check if this ortho is impacted - if so, add to work queue
                 if is_ortho_impacted(&ortho, &impacted_a) {
@@ -294,13 +304,19 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     let mut impacted_from_b = 0;
     while let Some(ortho) = results_b.pop()? {
         // Remap the ortho to new vocabulary
-        if let Some(remapped) = remap_ortho(&ortho, &vocab_map_b, new_version) {
+        if let Some(remapped) = ortho.remap(&vocab_map_b, new_version) {
             let remapped_id = remapped.id();
             if !tracker.contains(&remapped_id) {
                 tracker.insert(remapped_id);
                 // Add ALL remapped orthos to merged results
                 merged_results.push(remapped.clone())?;
                 total_from_b += 1;
+                
+                // Log progress every 10k orthos and keep heartbeat fresh
+                if total_from_b % 10000 == 0 {
+                    println!("[fold] Remapping archive B: {} orthos processed", total_from_b);
+                    file_handler::touch_heartbeat(&heartbeat_path)?;
+                }
                 
                 // Check if this ortho is impacted - if so, add to work queue
                 if is_ortho_impacted(&ortho, &impacted_b) {
@@ -370,10 +386,13 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     
     println!("[fold] Merged lineage: {}", merged_lineage);
     
-    // Create merged archive
-    let archive_name_a = Path::new(archive_a_path).file_stem().unwrap_or_default().to_str().unwrap_or("a");
-    let archive_name_b = Path::new(archive_b_path).file_stem().unwrap_or_default().to_str().unwrap_or("b");
-    let merged_archive_path = format!("{}/merged_{}_{}.bin", in_process_dir, archive_name_a, archive_name_b);
+    // Create merged archive with timestamp-based name to avoid long names
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let merged_archive_path = format!("{}/archive_{}.bin", in_process_dir, timestamp);
     
     file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
     println!("[fold] Merged archive saved: {}", merged_archive_path);
@@ -423,17 +442,6 @@ fn is_ortho_impacted(ortho: &Ortho, impacted_keys: &[Vec<usize>]) -> bool {
     }
     
     false
-}
-
-// Remap an ortho's payload to use new vocabulary indices
-fn remap_ortho(ortho: &Ortho, vocab_map: &[usize], new_version: usize) -> Option<Ortho> {
-    // Remap payload: translate old vocab indices to new vocab indices
-    let new_payload: Vec<Option<usize>> = ortho.payload().iter().map(|opt_idx| {
-        opt_idx.map(|old_idx| vocab_map[old_idx])
-    }).collect();
-    
-    // Create new ortho with remapped payload
-    Some(Ortho::from_parts(new_version, ortho.dims().clone(), new_payload))
 }
 
 fn print_optimal(ortho: &Ortho, interner: &Interner) {

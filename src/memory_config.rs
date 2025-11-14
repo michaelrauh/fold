@@ -13,14 +13,14 @@ impl MemoryConfig {
     /// Calculate optimal memory configuration targeting 75% of system RAM
     /// 
     /// Minimum requirements:
-    /// - Bloom filter: 0.1% false positive rate
+    /// - Bloom filter: 1% false positive rate
     /// - Queue buffer: 100k orthos minimum
     /// - Shards in memory: 50% of total shards minimum
     /// 
     /// Memory budget breakdown:
     /// - Interner: varies by vocabulary size (estimated from serialized size)
     /// - Queue buffers: 2 queues * buffer_size * ~200 bytes per ortho
-    /// - Bloom filter: ~4.8 bytes per item (optimal for 0.1% FPR)
+    /// - Bloom filter: ~2 bytes per item (optimal for 1% FPR)
     /// - Shards in memory: max_shards * avg_items_per_shard * 12 bytes (usize key + ())
     /// - Runtime overhead: ~20% reserve for working memory
     /// 
@@ -47,8 +47,8 @@ impl MemoryConfig {
         // Small orthos: ~80 bytes, large orthos: ~900 bytes, use 200 as middle estimate
         let bytes_per_ortho = 200;
         
-        // Bloom filter: ~4.8 bytes per item for 0.1% false positive rate
-        let bytes_per_bloom_item = 5; // Round up for safety
+        // Bloom filter: ~2 bytes per item for 1% false positive rate
+        let bytes_per_bloom_item = 2; // 1% FP rate
         
         // Shard item: 12 bytes (usize key + () value + hashmap overhead)
         let bytes_per_shard_item = 12;
@@ -84,7 +84,7 @@ impl MemoryConfig {
             eprintln!("\n[memory_config] ===== INSUFFICIENT MEMORY =====");
             eprintln!("[memory_config] Available for caches: {} MB", available_for_caches / 1_048_576);
             eprintln!("[memory_config] Minimum required:");
-            eprintln!("[memory_config]   - Bloom (0.1% FPR): {} MB", bloom_memory / 1_048_576);
+            eprintln!("[memory_config]   - Bloom (1% FPR): {} MB", bloom_memory / 1_048_576);
             eprintln!("[memory_config]   - Queue (100k min): {} MB", min_queue_memory / 1_048_576);
             eprintln!("[memory_config]   - Shards (50% in mem): {} MB", min_shard_memory / 1_048_576);
             eprintln!("[memory_config]   - Total minimum: {} MB", min_required_memory / 1_048_576);

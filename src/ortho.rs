@@ -123,6 +123,18 @@ impl Ortho {
         required
     }
     pub fn version(&self) -> usize { self.version }
+    
+    /// Remap an ortho's payload to use new vocabulary indices
+    pub fn remap(&self, vocab_map: &[usize], new_version: usize) -> Option<Self> {
+        // Remap payload: translate old vocab indices to new vocab indices
+        let new_payload: Vec<Option<usize>> = self.payload.iter().map(|opt_idx| {
+            opt_idx.map(|old_idx| vocab_map[old_idx])
+        }).collect();
+        
+        // Create new ortho with remapped payload
+        Some(Ortho::from_parts(new_version, self.dims.clone(), new_payload))
+    }
+    
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
         let mut result = Vec::new();
         for pos in 0..self.payload.len() {

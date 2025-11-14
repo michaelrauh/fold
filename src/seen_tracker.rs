@@ -94,7 +94,7 @@ impl SeenTracker {
     
     /// Create a new SeenTracker with specific configuration (for checkpoint resume)
     pub fn with_config(bloom_capacity: usize, num_shards: usize, max_shards_in_memory: usize) -> Self {
-        let false_positive_rate = 0.001; // 0.1% FPR
+        let false_positive_rate = 0.01; // 1% FPR
         let bloom = Bloom::new_for_fp_rate(bloom_capacity, false_positive_rate);
         
         let shard_dir = PathBuf::from("./fold_state/seen_shards");

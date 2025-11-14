@@ -21,16 +21,8 @@ pub fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<
         
         if entry_path.is_file() {
             if let Some(ext) = entry_path.extension() {
-                // Check for abandoned .txt files
-                if ext == "txt" {
-                    let filename = entry_path.file_name().unwrap_or_default();
-                    let target_path = format!("{}/{}", input_dir, filename.to_str().unwrap_or("recovered"));
-                    fs::rename(&entry_path, &target_path).map_err(|e| FoldError::Io(e))?;
-                    println!("[fold] Recovered abandoned file: {:?} -> {}", filename, target_path);
-                    recovered_count += 1;
-                }
                 // Check for stale heartbeat files
-                else if ext == "heartbeat" {
+                if ext == "heartbeat" {
                     if is_heartbeat_stale(&entry_path)? {
                         // Find corresponding .txt file and recover it
                         let stem = entry_path.file_stem().unwrap_or_default();
