@@ -218,8 +218,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &s
     println!("[fold] Impacted keys in A: {}", impacted_a.len());
     println!("[fold] Impacted keys in B: {}", impacted_b.len());
     
-    // Create merged interner by combining both vocabularies
-    let merged_interner = interner_a.add_text(&interner_b.vocabulary().join(" "));
+    // Create merged interner using proper merge method
+    let merged_interner = interner_a.merge(&interner_b);
     let new_version = merged_interner.version();
     
     println!("[fold] Merged interner: version={}, vocab size={}", 
