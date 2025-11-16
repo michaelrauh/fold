@@ -1,7 +1,4 @@
 use fold::{disk_backed_queue::DiskBackedQueue, file_handler, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
-use std::fs;
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
@@ -10,53 +7,36 @@ fn calculate_score(ortho: &Ortho) -> (usize, usize) {
 }
 
 fn main() -> Result<(), FoldError> {
-    let input_dir = "./fold_state/input";
-    let in_process_dir = "./fold_state/in_process";
-    
     println!("[fold] Starting fold processing");
-    println!("[fold] Input directory: {}", input_dir);
     
-    // Create in_process directory if it doesn't exist
-    fs::create_dir_all(in_process_dir).map_err(|e| FoldError::Io(e))?;
-    
-    // Recover any abandoned files from previous runs (includes heartbeat check)
-    file_handler::recover_abandoned_files(input_dir, in_process_dir)?;
+    // Initialize: setup directories and recover abandoned files
+    file_handler::initialize()?;
     
     // Main processing loop - two modes:
     // Mode 1: If there are 2+ result archives, merge smallest with largest
     // Mode 2: If there are not 2 results, process txt into result
     loop {
         // Check for existing archives
-        let mut archives = file_handler::find_archives(in_process_dir)?;
+        let archive_pair = file_handler::get_smallest_and_largest_archives()?;
         
-        if archives.len() >= 2 {
+        if let Some((smallest, largest)) = archive_pair {
             // Mode 1: Merge archives
             println!("\n[fold] ========================================");
             println!("[fold] MODE 1: Merging archives");
-            println!("[fold] Found {} archives", archives.len());
             println!("[fold] ========================================");
             
-            // Sort by size to find smallest and largest
-            archives.sort_by_key(|(_, size)| *size);
-            let smallest = archives[0].0.clone();
-            let largest = archives[archives.len() - 1].0.clone();
+            println!("[fold] Merging smallest: {}", smallest);
+            println!("[fold] With largest: {}", largest);
             
-            println!("[fold] Merging smallest: {} (size: {})", smallest, archives[0].1);
-            println!("[fold] With largest: {} (size: {})", largest, archives[archives.len() - 1].1);
-            
-            merge_archives(&smallest, &largest, in_process_dir)?;
+            merge_archives(&smallest, &largest)?;
             
         } else {
             // Mode 2: Process txt file
-            let txt_file = file_handler::find_next_txt_file(input_dir)?;
+            let txt_file = file_handler::find_txt_file()?;
             
             if txt_file.is_none() {
                 println!("[fold] No more .txt files to process");
-                if archives.is_empty() {
-                    println!("[fold] No archives remaining");
-                } else {
-                    println!("[fold] {} archive(s) remaining", archives.len());
-                }
+                println!("[fold] All processing completed");
                 break;
             }
             
@@ -64,39 +44,26 @@ fn main() -> Result<(), FoldError> {
             println!("[fold] MODE 2: Processing text file");
             println!("[fold] ========================================");
             
-            process_txt_file(txt_file.unwrap(), input_dir, in_process_dir)?;
+            process_txt_file(txt_file.unwrap())?;
         }
     }
     
     println!("\n[fold] ========================================");
-    println!("[fold] All processing completed");
+    println!("[fold] Processing completed");
     println!("[fold] ========================================");
     
     Ok(())
 }
 
-fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+fn process_txt_file(file_path: String) -> Result<(), FoldError> {
     println!("[fold] Processing file: {}", file_path);
     
-    // Create .txt.work folder in in_process directory
-    let filename = Path::new(&file_path).file_stem().unwrap_or_default();
-    let work_folder = format!("{}/{}.txt.work", in_process_dir, filename.to_str().unwrap_or("temp"));
-    fs::create_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    // Ingest the text file (now includes reading the text)
+    let ingestion = file_handler::ingest_txt_file(&file_path)?;
+    println!("[fold] Ingested file: {}", ingestion.filename);
     
-    // Move txt file to source.txt inside work folder
-    let source_txt_path = format!("{}/source.txt", work_folder);
-    fs::rename(&file_path, &source_txt_path).map_err(|e| FoldError::Io(e))?;
-    println!("[fold] Moved to work folder: {}", work_folder);
-    
-    // Create heartbeat file inside work folder
-    let heartbeat_path = file_handler::create_heartbeat(&work_folder)?;
-    
-    // Read text from source.txt
-    let text = fs::read_to_string(&source_txt_path)
-        .map_err(|e| FoldError::Io(e))?;
-    
-    // Build interner from this file only
-    let interner = Interner::from_text(&text);
+    // Build interner from the text
+    let interner = Interner::from_text(&ingestion.text);
     let version = interner.version();
     
     println!("[fold] Interner version: {}", version);
@@ -110,8 +77,7 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
     
     // Initialize results queue for this file (disk-backed to avoid OOM)
-    let results_path = format!("./fold_state/results_{}", 
-        filename.to_str().unwrap_or("temp"));
+    let results_path = ingestion.results_path();
     let mut results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
     
     // Initialize tracker for this file
@@ -144,8 +110,8 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
         
         if processed_count % 100000 == 0 {
             print_optimal(&best_ortho, &interner);
-            // Update heartbeat every 100k orthos
-            file_handler::touch_heartbeat(&heartbeat_path)?;
+            // Update heartbeat every 100k orthos (zero-arity)
+            ingestion.touch_heartbeat()?;
         }
         
         // Get requirements from ortho
@@ -183,41 +149,26 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     
     print_optimal(&best_ortho, &interner);
     
-    // Create lineage tracking for this text file (just the filename)
-    let lineage = format!("\"{}\"", filename.to_str().unwrap_or("unknown"));
+    // Save the result (using method on ingestion)
+    let archive_path = ingestion.save_result(&interner, &mut results, Some(&best_ortho))?;
     
-    // Create timestamp-based archive name in INPUT directory
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-        .as_secs();
-    let archive_path = format!("{}/archive_{}.bin", input_dir, timestamp);
-    file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho), &lineage)?;
+    println!("[fold] Archive saved: {}", archive_path);
     
-    println!("[fold] Archive saved to input: {}", archive_path);
-    
-    // Delete the work folder (including heartbeat and source.txt)
-    fs::remove_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    // Delete the work folder (using consuming cleanup method)
+    ingestion.cleanup()?;
     println!("[fold] Work folder deleted");
     
     Ok(())
 }
 
-fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
-    // Move both archives from input to in_process for mutual exclusion
-    let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
-    let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
-    let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
-    let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
-    
+fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), FoldError> {
+    // Ingest archives for merging
     println!("[fold] Moving archives to in_process for merging...");
-    fs::rename(archive_a_path, &work_a_path).map_err(FoldError::Io)?;
-    fs::rename(archive_b_path, &work_b_path).map_err(FoldError::Io)?;
+    let ingestion = file_handler::ingest_archives(archive_a_path, archive_b_path)?;
     println!("[fold] Loading interners...");
     
-    // Load both interners from work paths
-    let interner_a = file_handler::load_interner(&work_a_path)?;
-    let interner_b = file_handler::load_interner(&work_b_path)?;
+    // Load both interners using method
+    let (interner_a, interner_b) = ingestion.load_interners()?;
     
     println!("[fold] Interner A: vocab size={}, version={}", 
              interner_a.vocabulary().len(), interner_a.version());
@@ -268,15 +219,13 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
     let mut best_score = calculate_score(&best_ortho);
     work_queue.push(seed_ortho)?;
     
-    // Create heartbeat for merge operation early
-    let heartbeat_path = format!("{}/merge_{}.heartbeat", in_process_dir, std::process::id());
-    file_handler::touch_heartbeat(&heartbeat_path)?;
-    
     println!("[fold] Remapping and processing orthos from archives...");
+    
+    // Get results paths using method
+    let (results_a_path, results_b_path) = ingestion.get_results_paths();
     
     // Process archive A results: remap ALL orthos to results
     // Add impacted orthos to work queue for further processing
-    let results_a_path = file_handler::get_results_path(&work_a_path);
     let mut results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
     
     let mut total_from_a = 0;
@@ -291,10 +240,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
                 merged_results.push(remapped.clone())?;
                 total_from_a += 1;
                 
-                // Log progress every 10k orthos and keep heartbeat fresh
+                // Log progress every 10k orthos and keep heartbeat fresh (zero-arity)
                 if total_from_a % 10000 == 0 {
                     println!("[fold] Remapping archive A: {} orthos processed", total_from_a);
-                    file_handler::touch_heartbeat(&heartbeat_path)?;
+                    ingestion.touch_heartbeat()?;
                 }
                 
                 // Check if this ortho is impacted - if so, add to work queue
@@ -310,7 +259,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
     
     // Process archive B results: remap ALL orthos to results
     // Add impacted orthos to work queue for further processing
-    let results_b_path = file_handler::get_results_path(archive_b_path);
     let mut results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
     
     let mut total_from_b = 0;
@@ -325,10 +273,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
                 merged_results.push(remapped.clone())?;
                 total_from_b += 1;
                 
-                // Log progress every 10k orthos and keep heartbeat fresh
+                // Log progress every 10k orthos and keep heartbeat fresh (zero-arity)
                 if total_from_b % 10000 == 0 {
                     println!("[fold] Remapping archive B: {} orthos processed", total_from_b);
-                    file_handler::touch_heartbeat(&heartbeat_path)?;
+                    ingestion.touch_heartbeat()?;
                 }
                 
                 // Check if this ortho is impacted - if so, add to work queue
@@ -345,10 +293,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
     
     println!("[fold] Processing merged ortho space...");
     
-    // Create heartbeat for merge operation
-    let heartbeat_path = format!("{}/merge_{}.heartbeat", in_process_dir, std::process::id());
-    file_handler::touch_heartbeat(&heartbeat_path)?;
-    
     // Process work queue
     let mut processed_count = 0;
     while let Some(ortho) = work_queue.pop()? {
@@ -361,7 +305,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
         
         if processed_count % 100000 == 0 {
             print_optimal(&best_ortho, &merged_interner);
-            file_handler::touch_heartbeat(&heartbeat_path)?;
+            // Touch heartbeat (zero-arity)
+            ingestion.touch_heartbeat()?;
         }
         
         let (forbidden, required) = ortho.get_requirements();
@@ -392,33 +337,26 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
     println!("[fold] Merge complete. Total orthos: {}", merged_results.len());
     print_optimal(&best_ortho, &merged_interner);
     
-    // Load lineages from both archives and create merged lineage
-    let lineage_a = file_handler::load_lineage(archive_a_path)?;
-    let lineage_b = file_handler::load_lineage(archive_b_path)?;
-    let merged_lineage = format!("({} {})", lineage_a, lineage_b);
+    // Load lineages using method
+    let (lineage_a, lineage_b) = ingestion.load_lineages()?;
     
-    println!("[fold] Merged lineage: {}", merged_lineage);
+    println!("[fold] Merged lineage: ({} {})", lineage_a, lineage_b);
     
-    // Create merged archive with timestamp-based name in INPUT directory
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let merged_archive_path = format!("{}/archive_{}.bin", input_dir, timestamp);
+    // Save the merged result using method
+    let merged_archive_path = ingestion.save_result(
+        &merged_interner, 
+        &mut merged_results, 
+        &results_path, 
+        Some(&best_ortho), 
+        &lineage_a, 
+        &lineage_b
+    )?;
     
-    file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
-    println!("[fold] Merged archive saved to input: {}", merged_archive_path);
+    println!("[fold] Merged archive saved: {}", merged_archive_path);
     
-    // Delete the original archives
-    if Path::new(archive_a_path).exists() {
-        fs::remove_dir_all(archive_a_path).map_err(|e| FoldError::Io(e))?;
-        println!("[fold] Deleted archive: {}", archive_a_path);
-    }
-    if Path::new(archive_b_path).exists() {
-        fs::remove_dir_all(archive_b_path).map_err(|e| FoldError::Io(e))?;
-        println!("[fold] Deleted archive: {}", archive_b_path);
-    }
+    // Delete the original archives using consuming cleanup method
+    ingestion.cleanup()?;
+    println!("[fold] Deleted original archives");
     
     Ok(())
 }
