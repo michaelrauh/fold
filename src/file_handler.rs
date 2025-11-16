@@ -5,6 +5,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_GRACE_PERIOD_SECS: u64 = 600; // 10 minutes
 
+// Directory structure constants
+const INPUT_DIR: &str = "./fold_state/input";
+const IN_PROCESS_DIR: &str = "./fold_state/in_process";
+
+/// Initialize the file system: create directories and recover abandoned files
+pub fn initialize() -> Result<(), FoldError> {
+    ensure_directory_exists(IN_PROCESS_DIR)?;
+    recover_abandoned_files(INPUT_DIR, IN_PROCESS_DIR)?;
+    Ok(())
+}
+
 pub fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
     let in_process_path = std::path::Path::new(in_process_dir);
     
@@ -86,6 +97,12 @@ pub fn touch_heartbeat(heartbeat_path: &str) -> Result<(), FoldError> {
 pub fn create_heartbeat(work_folder_path: &str) -> Result<String, FoldError> {
     // Heartbeat is now inside the work folder
     let heartbeat_path = format!("{}/heartbeat", work_folder_path);
+    touch_heartbeat(&heartbeat_path)?;
+    Ok(heartbeat_path)
+}
+
+pub fn create_merge_heartbeat() -> Result<String, FoldError> {
+    let heartbeat_path = format!("{}/merge_{}.heartbeat", IN_PROCESS_DIR, std::process::id());
     touch_heartbeat(&heartbeat_path)?;
     Ok(heartbeat_path)
 }
@@ -305,6 +322,115 @@ pub fn cleanup_archives(archive_paths: &[&str]) -> Result<(), FoldError> {
         }
     }
     Ok(())
+}
+
+// ============================================================================
+// High-level API - encapsulates directory paths and provides clean operations
+// ============================================================================
+
+/// Result of ingesting a text file, containing paths needed for processing
+pub struct TxtIngestion {
+    pub work_folder: String,
+    pub source_txt_path: String,
+    pub heartbeat_path: String,
+    pub filename: String,
+}
+
+/// Result of ingesting archives for merging
+pub struct ArchiveIngestion {
+    pub work_a_path: String,
+    pub work_b_path: String,
+    pub original_a_path: String,
+    pub original_b_path: String,
+}
+
+/// Find the next text file to process (uses internal INPUT_DIR)
+pub fn find_txt_file() -> Result<Option<String>, FoldError> {
+    find_next_txt_file(INPUT_DIR)
+}
+
+/// Find all archives in the in-process directory (uses internal IN_PROCESS_DIR)
+pub fn find_all_archives() -> Result<Vec<(String, u64)>, FoldError> {
+    find_archives(IN_PROCESS_DIR)
+}
+
+/// Get the smallest and largest archives, or None if less than 2 exist
+pub fn get_smallest_and_largest_archives() -> Result<Option<(String, String)>, FoldError> {
+    let mut archives = find_all_archives()?;
+    
+    if archives.len() < 2 {
+        return Ok(None);
+    }
+    
+    archives.sort_by_key(|(_, size)| *size);
+    let smallest = archives[0].0.clone();
+    let largest = archives[archives.len() - 1].0.clone();
+    
+    Ok(Some((smallest, largest)))
+}
+
+/// Ingest a text file: setup work folder and prepare for processing
+pub fn ingest_txt_file(file_path: &str) -> Result<TxtIngestion, FoldError> {
+    let (work_folder, source_txt_path, heartbeat_path, filename) = 
+        setup_txt_processing(file_path, IN_PROCESS_DIR)?;
+    
+    Ok(TxtIngestion {
+        work_folder,
+        source_txt_path,
+        heartbeat_path,
+        filename,
+    })
+}
+
+/// Save a text processing result as an archive
+pub fn save_txt_result(
+    filename: &str,
+    interner: &Interner,
+    results: &mut DiskBackedQueue,
+    results_path: &str,
+    best_ortho: Option<&Ortho>,
+) -> Result<String, FoldError> {
+    let lineage = format!("\"{}\"", filename);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .as_secs();
+    let archive_path = format!("{}/archive_{}.bin", INPUT_DIR, timestamp);
+    
+    save_archive(&archive_path, interner, results, results_path, best_ortho, &lineage)?;
+    Ok(archive_path)
+}
+
+/// Ingest archives for merging: move them to in-process and prepare
+pub fn ingest_archives(archive_a_path: &str, archive_b_path: &str) -> Result<ArchiveIngestion, FoldError> {
+    let (work_a_path, work_b_path) = setup_archive_merge(archive_a_path, archive_b_path, IN_PROCESS_DIR)?;
+    
+    Ok(ArchiveIngestion {
+        work_a_path,
+        work_b_path,
+        original_a_path: archive_a_path.to_string(),
+        original_b_path: archive_b_path.to_string(),
+    })
+}
+
+/// Save a merged archive result
+pub fn save_merge_result(
+    interner: &Interner,
+    results: &mut DiskBackedQueue,
+    results_path: &str,
+    best_ortho: Option<&Ortho>,
+    lineage_a: &str,
+    lineage_b: &str,
+) -> Result<String, FoldError> {
+    let merged_lineage = format!("({} {})", lineage_a, lineage_b);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let archive_path = format!("{}/archive_{}.bin", INPUT_DIR, timestamp);
+    
+    save_archive(&archive_path, interner, results, results_path, best_ortho, &merged_lineage)?;
+    Ok(archive_path)
 }
 
 #[cfg(test)]
