@@ -247,6 +247,66 @@ pub fn load_lineage(archive_path: &str) -> Result<String, FoldError> {
     fs::read_to_string(&lineage_path).map_err(|e| FoldError::Io(e))
 }
 
+/// Ensures a directory exists by creating it if needed
+pub fn ensure_directory_exists(path: &str) -> Result<(), FoldError> {
+    fs::create_dir_all(path).map_err(|e| FoldError::Io(e))
+}
+
+/// Sets up processing for a txt file: creates work folder, moves file to source.txt
+/// Returns (work_folder_path, source_txt_path, heartbeat_path, filename)
+pub fn setup_txt_processing(file_path: &str, in_process_dir: &str) -> Result<(String, String, String, String), FoldError> {
+    // Extract filename from path
+    let filename = Path::new(file_path).file_stem().unwrap_or_default();
+    let filename_str = filename.to_str().unwrap_or("temp").to_string();
+    let work_folder = format!("{}/{}.txt.work", in_process_dir, &filename_str);
+    
+    // Create work folder
+    fs::create_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    
+    // Move txt file to source.txt inside work folder
+    let source_txt_path = format!("{}/source.txt", work_folder);
+    fs::rename(file_path, &source_txt_path).map_err(|e| FoldError::Io(e))?;
+    
+    // Create heartbeat file inside work folder
+    let heartbeat_path = create_heartbeat(&work_folder)?;
+    
+    Ok((work_folder, source_txt_path, heartbeat_path, filename_str))
+}
+
+/// Reads the text content from source.txt in a work folder
+pub fn read_source_text(source_txt_path: &str) -> Result<String, FoldError> {
+    fs::read_to_string(source_txt_path).map_err(|e| FoldError::Io(e))
+}
+
+/// Cleans up a txt processing work folder by removing it entirely
+pub fn cleanup_txt_processing(work_folder: &str) -> Result<(), FoldError> {
+    fs::remove_dir_all(work_folder).map_err(|e| FoldError::Io(e))
+}
+
+/// Sets up archive merging by moving archives to in_process directory
+/// Returns (work_path_a, work_path_b)
+pub fn setup_archive_merge(archive_a_path: &str, archive_b_path: &str, in_process_dir: &str) -> Result<(String, String), FoldError> {
+    let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
+    let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
+    let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
+    let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
+    
+    fs::rename(archive_a_path, &work_a_path).map_err(FoldError::Io)?;
+    fs::rename(archive_b_path, &work_b_path).map_err(FoldError::Io)?;
+    
+    Ok((work_a_path, work_b_path))
+}
+
+/// Cleans up archives by removing them if they exist
+pub fn cleanup_archives(archive_paths: &[&str]) -> Result<(), FoldError> {
+    for archive_path in archive_paths {
+        if Path::new(archive_path).exists() {
+            fs::remove_dir_all(archive_path).map_err(|e| FoldError::Io(e))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +383,99 @@ mod tests {
         
         // Verify heartbeat file is not stale (freshly created)
         assert!(!is_heartbeat_stale(Path::new(&heartbeat_path)).unwrap());
+    }
+    
+    #[test]
+    fn test_ensure_directory_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_path = temp_dir.path().join("new_dir");
+        
+        // Directory should not exist initially
+        assert!(!test_path.exists());
+        
+        // Call ensure_directory_exists
+        ensure_directory_exists(test_path.to_str().unwrap()).unwrap();
+        
+        // Directory should now exist
+        assert!(test_path.exists());
+        assert!(test_path.is_dir());
+        
+        // Calling again should be idempotent
+        ensure_directory_exists(test_path.to_str().unwrap()).unwrap();
+        assert!(test_path.exists());
+    }
+    
+    #[test]
+    fn test_setup_and_cleanup_txt_processing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input_dir = temp_dir.path().join("input");
+        let in_process_dir = temp_dir.path().join("in_process");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::create_dir_all(&in_process_dir).unwrap();
+        
+        // Create a test txt file
+        let txt_path = input_dir.join("test.txt");
+        fs::write(&txt_path, "test content").unwrap();
+        
+        // Setup processing
+        let (work_folder, source_txt_path, heartbeat_path, filename) = 
+            setup_txt_processing(txt_path.to_str().unwrap(), in_process_dir.to_str().unwrap()).unwrap();
+        
+        // Verify filename extraction
+        assert_eq!(filename, "test");
+        
+        // Verify work folder was created
+        assert!(Path::new(&work_folder).exists());
+        assert!(work_folder.ends_with("test.txt.work"));
+        
+        // Verify source.txt exists in work folder
+        assert!(Path::new(&source_txt_path).exists());
+        let content = fs::read_to_string(&source_txt_path).unwrap();
+        assert_eq!(content, "test content");
+        
+        // Verify heartbeat was created
+        assert!(Path::new(&heartbeat_path).exists());
+        
+        // Verify original file was moved
+        assert!(!txt_path.exists());
+        
+        // Test read_source_text
+        let read_content = read_source_text(&source_txt_path).unwrap();
+        assert_eq!(read_content, "test content");
+        
+        // Cleanup
+        cleanup_txt_processing(&work_folder).unwrap();
+        
+        // Verify work folder was deleted
+        assert!(!Path::new(&work_folder).exists());
+    }
+    
+    #[test]
+    fn test_cleanup_archives() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        
+        // Create test archive directories
+        let archive1 = temp_dir.path().join("archive1.bin");
+        let archive2 = temp_dir.path().join("archive2.bin");
+        fs::create_dir_all(&archive1).unwrap();
+        fs::create_dir_all(&archive2).unwrap();
+        
+        // Verify they exist
+        assert!(archive1.exists());
+        assert!(archive2.exists());
+        
+        // Cleanup
+        cleanup_archives(&[
+            archive1.to_str().unwrap(),
+            archive2.to_str().unwrap()
+        ]).unwrap();
+        
+        // Verify they were deleted
+        assert!(!archive1.exists());
+        assert!(!archive2.exists());
+        
+        // Test cleanup with non-existent archive (should not error)
+        let non_existent = temp_dir.path().join("non_existent.bin");
+        cleanup_archives(&[non_existent.to_str().unwrap()]).unwrap();
     }
 }
