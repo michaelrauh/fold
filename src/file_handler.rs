@@ -1,18 +1,53 @@
 use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, ortho::Ortho, FoldError};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_GRACE_PERIOD_SECS: u64 = 600; // 10 minutes
 
-// Directory structure constants
-const INPUT_DIR: &str = "./fold_state/input";
-const IN_PROCESS_DIR: &str = "./fold_state/in_process";
+/// Configuration for state directory locations
+#[derive(Clone)]
+pub struct StateConfig {
+    pub base_dir: PathBuf,
+}
+
+impl StateConfig {
+    /// Default configuration for production use
+    pub fn default() -> Self {
+        Self {
+            base_dir: PathBuf::from("./fold_state"),
+        }
+    }
+    
+    /// Custom configuration for tests
+    pub fn custom(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+    
+    pub fn input_dir(&self) -> PathBuf {
+        self.base_dir.join("input")
+    }
+    
+    pub fn in_process_dir(&self) -> PathBuf {
+        self.base_dir.join("in_process")
+    }
+    
+    pub fn results_dir(&self, name: &str) -> PathBuf {
+        self.base_dir.join(format!("results_{}", name))
+    }
+}
 
 /// Initialize the file system: create directories and recover abandoned files
 pub fn initialize() -> Result<(), FoldError> {
-    ensure_directory_exists(IN_PROCESS_DIR)?;
-    recover_abandoned_files(INPUT_DIR, IN_PROCESS_DIR)?;
+    initialize_with_config(&StateConfig::default())
+}
+
+/// Initialize with custom config (for tests)
+pub fn initialize_with_config(config: &StateConfig) -> Result<(), FoldError> {
+    let in_process = config.in_process_dir();
+    let input = config.input_dir();
+    ensure_directory_exists(in_process.to_str().unwrap())?;
+    recover_abandoned_files(input.to_str().unwrap(), in_process.to_str().unwrap())?;
     Ok(())
 }
 
@@ -102,6 +137,30 @@ fn create_heartbeat(work_folder_path: &str) -> Result<String, FoldError> {
 }
 
 
+fn count_txt_files(input_dir: &str) -> Result<usize, FoldError> {
+    let path = std::path::Path::new(input_dir);
+    
+    if !path.exists() {
+        return Ok(0);
+    }
+    
+    let mut count = 0;
+    for entry in fs::read_dir(path).map_err(|e| FoldError::Io(e))? {
+        let entry = entry.map_err(|e| FoldError::Io(e))?;
+        let entry_path = entry.path();
+        
+        if entry_path.is_file() {
+            if let Some(ext) = entry_path.extension() {
+                if ext == "txt" {
+                    count += 1;
+                }
+            }
+        }
+    }
+    
+    Ok(count)
+}
+
 fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> {
     let path = std::path::Path::new(input_dir);
     
@@ -177,20 +236,22 @@ fn find_archives(input_dir: &str) -> Result<Vec<(String, u64)>, FoldError> {
 fn save_archive(
     archive_path: &str, 
     interner: &Interner, 
-    results: &mut DiskBackedQueue, 
+    mut results: DiskBackedQueue, 
     results_path: &str,
     best_ortho: Option<&Ortho>,
     lineage: &str
 ) -> Result<(), FoldError> {
-    // Flush results to ensure all are on disk
+    // Flush and drop results to close file handles before rename
     results.flush()?;
+    drop(results);
     
     // Create archive directory
     fs::create_dir_all(archive_path).map_err(|e| FoldError::Io(e))?;
     
     // Move the DiskBackedQueue directory to the archive
     let archive_results_path = format!("{}/results", archive_path);
-    if Path::new(results_path).exists() {
+    let results_path_obj = Path::new(results_path);
+    if results_path_obj.exists() {
         fs::rename(results_path, &archive_results_path).map_err(|e| FoldError::Io(e))?;
     }
     
@@ -285,6 +346,7 @@ fn read_source_text(source_txt_path: &str) -> Result<String, FoldError> {
 }
 
 /// Cleans up a txt processing work folder by removing it entirely
+/// This removes the work folder which contains: source.txt, heartbeat, queue/, seen_shards/
 fn cleanup_txt_processing(work_folder: &str) -> Result<(), FoldError> {
     fs::remove_dir_all(work_folder).map_err(|e| FoldError::Io(e))
 }
@@ -323,6 +385,7 @@ pub struct TxtIngestion {
     heartbeat_path: String,
     pub filename: String,
     pub text: String,
+    config: StateConfig,
 }
 
 impl TxtIngestion {
@@ -333,26 +396,37 @@ impl TxtIngestion {
     
     /// Get the results path for this ingestion
     pub fn results_path(&self) -> String {
-        format!("./fold_state/results_{}", self.filename)
+        self.config.results_dir(&self.filename).to_string_lossy().to_string()
+    }
+    
+    /// Get the work queue path for this ingestion (isolated per file)
+    pub fn work_queue_path(&self) -> String {
+        format!("{}/queue", self.work_folder)
+    }
+    
+    /// Get the seen shards path for this ingestion (isolated per file)
+    pub fn seen_shards_path(&self) -> String {
+        format!("{}/seen_shards", self.work_folder)
     }
     
     /// Save the processing result as an archive
     pub fn save_result(
         &self,
         interner: &Interner,
-        results: &mut DiskBackedQueue,
+        results: DiskBackedQueue,
         best_ortho: Option<&Ortho>,
     ) -> Result<String, FoldError> {
         let lineage = format!("\"{}\"", self.filename);
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-            .as_secs();
-        let archive_path = format!("{}/archive_{}.bin", INPUT_DIR, timestamp);
+            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        // Use timestamp + nanos + filename for guaranteed uniqueness
+        let archive_path = self.config.input_dir().join(format!("archive_{}_{}_{}.bin", 
+            self.filename, now.as_secs(), now.subsec_nanos()));
         let results_path = self.results_path();
         
-        save_archive(&archive_path, interner, results, &results_path, best_ortho, &lineage)?;
-        Ok(archive_path)
+        save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage)?;
+        Ok(archive_path.to_string_lossy().to_string())
     }
     
     /// Cleanup work folder after processing
@@ -367,7 +441,9 @@ pub struct ArchiveIngestion {
     work_b_path: String,
     original_a_path: String,
     original_b_path: String,
+    merge_work_folder: String,
     heartbeat_path: String,
+    config: StateConfig,
 }
 
 impl ArchiveIngestion {
@@ -398,41 +474,76 @@ impl ArchiveIngestion {
         )
     }
     
+    /// Get the work queue path for this merge (isolated to merge work folder)
+    pub fn work_queue_path(&self) -> String {
+        format!("{}/queue", self.merge_work_folder)
+    }
+    
+    /// Get the seen shards path for this merge (isolated to merge work folder)
+    pub fn seen_shards_path(&self) -> String {
+        format!("{}/seen_shards", self.merge_work_folder)
+    }
+    
     /// Save merged result
     pub fn save_result(
         &self,
         interner: &Interner,
-        results: &mut DiskBackedQueue,
+        results: DiskBackedQueue,
         results_path: &str,
         best_ortho: Option<&Ortho>,
         lineage_a: &str,
         lineage_b: &str,
     ) -> Result<String, FoldError> {
         let merged_lineage = format!("({} {})", lineage_a, lineage_b);
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let archive_path = format!("{}/archive_{}.bin", INPUT_DIR, timestamp);
+            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        // Use timestamp + nanos + process ID for guaranteed uniqueness across merges
+        let archive_path = self.config.input_dir().join(format!("archive_merged_{}_{}_{}.bin", 
+            now.as_secs(), now.subsec_nanos(), std::process::id()));
         
-        save_archive(&archive_path, interner, results, results_path, best_ortho, &merged_lineage)?;
-        Ok(archive_path)
+        save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage)?;
+        Ok(archive_path.to_string_lossy().to_string())
     }
     
-    /// Cleanup original archives
+    /// Cleanup original archives and merge work folder
     pub fn cleanup(self) -> Result<(), FoldError> {
+        // Clean up merge work folder (contains queue/, seen_shards/, heartbeat)
+        if Path::new(&self.merge_work_folder).exists() {
+            fs::remove_dir_all(&self.merge_work_folder).map_err(FoldError::Io)?;
+        }
         cleanup_archives(&[&self.original_a_path, &self.original_b_path])
     }
 }
 
-/// Find the next text file to process (uses internal INPUT_DIR)
-pub fn find_txt_file() -> Result<Option<String>, FoldError> {
-    find_next_txt_file(INPUT_DIR)
+/// Count remaining text files in input (uses default config)
+pub fn count_txt_files_remaining() -> Result<usize, FoldError> {
+    count_txt_files_remaining_with_config(&StateConfig::default())
 }
 
-/// Get the smallest and largest archives, or None if less than 2 exist
+/// Count remaining text files in input with custom config
+pub fn count_txt_files_remaining_with_config(config: &StateConfig) -> Result<usize, FoldError> {
+    count_txt_files(config.input_dir().to_str().unwrap())
+}
+
+/// Find the next text file to process (uses default config)
+pub fn find_txt_file() -> Result<Option<String>, FoldError> {
+    find_txt_file_with_config(&StateConfig::default())
+}
+
+/// Find the next text file to process with custom config
+pub fn find_txt_file_with_config(config: &StateConfig) -> Result<Option<String>, FoldError> {
+    find_next_txt_file(config.input_dir().to_str().unwrap())
+}
+
+/// Get the smallest and largest archives (uses default config)
 pub fn get_smallest_and_largest_archives() -> Result<Option<(String, String)>, FoldError> {
-    let mut archives = find_archives(IN_PROCESS_DIR)?;
+    get_smallest_and_largest_archives_with_config(&StateConfig::default())
+}
+
+/// Get the smallest and largest archives with custom config
+pub fn get_smallest_and_largest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
+    let mut archives = find_archives(config.input_dir().to_str().unwrap())?;
     
     if archives.len() < 2 {
         return Ok(None);
@@ -445,10 +556,15 @@ pub fn get_smallest_and_largest_archives() -> Result<Option<(String, String)>, F
     Ok(Some((smallest, largest)))
 }
 
-/// Ingest a text file: setup work folder, read text, and prepare for processing
+/// Ingest a text file (uses default config)
 pub fn ingest_txt_file(file_path: &str) -> Result<TxtIngestion, FoldError> {
+    ingest_txt_file_with_config(file_path, &StateConfig::default())
+}
+
+/// Ingest a text file with custom config
+pub fn ingest_txt_file_with_config(file_path: &str, config: &StateConfig) -> Result<TxtIngestion, FoldError> {
     let (work_folder, source_txt_path, heartbeat_path, filename) = 
-        setup_txt_processing(file_path, IN_PROCESS_DIR)?;
+        setup_txt_processing(file_path, config.in_process_dir().to_str().unwrap())?;
     
     // Read the text immediately as part of ingestion
     let text = read_source_text(&source_txt_path)?;
@@ -458,23 +574,36 @@ pub fn ingest_txt_file(file_path: &str) -> Result<TxtIngestion, FoldError> {
         heartbeat_path,
         filename,
         text,
+        config: config.clone(),
     })
 }
 
-/// Ingest archives for merging: move them to in-process and prepare
+/// Ingest archives for merging (uses default config)
 pub fn ingest_archives(archive_a_path: &str, archive_b_path: &str) -> Result<ArchiveIngestion, FoldError> {
-    let (work_a_path, work_b_path) = setup_archive_merge(archive_a_path, archive_b_path, IN_PROCESS_DIR)?;
+    ingest_archives_with_config(archive_a_path, archive_b_path, &StateConfig::default())
+}
+
+/// Ingest archives for merging with custom config
+pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, config: &StateConfig) -> Result<ArchiveIngestion, FoldError> {
+    let in_process = config.in_process_dir();
+    let (work_a_path, work_b_path) = setup_archive_merge(archive_a_path, archive_b_path, in_process.to_str().unwrap())?;
+    
+    // Create merge work folder for isolated queue and seen_shards
+    let merge_work_folder = in_process.join(format!("merge_{}.work", std::process::id()));
+    fs::create_dir_all(&merge_work_folder).map_err(FoldError::Io)?;
     
     // Create heartbeat for merge operation
-    let heartbeat_path = format!("{}/merge_{}.heartbeat", IN_PROCESS_DIR, std::process::id());
-    touch_heartbeat(&heartbeat_path)?;
+    let heartbeat_path = merge_work_folder.join("heartbeat");
+    touch_heartbeat(heartbeat_path.to_str().unwrap())?;
     
     Ok(ArchiveIngestion {
         work_a_path,
         work_b_path,
         original_a_path: archive_a_path.to_string(),
         original_b_path: archive_b_path.to_string(),
-        heartbeat_path,
+        merge_work_folder: merge_work_folder.to_string_lossy().to_string(),
+        heartbeat_path: heartbeat_path.to_string_lossy().to_string(),
+        config: config.clone(),
     })
 }
 
@@ -499,7 +628,7 @@ mod tests {
         results.push(ortho2).unwrap();
         
         // Save archive
-        save_archive(archive_path.to_str().unwrap(), &interner, &mut results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"").unwrap();
+        save_archive(archive_path.to_str().unwrap(), &interner, results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"").unwrap();
         
         // Verify archive directory exists
         assert!(archive_path.exists());

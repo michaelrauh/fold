@@ -51,7 +51,7 @@ BASENAME=$(basename "$INPUT_FILE" .txt)
 
 # Split the file using awk - mimics Interner's sentence splitting
 # First split by double newlines (paragraphs), then by sentence delimiters
-awk -v output_dir="$INPUT_DIR" -v basename="$BASENAME" '
+LC_ALL=C awk -v output_dir="$INPUT_DIR" -v basename="$BASENAME" '
 BEGIN {
     chunk = 0
     RS = ""  # Paragraph mode - double newline separates records

@@ -1,4 +1,5 @@
-use fold::{disk_backed_queue::DiskBackedQueue, file_handler, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
+use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, StateConfig}, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
+use std::path::PathBuf;
 
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
@@ -9,15 +10,22 @@ fn calculate_score(ortho: &Ortho) -> (usize, usize) {
 fn main() -> Result<(), FoldError> {
     println!("[fold] Starting fold processing");
     
+    // Check for test environment variable
+    let config = if let Ok(test_dir) = std::env::var("FOLD_STATE_DIR") {
+        StateConfig::custom(PathBuf::from(test_dir))
+    } else {
+        StateConfig::default()
+    };
+    
     // Initialize: setup directories and recover abandoned files
-    file_handler::initialize()?;
+    file_handler::initialize_with_config(&config)?;
     
     // Main processing loop - two modes:
     // Mode 1: If there are 2+ result archives, merge smallest with largest
     // Mode 2: If there are not 2 results, process txt into result
     loop {
         // Check for existing archives
-        let archive_pair = file_handler::get_smallest_and_largest_archives()?;
+        let archive_pair = file_handler::get_smallest_and_largest_archives_with_config(&config)?;
         
         if let Some((smallest, largest)) = archive_pair {
             // Mode 1: Merge archives
@@ -28,11 +36,11 @@ fn main() -> Result<(), FoldError> {
             println!("[fold] Merging smallest: {}", smallest);
             println!("[fold] With largest: {}", largest);
             
-            merge_archives(&smallest, &largest)?;
+            merge_archives(&smallest, &largest, &config)?;
             
         } else {
             // Mode 2: Process txt file
-            let txt_file = file_handler::find_txt_file()?;
+            let txt_file = file_handler::find_txt_file_with_config(&config)?;
             
             if txt_file.is_none() {
                 println!("[fold] No more .txt files to process");
@@ -44,7 +52,7 @@ fn main() -> Result<(), FoldError> {
             println!("[fold] MODE 2: Processing text file");
             println!("[fold] ========================================");
             
-            process_txt_file(txt_file.unwrap())?;
+            process_txt_file(txt_file.unwrap(), &config)?;
         }
     }
     
@@ -55,12 +63,13 @@ fn main() -> Result<(), FoldError> {
     Ok(())
 }
 
-fn process_txt_file(file_path: String) -> Result<(), FoldError> {
+fn process_txt_file(file_path: String, config: &StateConfig) -> Result<(), FoldError> {
     println!("[fold] Processing file: {}", file_path);
     
     // Ingest the text file (now includes reading the text)
-    let ingestion = file_handler::ingest_txt_file(&file_path)?;
-    println!("[fold] Ingested file: {}", ingestion.filename);
+    let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)?;
+    let remaining = file_handler::count_txt_files_remaining_with_config(config)?;
+    println!("[fold] Ingested file: {} ({} chunks remaining in input)", ingestion.filename, remaining);
     
     // Build interner from the text
     let interner = Interner::from_text(&ingestion.text);
@@ -73,15 +82,18 @@ fn process_txt_file(file_path: String) -> Result<(), FoldError> {
     let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
     let memory_config = MemoryConfig::calculate(interner_bytes, 0);
     
-    // Initialize work queue for this file
-    let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
+    // Initialize work queue for this file (isolated to work folder)
+    let work_queue_path = ingestion.work_queue_path();
+    let mut work_queue = DiskBackedQueue::new_from_path(&work_queue_path, memory_config.queue_buffer_size)?;
     
     // Initialize results queue for this file (disk-backed to avoid OOM)
     let results_path = ingestion.results_path();
     let mut results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
     
-    // Initialize tracker for this file
-    let mut tracker = SeenTracker::with_config(
+    // Initialize tracker for this file (isolated to work folder)
+    let seen_shards_path = ingestion.seen_shards_path();
+    let mut tracker = SeenTracker::with_path(
+        &seen_shards_path,
         memory_config.bloom_capacity,
         memory_config.num_shards,
         memory_config.max_shards_in_memory,
@@ -106,6 +118,11 @@ fn process_txt_file(file_path: String) -> Result<(), FoldError> {
         if processed_count % 1000 == 0 {
             println!("[fold] Processed {} orthos, queue size: {}, seen: {}", 
                      processed_count, work_queue.len(), tracker.len());
+        }
+        
+        if processed_count % 50000 == 0 {
+            let remaining = file_handler::count_txt_files_remaining_with_config(config)?;
+            println!("[fold] Reminder: {} chunks remaining in input", remaining);
         }
         
         if processed_count % 100000 == 0 {
@@ -150,7 +167,7 @@ fn process_txt_file(file_path: String) -> Result<(), FoldError> {
     print_optimal(&best_ortho, &interner);
     
     // Save the result (using method on ingestion)
-    let archive_path = ingestion.save_result(&interner, &mut results, Some(&best_ortho))?;
+    let archive_path = ingestion.save_result(&interner, results, Some(&best_ortho))?;
     
     println!("[fold] Archive saved: {}", archive_path);
     
@@ -161,10 +178,10 @@ fn process_txt_file(file_path: String) -> Result<(), FoldError> {
     Ok(())
 }
 
-fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), FoldError> {
+fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConfig) -> Result<(), FoldError> {
     // Ingest archives for merging
     println!("[fold] Moving archives to in_process for merging...");
-    let ingestion = file_handler::ingest_archives(archive_a_path, archive_b_path)?;
+    let ingestion = file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)?;
     println!("[fold] Loading interners...");
     
     // Load both interners using method
@@ -199,13 +216,16 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
     let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
     let memory_config = MemoryConfig::calculate(interner_bytes, 0);
     
-    // Initialize work queue and results for merge
-    let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
-    let results_path = format!("./fold_state/results_merged_{}", std::process::id());
-    let mut merged_results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
+    // Initialize work queue and results for merge (isolated to merge work folder)
+    let work_queue_path = ingestion.work_queue_path();
+    let mut work_queue = DiskBackedQueue::new_from_path(&work_queue_path, memory_config.queue_buffer_size)?;
+    let results_path = config.results_dir(&format!("merged_{}", std::process::id()));
+    let mut merged_results = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), memory_config.queue_buffer_size)?;
     
-    // Initialize tracker
-    let mut tracker = SeenTracker::with_config(
+    // Initialize tracker (isolated to merge work folder)
+    let seen_shards_path = ingestion.seen_shards_path();
+    let mut tracker = SeenTracker::with_path(
+        &seen_shards_path,
         memory_config.bloom_capacity,
         memory_config.num_shards,
         memory_config.max_shards_in_memory,
@@ -228,6 +248,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
     // Add impacted orthos to work queue for further processing
     let mut results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
     
+    let total_a_count = results_a.len();
     let mut total_from_a = 0;
     let mut impacted_from_a = 0;
     while let Some(ortho) = results_a.pop()? {
@@ -242,7 +263,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
                 
                 // Log progress every 10k orthos and keep heartbeat fresh (zero-arity)
                 if total_from_a % 10000 == 0 {
-                    println!("[fold] Remapping archive A: {} orthos processed", total_from_a);
+                    let percent = (total_from_a as f64 / total_a_count as f64 * 100.0) as u32;
+                    println!("[fold] Remapping archive A: {} / {} orthos processed ({}%)", total_from_a, total_a_count, percent);
                     ingestion.touch_heartbeat()?;
                 }
                 
@@ -261,6 +283,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
     // Add impacted orthos to work queue for further processing
     let mut results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
     
+    let total_b_count = results_b.len();
     let mut total_from_b = 0;
     let mut impacted_from_b = 0;
     while let Some(ortho) = results_b.pop()? {
@@ -275,7 +298,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
                 
                 // Log progress every 10k orthos and keep heartbeat fresh (zero-arity)
                 if total_from_b % 10000 == 0 {
-                    println!("[fold] Remapping archive B: {} orthos processed", total_from_b);
+                    let percent = (total_from_b as f64 / total_b_count as f64 * 100.0) as u32;
+                    println!("[fold] Remapping archive B: {} / {} orthos processed ({}%)", total_from_b, total_b_count, percent);
                     ingestion.touch_heartbeat()?;
                 }
                 
@@ -301,6 +325,11 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
         if processed_count % 1000 == 0 {
             println!("[fold] Processed {} orthos, queue size: {}, seen: {}", 
                      processed_count, work_queue.len(), tracker.len());
+        }
+        
+        if processed_count % 50000 == 0 {
+            let remaining = file_handler::count_txt_files_remaining_with_config(config)?;
+            println!("[fold] Reminder: {} chunks remaining in input", remaining);
         }
         
         if processed_count % 100000 == 0 {
@@ -345,8 +374,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str) -> Result<(), Fold
     // Save the merged result using method
     let merged_archive_path = ingestion.save_result(
         &merged_interner, 
-        &mut merged_results, 
-        &results_path, 
+        merged_results, 
+        results_path.to_str().unwrap(), 
         Some(&best_ortho), 
         &lineage_a, 
         &lineage_b
