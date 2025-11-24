@@ -2,7 +2,7 @@
 
 ## Background
 
-When merging archives in a linear merge chain, the ortho remapping stage processes ALL orthos from both archives to translate vocabulary indices from the source interner to the merged interner. This is performed in `merge_archives()` (main.rs lines 353-434).
+When merging archives in a linear merge chain, the ortho remapping stage processes ALL orthos from both archives to translate vocabulary indices from the source interner to the merged interner. This is performed in the `merge_archives()` function in `main.rs`.
 
 The current implementation:
 1. Loads each ortho from Archive A and Archive B via `DiskBackedQueue::pop()`
@@ -54,9 +54,10 @@ The current implementation:
 
 **Description**: Use Rayon's parallel iterators to remap orthos in batches across multiple CPU cores.
 
-**Implementation**:
+**Implementation** (pseudocode):
 ```rust
 // Instead of sequential pop/remap/push loop:
+// Note: drain_batch() would need to be added to DiskBackedQueue
 let batch: Vec<Ortho> = results_a.drain_batch(1000)?;
 let remapped: Vec<Ortho> = batch.par_iter()
     .filter_map(|o| o.remap(&vocab_map_a, new_version))
@@ -82,7 +83,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 **Description**: Store token identifiers in ortho payloads as stable hashes or interned strings instead of vocabulary indices that change between interners.
 
 **Implementation**:
-- Change `Ortho.payload: Vec<Option<usize>>` to `Vec<Option<u64>>` using hash of token string
+- Change ortho payload from vocabulary index references to stable token identifiers (e.g., `u64` hashes of token strings)
 - Or use a global string interner that assigns permanent IDs
 - Merging interners just unions the vocabulary without reindexing
 
