@@ -83,7 +83,8 @@ let remapped: Vec<Ortho> = batch.par_iter()
 **Description**: Store token identifiers in ortho payloads as stable hashes or interned strings instead of vocabulary indices that change between interners.
 
 **Implementation**:
-- Change ortho payload from vocabulary index references to stable token identifiers (e.g., `u64` hashes of token strings)
+- Change ortho payload from vocabulary index references to stable token identifiers (e.g., `u64` hashes of token strings using a deterministic hash like SipHash or xxHash)
+- Handle hash collisions via secondary lookup or by using 128-bit hashes (collision probability ~1 in 10^19)
 - Or use a global string interner that assigns permanent IDs
 - Merging interners just unions the vocabulary without reindexing
 
@@ -136,6 +137,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 **Alternative approach**:
 - Store orthos as `(payload_tokens: Vec<String>, dims)` in archives
 - Remap to indices on load (shifts cost from merge to load)
+- Note: Full string storage increases archive size significantly (~10-50x per token); consider string interning with a shared dictionary to mitigate
 
 **Pros**:
 - Eliminates merge-time remapping entirely
