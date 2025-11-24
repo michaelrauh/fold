@@ -1,7 +1,6 @@
 use fold::{disk_backed_queue::DiskBackedQueue, file_handler, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
@@ -26,8 +25,8 @@ fn main() -> Result<(), FoldError> {
     // Mode 1: If there are 2+ result archives, merge smallest with largest
     // Mode 2: If there are not 2 results, process txt into result
     loop {
-        // Check for existing archives
-        let mut archives = file_handler::find_archives(in_process_dir)?;
+        // Check for existing archives in input directory
+        let mut archives = file_handler::find_archives(input_dir)?;
         
         if archives.len() >= 2 {
             // Mode 1: Merge archives
@@ -44,7 +43,7 @@ fn main() -> Result<(), FoldError> {
             println!("[fold] Merging smallest: {} (size: {})", smallest, archives[0].1);
             println!("[fold] With largest: {} (size: {})", largest, archives[archives.len() - 1].1);
             
-            merge_archives(&smallest, &largest, in_process_dir)?;
+            merge_archives(&smallest, &largest, input_dir, in_process_dir)?;
             
         } else {
             // Mode 2: Process txt file
@@ -75,23 +74,21 @@ fn main() -> Result<(), FoldError> {
     Ok(())
 }
 
-fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+fn process_txt_file(file_path: String, input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
     println!("[fold] Processing file: {}", file_path);
     
-    // Create .txt.work folder in in_process directory
-    let filename = Path::new(&file_path).file_stem().unwrap_or_default();
-    let work_folder = format!("{}/{}.txt.work", in_process_dir, filename.to_str().unwrap_or("temp"));
-    fs::create_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    // Extract filename for lineage tracking
+    let filename = Path::new(&file_path).file_stem().unwrap_or_default().to_str().unwrap_or("unknown").to_string();
     
-    // Move txt file to source.txt inside work folder
-    let source_txt_path = format!("{}/source.txt", work_folder);
-    fs::rename(&file_path, &source_txt_path).map_err(|e| FoldError::Io(e))?;
+    // Checkout: Move txt file to in_process work folder
+    let work_folder = file_handler::checkout_txt_file(&file_path, in_process_dir)?;
     println!("[fold] Moved to work folder: {}", work_folder);
     
     // Create heartbeat file inside work folder
     let heartbeat_path = file_handler::create_heartbeat(&work_folder)?;
     
     // Read text from source.txt
+    let source_txt_path = format!("{}/source.txt", work_folder);
     let text = fs::read_to_string(&source_txt_path)
         .map_err(|e| FoldError::Io(e))?;
     
@@ -110,8 +107,7 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
     
     // Initialize results queue for this file (disk-backed to avoid OOM)
-    let results_path = format!("./fold_state/results_{}", 
-        filename.to_str().unwrap_or("temp"));
+    let results_path = format!("./fold_state/results_{}", filename);
     let mut results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
     
     // Initialize tracker for this file
@@ -184,35 +180,25 @@ fn process_txt_file(file_path: String, _input_dir: &str, in_process_dir: &str) -
     print_optimal(&best_ortho, &interner);
     
     // Create lineage tracking for this text file (just the filename)
-    let lineage = format!("\"{}\"", filename.to_str().unwrap_or("unknown"));
+    let lineage = format!("\"{}\"", filename);
     
-    // Create timestamp-based archive name in INPUT directory
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
-        .as_secs();
-    let archive_path = format!("{}/archive_{}.bin", input_dir, timestamp);
+    // Create archive in INPUT directory
+    let archive_path = file_handler::get_new_archive_path(input_dir);
     file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho), &lineage)?;
     
     println!("[fold] Archive saved to input: {}", archive_path);
     
-    // Delete the work folder (including heartbeat and source.txt)
-    fs::remove_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    // Cleanup: delete the work folder (including heartbeat and source.txt)
+    file_handler::cleanup_txt_work_folder(&work_folder)?;
     println!("[fold] Work folder deleted");
     
     Ok(())
 }
 
 fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
-    // Move both archives from input to in_process for mutual exclusion
-    let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
-    let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
-    let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
-    let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
-    
+    // Checkout: Move both archives from input to in_process for mutual exclusion
     println!("[fold] Moving archives to in_process for merging...");
-    fs::rename(archive_a_path, &work_a_path).map_err(FoldError::Io)?;
-    fs::rename(archive_b_path, &work_b_path).map_err(FoldError::Io)?;
+    let (work_a_path, work_b_path) = file_handler::checkout_archives(archive_a_path, archive_b_path, in_process_dir)?;
     println!("[fold] Loading interners...");
     
     // Load both interners from work paths
@@ -310,7 +296,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
     
     // Process archive B results: remap ALL orthos to results
     // Add impacted orthos to work queue for further processing
-    let results_b_path = file_handler::get_results_path(archive_b_path);
+    let results_b_path = file_handler::get_results_path(&work_b_path);
     let mut results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
     
     let mut total_from_b = 0;
@@ -392,33 +378,22 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, i
     println!("[fold] Merge complete. Total orthos: {}", merged_results.len());
     print_optimal(&best_ortho, &merged_interner);
     
-    // Load lineages from both archives and create merged lineage
-    let lineage_a = file_handler::load_lineage(archive_a_path)?;
-    let lineage_b = file_handler::load_lineage(archive_b_path)?;
+    // Load lineages from both archives (now in work paths) and create merged lineage
+    let lineage_a = file_handler::load_lineage(&work_a_path)?;
+    let lineage_b = file_handler::load_lineage(&work_b_path)?;
     let merged_lineage = format!("({} {})", lineage_a, lineage_b);
     
     println!("[fold] Merged lineage: {}", merged_lineage);
     
-    // Create merged archive with timestamp-based name in INPUT directory
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let merged_archive_path = format!("{}/archive_{}.bin", input_dir, timestamp);
+    // Create merged archive in INPUT directory
+    let merged_archive_path = file_handler::get_new_archive_path(input_dir);
     
     file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
     println!("[fold] Merged archive saved to input: {}", merged_archive_path);
     
-    // Delete the original archives
-    if Path::new(archive_a_path).exists() {
-        fs::remove_dir_all(archive_a_path).map_err(|e| FoldError::Io(e))?;
-        println!("[fold] Deleted archive: {}", archive_a_path);
-    }
-    if Path::new(archive_b_path).exists() {
-        fs::remove_dir_all(archive_b_path).map_err(|e| FoldError::Io(e))?;
-        println!("[fold] Deleted archive: {}", archive_b_path);
-    }
+    // Cleanup: Delete the source archives from in_process and the heartbeat
+    file_handler::cleanup_merge_sources(&work_a_path, &work_b_path, &heartbeat_path)?;
+    println!("[fold] Deleted source archives and heartbeat");
     
     Ok(())
 }

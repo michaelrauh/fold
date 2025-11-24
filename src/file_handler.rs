@@ -52,6 +52,18 @@ pub fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<
                 }
             }
         }
+        // Check for stale merge heartbeat files (not in folders)
+        else if entry_path.is_file() {
+            if let Some(filename) = entry_path.file_name() {
+                let filename_str = filename.to_str().unwrap_or("");
+                if filename_str.ends_with(".heartbeat") && is_heartbeat_stale(&entry_path)? {
+                    // Just delete stale standalone heartbeat files
+                    println!("[fold] Deleting stale merge heartbeat: {:?}", entry_path);
+                    fs::remove_file(&entry_path).map_err(|e| FoldError::Io(e))?;
+                    recovered_count += 1;
+                }
+            }
+        }
     }
     
     if recovered_count > 0 {
@@ -245,6 +257,65 @@ pub fn get_results_path(archive_path: &str) -> String {
 pub fn load_lineage(archive_path: &str) -> Result<String, FoldError> {
     let lineage_path = format!("{}/lineage.txt", archive_path);
     fs::read_to_string(&lineage_path).map_err(|e| FoldError::Io(e))
+}
+
+/// Move a txt file to in_process as a work folder for processing
+/// Returns the work folder path
+pub fn checkout_txt_file(file_path: &str, in_process_dir: &str) -> Result<String, FoldError> {
+    let filename = Path::new(file_path).file_stem().unwrap_or_default();
+    let work_folder = format!("{}/{}.txt.work", in_process_dir, filename.to_str().unwrap_or("temp"));
+    fs::create_dir_all(&work_folder).map_err(|e| FoldError::Io(e))?;
+    
+    // Move txt file to source.txt inside work folder
+    let source_txt_path = format!("{}/source.txt", work_folder);
+    fs::rename(file_path, &source_txt_path).map_err(|e| FoldError::Io(e))?;
+    
+    Ok(work_folder)
+}
+
+/// Move archives from input to in_process for merging
+/// Returns the work paths for both archives
+pub fn checkout_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &str) -> Result<(String, String), FoldError> {
+    let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
+    let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
+    let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
+    let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
+    
+    fs::rename(archive_a_path, &work_a_path).map_err(|e| FoldError::Io(e))?;
+    fs::rename(archive_b_path, &work_b_path).map_err(|e| FoldError::Io(e))?;
+    
+    Ok((work_a_path, work_b_path))
+}
+
+/// Clean up a work folder (for txt processing)
+pub fn cleanup_txt_work_folder(work_folder: &str) -> Result<(), FoldError> {
+    if Path::new(work_folder).exists() {
+        fs::remove_dir_all(work_folder).map_err(|e| FoldError::Io(e))?;
+    }
+    Ok(())
+}
+
+/// Clean up source archives after merge and any heartbeat files
+pub fn cleanup_merge_sources(work_a_path: &str, work_b_path: &str, heartbeat_path: &str) -> Result<(), FoldError> {
+    if Path::new(work_a_path).exists() {
+        fs::remove_dir_all(work_a_path).map_err(|e| FoldError::Io(e))?;
+    }
+    if Path::new(work_b_path).exists() {
+        fs::remove_dir_all(work_b_path).map_err(|e| FoldError::Io(e))?;
+    }
+    if Path::new(heartbeat_path).exists() {
+        fs::remove_file(heartbeat_path).map_err(|e| FoldError::Io(e))?;
+    }
+    Ok(())
+}
+
+/// Get a timestamp-based archive path in the input directory
+pub fn get_new_archive_path(input_dir: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}/archive_{}.bin", input_dir, timestamp)
 }
 
 #[cfg(test)]
