@@ -30,6 +30,8 @@ impl Ortho {
         let payload = vec![None; 4];
         Ortho { version, dims, payload }
     }
+    
+
     pub fn id(&self) -> usize { Self::compute_id(self.version, &self.dims, &self.payload) }
     pub fn get_current_position(&self) -> usize { self.payload.iter().position(|x| x.is_none()).unwrap_or(self.payload.len()) }
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
@@ -111,7 +113,28 @@ impl Ortho {
             .collect();
         (forbidden, required)
     }
+
+    pub fn get_requirement_phrases(&self) -> Vec<Vec<usize>> {
+        let (_forbidden, required) = self.get_requirements();
+        required
+    }
     pub fn version(&self) -> usize { self.version }
+    
+    /// Remap an ortho's payload to use new vocabulary indices
+    pub fn remap(&self, vocab_map: &[usize], new_version: usize) -> Option<Self> {
+        // Remap payload: translate old vocab indices to new vocab indices
+        let new_payload: Vec<Option<usize>> = self.payload.iter().map(|opt_idx| {
+            opt_idx.map(|old_idx| vocab_map[old_idx])
+        }).collect();
+        
+        // Create new ortho with remapped payload
+        Some(Ortho {
+            version: new_version,
+            dims: self.dims.clone(),
+            payload: new_payload,
+        })
+    }
+    
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
         let mut result = Vec::new();
         for pos in 0..self.payload.len() {
@@ -738,6 +761,32 @@ mod tests {
         };
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "[dim0=0]\n   a    b\n   c    e\n\n[dim0=1]\n   d    f\n   g    ·");
+    }
+
+    #[test]
+    fn test_get_requirement_phrases() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(10, 1)[0];
+        let ortho = &ortho.add(20, 1)[0];
+        
+        let phrases = ortho.get_requirement_phrases();
+        assert_eq!(phrases, vec![vec![10]]);
+        
+        let ortho = &ortho.add(30, 1)[0];
+        let ortho = &ortho.add(40, 1)[0];
+        let phrases = ortho.get_requirement_phrases();
+        assert_eq!(phrases, vec![vec![10, 30]]);
+    }
+
+    #[test]
+    fn test_get_requirement_phrases_expansion() {
+        let ortho = Ortho::new(1);
+        let ortho = &ortho.add(1, 1)[0];
+        let ortho = &ortho.add(2, 1)[0];
+        let ortho = &ortho.add(3, 1)[0];
+        
+        let phrases = ortho.get_requirement_phrases();
+        assert_eq!(phrases, vec![vec![2], vec![3]]);
     }
 }
 

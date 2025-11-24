@@ -237,37 +237,37 @@ impl Interner {
         intersection.ones().collect()
     }
 
-    pub fn differing_completions_indices_up_to_vocab(&self, other: &Interner, prefix: &Vec<usize>) -> Vec<usize> {
-        // Compare completion sets for a prefix restricted to the lower (self) vocabulary size.
-        // Return sorted indices (< self.vocabulary.len()) whose membership differs.
-        let low_vocab_len = self.vocabulary.len();
-        let word_bits = usize::BITS as usize;
-        let words_needed = (low_vocab_len + word_bits - 1) / word_bits;
-        let low_opt = self.prefix_to_completions.get(prefix);
-        let high_opt = other.prefix_to_completions.get(prefix);
-        // Fast path: both absent => no differences.
-        if low_opt.is_none() && high_opt.is_none() { return Vec::new(); }
-        // Represent missing bitset as zeroed slice.
-        let zero_words: Vec<usize> = vec![0; words_needed];
-        let low_slice: &[usize] = match low_opt { Some(bs) => bs.as_slice(), None => &zero_words }; // may be longer than needed
-        let high_slice: &[usize] = match high_opt { Some(bs) => bs.as_slice(), None => &zero_words };
-        let mut diffs = Vec::new();
-        for w in 0..words_needed {
-            let lw = *low_slice.get(w).unwrap_or(&0);
-            let hw = *high_slice.get(w).unwrap_or(&0);
-            let mut xor = lw ^ hw;
-            // Mask off bits beyond vocab_len in final word
-            if w == words_needed - 1 {
-                let rem = low_vocab_len % word_bits;
-                if rem != 0 { let mask = (1usize << rem) - 1; xor &= mask; }
+    fn get_padded_bitset(&self, other: &Interner, prefix: &Vec<usize>, target_vocab_len: usize) -> Option<FixedBitSet> {
+        match other.prefix_to_completions.get(prefix) {
+            Some(bitset) => {
+                let mut padded = bitset.clone();
+                padded.grow(target_vocab_len);
+                Some(padded)
             }
-            while xor != 0 {
-                let tz = xor.trailing_zeros() as usize;
-                diffs.push(w * word_bits + tz);
-                xor &= xor - 1; // clear lowest set bit
+            None => None,
+        }
+    }
+
+    pub fn differing_completions_indices_up_to_vocab(&self, other: &Interner, prefix: &Vec<usize>) -> Vec<usize> {
+        let low_vocab_len = self.vocabulary.len();
+        let self_bitset = self.get_padded_bitset(self, prefix, low_vocab_len);
+        let other_bitset = self.get_padded_bitset(other, prefix, low_vocab_len);
+        
+        match (self_bitset, other_bitset) {
+            (None, None) => Vec::new(),
+            (None, Some(other_bs)) => {
+                other_bs.ones().filter(|&idx| idx < low_vocab_len).collect()
+            }
+            (Some(self_bs), None) => {
+                self_bs.ones().filter(|&idx| idx < low_vocab_len).collect()
+            }
+            (Some(self_bs), Some(other_bs)) => {
+                self_bs.ones()
+                    .filter(|&idx| idx < low_vocab_len && !other_bs.contains(idx))
+                    .chain(other_bs.ones().filter(|&idx| idx < low_vocab_len && !self_bs.contains(idx)))
+                    .collect()
             }
         }
-        diffs
     }
 
     pub fn completions_equal_up_to_vocab(&self, other: &Interner, prefix: &Vec<usize>) -> bool {
@@ -276,6 +276,79 @@ impl Interner {
 
     pub fn all_completions_equal_up_to_vocab(&self, other: &Interner, prefixes: &[Vec<usize>]) -> bool {
         prefixes.iter().all(|p| self.completions_equal_up_to_vocab(other, p))
+    }
+
+    pub fn impacted_keys(&self, new_interner: &Interner) -> Vec<Vec<usize>> {
+        let new_vocab_len = new_interner.vocabulary.len();
+        let mut impacted = Vec::new();
+        
+        for key in new_interner.prefix_to_completions.keys() {
+            let old_bitset = self.get_padded_bitset(self, key, new_vocab_len);
+            let new_bitset = self.get_padded_bitset(new_interner, key, new_vocab_len);
+            
+            let is_impacted = match (old_bitset, new_bitset) {
+                (None, Some(bs)) => bs.count_ones(..) > 0,
+                (Some(old_bs), Some(new_bs)) => old_bs != new_bs,
+                _ => false,
+            };
+            
+            if is_impacted {
+                impacted.push(key.clone());
+            }
+        }
+        
+        impacted
+    }
+
+    pub fn merge(&self, other: &Interner) -> Self {
+        // Step 1: Build combined vocabulary
+        let mut vocabulary = self.vocabulary.clone();
+        for word in other.vocabulary() {
+            if !vocabulary.contains(word) {
+                vocabulary.push(word.to_string());
+            }
+        }
+        let new_vocab_len = vocabulary.len();
+        
+        // Step 2: Build vocabulary mapping for other interner (old index -> new index)
+        let mut other_vocab_map = Vec::with_capacity(other.vocabulary().len());
+        for word in other.vocabulary() {
+            let new_idx = vocabulary.iter().position(|v| v == word).unwrap();
+            other_vocab_map.push(new_idx);
+        }
+        
+        // Step 3: Start with self's prefix_to_completions, padded to new vocab length
+        let mut prefix_to_completions = HashMap::new();
+        for (prefix, bitset) in &self.prefix_to_completions {
+            let mut new_bitset = bitset.clone();
+            new_bitset.grow(new_vocab_len);
+            prefix_to_completions.insert(prefix.clone(), new_bitset);
+        }
+        
+        // Step 4: Add other's prefix_to_completions with remapped indices
+        for (old_prefix, old_bitset) in &other.prefix_to_completions {
+            // Remap the prefix keys
+            let new_prefix: Vec<usize> = old_prefix.iter().map(|&idx| other_vocab_map[idx]).collect();
+            
+            // Remap the completion bits
+            let entry = prefix_to_completions.entry(new_prefix).or_insert_with(|| {
+                let mut fbs = FixedBitSet::with_capacity(new_vocab_len);
+                fbs.grow(new_vocab_len);
+                fbs
+            });
+            
+            // Flip bits from other that aren't already set in self (union operation)
+            for old_idx in old_bitset.ones() {
+                let new_idx = other_vocab_map[old_idx];
+                entry.insert(new_idx);
+            }
+        }
+        
+        Interner {
+            version: self.version + 1,
+            vocabulary,
+            prefix_to_completions,
+        }
     }
 }
 
@@ -383,6 +456,49 @@ mod tests {
         let completions = interner.completions_for_prefix(&terminal);
         assert!(completions.is_some());
     }
+
+    #[test]
+    fn test_merge_combines_vocabularies() {
+        let interner_a = Interner::from_text("a b");
+        let interner_b = Interner::from_text("c d");
+        let merged = interner_a.merge(&interner_b);
+        
+        assert_eq!(merged.vocabulary().len(), 4);
+        assert!(merged.vocabulary().contains(&"a".to_string()));
+        assert!(merged.vocabulary().contains(&"b".to_string()));
+        assert!(merged.vocabulary().contains(&"c".to_string()));
+        assert!(merged.vocabulary().contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn test_merge_increments_version() {
+        let interner_a = Interner::from_text("a b");
+        let interner_b = Interner::from_text("c d");
+        let merged = interner_a.merge(&interner_b);
+        
+        assert_eq!(merged.version(), 2);
+    }
+
+    #[test]
+    fn test_merge_preserves_completions() {
+        let interner_a = Interner::from_text("a b");
+        let interner_b = Interner::from_text("a c");
+        let merged = interner_a.merge(&interner_b);
+        
+        // Find index of 'a' in merged vocabulary
+        let a_idx = merged.vocabulary().iter().position(|v| v == "a").unwrap();
+        let b_idx = merged.vocabulary().iter().position(|v| v == "b").unwrap();
+        let c_idx = merged.vocabulary().iter().position(|v| v == "c").unwrap();
+        
+        // Check that prefix [a] has completions for both b and c
+        let prefix = vec![a_idx];
+        let completions = merged.completions_for_prefix(&prefix);
+        assert!(completions.is_some());
+        
+        let bitset = completions.unwrap();
+        assert!(bitset.contains(b_idx));
+        assert!(bitset.contains(c_idx));
+    }
 }
 
 #[cfg(test)]
@@ -481,5 +597,34 @@ mod version_compare_tests {
         let diffs = low.differing_completions_indices_up_to_vocab(&high, &prefix);
         
         assert!(diffs.len() <= low.vocabulary().len());
+    }
+
+    #[test]
+    fn test_impacted_keys_new_key() {
+        let (low, high) = build_low_high("a b", "c d");
+        let impacted = low.impacted_keys(&high);
+        assert!(impacted.len() > 0);
+    }
+
+    #[test]
+    fn test_impacted_keys_new_completion() {
+        let low = Interner::from_text("a b");
+        let high = low.add_text("a c");
+        let impacted = low.impacted_keys(&high);
+        let a_idx = low.vocabulary().iter().position(|w| w == "a").unwrap();
+        let prefix = vec![a_idx];
+        assert!(impacted.contains(&prefix));
+    }
+
+    #[test]
+    fn test_impacted_keys_no_change() {
+        let low = Interner::from_text("a b");
+        let high = Interner {
+            version: low.version + 1,
+            vocabulary: low.vocabulary.clone(),
+            prefix_to_completions: low.prefix_to_completions.clone(),
+        };
+        let impacted = low.impacted_keys(&high);
+        assert_eq!(impacted.len(), 0);
     }
 }

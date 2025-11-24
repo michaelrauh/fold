@@ -35,9 +35,45 @@ cargo run --release
 ```
 
 The program will:
-- Process each file in `fold_state/input/`
+- Check `fold_state/in_process/` for any abandoned `.txt` files or stale heartbeats from previous runs and recover them
+- Loop through `fold_state/input/` to find `.txt` files
+- Move each `.txt` file to `fold_state/in_process/` before processing (prevents other processes from picking it up)
+- Create a heartbeat file that is updated every 100,000 orthos processed
+- Process each file independently (one at a time)
+- Build a separate interner for each file
+- Generate and track orthos for each file
 - Print optimal ortho after each file
-- Print final optimal ortho at the end
+- Save an archive directory (`.bin`) in `fold_state/in_process/`
+- Delete the `.txt` file and heartbeat file after successful archiving
+- Continue looping until no `.txt` files remain
+
+Each archive is a directory containing:
+- `interner.bin`: The interner built from that specific file
+- `results/`: DiskBackedQueue directory with all ortho results
+- `optimal.txt`: Formatted text of the optimal ortho (ID, version, dimensions, score, geometry)
+- `lineage.txt`: S-expression tracking which source TXT files contributed to this archive
+
+### Process Safety
+
+The program uses an in-process directory to ensure mutual exclusion when multiple instances run concurrently. Files are moved to `fold_state/in_process/` before processing, preventing race conditions. 
+
+**Heartbeat Mechanism**: A heartbeat file is created for each processing job and updated every 100,000 orthos. On startup, the program checks for heartbeat files that haven't been updated for more than 10 minutes (grace period) and considers them stale. Files with stale heartbeats are automatically recovered and moved back to input for reprocessing.
+
+**Recovery**: On startup, any abandoned `.txt` files in the in-process directory are automatically recovered and moved back to input for reprocessing.
+
+### Lineage Tracking
+
+Each archive includes a `lineage.txt` file containing an S-expression that tracks which source TXT files contributed to the archive through any merges. This provides complete provenance information showing the merge tree structure.
+
+**Examples:**
+- Single file archive: `"file1"` 
+- Simple merge: `("file1" "file2")` represents merging file1 and file2
+- Nested merges: `("file3" ("file1" "file2"))` represents (file1 + file2) then merged with file3
+- Deep nesting: `(("file1" "file2") ("file3" "file4"))` represents (file1 + file2) merged with (file3 + file4)
+
+The S-expression format makes it clear to distinguish between different merge orders like:
+- `(((a b) c) d)` - left-associative sequential merging
+- `((a b) (c d))` - balanced binary tree merging
 
 ## Development
 

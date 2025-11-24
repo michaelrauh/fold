@@ -5,14 +5,20 @@ edition = "2024"
 
 [dependencies]
 bincode = "2.0.1"
+bloomfilter = "1.0"
 fixedbitset = "0.5.7"
 itertools = "0.12"
 serde = { version = "1.0.219", features = ["derive"] }
 rustc-hash = "1.1"
 smallvec = "1.13"
+sysinfo = "0.32"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.8"
+filetime = "0.2"
 
 [[bench]]
 name = "spatial_bench"
