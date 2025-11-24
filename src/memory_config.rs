@@ -32,16 +32,16 @@ impl MemoryConfig {
         let total_memory = sys.total_memory() as usize;
         let target_memory = (total_memory * 75) / 100;
         
-        println!("[memory_config] Total system RAM: {} MB", total_memory / 1_048_576);
-        println!("[memory_config] Target memory usage: {} MB (75%)", target_memory / 1_048_576);
-        println!("[memory_config] Interner size: {} MB", interner_bytes / 1_048_576);
+        // println!("[memory_config] Total system RAM: {} MB", total_memory / 1_048_576);
+        // println!("[memory_config] Target memory usage: {} MB (75%)", target_memory / 1_048_576);
+        // println!("[memory_config] Interner size: {} MB", interner_bytes / 1_048_576);
         
         // Reserve 20% for runtime overhead (ortho processing, vectors, etc)
         let runtime_reserve = target_memory / 5;
         let available_for_caches = target_memory.saturating_sub(interner_bytes).saturating_sub(runtime_reserve);
         
-        println!("[memory_config] Runtime reserve: {} MB", runtime_reserve / 1_048_576);
-        println!("[memory_config] Available for caches: {} MB", available_for_caches / 1_048_576);
+        // println!("[memory_config] Runtime reserve: {} MB", runtime_reserve / 1_048_576);
+        // println!("[memory_config] Available for caches: {} MB", available_for_caches / 1_048_576);
         
         // Estimate ortho size (conservative estimate based on typical dimensions)
         // Small orthos: ~80 bytes, large orthos: ~900 bytes, use 200 as middle estimate
@@ -129,17 +129,17 @@ impl MemoryConfig {
         let shard_memory = self.max_shards_in_memory * target_items_per_shard * bytes_per_shard_item;
         let total_estimated = interner_bytes + queue_memory + bloom_memory + shard_memory + runtime_reserve;
         
-        println!("\n[memory_config] ===== MEMORY CONFIGURATION =====");
-        println!("[memory_config] Queue buffer size: {} orthos (~{} MB per queue)", 
-                 self.queue_buffer_size, (self.queue_buffer_size * bytes_per_ortho) / 1_048_576);
-        println!("[memory_config] Bloom capacity: {} items (~{} MB, 0.1% FPR)", 
-                 self.bloom_capacity, bloom_memory / 1_048_576);
-        println!("[memory_config] Shards: {} total, {} in memory ({:.1}%, ~{} MB)", 
-                 self.num_shards, self.max_shards_in_memory, 
-                 (self.max_shards_in_memory as f64 / self.num_shards as f64) * 100.0,
-                 shard_memory / 1_048_576);
-        println!("[memory_config] Estimated total: {} MB", total_estimated / 1_048_576);
-        println!("[memory_config] ================================\n");
+        // println!("\n[memory_config] ===== MEMORY CONFIGURATION =====");
+        // println!("[memory_config] Queue buffer size: {} orthos (~{} MB per queue)", 
+        //          self.queue_buffer_size, (self.queue_buffer_size * bytes_per_ortho) / 1_048_576);
+        // println!("[memory_config] Bloom capacity: {} items (~{} MB, 0.1% FPR)", 
+        //          self.bloom_capacity, bloom_memory / 1_048_576);
+        // println!("[memory_config] Shards: {} total, {} in memory ({:.1}%, ~{} MB)", 
+        //          self.num_shards, self.max_shards_in_memory, 
+        //          (self.max_shards_in_memory as f64 / self.num_shards as f64) * 100.0,
+        //          shard_memory / 1_048_576);
+        // println!("[memory_config] Estimated total: {} MB", total_estimated / 1_048_576);
+        // println!("[memory_config] ================================\n");
     }
     
     /// Get default configuration for testing or when system info unavailable

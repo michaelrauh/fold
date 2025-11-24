@@ -80,7 +80,7 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                             let base_name = &folder_name_str[..folder_name_str.len() - 9]; // Remove ".txt.work"
                             let target_path = format!("{}/{}.txt", input_dir, base_name);
                             fs::rename(&source_txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
-                            println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
+                            // println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
                             
                             // Remove the abandoned work folder
                             fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
@@ -92,16 +92,61 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                 else if entry_path.to_string_lossy().ends_with(".bin") {
                     let archive_name = entry_path.file_name().unwrap();
                     let input_path = Path::new(input_dir).join(archive_name);
-                    println!("[fold] Recovering stale archive: {:?} -> {:?}", entry_path, input_path);
+                    // println!("[fold] Recovering stale archive: {:?} -> {:?}", entry_path, input_path);
                     fs::rename(&entry_path, &input_path).map_err(|e| FoldError::Io(e))?;
                     recovered_count += 1;
+                }
+                // If it's a merge_*.work folder with stale heartbeat, delete it
+                else if let Some(folder_name) = entry_path.file_name() {
+                    let folder_name_str = folder_name.to_str().unwrap_or("");
+                    if folder_name_str.starts_with("merge_") && folder_name_str.ends_with(".work") {
+                        // println!("[fold] Removing abandoned merge work folder: {}", folder_name_str);
+                        fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
+                        recovered_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Clean up orphaned results_merged_* directories in the parent directory
+    // Only delete if the corresponding merge_*.work folder doesn't exist or has stale heartbeat
+    let base_dir = Path::new(in_process_dir).parent().unwrap_or_else(|| Path::new("."));
+    if base_dir.exists() {
+        for entry in fs::read_dir(base_dir).map_err(|e| FoldError::Io(e))? {
+            let entry = entry.map_err(|e| FoldError::Io(e))?;
+            let entry_path = entry.path();
+            
+            if entry_path.is_dir() {
+                if let Some(folder_name) = entry_path.file_name() {
+                    let folder_name_str = folder_name.to_str().unwrap_or("");
+                    if folder_name_str.starts_with("results_merged_") {
+                        // Extract PID from results_merged_{pid}
+                        if let Some(pid_str) = folder_name_str.strip_prefix("results_merged_") {
+                            // Check if corresponding merge_*.work folder exists with fresh heartbeat
+                            let merge_work_name = format!("merge_{}.work", pid_str);
+                            let merge_work_path = in_process_path.join(&merge_work_name);
+                            let merge_heartbeat = merge_work_path.join("heartbeat");
+                            
+                            // Only delete if merge work doesn't exist or has stale heartbeat
+                            let should_delete = !merge_work_path.exists() || 
+                                !merge_heartbeat.exists() ||
+                                is_heartbeat_stale(&merge_heartbeat).unwrap_or(true);
+                            
+                            if should_delete {
+                                // println!("[fold] Removing orphaned results directory: {}", folder_name_str);
+                                fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
+                                recovered_count += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     
     if recovered_count > 0 {
-        println!("[fold] Recovered {} abandoned file(s) from previous run", recovered_count);
+        // println!("[fold] Recovered {} abandoned file(s) from previous run", recovered_count);
     }
     
     Ok(())
@@ -415,7 +460,7 @@ impl TxtIngestion {
         interner: &Interner,
         results: DiskBackedQueue,
         best_ortho: Option<&Ortho>,
-    ) -> Result<String, FoldError> {
+    ) -> Result<(String, String), FoldError> {
         let lineage = format!("\"{}\"", self.filename);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -426,7 +471,7 @@ impl TxtIngestion {
         let results_path = self.results_path();
         
         save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage)?;
-        Ok(archive_path.to_string_lossy().to_string())
+        Ok((archive_path.to_string_lossy().to_string(), lineage))
     }
     
     /// Cleanup work folder after processing
@@ -493,7 +538,7 @@ impl ArchiveIngestion {
         best_ortho: Option<&Ortho>,
         lineage_a: &str,
         lineage_b: &str,
-    ) -> Result<String, FoldError> {
+    ) -> Result<(String, String), FoldError> {
         let merged_lineage = format!("({} {})", lineage_a, lineage_b);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -503,7 +548,7 @@ impl ArchiveIngestion {
             now.as_secs(), now.subsec_nanos(), std::process::id()));
         
         save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage)?;
-        Ok(archive_path.to_string_lossy().to_string())
+        Ok((archive_path.to_string_lossy().to_string(), merged_lineage))
     }
     
     /// Cleanup original archives and merge work folder

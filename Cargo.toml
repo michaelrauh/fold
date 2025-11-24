@@ -12,6 +12,8 @@ serde = { version = "1.0.219", features = ["derive"] }
 rustc-hash = "1.1"
 smallvec = "1.13"
 sysinfo = "0.32"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

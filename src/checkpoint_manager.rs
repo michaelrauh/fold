@@ -66,7 +66,7 @@ impl CheckpointManager {
         }
         fs::rename(&self.temp_checkpoint_dir, &self.checkpoint_dir).map_err(|e| FoldError::Io(e))?;
         
-        println!("[fold] Checkpoint saved atomically");
+        // println!("[fold] Checkpoint saved atomically");
         
         Ok(())
     }
@@ -79,7 +79,7 @@ impl CheckpointManager {
             return Ok(None);
         }
         
-        println!("[fold] Loading checkpoint...");
+        // println!("[fold] Loading checkpoint...");
         
         // Load interner
         let interner_bytes = fs::read(format!("{}/interner.bin", self.checkpoint_dir))
@@ -107,17 +107,17 @@ impl CheckpointManager {
         
         // Create temporary queue to consume
         let mut temp_queue = DiskBackedQueue::new_from_path(&self.results_temp, memory_config.queue_buffer_size)?;
-        let total_items = temp_queue.len();
+        let _total_items = temp_queue.len();
         
-        println!("[fold] Reconstructing bloom filter and seen set from {} results...", total_items);
+        // println!("[fold] Reconstructing bloom filter and seen set from {} results...", total_items);
         
         // Use memory configuration
         let bloom_capacity = memory_config.bloom_capacity;
         let num_shards = memory_config.num_shards;
         let max_shards_in_memory = memory_config.max_shards_in_memory;
         
-        println!("[fold] Tracker config: bloom_capacity={}, num_shards={}, max_in_memory={}", 
-                 bloom_capacity, num_shards, max_shards_in_memory);
+        // println!("[fold] Tracker config: bloom_capacity={}, num_shards={}, max_in_memory={}", 
+        //          bloom_capacity, num_shards, max_shards_in_memory);
         
         // Create tracker with calculated configuration
         let mut tracker = SeenTracker::with_config(bloom_capacity, num_shards, max_shards_in_memory);
@@ -139,7 +139,7 @@ impl CheckpointManager {
             
             consumed += 1;
             if consumed % 10000 == 0 {
-                println!("[fold] Consumed {}/{} results...", consumed, total_items);
+                // println!("[fold] Consumed {}/{} results...", consumed, total_items);
             }
         }
         
@@ -148,8 +148,8 @@ impl CheckpointManager {
             fs::remove_dir_all(&self.results_temp).map_err(|e| FoldError::Io(e))?;
         }
         
-        println!("[fold] Checkpoint loaded - interner version: {}, results: {}, seen: {}", 
-                 interner.version(), new_results.len(), tracker.len());
+        // println!("[fold] Checkpoint loaded - interner version: {}, results: {}, seen: {}", 
+        //          interner.version(), new_results.len(), tracker.len());
         
         Ok(Some((interner, new_results, tracker)))
     }
