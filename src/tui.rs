@@ -1,4 +1,5 @@
 use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::spatial;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -157,8 +158,8 @@ impl Tui {
             .constraints([
                 Constraint::Length(6),
                 Constraint::Length(9),
-                Constraint::Length(6),
-                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Length(7),
                 Constraint::Min(5),
             ])
             .split(area);
@@ -241,10 +242,10 @@ impl Tui {
                 Span::raw(truncate_string(&snapshot.merge.current_merge, max_width.saturating_sub(9))),
             ]),
             Line::from(vec![
-                Span::styled("Sizes: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(truncate_string(
-                    &format!("A:{} B:{}", snapshot.merge.archive_a_size, snapshot.merge.archive_b_size),
-                    max_width.saturating_sub(7)
+                Span::styled("Orthos: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("A:{} B:{}", 
+                    format_number(snapshot.merge.archive_a_orthos),
+                    format_number(snapshot.merge.archive_b_orthos)
                 )),
             ]),
             Line::from(vec![
@@ -276,18 +277,35 @@ impl Tui {
     }
 
     fn render_optimal_ortho(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let volume = snapshot.optimal_volume_samples.last()
-            .map(|s| s.value)
-            .unwrap_or(0);
+        let opt = &snapshot.optimal_ortho;
+        let max_width = area.width.saturating_sub(2) as usize;
+        
+        // Format dimensions as [d1,d2,d3,...]
+        let dims_str = if opt.dims.is_empty() {
+            "N/A".to_string()
+        } else {
+            format!("{:?}", opt.dims)
+        };
+        
+        // Calculate fullness percentage
+        let fullness_pct = if opt.capacity > 0 {
+            (opt.fullness * 100) / opt.capacity
+        } else {
+            0
+        };
         
         let lines = vec![
             Line::from(vec![
                 Span::styled("Volume: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format_number(volume), Style::default().fg(Color::Cyan)),
+                Span::styled(format_number(opt.volume), Style::default().fg(Color::Cyan)),
             ]),
             Line::from(vec![
-                Span::styled("Geometry: ", Style::default().fg(Color::DarkGray)),
-                Span::raw("(tracked in results)"),
+                Span::styled("Shape: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate_string(&dims_str, max_width.saturating_sub(7))),
+            ]),
+            Line::from(vec![
+                Span::styled("Filled: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{}/{} ({}%)", opt.fullness, opt.capacity, fullness_pct)),
             ]),
         ];
 
@@ -302,10 +320,10 @@ impl Tui {
     fn render_largest_archive(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let max_width = area.width.saturating_sub(2) as usize;
         
-        let size_display = if snapshot.largest_archive.size_bytes == 0 {
+        let ortho_display = if snapshot.largest_archive.ortho_count == 0 {
             "N/A".to_string()
         } else {
-            format_size(snapshot.largest_archive.size_bytes)
+            format_number(snapshot.largest_archive.ortho_count)
         };
         
         let lines = vec![
@@ -314,12 +332,8 @@ impl Tui {
                 Span::raw(truncate_string(&snapshot.largest_archive.filename, max_width.saturating_sub(6))),
             ]),
             Line::from(vec![
-                Span::styled("Size: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(size_display),
-            ]),
-            Line::from(vec![
                 Span::styled("Orthos: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format_number(snapshot.largest_archive.ortho_count)),
+                Span::raw(ortho_display),
             ]),
         ];
 
@@ -355,15 +369,17 @@ impl Tui {
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(5),
                 Constraint::Length(6),
-                Constraint::Min(8),
-                Constraint::Min(8),
+                Constraint::Length(6),
+                Constraint::Min(10),
             ])
             .split(area);
 
         self.render_queue_depth_chart(f, right_chunks[0], snapshot);
         self.render_seen_size_chart(f, right_chunks[1], snapshot);
         self.render_results_chart(f, right_chunks[2], snapshot);
+        self.render_optimal_ortho_display(f, right_chunks[3], snapshot);
     }
 
     fn render_queue_depth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -534,6 +550,97 @@ impl Tui {
 
         f.render_widget(list, area);
     }
+
+    fn render_optimal_ortho_display(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let opt = &snapshot.optimal_ortho;
+        let max_width = area.width.saturating_sub(2) as usize;
+        
+        // If no ortho data, show placeholder
+        if opt.dims.is_empty() || opt.payload.is_empty() {
+            let lines = vec![Line::from("No optimal ortho yet")];
+            let block = Block::default().borders(Borders::ALL).title("Optimal Ortho Display");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let paragraph = Paragraph::new(lines);
+            f.render_widget(paragraph, inner);
+            return;
+        }
+        
+        // Format the ortho display
+        let display_lines = self.format_ortho_display(&opt.dims, &opt.payload, &opt.vocab, max_width);
+        
+        let lines: Vec<Line> = display_lines
+            .into_iter()
+            .map(|s| Line::from(s))
+            .collect();
+
+        let block = Block::default().borders(Borders::ALL).title("Optimal Ortho Display");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
+    
+    fn format_ortho_display(&self, dims: &[usize], payload: &[Option<usize>], vocab: &[String], max_width: usize) -> Vec<String> {
+        if dims.len() < 2 {
+            return vec!["Invalid dimensions".to_string()];
+        }
+        
+        let rows = dims[dims.len() - 2];
+        let cols = dims[dims.len() - 1];
+        let higher_dims = &dims[..dims.len() - 2];
+        
+        // Use spatial module to get proper coordinate mapping
+        let location_to_index = spatial::get_location_to_index(dims);
+        
+        // Calculate max token width
+        let max_token_width = payload
+            .iter()
+            .filter_map(|&opt| opt)
+            .filter_map(|idx| vocab.get(idx))
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(1)
+            .max(4)
+            .min(10); // Cap at 10 to avoid overflow
+        
+        let format_cell = |token_id: Option<usize>| -> String {
+            token_id
+                .and_then(|id| vocab.get(id))
+                .map(|s| format!("{:>width$}", truncate_string(s, max_token_width), width = max_token_width))
+                .unwrap_or_else(|| format!("{:>width$}", "·", width = max_token_width))
+        };
+        
+        let format_2d_slice = |prefix: &[usize]| -> Vec<String> {
+            (0..rows)
+                .map(|row| {
+                    let row_str = (0..cols)
+                        .map(|col| {
+                            let coords: Vec<usize> = prefix.iter().copied().chain([row, col]).collect();
+                            location_to_index.get(&coords)
+                                .and_then(|&idx| payload.get(idx))
+                                .and_then(|&opt| opt)
+                                .map(|token_id| format_cell(Some(token_id)))
+                                .unwrap_or_else(|| format_cell(None))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    truncate_string(&row_str, max_width)
+                })
+                .collect()
+        };
+        
+        if higher_dims.is_empty() {
+            return format_2d_slice(&[]);
+        }
+        
+        // For higher dimensions, show first tile only (to fit in space)
+        let mut result = Vec::new();
+        result.push("[dim0=0, ...]".to_string());
+        result.extend(format_2d_slice(&vec![0; higher_dims.len()]));
+        result
+    }
 }
 
 fn truncate_string(s: &str, max_len: usize) -> String {
@@ -555,16 +662,6 @@ fn format_number(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
     }
 }
 

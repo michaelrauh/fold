@@ -68,8 +68,8 @@ impl Default for OperationStatus {
 pub struct MergeStatus {
     pub completed_merges: usize,
     pub current_merge: String,
-    pub archive_a_size: String,
-    pub archive_b_size: String,
+    pub archive_a_orthos: usize,
+    pub archive_b_orthos: usize,
     pub impacted_a: usize,
     pub impacted_b: usize,
     pub seed_orthos_a: usize,
@@ -81,8 +81,8 @@ impl Default for MergeStatus {
         Self {
             completed_merges: 0,
             current_merge: String::new(),
-            archive_a_size: String::new(),
-            archive_b_size: String::new(),
+            archive_a_orthos: 0,
+            archive_b_orthos: 0,
             impacted_a: 0,
             impacted_b: 0,
             seed_orthos_a: 0,
@@ -94,7 +94,6 @@ impl Default for MergeStatus {
 #[derive(Clone, Debug)]
 pub struct LargestArchive {
     pub filename: String,
-    pub size_bytes: u64,
     pub ortho_count: usize,
     pub lineage: String,
 }
@@ -103,9 +102,31 @@ impl Default for LargestArchive {
     fn default() -> Self {
         Self {
             filename: String::new(),
-            size_bytes: 0,
             ortho_count: 0,
             lineage: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OptimalOrtho {
+    pub volume: usize,
+    pub dims: Vec<usize>,
+    pub fullness: usize,
+    pub capacity: usize,
+    pub payload: Vec<Option<usize>>,
+    pub vocab: Vec<String>,
+}
+
+impl Default for OptimalOrtho {
+    fn default() -> Self {
+        Self {
+            volume: 0,
+            dims: vec![],
+            fullness: 0,
+            capacity: 0,
+            payload: vec![],
+            vocab: vec![],
         }
     }
 }
@@ -125,6 +146,7 @@ struct MetricsInner {
     operation: OperationStatus,
     merge: MergeStatus,
     largest_archive: LargestArchive,
+    optimal_ortho: OptimalOrtho,
     
     queue_depth_samples: VecDeque<MetricSample>,
     seen_size_samples: VecDeque<MetricSample>,
@@ -142,6 +164,7 @@ impl Metrics {
                 operation: OperationStatus::default(),
                 merge: MergeStatus::default(),
                 largest_archive: LargestArchive::default(),
+                optimal_ortho: OptimalOrtho::default(),
                 queue_depth_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 results_count_samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -182,6 +205,11 @@ impl Metrics {
     pub fn update_largest_archive(&self, update: impl FnOnce(&mut LargestArchive)) {
         let mut inner = self.inner.lock().unwrap();
         update(&mut inner.largest_archive);
+    }
+
+    pub fn update_optimal_ortho(&self, update: impl FnOnce(&mut OptimalOrtho)) {
+        let mut inner = self.inner.lock().unwrap();
+        update(&mut inner.optimal_ortho);
     }
 
     pub fn record_queue_depth(&self, depth: usize) {
@@ -238,6 +266,7 @@ impl Metrics {
             operation: inner.operation.clone(),
             merge: inner.merge.clone(),
             largest_archive: inner.largest_archive.clone(),
+            optimal_ortho: inner.optimal_ortho.clone(),
             queue_depth_samples: inner.queue_depth_samples.iter().cloned().collect(),
             seen_size_samples: inner.seen_size_samples.iter().cloned().collect(),
             results_count_samples: inner.results_count_samples.iter().cloned().collect(),
@@ -253,6 +282,7 @@ pub struct MetricsSnapshot {
     pub operation: OperationStatus,
     pub merge: MergeStatus,
     pub largest_archive: LargestArchive,
+    pub optimal_ortho: OptimalOrtho,
     pub queue_depth_samples: Vec<MetricSample>,
     pub seen_size_samples: Vec<MetricSample>,
     pub results_count_samples: Vec<MetricSample>,

@@ -284,7 +284,8 @@ fn save_archive(
     mut results: DiskBackedQueue, 
     results_path: &str,
     best_ortho: Option<&Ortho>,
-    lineage: &str
+    lineage: &str,
+    ortho_count: usize
 ) -> Result<(), FoldError> {
     // Flush and drop results to close file handles before rename
     results.flush()?;
@@ -315,6 +316,10 @@ fn save_archive(
     // Write the lineage tracking as S-expression
     let lineage_path = format!("{}/lineage.txt", archive_path);
     fs::write(lineage_path, lineage).map_err(|e| FoldError::Io(e))?;
+    
+    // Write metadata (ortho count)
+    let metadata_path = format!("{}/metadata.txt", archive_path);
+    fs::write(metadata_path, ortho_count.to_string()).map_err(|e| FoldError::Io(e))?;
     
     // Create heartbeat file in the archive
     let heartbeat_path = format!("{}/heartbeat", archive_path);
@@ -357,6 +362,13 @@ fn get_results_path(archive_path: &str) -> String {
 fn load_lineage(archive_path: &str) -> Result<String, FoldError> {
     let lineage_path = format!("{}/lineage.txt", archive_path);
     fs::read_to_string(&lineage_path).map_err(|e| FoldError::Io(e))
+}
+
+fn load_metadata(archive_path: &str) -> Result<usize, FoldError> {
+    let metadata_path = format!("{}/metadata.txt", archive_path);
+    let content = fs::read_to_string(&metadata_path).map_err(|e| FoldError::Io(e))?;
+    content.trim().parse::<usize>()
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
 /// Ensures a directory exists by creating it if needed
@@ -460,17 +472,18 @@ impl TxtIngestion {
         interner: &Interner,
         results: DiskBackedQueue,
         best_ortho: Option<&Ortho>,
+        ortho_count: usize,
     ) -> Result<(String, String), FoldError> {
         let lineage = format!("\"{}\"", self.filename);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         // Use timestamp + nanos + filename for guaranteed uniqueness
-        let archive_path = self.config.input_dir().join(format!("archive_{}_{}_{}.bin", 
+        let archive_path = self.config.input_dir().join(format!("archive_{}_{}_{}=.bin", 
             self.filename, now.as_secs(), now.subsec_nanos()));
         let results_path = self.results_path();
         
-        save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage)?;
+        save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage, ortho_count)?;
         Ok((archive_path.to_string_lossy().to_string(), lineage))
     }
     
@@ -538,6 +551,7 @@ impl ArchiveIngestion {
         best_ortho: Option<&Ortho>,
         lineage_a: &str,
         lineage_b: &str,
+        ortho_count: usize,
     ) -> Result<(String, String), FoldError> {
         let merged_lineage = format!("({} {})", lineage_a, lineage_b);
         let now = SystemTime::now()
@@ -547,7 +561,7 @@ impl ArchiveIngestion {
         let archive_path = self.config.input_dir().join(format!("archive_merged_{}_{}_{}.bin", 
             now.as_secs(), now.subsec_nanos(), std::process::id()));
         
-        save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage)?;
+        save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage, ortho_count)?;
         Ok((archive_path.to_string_lossy().to_string(), merged_lineage))
     }
     
@@ -588,17 +602,81 @@ pub fn get_smallest_and_largest_archives() -> Result<Option<(String, String)>, F
 
 /// Get the smallest and largest archives with custom config
 pub fn get_smallest_and_largest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
-    let mut archives = find_archives(config.input_dir().to_str().unwrap())?;
+    let archives = find_archives(config.input_dir().to_str().unwrap())?;
     
     if archives.len() < 2 {
         return Ok(None);
     }
     
-    archives.sort_by_key(|(_, size)| *size);
-    let smallest = archives[0].0.clone();
-    let largest = archives[archives.len() - 1].0.clone();
+    // Collect archives with valid metadata (ortho counts)
+    let mut archives_with_counts: Vec<(String, usize)> = archives
+        .into_iter()
+        .filter_map(|(path, _size)| {
+            load_metadata(&path).ok().map(|count| (path, count))
+        })
+        .collect();
+    
+    if archives_with_counts.len() < 2 {
+        return Ok(None);
+    }
+    
+    archives_with_counts.sort_by_key(|(_, count)| *count);
+    let smallest = archives_with_counts[0].0.clone();
+    let largest = archives_with_counts[archives_with_counts.len() - 1].0.clone();
     
     Ok(Some((smallest, largest)))
+}
+
+/// Archive metadata for initialization
+pub struct ArchiveMetadata {
+    pub path: String,
+    pub ortho_count: usize,
+    pub lineage: String,
+}
+
+/// Load archive metadata (ortho count) - public wrapper
+pub fn load_archive_metadata(archive_path: &str) -> Result<usize, FoldError> {
+    load_metadata(archive_path)
+}
+
+/// Find the largest archive by ortho count (uses default config)
+pub fn find_largest_archive() -> Result<Option<ArchiveMetadata>, FoldError> {
+    find_largest_archive_with_config(&StateConfig::default())
+}
+
+/// Find the largest archive by ortho count with custom config
+pub fn find_largest_archive_with_config(config: &StateConfig) -> Result<Option<ArchiveMetadata>, FoldError> {
+    let archives = find_archives(config.input_dir().to_str().unwrap())?;
+    
+    if archives.is_empty() {
+        return Ok(None);
+    }
+    
+    let mut largest: Option<ArchiveMetadata> = None;
+    
+    for (archive_path, _size_bytes) in archives {
+        if let Ok(ortho_count) = load_metadata(&archive_path) {
+            if let Ok(lineage) = load_lineage(&archive_path) {
+                if let Some(ref current) = largest {
+                    if ortho_count > current.ortho_count {
+                        largest = Some(ArchiveMetadata {
+                            path: archive_path,
+                            ortho_count,
+                            lineage,
+                        });
+                    }
+                } else {
+                    largest = Some(ArchiveMetadata {
+                        path: archive_path,
+                        ortho_count,
+                        lineage,
+                    });
+                }
+            }
+        }
+    }
+    
+    Ok(largest)
 }
 
 /// Ingest a text file (uses default config)
@@ -673,7 +751,7 @@ mod tests {
         results.push(ortho2).unwrap();
         
         // Save archive
-        save_archive(archive_path.to_str().unwrap(), &interner, results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"").unwrap();
+        save_archive(archive_path.to_str().unwrap(), &interner, results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"", 2).unwrap();
         
         // Verify archive directory exists
         assert!(archive_path.exists());

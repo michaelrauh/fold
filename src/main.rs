@@ -4,16 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-fn format_size(bytes: u64) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
     let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
@@ -51,6 +41,15 @@ fn main() -> Result<(), FoldError> {
         g.total_chunks = total_chunks;
         g.remaining_chunks = total_chunks;
     });
+    
+    // Initialize largest archive metric from existing archives
+    if let Ok(Some(largest)) = file_handler::find_largest_archive_with_config(&config) {
+        metrics.update_largest_archive(|la| {
+            la.filename = largest.path;
+            la.ortho_count = largest.ortho_count;
+            la.lineage = largest.lineage;
+        });
+    }
     
     // Main processing loop - two modes:
     // Mode 1: If there are 2+ result archives, merge smallest with largest
@@ -200,9 +199,26 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
                     tracker.insert(child_id);
                     
                     let candidate_score = calculate_score(&child);
+                    
+                    // Update local best for this operation
                     if candidate_score > best_score {
                         best_ortho = child.clone();
                         best_score = candidate_score;
+                    }
+                    
+                    // Check against global optimal
+                    let snapshot = metrics.snapshot();
+                    let global_score = (snapshot.optimal_ortho.volume, snapshot.optimal_ortho.fullness);
+                    if candidate_score > global_score {
+                        let (volume, fullness) = candidate_score;
+                        metrics.update_optimal_ortho(|opt| {
+                            opt.volume = volume;
+                            opt.dims = child.dims().clone();
+                            opt.fullness = fullness;
+                            opt.capacity = child.payload().len();
+                            opt.payload = child.payload().clone();
+                            opt.vocab = interner.vocabulary().to_vec();
+                        });
                     }
                     
                     results.push(child.clone())?;
@@ -218,22 +234,18 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     print_optimal(&best_ortho, &interner);
     
     // Save the result (using method on ingestion)
-    let (archive_path, lineage) = ingestion.save_result(&interner, results, Some(&best_ortho))?;
+    let (archive_path, lineage) = ingestion.save_result(&interner, results, Some(&best_ortho), total_orthos)?;
     
     metrics.add_log(format!("Archive saved: {}", archive_path));
     
     // Update largest archive if this is bigger
-    if let Ok(metadata) = std::fs::metadata(&archive_path) {
-        let size_bytes = metadata.len();
-        metrics.update_largest_archive(|la| {
-            if size_bytes > la.size_bytes {
-                la.filename = archive_path.clone();
-                la.size_bytes = size_bytes;
-                la.ortho_count = total_orthos;
-                la.lineage = lineage;
-            }
-        });
-    }
+    metrics.update_largest_archive(|la| {
+        if total_orthos > la.ortho_count {
+            la.filename = archive_path.clone();
+            la.ortho_count = total_orthos;
+            la.lineage = lineage;
+        }
+    });
     
     metrics.update_global(|g| g.processed_chunks += 1);
     
@@ -244,13 +256,9 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
 }
 
 fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConfig, metrics: &Metrics) -> Result<(), FoldError> {
-    // Get archive sizes for display BEFORE ingest moves them
-    let size_a = std::fs::metadata(archive_a_path)
-        .map(|m| format_size(m.len()))
-        .unwrap_or_else(|_| "?".to_string());
-    let size_b = std::fs::metadata(archive_b_path)
-        .map(|m| format_size(m.len()))
-        .unwrap_or_else(|_| "?".to_string());
+    // Get archive ortho counts for display BEFORE ingest moves them
+    let orthos_a = file_handler::load_archive_metadata(archive_a_path).unwrap_or(0);
+    let orthos_b = file_handler::load_archive_metadata(archive_b_path).unwrap_or(0);
     
     // Ingest archives for merging
     let ingestion = file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)?;
@@ -271,8 +279,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     
     metrics.update_merge(|m| {
         m.current_merge = format!("merge_{}", std::process::id());
-        m.archive_a_size = size_a;
-        m.archive_b_size = size_b;
+        m.archive_a_orthos = orthos_a;
+        m.archive_b_orthos = orthos_b;
         m.impacted_a = impacted_a.len();
         m.impacted_b = impacted_b.len();
     });
@@ -464,9 +472,26 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                     tracker.insert(child_id);
                     
                     let candidate_score = calculate_score(&child);
+                    
+                    // Update local best for this operation
                     if candidate_score > best_score {
                         best_ortho = child.clone();
                         best_score = candidate_score;
+                    }
+                    
+                    // Check against global optimal
+                    let snapshot = metrics.snapshot();
+                    let global_score = (snapshot.optimal_ortho.volume, snapshot.optimal_ortho.fullness);
+                    if candidate_score > global_score {
+                        let (volume, fullness) = candidate_score;
+                        metrics.update_optimal_ortho(|opt| {
+                            opt.volume = volume;
+                            opt.dims = child.dims().clone();
+                            opt.fullness = fullness;
+                            opt.capacity = child.payload().len();
+                            opt.payload = child.payload().clone();
+                            opt.vocab = merged_interner.vocabulary().to_vec();
+                        });
                     }
                     
                     merged_results.push(child.clone())?;
@@ -490,23 +515,20 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         results_path.to_str().unwrap(), 
         Some(&best_ortho), 
         &lineage_a_early, 
-        &lineage_b_early
+        &lineage_b_early,
+        total_merged
     )?;
     
     metrics.add_log(format!("Archive saved: {}", merged_archive_path));
     
     // Update largest archive metrics
-    if let Ok(metadata) = std::fs::metadata(&merged_archive_path) {
-        let size_bytes = metadata.len();
-        metrics.update_largest_archive(|la| {
-            if size_bytes > la.size_bytes {
-                la.filename = merged_archive_path.clone();
-                la.size_bytes = size_bytes;
-                la.ortho_count = total_merged;
-                la.lineage = merged_lineage;
-            }
-        });
-    }
+    metrics.update_largest_archive(|la| {
+        if total_merged > la.ortho_count {
+            la.filename = merged_archive_path.clone();
+            la.ortho_count = total_merged;
+            la.lineage = merged_lineage;
+        }
+    });
     
     // Delete the original archives using consuming cleanup method
     ingestion.cleanup()?;
