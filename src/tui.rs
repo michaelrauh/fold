@@ -438,20 +438,23 @@ impl Tui {
             .map(|s| s.value as u64)
             .collect();
 
-        let (current, rate) = if data.len() >= 2 {
+        let (current, peak, rate) = if data.len() >= 2 {
             let current = *data.last().unwrap_or(&0);
+            let peak = *data.iter().max().unwrap_or(&0);
             let prev = data[data.len().saturating_sub(10).max(0)];
             let rate = (current.saturating_sub(prev)) / 10;
-            (current, rate)
+            (current, peak, rate)
         } else if !data.is_empty() {
-            (*data.last().unwrap(), 0)
+            let current = *data.last().unwrap();
+            (current, current, 0)
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
 
         let title = format!(
-            "Seen │ Cur:{} Δ+{}/s",
+            "Seen │ Cur:{} Pk:{} Δ+{}/s",
             format_number(current as usize),
+            format_number(peak as usize),
             format_number(rate as usize)
         );
         let max_width = area.width.saturating_sub(2) as usize;
@@ -475,28 +478,21 @@ impl Tui {
             .map(|s| s.value as u64)
             .collect();
 
-        let volume_data: Vec<u64> = snapshot
-            .optimal_volume_samples
-            .iter()
-            .map(|s| s.value as u64)
-            .collect();
-
-        let (current_results, rate) = if results_data.len() >= 2 {
+        let (current_results, peak_results, rate) = if results_data.len() >= 2 {
             let current = *results_data.last().unwrap_or(&0);
+            let peak = *results_data.iter().max().unwrap_or(&0);
             let prev = results_data[results_data.len().saturating_sub(10).max(0)];
             let rate = (current as i64 - prev as i64) / 10;
-            (current, rate)
+            (current, peak, rate)
         } else if !results_data.is_empty() {
-            (*results_data.last().unwrap(), 0)
+            let current = *results_data.last().unwrap();
+            (current, current, 0)
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
-        
-        let current_volume = volume_data.last().copied().unwrap_or(0);
 
         let max_val = results_data
             .iter()
-            .chain(volume_data.iter())
             .max()
             .copied()
             .unwrap_or(1)
@@ -509,9 +505,9 @@ impl Tui {
 
         let rate_sign = if rate >= 0 { "+" } else { "" };
         let title = format!(
-            "Results │ Cnt:{} OptVol:{} Δ{}{}/s",
+            "Results │ Cur:{} Pk:{} Δ{}{}/s",
             format_number(current_results as usize),
-            format_number(current_volume as usize),
+            format_number(peak_results as usize),
             rate_sign,
             format_number(rate.abs() as usize)
         );
