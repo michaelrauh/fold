@@ -24,9 +24,12 @@ The current implementation loop performs multiple operations per ortho:
 | **1. Lazy Remapping** | Defer remapping until ortho is accessed for processing | Medium | Medium (still traverses all) | Low | Low | ✅ Yes |
 | **2. Parallel Remapping** | Use Rayon to remap orthos in parallel batches | Low | Medium (linear speedup) | Medium | Low | ✅ Yes |
 | **3. Eliminate Remapping via Stable Canonical Indices** | Use canonical vocabulary ordering so indices are stable across interners (bitset-compatible) | High | Medium (loop still required for seen/results) | Low | Medium | ⚠️ Maybe |
-| **4. Incremental Merge** | Only remap orthos that are impacted by vocabulary changes | Medium | Variable (high when few changes) | Low | Medium | ⚠️ Maybe |
-| **5. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Medium (loop still required) | Low | Low | ⚠️ Maybe |
-| **6. Persist SeenTracker/Results in Archive** | Store seen set and results state in archive; merge via union/concat | Very High | Very High (eliminates O(n) loop) | High | Medium | ⚠️ Maybe |
+| **4. Per-Ortho Remap Check** | Check if remap is identity for each ortho; skip if indices unchanged | Very Low | Variable (high when vocabs align) | None | Low | ✅ Yes |
+| **5. Incremental Merge** | Only remap orthos that are impacted by vocabulary changes | Medium | Variable (high when few changes) | Low | Medium | ⚠️ Maybe |
+| **6. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Medium (loop still required) | Low | Low | ⚠️ Maybe |
+| **7. Persist SeenTracker/Results in Archive** | Store seen set and results state in archive; merge via union/concat | Very High | Very High (eliminates O(n) loop) | High | Medium | ⚠️ Maybe |
+| **8. File Concatenation with Deferred Dedup** | Concatenate result files; rebuild seen set lazily or at query time | High | Very High (eliminates loop) | Low | Medium | ⚠️ Maybe |
+| **9. Structural Sharing / Copy-on-Write Archives** | Use immutable data structures; merge by referencing parent archives | Very High | Very High (O(1) merge) | Medium | High | ⚠️ Maybe |
 
 ---
 
@@ -123,7 +126,47 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 ---
 
-### Option 4: Incremental Merge (Impacted-Only Remapping)
+### Option 4: Per-Ortho Remap Check (Skip Identity Mappings)
+
+**Description**: Before calling `ortho.remap()`, check if the vocabulary mapping is an identity for that ortho's tokens. If so, skip the remap call entirely.
+
+**Implementation**:
+```rust
+// Check if vocab_map is identity for this ortho's payload
+fn needs_remap(ortho: &Ortho, vocab_map: &[usize]) -> bool {
+    ortho.payload().iter()
+        .filter_map(|opt| *opt)
+        .any(|idx| vocab_map[idx] != idx)
+}
+
+// In the loop:
+let remapped = if needs_remap(&ortho, &vocab_map_a) {
+    ortho.remap(&vocab_map_a, new_version)
+} else {
+    Some(ortho.with_version(new_version)) // Just update version
+};
+```
+
+**When this helps**:
+- When archive A's vocabulary is a prefix of the merged vocabulary (append-only growth)
+- When merging archives with identical or overlapping vocabularies
+- Common in linear merge chains where each new file adds few new tokens
+
+**Pros**:
+- Very low implementation complexity (simple check before remap)
+- Zero overhead when remap is needed
+- Significant savings when vocabularies align
+
+**Cons**:
+- Still requires the O(n) loop for seen/results rehydration
+- Negligible benefit when vocabularies are disjoint or reordered
+- Adds a check cost (but much cheaper than full remap)
+
+**Expected Speedup**: 0-90% of remapping time (depends on vocabulary alignment pattern)
+
+---
+
+### Option 5: Incremental Merge (Impacted-Only Processing)
 
 **Description**: Leverage the existing `impacted_keys` computation to skip remapping orthos whose vocabulary indices don't change.
 
@@ -146,7 +189,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 ---
 
-### Option 5: Streaming Archive Format
+### Option 6: Streaming Archive Format
 
 **Description**: When saving an archive, pre-compute and store the remapped orthos for all possible merge targets (or use a canonical vocabulary ordering).
 
@@ -174,11 +217,11 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 ---
 
-## Eliminating the Loop Entirely
+## Eliminating the Rehydrate Loop Entirely
 
-As noted in the Background, the current remapping loop also rehydrates the `SeenTracker` and `merged_results` queue. To truly eliminate the O(n) traversal (not just the remapping), consider these additional architectural changes:
+As noted in the Background, the current remapping loop also rehydrates the `SeenTracker` and `merged_results` queue. To truly eliminate the O(n) traversal (not just the remapping), consider these architectural changes:
 
-### Option 6: Persist SeenTracker and Results in Archive
+### Option 7: Persist SeenTracker and Results in Archive
 
 **Description**: Store the `SeenTracker` state (bloom filter + shards) and `merged_results` queue alongside the orthos in the archive format. On merge, union the seen sets and concatenate results without per-ortho iteration.
 
@@ -200,19 +243,79 @@ As noted in the Background, the current remapping loop also rehydrates the `Seen
 
 ---
 
+### Option 8: File Concatenation with Deferred Deduplication
+
+**Description**: Instead of eagerly deduplicating during merge, concatenate result files and defer deduplication to query time or a background compaction process.
+
+**Implementation**:
+- Merge simply concatenates archive result files (O(1) file operation)
+- Maintain a "layers" structure: each merge adds a new layer
+- Deduplication happens lazily when orthos are accessed, or during background compaction
+- Query: iterate through layers, skip already-seen IDs
+
+**Pros**:
+- O(1) merge time (just file concat + metadata update)
+- Deduplication cost amortized over queries
+- Simple implementation for merge operation
+
+**Cons**:
+- Query time increases with number of uncompacted layers
+- Requires background compaction strategy to bound layer count
+- More complex read path with layer iteration
+- Duplicates temporarily consume disk space
+
+**Expected Speedup**: 99%+ at merge time (cost shifted to query/compaction)
+
+---
+
+### Option 9: Structural Sharing / Copy-on-Write Archives
+
+**Description**: Use immutable, content-addressed data structures where merge creates a new archive that references parent archives rather than copying data.
+
+**Implementation**:
+- Archives are immutable; merge creates a "merge node" referencing A and B
+- Ortho lookup traverses the merge DAG
+- Vocabulary indices are resolved through the inheritance chain
+- Compaction flattens the DAG when too deep
+
+**Analogy**: Similar to Git's commit graph or persistent data structures.
+
+**Pros**:
+- O(1) merge time (just create reference node)
+- No data copying during merge
+- Full history preserved
+- Natural support for branching/parallel exploration
+
+**Cons**:
+- Complex query resolution through DAG
+- Need garbage collection for unreachable archives
+- Vocabulary mapping must be resolved per-query
+- Deep DAG = slow queries; requires periodic compaction
+
+**Expected Speedup**: 99%+ at merge time (cost shifted to query time)
+
+---
+
 ## Recommendation
 
-**Key insight**: Under the current design, the O(n) loop cannot be eliminated because it rehydrates the `SeenTracker` and `merged_results` queue. Options 1-5 can only reduce per-ortho cost within the loop; only Option 6 addresses the loop itself.
+**Key insight**: Under the current design, the O(n) loop cannot be eliminated because it rehydrates the `SeenTracker` and `merged_results` queue. Options 1-6 can only reduce per-ortho cost within the loop; Options 7-9 address eliminating the loop itself through architectural changes.
+
+### Within-Loop Optimizations (Quick Wins)
 
 For **immediate improvement** with minimal risk:
-1. **Option 2 (Parallel Remapping)** - Quick win with Rayon, low risk
+1. **Option 4 (Per-Ortho Remap Check)** - Very low implementation cost; skip remap when indices unchanged
+2. **Option 2 (Parallel Remapping)** - Quick win with Rayon, low risk
 
 For **medium-term optimization**:
-2. **Option 1 (Lazy Remapping)** - Reduces remapping cost but loop still required
-3. **Option 4 (Incremental Merge)** - Skip remapping for unchanged indices
+3. **Option 1 (Lazy Remapping)** - Reduces remapping cost but loop still required
+4. **Option 5 (Incremental Merge)** - Skip remapping for unchanged indices
 
-For **long-term architectural improvement**:
-4. **Option 6 (Persist SeenTracker/Results)** - Only approach that eliminates the O(n) loop entirely
+### Loop Elimination (Architectural Changes)
+
+For **long-term architectural improvement** to eliminate the O(n) loop:
+5. **Option 8 (File Concatenation with Deferred Dedup)** - Simplest path to O(1) merge; shifts dedup to query/compaction
+6. **Option 7 (Persist SeenTracker/Results)** - Eliminates loop for non-impacted orthos; moderate complexity
+7. **Option 9 (Structural Sharing)** - Most flexible but highest complexity; enables new use cases like branching
 
 ---
 
