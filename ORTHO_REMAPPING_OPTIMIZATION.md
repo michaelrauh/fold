@@ -4,13 +4,16 @@
 
 When merging archives in a linear merge chain, the ortho remapping stage processes ALL orthos from both archives to translate vocabulary indices from the source interner to the merged interner. This is performed in the `merge_archives()` function in `main.rs`.
 
-The current implementation:
+The current implementation loop performs multiple operations per ortho:
 1. Loads each ortho from Archive A and Archive B via `DiskBackedQueue::pop()`
 2. Calls `ortho.remap(&vocab_map, new_version)` to translate payload indices
-3. Checks deduplication via `SeenTracker`
-4. Pushes remapped orthos to `merged_results` and conditionally to `work_queue`
+3. Computes remapped ID and checks deduplication via `SeenTracker`
+4. Pushes remapped orthos to `merged_results` (rehydrating results queue)
+5. Checks if ortho is impacted and conditionally adds to `work_queue`
 
-**Key bottleneck**: This is O(n) where n is the total number of orthos across both archives, and becomes increasingly expensive as archives grow through successive merges.
+**Important architectural note**: The loop that performs remapping also rehydrates the `SeenTracker` and `merged_results` queue. These operations are essential for the merge and cannot be eliminated—every ortho must be visited to populate the deduplication set and results. Therefore, **the loop itself cannot be removed under the current design**; optimization strategies should focus on reducing the cost of remapping within the loop or restructuring how state is persisted.
+
+**Key bottleneck**: The loop is O(n) where n is the total number of orthos across both archives, and becomes increasingly expensive as archives grow through successive merges. While remapping adds per-ortho cost, the loop traversal is unavoidable given current state management.
 
 ---
 
@@ -18,11 +21,12 @@ The current implementation:
 
 | Option | Description | Implementation Complexity | Performance Improvement | Memory Impact | Correctness Risk | Recommended |
 |--------|-------------|--------------------------|------------------------|---------------|------------------|-------------|
-| **1. Lazy Remapping** | Defer remapping until ortho is accessed for processing | Medium | High (O(1) per unused ortho) | Low | Low | ✅ Yes |
+| **1. Lazy Remapping** | Defer remapping until ortho is accessed for processing | Medium | Medium (still traverses all) | Low | Low | ✅ Yes |
 | **2. Parallel Remapping** | Use Rayon to remap orthos in parallel batches | Low | Medium (linear speedup) | Medium | Low | ✅ Yes |
-| **3. Eliminate Remapping via Stable Canonical Indices** | Use canonical vocabulary ordering so indices are stable across interners (bitset-compatible) | High | Very High (eliminate stage) | Low | Medium | ⚠️ Maybe |
+| **3. Eliminate Remapping via Stable Canonical Indices** | Use canonical vocabulary ordering so indices are stable across interners (bitset-compatible) | High | Medium (loop still required for seen/results) | Low | Medium | ⚠️ Maybe |
 | **4. Incremental Merge** | Only remap orthos that are impacted by vocabulary changes | Medium | Variable (high when few changes) | Low | Medium | ⚠️ Maybe |
-| **5. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Very High (shift cost to save) | Low | Low | ✅ Yes |
+| **5. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Medium (loop still required) | Low | Low | ⚠️ Maybe |
+| **6. Persist SeenTracker/Results in Archive** | Store seen set and results state in archive; merge via union/concat | Very High | Very High (eliminates O(n) loop) | High | Medium | ⚠️ Maybe |
 
 ---
 
@@ -170,16 +174,45 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 ---
 
+## Eliminating the Loop Entirely
+
+As noted in the Background, the current remapping loop also rehydrates the `SeenTracker` and `merged_results` queue. To truly eliminate the O(n) traversal (not just the remapping), consider these additional architectural changes:
+
+### Option 6: Persist SeenTracker and Results in Archive
+
+**Description**: Store the `SeenTracker` state (bloom filter + shards) and `merged_results` queue alongside the orthos in the archive format. On merge, union the seen sets and concatenate results without per-ortho iteration.
+
+**Implementation**:
+- Serialize `SeenTracker` bloom filter and shard data into archive
+- Store results queue metadata (count, disk locations) in archive
+- Merge becomes: union seen sets + concatenate result files + remap impacted orthos only
+
+**Pros**:
+- Eliminates O(n) loop for non-impacted orthos
+- Only impacted orthos need individual processing
+
+**Cons**:
+- Larger archive files (seen set state can be significant)
+- Bloom filter union may increase false positive rate
+- Complex archive format with multiple data streams
+
+**Expected Speedup**: 90%+ reduction in merge time when few orthos are impacted
+
+---
+
 ## Recommendation
+
+**Key insight**: Under the current design, the O(n) loop cannot be eliminated because it rehydrates the `SeenTracker` and `merged_results` queue. Options 1-5 can only reduce per-ortho cost within the loop; only Option 6 addresses the loop itself.
 
 For **immediate improvement** with minimal risk:
 1. **Option 2 (Parallel Remapping)** - Quick win with Rayon, low risk
 
 For **medium-term optimization**:
-2. **Option 1 (Lazy Remapping)** - Good ROI for typical workloads
+2. **Option 1 (Lazy Remapping)** - Reduces remapping cost but loop still required
+3. **Option 4 (Incremental Merge)** - Skip remapping for unchanged indices
 
 For **long-term architectural improvement**:
-3. **Option 5 (Streaming Archive Format)** - Best for eliminating the bottleneck entirely
+4. **Option 6 (Persist SeenTracker/Results)** - Only approach that eliminates the O(n) loop entirely
 
 ---
 
