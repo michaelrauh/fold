@@ -95,7 +95,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 **Cons**:
 - Breaking change to serialization format (migration required)
-- Higher memory per ortho (`u64` hash = 8 bytes vs `usize` index = 4-8 bytes depending on platform)
+- Higher memory per ortho on 32-bit platforms (`u64` hash = 8 bytes vs `usize` index = 4 bytes); no overhead on 64-bit where `usize` is already 8 bytes
 - Hash collisions require handling (though extremely rare with good hash functions)
 
 **Expected Speedup**: 100% elimination of remapping overhead
@@ -137,7 +137,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 **Alternative approach**:
 - Store orthos as `(payload_tokens: Vec<String>, dims)` in archives
 - Remap to indices on load (shifts cost from merge to load)
-- Note: Full string storage increases archive size significantly (~10-50x per token); consider string interning with a shared dictionary to mitigate
+- Note: Full string storage increases archive size (e.g., 8 bytes for index vs average ~6-12 bytes per token string plus length prefix); consider string interning with a shared dictionary to mitigate
 
 **Pros**:
 - Eliminates merge-time remapping entirely
