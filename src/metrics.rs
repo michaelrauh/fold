@@ -84,6 +84,7 @@ pub struct MergeStatus {
     pub seed_orthos_b: usize,
     pub impacted_queued_a: usize,
     pub impacted_queued_b: usize,
+    pub new_orthos_from_merge: usize,
 }
 
 impl Default for MergeStatus {
@@ -99,6 +100,7 @@ impl Default for MergeStatus {
             seed_orthos_b: 0,
             impacted_queued_a: 0,
             impacted_queued_b: 0,
+            new_orthos_from_merge: 0,
         }
     }
 }

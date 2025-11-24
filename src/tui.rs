@@ -164,7 +164,7 @@ impl Tui {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(6),
-                Constraint::Length(9),
+                Constraint::Length(10),
                 Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Min(5),
@@ -268,6 +268,10 @@ impl Tui {
                     format_number(snapshot.merge.impacted_a),
                     format_number(snapshot.merge.impacted_b)
                 )),
+            ]),
+            Line::from(vec![
+                Span::styled("New: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format_number(snapshot.merge.new_orthos_from_merge), Style::default().fg(Color::Green)),
             ]),
         ];
 

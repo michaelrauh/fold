@@ -522,8 +522,13 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let total_merged = merged_results.len();
     print_optimal(&best_ortho, &merged_interner);
     
-    metrics.add_log(format!("Merge complete: {} orthos", total_merged));
-    metrics.update_merge(|m| m.completed_merges += 1);
+    let new_orthos_from_merge = total_merged.saturating_sub(total_from_a + total_from_b);
+    
+    metrics.add_log(format!("Merge complete: {} orthos ({} new)", total_merged, new_orthos_from_merge));
+    metrics.update_merge(|m| {
+        m.completed_merges += 1;
+        m.new_orthos_from_merge = new_orthos_from_merge;
+    });
     metrics.update_global(|g| g.processed_chunks += 1);
     
     // Save the merged result using method (lineages already loaded earlier)
