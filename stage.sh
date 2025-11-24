@@ -1,30 +1,33 @@
 #!/bin/bash
-# stage.sh - Split a file by delimiter and move chunks to input folder
+# stage.sh - Split a file by sentences (like Interner does) into input folder
 #
-# Usage: ./stage.sh <input_file> <delimiter> [min_length] [state_dir]
+# Usage: ./stage.sh <input_file> [min_length] [state_dir]
 #   input_file  - Path to the file to split
-#   delimiter   - Word or phrase to split on (e.g., "chapter", "CHAPTER")
-#   min_length  - Optional: Minimum length in characters to keep chunk (default: 0, keep all)
+#   min_length  - Optional: Minimum length in words to keep chunk (default: 2)
 #   state_dir   - Optional: State directory path (default: ./fold_state)
 #
 # Chunks smaller than min_length are automatically deleted to filter out junk.
+# The input file is always kept (not deleted).
 #
-# Example: ./stage.sh book.txt "CHAPTER" 50000 ./fold_state
+# Splits text the same way the Interner finds sentences:
+# - Splits on paragraph breaks (\n\n)
+# - Then splits on sentence delimiters (. ? ; !)
+#
+# Example: ./stage.sh book.txt 10 ./fold_state
 
 set -e
 
 # Parse arguments
 INPUT_FILE="${1:-}"
-DELIMITER="${2:-}"
-MIN_LENGTH="${3:-0}"
-STATE_DIR="${4:-./fold_state}"
+MIN_LENGTH="${2:-2}"
+STATE_DIR="${3:-./fold_state}"
 
 INPUT_DIR="${STATE_DIR}/input"
 
 # Validate arguments
 if [ -z "$INPUT_FILE" ]; then
     echo "Error: No input file specified"
-    echo "Usage: $0 <input_file> <delimiter> [min_length] [state_dir]"
+    echo "Usage: $0 <input_file> [min_length] [state_dir]"
     exit 1
 fi
 
@@ -33,69 +36,69 @@ if [ ! -f "$INPUT_FILE" ]; then
     exit 1
 fi
 
-if [ -z "$DELIMITER" ]; then
-    echo "Error: No delimiter specified"
-    echo "Usage: $0 <input_file> <delimiter> [min_length] [state_dir]"
-    exit 1
-fi
-
 # Create input directory if it doesn't exist
 mkdir -p "$INPUT_DIR"
 
 echo "[stage] Input file: $INPUT_FILE"
-echo "[stage] Delimiter: $DELIMITER"
-echo "[stage] Minimum length: ${MIN_LENGTH} chars (chunks smaller will be deleted)"
+echo "[stage] Minimum length: ${MIN_LENGTH} words (chunks smaller will be deleted)"
 echo "[stage] State directory: $STATE_DIR"
 echo "[stage] Input directory: $INPUT_DIR"
+echo "[stage] Splitting by sentences (like Interner)"
 echo ""
 
 # Get the base name of the input file (without path and extension)
 BASENAME=$(basename "$INPUT_FILE" .txt)
 
-# Split the file using awk
-awk -v delimiter="$DELIMITER" -v output_dir="$INPUT_DIR" -v basename="$BASENAME" '
+# Split the file using awk - mimics Interner's sentence splitting
+# First split by double newlines (paragraphs), then by sentence delimiters
+awk -v output_dir="$INPUT_DIR" -v basename="$BASENAME" '
 BEGIN {
     chunk = 0
-    current_length = 0
-    filename = ""
+    RS = ""  # Paragraph mode - double newline separates records
+    ORS = ""
 }
 
-# Check if line contains delimiter (case-insensitive)
-tolower($0) ~ tolower(delimiter) {
-    # If we have accumulated content, write it out
-    if (current_length > 0 && filename != "") {
-        close(filename)
-    }
-    
-    # Start new chunk
-    chunk++
-    filename = sprintf("%s/%s_chunk_%04d.txt", output_dir, basename, chunk)
-    current_length = 0
-    
-    # Write the delimiter line to the new chunk
-    print $0 > filename
-    current_length += length($0) + 1
-    next
-}
-
-# Regular line
 {
-    # If no chunk started yet, start the first one
-    if (filename == "") {
-        chunk = 1
-        filename = sprintf("%s/%s_chunk_%04d.txt", output_dir, basename, chunk)
-        current_length = 0
+    # Process each paragraph
+    paragraph = $0
+    
+    # Split by sentence delimiters: . ? ; !
+    # We need to handle each character and accumulate sentences
+    sentence = ""
+    for (i = 1; i <= length(paragraph); i++) {
+        char = substr(paragraph, i, 1)
+        
+        if (char ~ /[.?;!]/) {
+            # Found a sentence delimiter
+            if (length(sentence) > 0) {
+                # Trim and write the sentence if not empty
+                gsub(/^[ \t\n]+|[ \t\n]+$/, "", sentence)
+                if (length(sentence) > 0) {
+                    chunk++
+                    filename = sprintf("%s/%s_chunk_%04d.txt", output_dir, basename, chunk)
+                    print sentence "\n" > filename
+                    close(filename)
+                }
+                sentence = ""
+            }
+        } else {
+            sentence = sentence char
+        }
     }
     
-    # Write line to current chunk
-    print $0 > filename
-    current_length += length($0) + 1
+    # Handle any remaining sentence in the paragraph
+    if (length(sentence) > 0) {
+        gsub(/^[ \t\n]+|[ \t\n]+$/, "", sentence)
+        if (length(sentence) > 0) {
+            chunk++
+            filename = sprintf("%s/%s_chunk_%04d.txt", output_dir, basename, chunk)
+            print sentence "\n" > filename
+            close(filename)
+        }
+    }
 }
 
 END {
-    if (filename != "") {
-        close(filename)
-    }
     print "[stage] Created " chunk " chunks" > "/dev/stderr"
 }
 ' "$INPUT_FILE"
@@ -108,7 +111,7 @@ echo "[stage] Successfully created $NUM_FILES chunks"
 
 # Filter out small chunks if min_length is specified
 if [ "$MIN_LENGTH" -gt 0 ]; then
-    echo "[stage] Filtering chunks smaller than $MIN_LENGTH characters..."
+    echo "[stage] Filtering chunks smaller than $MIN_LENGTH words..."
     
     DELETED_COUNT=0
     for file in "$INPUT_DIR"/${BASENAME}_chunk_*.txt; do
@@ -133,16 +136,5 @@ fi
 
 echo ""
 echo "[stage] $REMAINING_FILES files ready for processing in $INPUT_DIR"
-echo ""
-
-# Optionally delete the input file
-read -p "[stage] Delete original file $INPUT_FILE? (y/N) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    rm "$INPUT_FILE"
-    echo "[stage] Deleted original file: $INPUT_FILE"
-else
-    echo "[stage] Original file kept: $INPUT_FILE"
-fi
-
+echo "[stage] Input file kept: $INPUT_FILE"
 echo "[stage] Done!"

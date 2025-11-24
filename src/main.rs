@@ -1,43 +1,6 @@
-use fold::{checkpoint_manager::CheckpointManager, disk_backed_queue::DiskBackedQueue, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
+use fold::{disk_backed_queue::DiskBackedQueue, file_handler, interner::Interner, memory_config::MemoryConfig, ortho::Ortho, seen_tracker::SeenTracker, FoldError};
 use std::fs;
-
-/// Load checkpoint and gather metrics for memory configuration
-fn load_checkpoint_with_metrics(manager: &CheckpointManager) -> Result<Option<(Interner, DiskBackedQueue, SeenTracker, usize, usize)>, FoldError> {
-    // Check if checkpoint exists
-    let checkpoint_dir = "./fold_state/checkpoint";
-    let interner_path = format!("{}/interner.bin", checkpoint_dir);
-    
-    if !std::path::Path::new(&interner_path).exists() {
-        return Ok(None);
-    }
-    
-    // Read interner to get its size
-    let interner_bytes_data = fs::read(&interner_path).map_err(|e| FoldError::Io(e))?;
-    let interner_bytes = interner_bytes_data.len();
-    let (_interner, _): (Interner, usize) = bincode::decode_from_slice(&interner_bytes_data, bincode::config::standard())?;
-    
-    // Count results to estimate bloom/shard needs
-    let results_backup = format!("{}/results_backup", checkpoint_dir);
-    let result_count = if std::path::Path::new(&results_backup).exists() {
-        // Quick scan to count items
-        let temp_queue = DiskBackedQueue::new_from_path(&results_backup, 1000)?;
-        temp_queue.len()
-    } else {
-        0
-    };
-    
-    println!("[fold] Checkpoint metrics - Interner: {} MB, Results: {}", 
-             interner_bytes / 1_048_576, result_count);
-    
-    // Now calculate memory config and do full load
-    let memory_config = MemoryConfig::calculate(interner_bytes, result_count);
-    let loaded = manager.load(&memory_config)?;
-    
-    match loaded {
-        Some((int, res, trk)) => Ok(Some((int, res, trk, interner_bytes, result_count))),
-        None => Ok(None),
-    }
-}
+use std::path::Path;
 
 fn calculate_score(ortho: &Ortho) -> (usize, usize) {
     let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
@@ -47,226 +10,421 @@ fn calculate_score(ortho: &Ortho) -> (usize, usize) {
 
 fn main() -> Result<(), FoldError> {
     let input_dir = "./fold_state/input";
+    let in_process_dir = "./fold_state/in_process";
     
     println!("[fold] Starting fold processing");
     println!("[fold] Input directory: {}", input_dir);
     
-    let checkpoint_manager = CheckpointManager::new();
+    // Create in_process directory if it doesn't exist
+    fs::create_dir_all(in_process_dir).map_err(|e| FoldError::Io(e))?;
     
-    // Try to load checkpoint and calculate memory configuration
-    let (mut interner, mut all_results, mut tracker, memory_config, mut global_best, mut global_best_score) = if let Some((int, res, trk, interner_bytes, result_count)) = load_checkpoint_with_metrics(&checkpoint_manager)? {
-        println!("[fold] Resuming from checkpoint");
-        println!("[fold] Results queue size: {}", res.len());
-        println!("[fold] Seen orthos: {}", trk.len());
-        
-        // Calculate memory config based on checkpoint state
-        let config = MemoryConfig::calculate(interner_bytes, result_count);
-        
-        (Some(int), res, trk, config, Ortho::new(0), (0, 0))
-    } else {
-        println!("[fold] Starting fresh");
-        
-        // Calculate memory config with defaults for fresh start
-        let config = MemoryConfig::calculate(0, 0);
-        
-        let fresh_tracker = SeenTracker::with_config(config.bloom_capacity, config.num_shards, config.max_shards_in_memory);
-        let fresh_results = DiskBackedQueue::new_from_path("./fold_state/results", config.queue_buffer_size)?;
-        (None, fresh_results, fresh_tracker, config, Ortho::new(0), (0, 0))
-    };
+    // Recover any abandoned files from previous runs (includes heartbeat check)
+    file_handler::recover_abandoned_files(input_dir, in_process_dir)?;
     
-    // Get all files from input directory, sorted
-    let mut files = get_input_files(&input_dir)?;
-    files.sort();
-    
-    if files.is_empty() {
-        println!("[fold] No input files found in {}", input_dir);
-        return Ok(());
-    }
-    
-    println!("[fold] Found {} file(s) to process", files.len());
-    
-    for file_path in files {
-        println!("\n[fold] Processing file: {}", file_path);
+    // Main processing loop - two modes:
+    // Mode 1: If there are 2+ result archives, merge smallest with largest
+    // Mode 2: If there are not 2 results, process txt into result
+    loop {
+        // Check for existing archives in input directory
+        let mut archives = file_handler::find_archives(input_dir)?;
         
-        let text = fs::read_to_string(&file_path)
-            .map_err(|e| FoldError::Io(e))?;
-        
-        // Keep old interner to detect changes
-        let old_interner = interner.clone();
-        
-        // Build or extend interner
-        interner = Some(if let Some(prev) = interner {
-            prev.add_text(&text)
+        if archives.len() >= 2 {
+            // Mode 1: Merge archives
+            println!("\n[fold] ========================================");
+            println!("[fold] MODE 1: Merging archives");
+            println!("[fold] Found {} archives", archives.len());
+            println!("[fold] ========================================");
+            
+            // Sort by size to find smallest and largest
+            archives.sort_by_key(|(_, size)| *size);
+            let smallest = archives[0].0.clone();
+            let largest = archives[archives.len() - 1].0.clone();
+            
+            println!("[fold] Merging smallest: {} (size: {})", smallest, archives[0].1);
+            println!("[fold] With largest: {} (size: {})", largest, archives[archives.len() - 1].1);
+            
+            merge_archives(&smallest, &largest, input_dir, in_process_dir)?;
+            
         } else {
-            Interner::from_text(&text)
-        });
-        
-        let current_interner = interner.as_ref().unwrap();
-        let version = current_interner.version();
-        
-        println!("[fold] Interner version: {}", version);
-        println!("[fold] Vocabulary size: {}", current_interner.vocabulary().len());
-        
-        // Initialize work queue - use global seen orthos set
-        let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
-        
-        // If interner changed, find impacted orthos from results and re-queue them
-        if let Some(old_int) = old_interner {
-            let impacted_keys = old_int.impacted_keys(current_interner);
+            // Mode 2: Process txt file
+            let txt_file = file_handler::find_next_txt_file(input_dir)?;
             
-            if !impacted_keys.is_empty() {
-            println!("[fold] Interner changed: {} impacted keys detected", impacted_keys.len());
-            println!("[fold] Scanning {} results for impacted orthos...", all_results.len());
-            
-            let mut requeued_count = 0;
-            let mut scanned_count = 0;
-            let total_results = all_results.len();
-            
-            // Create a temporary queue to consume all results and rebuild
-            let mut temp_results = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
-            
-            println!("[fold] Starting scan to identify impacted orthos...");
-            
-            while let Some(ortho) = all_results.pop()? {
-                scanned_count += 1;
-                
-                if scanned_count % 1000 == 0 {
-                println!("[fold] Scanning... {}/{} results ({:.1}%), requeued {} impacted orthos so far", 
-                     scanned_count, total_results, 
-                     (scanned_count as f64 / total_results as f64) * 100.0,
-                     requeued_count);
+            if txt_file.is_none() {
+                println!("[fold] No more .txt files to process");
+                if archives.is_empty() {
+                    println!("[fold] No archives remaining");
+                } else {
+                    println!("[fold] {} archive(s) remaining", archives.len());
                 }
-                
-                // Check for optimal while streaming through results
-                let score = calculate_score(&ortho);
-                if score > global_best_score {
-                    global_best = ortho.clone();
-                    global_best_score = score;
-                }
-                
-                let requirement_phrases = ortho.get_requirement_phrases();
-                
-                // Check if any requirement phrase overlaps with impacted keys
-                let is_impacted = requirement_phrases.iter()
-                .any(|phrase| impacted_keys.contains(phrase));
-                
-                if is_impacted {
-                work_queue.push(ortho.clone())?;
-                requeued_count += 1;
-                }
-                
-                temp_results.push(ortho)?;
+                break;
             }
             
-            // Swap temp results back to all_results
-            all_results = temp_results;
+            println!("\n[fold] ========================================");
+            println!("[fold] MODE 2: Processing text file");
+            println!("[fold] ========================================");
             
-            println!("[fold] Re-queued {} impacted orthos for reprocessing", requeued_count);
-            }
+            process_txt_file(txt_file.unwrap(), input_dir, in_process_dir)?;
         }
-        
-        // Always seed with empty ortho
-        let seed_ortho = Ortho::new(version);
-        let seed_id = seed_ortho.id();
-        println!("[fold] Seeding with empty ortho id={}, version={}", seed_id, version);
-        
-        tracker.insert(seed_id);
-        if global_best_score == (0, 0) {
-            global_best = seed_ortho.clone();
-            global_best_score = calculate_score(&global_best);
-        }
-        
-        work_queue.push(seed_ortho)?;
-        
-        // Process work queue until empty
-        let mut processed_count = 0;
-        while let Some(ortho) = work_queue.pop()? {
-            processed_count += 1;
-            
-            if processed_count % 1000 == 0 {
-                println!("[fold] Processed {} orthos, queue size: {}, seen: {}", 
-                         processed_count, work_queue.len(), tracker.len());
-            }
-            
-            if processed_count % 100000 == 0 {
-                print_optimal(&global_best, current_interner);
-            }
-            
-            // Get requirements from ortho
-            let (forbidden, required) = ortho.get_requirements();
-            
-            // Get completions from interner
-            let completions = current_interner.intersect(&required, &forbidden);
-            
-            // Generate child orthos
-            for completion in completions {
-                let children = ortho.add(completion, version);
-                
-                for child in children {
-                    let child_id = child.id();
-                    
-                    // Use tracker for bloom-filtered deduplication check
-                    if !tracker.contains(&child_id) {
-                        tracker.insert(child_id);
-                        
-                        let candidate_score = calculate_score(&child);
-                        if candidate_score > global_best_score {
-                            global_best = child.clone();
-                            global_best_score = candidate_score;
-                        }
-                        
-                        all_results.push(child.clone())?;
-                        work_queue.push(child)?;
-                    }
-                }
-            }
-        }
-        
-        println!("[fold] Finished processing file");
-        println!("[fold] Total orthos seen globally: {}", tracker.len());
-        
-        print_optimal(&global_best, current_interner);
-        
-        // Save checkpoint after successful file processing
-        checkpoint_manager.save(current_interner, &mut all_results)?;
-        
-        // Delete the processed file
-        fs::remove_file(&file_path).map_err(|e| FoldError::Io(e))?;
-        println!("[fold] Checkpoint saved, file deleted");
     }
     
-    println!("\n[fold] All files processed");
-    println!("[fold] Total results: {}", all_results.len());
-    
-    if let Some(final_interner) = interner {
-        println!("\n[fold] ===== FINAL OPTIMAL ORTHO =====");
-        print_optimal(&global_best, &final_interner);
-    }
+    println!("\n[fold] ========================================");
+    println!("[fold] All processing completed");
+    println!("[fold] ========================================");
     
     Ok(())
 }
 
-fn get_input_files(input_dir: &str) -> Result<Vec<String>, FoldError> {
-    let path = std::path::Path::new(input_dir);
+fn process_txt_file(file_path: String, input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+    println!("[fold] Processing file: {}", file_path);
     
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+    // Extract filename for lineage tracking
+    let filename = Path::new(&file_path).file_stem().unwrap_or_default().to_str().unwrap_or("unknown").to_string();
     
-    let mut files = Vec::new();
+    // Checkout: Move txt file to in_process work folder
+    let work_folder = file_handler::checkout_txt_file(&file_path, in_process_dir)?;
+    println!("[fold] Moved to work folder: {}", work_folder);
     
-    for entry in fs::read_dir(path).map_err(|e| FoldError::Io(e))? {
-        let entry = entry.map_err(|e| FoldError::Io(e))?;
-        let path = entry.path();
+    // Create heartbeat file inside work folder
+    let heartbeat_path = file_handler::create_heartbeat(&work_folder)?;
+    
+    // Read text from source.txt
+    let source_txt_path = format!("{}/source.txt", work_folder);
+    let text = fs::read_to_string(&source_txt_path)
+        .map_err(|e| FoldError::Io(e))?;
+    
+    // Build interner from this file only
+    let interner = Interner::from_text(&text);
+    let version = interner.version();
+    
+    println!("[fold] Interner version: {}", version);
+    println!("[fold] Vocabulary size: {}", interner.vocabulary().len());
+    
+    // Calculate memory config for this file
+    let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
+    let memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    
+    // Initialize work queue for this file
+    let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
+    
+    // Initialize results queue for this file (disk-backed to avoid OOM)
+    let results_path = format!("./fold_state/results_{}", filename);
+    let mut results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
+    
+    // Initialize tracker for this file
+    let mut tracker = SeenTracker::with_config(
+        memory_config.bloom_capacity,
+        memory_config.num_shards,
+        memory_config.max_shards_in_memory,
+    );
+    
+    // Seed with empty ortho
+    let seed_ortho = Ortho::new(version);
+    let seed_id = seed_ortho.id();
+    println!("[fold] Seeding with empty ortho id={}, version={}", seed_id, version);
+    
+    tracker.insert(seed_id);
+    let mut best_ortho = seed_ortho.clone();
+    let mut best_score = calculate_score(&best_ortho);
+    
+    work_queue.push(seed_ortho)?;
+    
+    // Process work queue until empty
+    let mut processed_count = 0;
+    while let Some(ortho) = work_queue.pop()? {
+        processed_count += 1;
         
-        if path.is_file() {
-            if let Some(path_str) = path.to_str() {
-                files.push(path_str.to_string());
+        if processed_count % 1000 == 0 {
+            println!("[fold] Processed {} orthos, queue size: {}, seen: {}", 
+                     processed_count, work_queue.len(), tracker.len());
+        }
+        
+        if processed_count % 100000 == 0 {
+            print_optimal(&best_ortho, &interner);
+            // Update heartbeat every 100k orthos
+            file_handler::touch_heartbeat(&heartbeat_path)?;
+        }
+        
+        // Get requirements from ortho
+        let (forbidden, required) = ortho.get_requirements();
+        
+        // Get completions from interner
+        let completions = interner.intersect(&required, &forbidden);
+        
+        // Generate child orthos
+        for completion in completions {
+            let children = ortho.add(completion, version);
+            
+            for child in children {
+                let child_id = child.id();
+                
+                // Use tracker for bloom-filtered deduplication check
+                if !tracker.contains(&child_id) {
+                    tracker.insert(child_id);
+                    
+                    let candidate_score = calculate_score(&child);
+                    if candidate_score > best_score {
+                        best_ortho = child.clone();
+                        best_score = candidate_score;
+                    }
+                    
+                    results.push(child.clone())?;
+                    work_queue.push(child)?;
+                }
             }
         }
     }
     
-    Ok(files)
+    println!("[fold] Finished processing file");
+    println!("[fold] Total orthos generated: {}", results.len());
+    
+    print_optimal(&best_ortho, &interner);
+    
+    // Create lineage tracking for this text file (just the filename)
+    let lineage = format!("\"{}\"", filename);
+    
+    // Create archive in INPUT directory
+    let archive_path = file_handler::get_new_archive_path(input_dir);
+    file_handler::save_archive(&archive_path, &interner, &mut results, &results_path, Some(&best_ortho), &lineage)?;
+    
+    println!("[fold] Archive saved to input: {}", archive_path);
+    
+    // Cleanup: delete the work folder (including heartbeat and source.txt)
+    file_handler::cleanup_txt_work_folder(&work_folder)?;
+    println!("[fold] Work folder deleted");
+    
+    Ok(())
+}
+
+fn merge_archives(archive_a_path: &str, archive_b_path: &str, input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+    // Checkout: Move both archives from input to in_process for mutual exclusion
+    println!("[fold] Moving archives to in_process for merging...");
+    let (work_a_path, work_b_path) = file_handler::checkout_archives(archive_a_path, archive_b_path, in_process_dir)?;
+    println!("[fold] Loading interners...");
+    
+    // Load both interners from work paths
+    let interner_a = file_handler::load_interner(&work_a_path)?;
+    let interner_b = file_handler::load_interner(&work_b_path)?;
+    
+    println!("[fold] Interner A: vocab size={}, version={}", 
+             interner_a.vocabulary().len(), interner_a.version());
+    println!("[fold] Interner B: vocab size={}, version={}", 
+             interner_b.vocabulary().len(), interner_b.version());
+    
+    // Find differences from a to b and from b to a
+    let impacted_a = interner_a.impacted_keys(&interner_b);
+    let impacted_b = interner_b.impacted_keys(&interner_a);
+    
+    println!("[fold] Impacted keys in A: {}", impacted_a.len());
+    println!("[fold] Impacted keys in B: {}", impacted_b.len());
+    
+    // Create merged interner using proper merge method
+    let merged_interner = interner_a.merge(&interner_b);
+    let new_version = merged_interner.version();
+    
+    println!("[fold] Merged interner: version={}, vocab size={}", 
+             new_version, merged_interner.vocabulary().len());
+    
+    // Build vocabulary mapping for A and B
+    let vocab_map_a = build_vocab_mapping(interner_a.vocabulary(), merged_interner.vocabulary());
+    let vocab_map_b = build_vocab_mapping(interner_b.vocabulary(), merged_interner.vocabulary());
+    
+    println!("[fold] Vocab mappings created");
+    
+    // Calculate memory config
+    let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
+    let memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    
+    // Initialize work queue and results for merge
+    let mut work_queue = DiskBackedQueue::new(memory_config.queue_buffer_size)?;
+    let results_path = format!("./fold_state/results_merged_{}", std::process::id());
+    let mut merged_results = DiskBackedQueue::new_from_path(&results_path, memory_config.queue_buffer_size)?;
+    
+    // Initialize tracker
+    let mut tracker = SeenTracker::with_config(
+        memory_config.bloom_capacity,
+        memory_config.num_shards,
+        memory_config.max_shards_in_memory,
+    );
+    
+    // Seed with empty ortho
+    let seed_ortho = Ortho::new(new_version);
+    let seed_id = seed_ortho.id();
+    tracker.insert(seed_id);
+    let mut best_ortho = seed_ortho.clone();
+    let mut best_score = calculate_score(&best_ortho);
+    work_queue.push(seed_ortho)?;
+    
+    // Create heartbeat for merge operation early
+    let heartbeat_path = format!("{}/merge_{}.heartbeat", in_process_dir, std::process::id());
+    file_handler::touch_heartbeat(&heartbeat_path)?;
+    
+    println!("[fold] Remapping and processing orthos from archives...");
+    
+    // Process archive A results: remap ALL orthos to results
+    // Add impacted orthos to work queue for further processing
+    let results_a_path = file_handler::get_results_path(&work_a_path);
+    let mut results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
+    
+    let mut total_from_a = 0;
+    let mut impacted_from_a = 0;
+    while let Some(ortho) = results_a.pop()? {
+        // Remap the ortho to new vocabulary
+        if let Some(remapped) = ortho.remap(&vocab_map_a, new_version) {
+            let remapped_id = remapped.id();
+            if !tracker.contains(&remapped_id) {
+                tracker.insert(remapped_id);
+                // Add ALL remapped orthos to merged results
+                merged_results.push(remapped.clone())?;
+                total_from_a += 1;
+                
+                // Log progress every 10k orthos and keep heartbeat fresh
+                if total_from_a % 10000 == 0 {
+                    println!("[fold] Remapping archive A: {} orthos processed", total_from_a);
+                    file_handler::touch_heartbeat(&heartbeat_path)?;
+                }
+                
+                // Check if this ortho is impacted - if so, add to work queue
+                if is_ortho_impacted(&ortho, &impacted_a) {
+                    work_queue.push(remapped)?;
+                    impacted_from_a += 1;
+                }
+            }
+        }
+    }
+    
+    println!("[fold] Archive A: {} total remapped, {} impacted added to work queue", total_from_a, impacted_from_a);
+    
+    // Process archive B results: remap ALL orthos to results
+    // Add impacted orthos to work queue for further processing
+    let results_b_path = file_handler::get_results_path(&work_b_path);
+    let mut results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
+    
+    let mut total_from_b = 0;
+    let mut impacted_from_b = 0;
+    while let Some(ortho) = results_b.pop()? {
+        // Remap the ortho to new vocabulary
+        if let Some(remapped) = ortho.remap(&vocab_map_b, new_version) {
+            let remapped_id = remapped.id();
+            if !tracker.contains(&remapped_id) {
+                tracker.insert(remapped_id);
+                // Add ALL remapped orthos to merged results
+                merged_results.push(remapped.clone())?;
+                total_from_b += 1;
+                
+                // Log progress every 10k orthos and keep heartbeat fresh
+                if total_from_b % 10000 == 0 {
+                    println!("[fold] Remapping archive B: {} orthos processed", total_from_b);
+                    file_handler::touch_heartbeat(&heartbeat_path)?;
+                }
+                
+                // Check if this ortho is impacted - if so, add to work queue
+                if is_ortho_impacted(&ortho, &impacted_b) {
+                    work_queue.push(remapped)?;
+                    impacted_from_b += 1;
+                }
+            }
+        }
+    }
+    
+    println!("[fold] Archive B: {} total remapped, {} impacted added to work queue", total_from_b, impacted_from_b);
+    println!("[fold] Total work queue seeds: {} (empty ortho + {} impacted)", 1 + impacted_from_a + impacted_from_b, impacted_from_a + impacted_from_b);
+    
+    println!("[fold] Processing merged ortho space...");
+    
+    // Create heartbeat for merge operation
+    let heartbeat_path = format!("{}/merge_{}.heartbeat", in_process_dir, std::process::id());
+    file_handler::touch_heartbeat(&heartbeat_path)?;
+    
+    // Process work queue
+    let mut processed_count = 0;
+    while let Some(ortho) = work_queue.pop()? {
+        processed_count += 1;
+        
+        if processed_count % 1000 == 0 {
+            println!("[fold] Processed {} orthos, queue size: {}, seen: {}", 
+                     processed_count, work_queue.len(), tracker.len());
+        }
+        
+        if processed_count % 100000 == 0 {
+            print_optimal(&best_ortho, &merged_interner);
+            file_handler::touch_heartbeat(&heartbeat_path)?;
+        }
+        
+        let (forbidden, required) = ortho.get_requirements();
+        let completions = merged_interner.intersect(&required, &forbidden);
+        
+        for completion in completions {
+            let children = ortho.add(completion, new_version);
+            
+            for child in children {
+                let child_id = child.id();
+                
+                if !tracker.contains(&child_id) {
+                    tracker.insert(child_id);
+                    
+                    let candidate_score = calculate_score(&child);
+                    if candidate_score > best_score {
+                        best_ortho = child.clone();
+                        best_score = candidate_score;
+                    }
+                    
+                    merged_results.push(child.clone())?;
+                    work_queue.push(child)?;
+                }
+            }
+        }
+    }
+    
+    println!("[fold] Merge complete. Total orthos: {}", merged_results.len());
+    print_optimal(&best_ortho, &merged_interner);
+    
+    // Load lineages from both archives (now in work paths) and create merged lineage
+    let lineage_a = file_handler::load_lineage(&work_a_path)?;
+    let lineage_b = file_handler::load_lineage(&work_b_path)?;
+    let merged_lineage = format!("({} {})", lineage_a, lineage_b);
+    
+    println!("[fold] Merged lineage: {}", merged_lineage);
+    
+    // Create merged archive in INPUT directory
+    let merged_archive_path = file_handler::get_new_archive_path(input_dir);
+    
+    file_handler::save_archive(&merged_archive_path, &merged_interner, &mut merged_results, &results_path, Some(&best_ortho), &merged_lineage)?;
+    println!("[fold] Merged archive saved to input: {}", merged_archive_path);
+    
+    // Cleanup: Delete the source archives from in_process and the heartbeat
+    file_handler::cleanup_merge_sources(&work_a_path, &work_b_path, &heartbeat_path)?;
+    println!("[fold] Deleted source archives and heartbeat");
+    
+    Ok(())
+}
+
+// Build a mapping from old vocabulary indices to new vocabulary indices
+fn build_vocab_mapping(old_vocab: &[String], new_vocab: &[String]) -> Vec<usize> {
+    old_vocab.iter().map(|word| {
+        new_vocab.iter().position(|w| w == word)
+            .expect("Word from old vocab must exist in new vocab")
+    }).collect()
+}
+
+// Check if an ortho uses any of the impacted keys
+fn is_ortho_impacted(ortho: &Ortho, impacted_keys: &[Vec<usize>]) -> bool {
+    if impacted_keys.is_empty() {
+        return false;
+    }
+    
+    // Get the requirement phrases from the ortho
+    let requirement_phrases = ortho.get_requirement_phrases();
+    
+    // Check if any requirement phrase matches an impacted key
+    for req_phrase in &requirement_phrases {
+        for impacted_key in impacted_keys {
+            if req_phrase == impacted_key {
+                return true;
+            }
+        }
+    }
+    
+    false
 }
 
 fn print_optimal(ortho: &Ortho, interner: &Interner) {
@@ -288,65 +446,14 @@ fn print_optimal(ortho: &Ortho, interner: &Interner) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    
     #[test]
-    fn test_results_queue_persistence() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let persist_path = temp_dir.path().join("persist");
-        
-        {
-            let mut queue = DiskBackedQueue::new_from_path(persist_path.to_str().unwrap(), 5).unwrap();
-            
-            for v in 1..=10 {
-                queue.push(Ortho::new(v)).unwrap();
-            }
-            
-            queue.flush().unwrap();
-            assert_eq!(queue.len(), 10);
-        }
-        
-        // Reload from same path
-        {
-            let mut queue = DiskBackedQueue::new_from_path(persist_path.to_str().unwrap(), 5).unwrap();
-            assert_eq!(queue.len(), 10);
-            
-            let first = queue.pop().unwrap().unwrap();
-            assert_eq!(first.version(), 1);
-        }
-    }
-
-    #[test]
-    fn test_checkpoint_manager_integration() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let fold_state = temp_dir.path().join("fold_state");
-        fs::create_dir_all(&fold_state).unwrap();
-        
-        let manager = CheckpointManager::with_base_dir(&fold_state);
-        let interner = Interner::from_text("hello world");
-        let results_path = fold_state.join("results");
-        let memory_config = MemoryConfig::default_config();
-        let mut results_queue = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), memory_config.queue_buffer_size).unwrap();
-        
-        let ortho1 = Ortho::new(1);
-        let ortho2 = Ortho::new(2);
-        let id1 = ortho1.id();
-        let id2 = ortho2.id();
-        
-        results_queue.push(ortho1).unwrap();
-        results_queue.push(ortho2).unwrap();
-        
-        // Save checkpoint (tracker reconstructed on load)
-        manager.save(&interner, &mut results_queue).unwrap();
-        
-        // Load checkpoint
-        let result = manager.load(&memory_config).unwrap();
-        assert!(result.is_some());
-        
-        let (loaded_interner, loaded_results, mut loaded_tracker) = result.unwrap();
-        
-        assert_eq!(loaded_interner.version(), interner.version());
-        assert_eq!(loaded_results.len(), 2, "Should have 2 results");
-        assert_eq!(loaded_tracker.len(), 2, "Tracker should have 2 IDs");
-        assert!(loaded_tracker.contains(&id1));
-        assert!(loaded_tracker.contains(&id2));
+    fn test_calculate_score() {
+        let ortho = Ortho::new(1);
+        let (volume, fullness) = calculate_score(&ortho);
+        // Empty ortho with dims [2,2] has volume (2-1)*(2-1) = 1
+        assert_eq!(volume, 1);
+        // All 4 slots are None
+        assert_eq!(fullness, 0);
     }
 }

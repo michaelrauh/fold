@@ -30,6 +30,8 @@ impl Ortho {
         let payload = vec![None; 4];
         Ortho { version, dims, payload }
     }
+    
+
     pub fn id(&self) -> usize { Self::compute_id(self.version, &self.dims, &self.payload) }
     pub fn get_current_position(&self) -> usize { self.payload.iter().position(|x| x.is_none()).unwrap_or(self.payload.len()) }
     pub fn add(&self, value: usize, version: usize) -> Vec<Self> {
@@ -117,6 +119,22 @@ impl Ortho {
         required
     }
     pub fn version(&self) -> usize { self.version }
+    
+    /// Remap an ortho's payload to use new vocabulary indices
+    pub fn remap(&self, vocab_map: &[usize], new_version: usize) -> Option<Self> {
+        // Remap payload: translate old vocab indices to new vocab indices
+        let new_payload: Vec<Option<usize>> = self.payload.iter().map(|opt_idx| {
+            opt_idx.map(|old_idx| vocab_map[old_idx])
+        }).collect();
+        
+        // Create new ortho with remapped payload
+        Some(Ortho {
+            version: new_version,
+            dims: self.dims.clone(),
+            payload: new_payload,
+        })
+    }
+    
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
         let mut result = Vec::new();
         for pos in 0..self.payload.len() {
