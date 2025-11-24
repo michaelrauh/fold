@@ -276,8 +276,16 @@ pub fn checkout_txt_file(file_path: &str, in_process_dir: &str) -> Result<String
 /// Move archives from input to in_process for merging
 /// Returns the work paths for both archives
 pub fn checkout_archives(archive_a_path: &str, archive_b_path: &str, in_process_dir: &str) -> Result<(String, String), FoldError> {
-    let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
-    let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
+    let archive_a_name = Path::new(archive_a_path)
+        .file_name()
+        .ok_or_else(|| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid archive A path")))?
+        .to_str()
+        .ok_or_else(|| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid archive A filename")))?;
+    let archive_b_name = Path::new(archive_b_path)
+        .file_name()
+        .ok_or_else(|| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid archive B path")))?
+        .to_str()
+        .ok_or_else(|| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid archive B filename")))?;
     let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
     let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
     
