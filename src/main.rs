@@ -119,6 +119,13 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
     let memory_config = MemoryConfig::calculate(interner_bytes, 0);
     
+    metrics.update_global(|g| {
+        g.queue_buffer_size = memory_config.queue_buffer_size;
+        g.bloom_capacity = memory_config.bloom_capacity;
+        g.num_shards = memory_config.num_shards;
+        g.max_shards_in_memory = memory_config.max_shards_in_memory;
+    });
+    
     // Initialize work queue for this file (isolated to work folder)
     let work_queue_path = ingestion.work_queue_path();
     let mut work_queue = DiskBackedQueue::new_from_path(&work_queue_path, memory_config.queue_buffer_size)?;
@@ -302,6 +309,13 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     // Calculate memory config
     let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
     let memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    
+    metrics.update_global(|g| {
+        g.queue_buffer_size = memory_config.queue_buffer_size;
+        g.bloom_capacity = memory_config.bloom_capacity;
+        g.num_shards = memory_config.num_shards;
+        g.max_shards_in_memory = memory_config.max_shards_in_memory;
+    });
     
     // Initialize work queue and results for merge (isolated to merge work folder)
     let work_queue_path = ingestion.work_queue_path();

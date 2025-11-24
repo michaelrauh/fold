@@ -92,7 +92,7 @@ impl Tui {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
+                Constraint::Length(6),
                 Constraint::Min(15),
                 Constraint::Length(7),
             ])
@@ -130,11 +130,18 @@ impl Tui {
             snapshot.global.processed_chunks,
             snapshot.global.remaining_chunks
         );
+        let line4 = format!("QBuf: {} │ Bloom: {} │ Shards: {}/{} in mem",
+            format_number(snapshot.global.queue_buffer_size),
+            format_number(snapshot.global.bloom_capacity),
+            format_number(snapshot.global.max_shards_in_memory),
+            format_number(snapshot.global.num_shards)
+        );
         
         let header_lines = vec![
             Line::from(truncate_string(&line1, max_width)),
             Line::from(truncate_string(&line2, max_width)),
             Line::from(truncate_string(&line3, max_width)),
+            Line::from(truncate_string(&line4, max_width)),
         ];
 
         let header = Paragraph::new(header_lines)

@@ -22,6 +22,10 @@ pub struct GlobalMetrics {
     pub start_time: u64,
     pub ram_mb: usize,
     pub current_lineage: String,
+    pub queue_buffer_size: usize,
+    pub bloom_capacity: usize,
+    pub num_shards: usize,
+    pub max_shards_in_memory: usize,
 }
 
 impl Default for GlobalMetrics {
@@ -41,6 +45,10 @@ impl Default for GlobalMetrics {
             start_time,
             ram_mb: 0,
             current_lineage: String::new(),
+            queue_buffer_size: 0,
+            bloom_capacity: 0,
+            num_shards: 0,
+            max_shards_in_memory: 0,
         }
     }
 }
