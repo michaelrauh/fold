@@ -84,7 +84,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 **Implementation**:
 - Change ortho payload from vocabulary index references to stable token identifiers (e.g., `u64` hashes of token strings using a deterministic hash like SipHash or xxHash)
-- Handle hash collisions via secondary lookup or by using 128-bit hashes (collision probability ~1 in 10^19)
+- Handle hash collisions via secondary lookup table, or use 128-bit hashes where collision is negligible for practical vocabulary sizes (< billions of tokens)
 - Or use a global string interner that assigns permanent IDs
 - Merging interners just unions the vocabulary without reindexing
 
@@ -95,8 +95,8 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 **Cons**:
 - Breaking change to serialization format (migration required)
-- Higher memory per ortho (8 bytes vs ~4 bytes per token)
-- Hash collisions require handling (though extremely rare)
+- Higher memory per ortho (`u64` hash = 8 bytes vs `usize` index = 4-8 bytes depending on platform)
+- Hash collisions require handling (though extremely rare with good hash functions)
 
 **Expected Speedup**: 100% elimination of remapping overhead
 
