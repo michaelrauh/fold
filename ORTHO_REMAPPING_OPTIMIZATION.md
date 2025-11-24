@@ -136,7 +136,7 @@ let remapped: Vec<Ortho> = batch.par_iter()
 fn needs_remap(ortho: &Ortho, vocab_map: &[usize]) -> bool {
     ortho.payload().iter()
         .filter_map(|opt| *opt)
-        .any(|idx| vocab_map[idx] != idx)
+        .any(|idx| idx >= vocab_map.len() || vocab_map[idx] != idx)
 }
 
 // In the loop:
