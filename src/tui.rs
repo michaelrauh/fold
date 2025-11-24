@@ -249,13 +249,6 @@ impl Tui {
                 Span::raw(truncate_string(&snapshot.merge.current_merge, max_width.saturating_sub(9))),
             ]),
             Line::from(vec![
-                Span::styled("Orthos: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("A:{} B:{}", 
-                    format_number(snapshot.merge.archive_a_orthos),
-                    format_number(snapshot.merge.archive_b_orthos)
-                )),
-            ]),
-            Line::from(vec![
                 Span::styled("Seeds: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("A:{} B:{}", 
                     format_number(snapshot.merge.seed_orthos_a),
@@ -263,15 +256,18 @@ impl Tui {
                 )),
             ]),
             Line::from(vec![
-                Span::styled("Changed: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Queued: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("A:{} B:{}", 
+                    format_number(snapshot.merge.impacted_queued_a),
+                    format_number(snapshot.merge.impacted_queued_b)
+                )),
+            ]),
+            Line::from(vec![
+                Span::styled("Vocab Δ: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("A:{} B:{}", 
                     format_number(snapshot.merge.impacted_a),
                     format_number(snapshot.merge.impacted_b)
                 )),
-            ]),
-            Line::from(vec![
-                Span::styled("", Style::default().fg(Color::DarkGray)),
-                Span::styled("(vocab keys that changed)", Style::default().fg(Color::DarkGray)),
             ]),
         ];
 

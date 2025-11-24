@@ -290,6 +290,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         m.archive_b_orthos = orthos_b;
         m.impacted_a = impacted_a.len();
         m.impacted_b = impacted_b.len();
+        m.seed_orthos_a = orthos_a;
+        m.seed_orthos_b = orthos_b;
     });
     
     // Create merged interner using proper merge method
@@ -354,10 +356,9 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     
     let total_a_count = results_a.len();
     let mut total_from_a = 0;
-    let mut _impacted_from_a = 0;
+    let mut impacted_from_a = 0;
     
     metrics.update_operation(|op| op.progress_total = total_a_count);
-    metrics.update_merge(|m| m.seed_orthos_a = total_a_count);
     
     while let Some(ortho) = results_a.pop()? {
         // Remap the ortho to new vocabulary
@@ -381,11 +382,13 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 // Check if this ortho is impacted - if so, add to work queue
                 if is_ortho_impacted(&ortho, &impacted_a) {
                     work_queue.push(remapped)?;
-                    _impacted_from_a += 1;
+                    impacted_from_a += 1;
                 }
             }
         }
     }
+    
+    metrics.update_merge(|m| m.impacted_queued_a = impacted_from_a);
     
     metrics.update_operation(|op| {
         op.status = "Remapping Archive B".to_string();
@@ -398,10 +401,9 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     
     let total_b_count = results_b.len();
     let mut total_from_b = 0;
-    let mut _impacted_from_b = 0;
+    let mut impacted_from_b = 0;
     
     metrics.update_operation(|op| op.progress_total = total_b_count);
-    metrics.update_merge(|m| m.seed_orthos_b = total_b_count);
     
     while let Some(ortho) = results_b.pop()? {
         // Remap the ortho to new vocabulary
@@ -425,11 +427,13 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 // Check if this ortho is impacted - if so, add to work queue
                 if is_ortho_impacted(&ortho, &impacted_b) {
                     work_queue.push(remapped)?;
-                    _impacted_from_b += 1;
+                    impacted_from_b += 1;
                 }
             }
         }
     }
+    
+    metrics.update_merge(|m| m.impacted_queued_b = impacted_from_b);
     
     metrics.add_log(format!("Remapping complete: A={}, B={}", total_from_a, total_from_b));
     
