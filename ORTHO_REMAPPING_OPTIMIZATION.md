@@ -20,7 +20,7 @@ The current implementation:
 |--------|-------------|--------------------------|------------------------|---------------|------------------|-------------|
 | **1. Lazy Remapping** | Defer remapping until ortho is accessed for processing | Medium | High (O(1) per unused ortho) | Low | Low | ✅ Yes |
 | **2. Parallel Remapping** | Use Rayon to remap orthos in parallel batches | Low | Medium (linear speedup) | Medium | Low | ✅ Yes |
-| **3. Eliminate Remapping via Stable IDs** | Use string-based or hash-based stable identifiers instead of vocabulary indices | High | Very High (eliminate stage) | High | Medium | ⚠️ Maybe |
+| **3. Eliminate Remapping via Stable Canonical Indices** | Use canonical vocabulary ordering so indices are stable across interners (bitset-compatible) | High | Very High (eliminate stage) | Low | Medium | ⚠️ Maybe |
 | **4. Incremental Merge** | Only remap orthos that are impacted by vocabulary changes | Medium | Variable (high when few changes) | Low | Medium | ⚠️ Maybe |
 | **5. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Very High (shift cost to save) | Low | Low | ✅ Yes |
 
@@ -78,25 +78,42 @@ let remapped: Vec<Ortho> = batch.par_iter()
 
 ---
 
-### Option 3: Eliminate Remapping via Stable IDs
+### Option 3: Eliminate Remapping via Stable Canonical Indices
 
-**Description**: Store token identifiers in ortho payloads as stable hashes or interned strings instead of vocabulary indices that change between interners.
+**Description**: Use a canonical vocabulary ordering so that indices are stable across all interners, eliminating the need for remapping during merges.
 
-**Implementation**:
-- Change ortho payload from vocabulary index references to stable token identifiers (e.g., `u64` hashes of token strings using a deterministic hash like SipHash or xxHash)
-- Handle hash collisions via secondary lookup table, or use 128-bit hashes where collision is negligible for practical vocabulary sizes (< billions of tokens)
-- Or use a global string interner that assigns permanent IDs
-- Merging interners just unions the vocabulary without reindexing
+**Critical Constraint**: Vocabulary indices in this system are not arbitrary identifiers—they serve as **bitset positions** in `FixedBitSet` structures used by `prefix_to_completions`. The `intersect()` method performs bitset operations where indices must be dense and contiguous. Arbitrary hashes or sparse IDs would break this fundamental design.
+
+**Implementation** (bitset-compatible approaches):
+
+1. **Global Canonical Vocabulary**:
+   - Maintain a single canonical vocabulary ordering (e.g., sorted alphabetically, or insertion-order across all files)
+   - All interners share the same index assignments for common tokens
+   - New tokens are always appended at the end, preserving existing indices
+   - Requires coordination across archive boundaries
+
+2. **Sorted Vocabulary Convention**:
+   - Always store vocabulary in sorted order
+   - When merging, the merged vocabulary is the sorted union
+   - Tokens with the same string always get the same index in any interner that contains them
+   - Remapping becomes a simple sorted-merge operation that can be precomputed
+
+3. **Append-Only with Index Registry**:
+   - Maintain a persistent index registry file that assigns permanent indices to tokens
+   - New tokens are appended to the registry, never reassigned
+   - All interners reference the same registry for index lookups
+   - Bitsets grow as vocabulary grows but never need reindexing
 
 **Pros**:
-- Completely eliminates remapping stage
-- Simplifies merge logic significantly
-- Ortho IDs become truly stable across merges
+- Eliminates remapping stage entirely
+- Maintains bitset compatibility for `intersect()` operations
+- Ortho IDs become stable across merges
 
 **Cons**:
-- Breaking change to serialization format (migration required)
-- Higher memory per ortho on 32-bit platforms (`u64` hash = 8 bytes vs `usize` index = 4 bytes); no overhead on 64-bit where `usize` is already 8 bytes
-- Hash collisions require handling (though extremely rare with good hash functions)
+- Requires coordination mechanism for canonical index assignment
+- Breaking change to interner construction logic
+- Sorted approach may reorder existing vocabulary (one-time migration)
+- Append-only registry introduces external state dependency
 
 **Expected Speedup**: 100% elimination of remapping overhead
 
