@@ -311,6 +311,11 @@ fn save_archive(
         let optimal_path = format!("{}/optimal.txt", archive_path);
         let optimal_text = format_optimal_ortho(ortho, interner);
         fs::write(optimal_path, optimal_text).map_err(|e| FoldError::Io(e))?;
+        
+        // Also save the optimal ortho in binary format for recovery
+        let optimal_bin_path = format!("{}/optimal.bin", archive_path);
+        let optimal_bytes = bincode::encode_to_vec(ortho, bincode::config::standard())?;
+        fs::write(optimal_bin_path, optimal_bytes).map_err(|e| FoldError::Io(e))?;
     }
     
     // Write the lineage tracking as S-expression
@@ -347,7 +352,8 @@ fn format_optimal_ortho(ortho: &Ortho, interner: &Interner) -> String {
     output
 }
 
-fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
+/// Load interner from an archive
+pub fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
     let interner_path = format!("{}/interner.bin", archive_path);
     let interner_bytes = fs::read(&interner_path).map_err(|e| FoldError::Io(e))?;
     let (interner, _): (Interner, usize) = 
@@ -637,6 +643,15 @@ pub struct ArchiveMetadata {
 /// Load archive metadata (ortho count) - public wrapper
 pub fn load_archive_metadata(archive_path: &str) -> Result<usize, FoldError> {
     load_metadata(archive_path)
+}
+
+/// Load the optimal ortho from an archive (required - will error if missing)
+pub fn load_optimal_ortho(archive_path: &str) -> Result<Ortho, FoldError> {
+    let optimal_bin_path = format!("{}/optimal.bin", archive_path);
+    let optimal_bytes = fs::read(&optimal_bin_path).map_err(|e| FoldError::Io(e))?;
+    let (ortho, _): (Ortho, usize) = 
+        bincode::decode_from_slice(&optimal_bytes, bincode::config::standard())?;
+    Ok(ortho)
 }
 
 /// Find the largest archive by ortho count (uses default config)

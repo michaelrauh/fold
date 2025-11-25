@@ -627,4 +627,35 @@ mod version_compare_tests {
         let impacted = low.impacted_keys(&high);
         assert_eq!(impacted.len(), 0);
     }
+
+    #[test]
+    fn test_punctuation_does_not_create_duplicate_words() {
+        // Test the case from e.txt: "the party, and" 
+        // With comma as delimiter: "the party" is one sentence, "and" is another
+        // Vocabulary includes all words (even from single-word sentences)
+        // So "the party, and" produces vocabulary ["and", "party", "the"] and phrase ["the", "party"]
+        
+        // First test: feed in "the party, and" - comma splits into two sentences
+        let interner1 = Interner::from_text("the party, and");
+        // "the party" creates phrase, "and" is in vocab but creates no phrases (single word)
+        assert_eq!(interner1.vocabulary().len(), 3, "interner1 vocab: {:?}", interner1.vocabulary());
+        
+        // Second test: "the party and" - single sentence with all three words
+        let interner2 = Interner::from_text("the party and");
+        assert_eq!(interner2.vocabulary().len(), 3, "interner2 vocab: {:?}", interner2.vocabulary());
+        
+        // Now test: feed both into the same interner
+        let interner3 = Interner::from_text("the party, and");
+        let interner3 = interner3.add_text("the party and");
+        
+        // Should have exactly 3 words total (and, party, the)
+        println!("Combined interner vocabulary: {:?}", interner3.vocabulary());
+        assert_eq!(interner3.vocabulary().len(), 3, 
+                   "Combined interner should have 3 unique words, got: {:?}",
+                   interner3.vocabulary());
+        
+        // Check that "and" appears exactly once
+        let and_count = interner3.vocabulary().iter().filter(|w| *w == "and").count();
+        assert_eq!(and_count, 1, "The word 'and' should appear exactly once in vocabulary");
+    }
 }

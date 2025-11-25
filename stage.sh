@@ -62,13 +62,13 @@ BEGIN {
     # Process each paragraph
     paragraph = $0
     
-    # Split by sentence delimiters: . ? ; !
+    # Split by sentence delimiters: . ? ; ! ,
     # We need to handle each character and accumulate sentences
     sentence = ""
     for (i = 1; i <= length(paragraph); i++) {
         char = substr(paragraph, i, 1)
         
-        if (char ~ /[.?;!]/) {
+        if (char ~ /[.?;!,]/) {
             # Found a sentence delimiter
             if (length(sentence) > 0) {
                 # Trim and write the sentence if not empty

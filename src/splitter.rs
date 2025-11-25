@@ -32,7 +32,7 @@ impl Splitter {
         text.split("\n\n")
             .flat_map(|paragraph| {
                 paragraph
-                    .split(|c| matches!(c, '.' | '?' | ';' | '!'))
+                    .split(|c| matches!(c, '.' | '?' | ';' | '!' | ','))
                     .map(|sentence| sentence.trim().to_string())
                     .filter(|sentence| !sentence.is_empty())
             })
@@ -164,10 +164,10 @@ mod tests {
         let text = "hello, world! it's working.";
         let phrases = splitter.phrases(text);
 
-        // This creates two sentences since sentences are split by . ? ; ! \n\n
-        // "hello, world" and "it's working" become two separate sentences
+        // This creates three sentences since sentences are split by . ? ; ! , \n\n
+        // "hello", "world", and "it's working" become three separate sentences
+        // "hello" and "world" are single words, so they don't create phrases
         let expected = vec![
-            vec!["hello".to_string(), "world".to_string()],
             vec!["it's".to_string(), "working".to_string()],
         ];
         assert_eq!(phrases, expected);

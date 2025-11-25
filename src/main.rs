@@ -45,10 +45,25 @@ fn main() -> Result<(), FoldError> {
     // Initialize largest archive metric from existing archives
     if let Ok(Some(largest)) = file_handler::find_largest_archive_with_config(&config) {
         metrics.update_largest_archive(|la| {
-            la.filename = largest.path;
+            la.filename = largest.path.clone();
             la.ortho_count = largest.ortho_count;
             la.lineage = largest.lineage;
         });
+        
+        // Load and restore the optimal ortho from the largest archive
+        let optimal_ortho = file_handler::load_optimal_ortho(&largest.path)?;
+        let interner = file_handler::load_interner(&largest.path)?;
+        
+        let (volume, fullness) = calculate_score(&optimal_ortho);
+        metrics.update_optimal_ortho(|opt| {
+            opt.volume = volume;
+            opt.dims = optimal_ortho.dims().clone();
+            opt.fullness = fullness;
+            opt.capacity = optimal_ortho.payload().len();
+            opt.payload = optimal_ortho.payload().clone();
+            opt.vocab = interner.vocabulary().to_vec();
+        });
+        metrics.add_log(format!("Restored optimal ortho from archive: volume={}", volume));
     }
     
     // Main processing loop - two modes:
