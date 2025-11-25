@@ -1,4 +1,4 @@
-use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::metrics::{Metrics, MetricsSnapshot, MetricSample};
 use crate::spatial;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -24,6 +24,7 @@ pub struct Tui {
     metrics: Metrics,
     should_quit: Arc<AtomicBool>,
     log_scroll: usize,
+    ortho_scroll: usize,
 }
 
 impl Tui {
@@ -32,6 +33,7 @@ impl Tui {
             metrics,
             should_quit,
             log_scroll: 0,
+            ortho_scroll: 0,
         }
     }
 
@@ -77,6 +79,14 @@ impl Tui {
                         }
                         KeyCode::Down => {
                             self.log_scroll += 1;
+                        }
+                        KeyCode::Left => {
+                            if self.ortho_scroll > 0 {
+                                self.ortho_scroll -= 1;
+                            }
+                        }
+                        KeyCode::Right => {
+                            self.ortho_scroll += 1;
                         }
                         _ => {}
                     }
@@ -164,6 +174,7 @@ impl Tui {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(6),
+                Constraint::Length(6),
                 Constraint::Length(10),
                 Constraint::Length(7),
                 Constraint::Length(7),
@@ -172,10 +183,11 @@ impl Tui {
             .split(area);
 
         self.render_current_operation(f, left_chunks[0], snapshot);
-        self.render_merge_progress(f, left_chunks[1], snapshot);
-        self.render_optimal_ortho(f, left_chunks[2], snapshot);
-        self.render_largest_archive(f, left_chunks[3], snapshot);
-        self.render_provenance_tree(f, left_chunks[4], snapshot);
+        self.render_text_preview(f, left_chunks[1], snapshot);
+        self.render_merge_progress(f, left_chunks[2], snapshot);
+        self.render_optimal_ortho(f, left_chunks[3], snapshot);
+        self.render_largest_archive(f, left_chunks[4], snapshot);
+        self.render_provenance_tree(f, left_chunks[5], snapshot);
     }
 
     fn render_current_operation(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -234,6 +246,51 @@ impl Tui {
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(progress_ratio);
         f.render_widget(gauge, gauge_area);
+    }
+
+    fn render_text_preview(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let max_width = area.width.saturating_sub(2) as usize;
+        
+        let lines = if snapshot.global.mode.contains("Merging") {
+            // Show merge text preview (first 2 and last 2 words from each side)
+            let preview_width = max_width.saturating_sub(20); // Reserve space for labels and word counts
+            vec![
+                Line::from(vec![
+                    Span::styled("A: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate_string(&snapshot.merge.text_preview_a, preview_width)),
+                ]),
+                Line::from(vec![
+                    Span::styled("B: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate_string(&snapshot.merge.text_preview_b, preview_width)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Words: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!("A:{} B:{}", 
+                        format_number(snapshot.merge.word_count_a),
+                        format_number(snapshot.merge.word_count_b)
+                    )),
+                ]),
+            ]
+        } else {
+            // Show text blob preview (first 4 and last 4 words)
+            vec![
+                Line::from(vec![
+                    Span::styled("Preview: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate_string(&snapshot.operation.text_preview, max_width.saturating_sub(9))),
+                ]),
+                Line::from(vec![
+                    Span::styled("Words: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format_number(snapshot.operation.word_count)),
+                ]),
+            ]
+        };
+
+        let block = Block::default().borders(Borders::ALL).title("Text Preview");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
     }
 
     fn render_merge_progress(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -301,6 +358,18 @@ impl Tui {
             0
         };
         
+        // Calculate time since last update
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let time_since_update = if opt.last_update_time > 0 {
+            now.saturating_sub(opt.last_update_time)
+        } else {
+            0
+        };
+        let time_str = format_elapsed(time_since_update);
+        
         let lines = vec![
             Line::from(vec![
                 Span::styled("Volume: ", Style::default().fg(Color::DarkGray)),
@@ -313,6 +382,10 @@ impl Tui {
             Line::from(vec![
                 Span::styled("Filled: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("{}/{} ({}%)", opt.fullness, opt.capacity, fullness_pct)),
+            ]),
+            Line::from(vec![
+                Span::styled("Updated: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{} ago", time_str)),
             ]),
         ];
 
@@ -385,31 +458,30 @@ impl Tui {
 
         self.render_queue_depth_chart(f, right_chunks[0], snapshot);
         self.render_seen_size_chart(f, right_chunks[1], snapshot);
-        self.render_results_chart(f, right_chunks[2], snapshot);
+        self.render_seen_history_chart(f, right_chunks[2], snapshot);
         self.render_optimal_ortho_display(f, right_chunks[3], snapshot);
     }
 
     fn render_queue_depth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let data: Vec<u64> = snapshot
-            .queue_depth_samples
-            .iter()
-            .map(|s| s.value as u64)
-            .collect();
+        let sampled_data = sample_data(&snapshot.queue_depth_samples, area.width.saturating_sub(2) as usize);
+        let data: Vec<u64> = sampled_data.iter().map(|s| s.value as u64).collect();
 
-        let (current, peak, rate) = if data.len() >= 2 {
-            let current = *data.last().unwrap_or(&0);
-            let peak = *data.iter().max().unwrap_or(&0);
-            let prev = data[data.len().saturating_sub(10).max(0)];
-            let rate = (current as i64 - prev as i64) / 10;
-            (current, peak, rate)
-        } else if !data.is_empty() {
-            let current = *data.last().unwrap();
-            (current, current, 0)
+        let (current, peak, rate) = if !snapshot.queue_depth_samples.is_empty() {
+            let current = snapshot.queue_depth_samples.last().map(|s| s.value).unwrap_or(0);
+            let peak = snapshot.global.queue_depth_pk;
+            let rate = if snapshot.queue_depth_samples.len() >= 10 {
+                let prev_idx = snapshot.queue_depth_samples.len().saturating_sub(10);
+                let prev = snapshot.queue_depth_samples[prev_idx].value;
+                (current as i64 - prev as i64) / 10
+            } else {
+                0
+            };
+            (current as u64, peak as u64, rate)
         } else {
             (0, 0, 0)
         };
 
-        let rate_sign = if rate >= 0 { "+" } else { "" };
+        let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
             "Queue │ Cur:{} Pk:{} Δ{}{}/s",
             format_number(current as usize),
@@ -432,30 +504,31 @@ impl Tui {
     }
 
     fn render_seen_size_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let data: Vec<u64> = snapshot
-            .seen_size_samples
-            .iter()
-            .map(|s| s.value as u64)
-            .collect();
+        let sampled_data = sample_data(&snapshot.seen_size_samples, area.width.saturating_sub(2) as usize);
+        let data: Vec<u64> = sampled_data.iter().map(|s| s.value as u64).collect();
 
-        let (current, peak, rate) = if data.len() >= 2 {
-            let current = *data.last().unwrap_or(&0);
-            let peak = *data.iter().max().unwrap_or(&0);
-            let prev = data[data.len().saturating_sub(10).max(0)];
-            let rate = (current.saturating_sub(prev)) / 10;
-            (current, peak, rate)
-        } else if !data.is_empty() {
-            let current = *data.last().unwrap();
-            (current, current, 0)
+        let (current, peak, rate) = if !snapshot.seen_size_samples.is_empty() {
+            let current = snapshot.seen_size_samples.last().map(|s| s.value).unwrap_or(0);
+            let peak = snapshot.global.seen_size_pk;
+            let rate = if snapshot.seen_size_samples.len() >= 10 {
+                let prev_idx = snapshot.seen_size_samples.len().saturating_sub(10);
+                let prev = snapshot.seen_size_samples[prev_idx].value;
+                (current as i64 - prev as i64) / 10
+            } else {
+                0
+            };
+            (current as u64, peak as u64, rate)
         } else {
             (0, 0, 0)
         };
 
+        let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Seen │ Cur:{} Pk:{} Δ+{}/s",
+            "Seen │ Cur:{} Pk:{} Δ{}{}/s",
             format_number(current as usize),
             format_number(peak as usize),
-            format_number(rate as usize)
+            rate_sign,
+            format_number(rate.abs() as usize)
         );
         let max_width = area.width.saturating_sub(2) as usize;
 
@@ -471,45 +544,34 @@ impl Tui {
         f.render_widget(sparkline, area);
     }
 
-    fn render_results_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let results_data: Vec<u64> = snapshot
-            .results_count_samples
-            .iter()
-            .map(|s| s.value as u64)
-            .collect();
-
-        let (current_results, peak_results, rate) = if results_data.len() >= 2 {
-            let current = *results_data.last().unwrap_or(&0);
-            let peak = *results_data.iter().max().unwrap_or(&0);
-            let prev = results_data[results_data.len().saturating_sub(10).max(0)];
-            let rate = (current as i64 - prev as i64) / 10;
-            (current, peak, rate)
-        } else if !results_data.is_empty() {
-            let current = *results_data.last().unwrap();
-            (current, current, 0)
+    fn render_seen_history_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        // Use all available width for maximum historical resolution
+        let max_points = area.width.saturating_sub(2) as usize;
+        let sampled_data = sample_data(&snapshot.seen_history_samples, max_points);
+        
+        let (peak, duration_secs) = if !snapshot.seen_history_samples.is_empty() {
+            let peak = snapshot.global.seen_size_pk;
+            let first_ts = snapshot.seen_history_samples.first().map(|s| s.timestamp).unwrap_or(0);
+            let last_ts = snapshot.seen_history_samples.last().map(|s| s.timestamp).unwrap_or(0);
+            let duration = last_ts.saturating_sub(first_ts);
+            (peak, duration)
         } else {
-            (0, 0, 0)
+            (0, 0)
         };
 
-        let max_val = results_data
+        // Normalize all data points to peak for consistent visualization
+        let max_val = peak.max(1);
+        let normalized_data: Vec<u64> = sampled_data
             .iter()
-            .max()
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-
-        let normalized_results: Vec<u64> = results_data
-            .iter()
-            .map(|&v| (v * 100) / max_val)
+            .map(|s| (s.value as u64 * 100) / max_val as u64)
             .collect();
 
-        let rate_sign = if rate >= 0 { "+" } else { "" };
+        let duration_str = format_elapsed(duration_secs);
         let title = format!(
-            "Results │ Cur:{} Pk:{} Δ{}{}/s",
-            format_number(current_results as usize),
-            format_number(peak_results as usize),
-            rate_sign,
-            format_number(rate.abs() as usize)
+            "Seen History │ Pk:{} │ Duration:{} │ {} samples",
+            format_number(peak),
+            duration_str,
+            format_number(snapshot.seen_history_samples.len())
         );
         let max_width = area.width.saturating_sub(2) as usize;
 
@@ -519,8 +581,8 @@ impl Tui {
                     .borders(Borders::ALL)
                     .title(truncate_string(&title, max_width)),
             )
-            .data(&normalized_results)
-            .style(Style::default().fg(Color::Cyan));
+            .data(&normalized_data)
+            .style(Style::default().fg(Color::Green));
 
         f.render_widget(sparkline, area);
     }
@@ -544,7 +606,7 @@ impl Tui {
             })
             .collect();
 
-        let title = truncate_string("Logs (↑/↓ scroll, q quit)", max_width);
+        let title = truncate_string("Logs (↑/↓ scroll logs, ←/→ scroll ortho, q quit)", max_width);
         let list = List::new(logs).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -557,6 +619,7 @@ impl Tui {
     fn render_optimal_ortho_display(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let opt = &snapshot.optimal_ortho;
         let max_width = area.width.saturating_sub(2) as usize;
+        let max_height = area.height.saturating_sub(2) as usize;
         
         // If no ortho data, show placeholder
         if opt.dims.is_empty() || opt.payload.is_empty() {
@@ -569,15 +632,19 @@ impl Tui {
             return;
         }
         
-        // Format the ortho display
-        let display_lines = self.format_ortho_display(&opt.dims, &opt.payload, &opt.vocab, max_width);
+        // Format the ortho display with column layout
+        let display_lines = self.format_ortho_display(&opt.dims, &opt.payload, &opt.vocab, max_width, max_height);
         
+        // Apply scrolling
         let lines: Vec<Line> = display_lines
             .into_iter()
+            .skip(self.ortho_scroll)
+            .take(max_height)
             .map(|s| Line::from(s))
             .collect();
 
-        let block = Block::default().borders(Borders::ALL).title("Optimal Ortho Display");
+        let title = "Optimal Ortho Display (←/→ scroll)";
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
         
@@ -585,7 +652,7 @@ impl Tui {
         f.render_widget(paragraph, inner);
     }
     
-    fn format_ortho_display(&self, dims: &[usize], payload: &[Option<usize>], vocab: &[String], max_width: usize) -> Vec<String> {
+    fn format_ortho_display(&self, dims: &[usize], payload: &[Option<usize>], vocab: &[String], max_width: usize, max_height: usize) -> Vec<String> {
         if dims.len() < 2 {
             return vec!["Invalid dimensions".to_string()];
         }
@@ -629,7 +696,7 @@ impl Tui {
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    truncate_string(&row_str, max_width)
+                    row_str
                 })
                 .collect()
         };
@@ -638,11 +705,105 @@ impl Tui {
             return format_2d_slice(&[]);
         }
         
-        // For higher dimensions, show first tile only (to fit in space)
-        let mut result = Vec::new();
-        result.push("[dim0=0, ...]".to_string());
-        result.extend(format_2d_slice(&vec![0; higher_dims.len()]));
-        result
+        // Generate all possible coordinate combinations for higher dimensions
+        fn generate_coords(dims: &[usize], current: Vec<usize>, all: &mut Vec<Vec<usize>>) {
+            if current.len() == dims.len() {
+                all.push(current);
+                return;
+            }
+            let dim_idx = current.len();
+            for i in 0..dims[dim_idx] {
+                let mut next = current.clone();
+                next.push(i);
+                generate_coords(dims, next, all);
+            }
+        }
+        
+        let mut all_coords = Vec::new();
+        generate_coords(higher_dims, Vec::new(), &mut all_coords);
+        
+        // Format each tile with header and content
+        struct Tile {
+            header: String,
+            lines: Vec<String>,
+        }
+        
+        let tiles: Vec<Tile> = all_coords.iter().map(|coords| {
+            let coord_str = coords.iter()
+                .enumerate()
+                .map(|(i, &c)| format!("d{}={}", i, c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let header = format!("[{}]", coord_str);
+            let lines = format_2d_slice(coords);
+            Tile { header, lines }
+        }).collect();
+        
+        if tiles.is_empty() {
+            return vec!["No tiles".to_string()];
+        }
+        
+        // Calculate dimensions of a single tile
+        let tile_height = tiles[0].lines.len() + 1; // +1 for header
+        let tile_width = tiles[0].lines.iter().map(|l| l.len()).max().unwrap_or(0).max(tiles[0].header.len());
+        
+        // Determine column layout
+        let col_spacing = 2;
+        let tiles_per_row = ((max_width + col_spacing) / (tile_width + col_spacing)).max(1);
+        
+        // Check if tiles fit in columns within available height
+        let num_tile_rows = (tiles.len() + tiles_per_row - 1) / tiles_per_row;
+        let total_height = num_tile_rows * tile_height;
+        
+        if tiles_per_row == 1 || total_height > max_height * 3 {
+            // Too tall even with columns, or only one column fits - just stack vertically
+            let mut result = Vec::new();
+            for tile in tiles {
+                result.push(tile.header);
+                result.extend(tile.lines);
+                result.push("".to_string());
+            }
+            result
+        } else {
+            // Arrange in columns
+            let mut result = vec![String::new(); tile_height * num_tile_rows];
+            
+            for (tile_idx, tile) in tiles.iter().enumerate() {
+                let row_idx = tile_idx / tiles_per_row;
+                let col_idx = tile_idx % tiles_per_row;
+                let base_line = row_idx * tile_height;
+                let x_offset = col_idx * (tile_width + col_spacing);
+                
+                // Add header
+                if base_line < result.len() {
+                    let padded_header = format!("{:<width$}", tile.header, width = tile_width);
+                    let current_len = result[base_line].len();
+                    if current_len < x_offset {
+                        result[base_line].push_str(&" ".repeat(x_offset - current_len));
+                    }
+                    if result[base_line].len() == x_offset {
+                        result[base_line].push_str(&padded_header);
+                    }
+                }
+                
+                // Add tile lines
+                for (i, line) in tile.lines.iter().enumerate() {
+                    let line_idx = base_line + 1 + i;
+                    if line_idx < result.len() {
+                        let padded_line = format!("{:<width$}", line, width = tile_width);
+                        let current_len = result[line_idx].len();
+                        if current_len < x_offset {
+                            result[line_idx].push_str(&" ".repeat(x_offset - current_len));
+                        }
+                        if result[line_idx].len() == x_offset {
+                            result[line_idx].push_str(&padded_line);
+                        }
+                    }
+                }
+            }
+            
+            result
+        }
     }
 }
 
@@ -852,4 +1013,22 @@ fn count_leaves(node: &TreeNode) -> usize {
         TreeNode::Leaf(_) => 1,
         TreeNode::Branch(left, right) => count_leaves(left) + count_leaves(right),
     }
+}
+
+fn sample_data(samples: &[MetricSample], max_points: usize) -> Vec<MetricSample> {
+    if samples.len() <= max_points {
+        return samples.to_vec();
+    }
+    
+    let step = samples.len() as f64 / max_points as f64;
+    let mut result = Vec::with_capacity(max_points);
+    
+    for i in 0..max_points {
+        let idx = (i as f64 * step) as usize;
+        if idx < samples.len() {
+            result.push(samples[idx].clone());
+        }
+    }
+    
+    result
 }

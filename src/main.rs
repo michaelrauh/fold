@@ -1,4 +1,5 @@
 use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, StateConfig}, interner::Interner, memory_config::MemoryConfig, metrics::Metrics, ortho::Ortho, seen_tracker::SeenTracker, tui::Tui, FoldError};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -55,6 +56,10 @@ fn main() -> Result<(), FoldError> {
         let interner = file_handler::load_interner(&largest.path)?;
         
         let (volume, fullness) = calculate_score(&optimal_ortho);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         metrics.update_optimal_ortho(|opt| {
             opt.volume = volume;
             opt.dims = optimal_ortho.dims().clone();
@@ -62,6 +67,7 @@ fn main() -> Result<(), FoldError> {
             opt.capacity = optimal_ortho.payload().len();
             opt.payload = optimal_ortho.payload().clone();
             opt.vocab = interner.vocabulary().to_vec();
+            opt.last_update_time = now;
         });
         metrics.add_log(format!("Restored optimal ortho from archive: volume={}", volume));
     }
@@ -70,12 +76,16 @@ fn main() -> Result<(), FoldError> {
     // Mode 1: If there are 2+ result archives, merge smallest with largest
     // Mode 2: If there are not 2 results, process txt into result
     loop {
+        // Check for stale heartbeats and recover abandoned work from crashed processes
+        file_handler::check_and_recover_stale_work(&config)?;
+        
         // Check for existing archives
         let archive_pair = file_handler::get_smallest_and_largest_archives_with_config(&config)?;
         
         if let Some((smallest, largest)) = archive_pair {
             // Mode 1: Merge archives
             metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+            metrics.clear_chart_history();
             metrics.add_log("MODE 1: Merging archives".to_string());
             metrics.add_log(format!("Merging: {} + {}", smallest, largest));
             
@@ -92,6 +102,7 @@ fn main() -> Result<(), FoldError> {
             }
             
             metrics.update_global(|g| g.mode = "Processing Text".to_string());
+            metrics.clear_chart_history();
             metrics.add_log("MODE 2: Processing text file".to_string());
             
             process_txt_file(txt_file.unwrap(), &config, &metrics)?;
@@ -113,6 +124,8 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     metrics.update_operation(|op| {
         op.current_file = ingestion.filename.clone();
         op.status = "Building interner".to_string();
+        op.text_preview = ingestion.text_preview.clone();
+        op.word_count = ingestion.word_count;
     });
     metrics.update_global(|g| {
         g.remaining_chunks = remaining;
@@ -178,7 +191,6 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
             // Update metrics
             metrics.record_queue_depth(work_queue.len());
             metrics.record_seen_size(tracker.len());
-            metrics.record_results_count(results.len());
             let (volume, _) = calculate_score(&best_ortho);
             metrics.record_optimal_volume(volume);
             metrics.update_operation(|op| {
@@ -232,6 +244,10 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
                     let global_score = (snapshot.optimal_ortho.volume, snapshot.optimal_ortho.fullness);
                     if candidate_score > global_score {
                         let (volume, fullness) = candidate_score;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
                         metrics.update_optimal_ortho(|opt| {
                             opt.volume = volume;
                             opt.dims = child.dims().clone();
@@ -239,6 +255,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
                             opt.capacity = child.payload().len();
                             opt.payload = child.payload().clone();
                             opt.vocab = interner.vocabulary().to_vec();
+                            opt.last_update_time = now;
                         });
                     }
                     
@@ -316,6 +333,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         m.impacted_b = if a_is_smaller { impacted_larger.len() } else { impacted_smaller.len() };
         m.seed_orthos_a = orthos_a;
         m.seed_orthos_b = orthos_b;
+        m.text_preview_a = ingestion.text_preview_a.clone();
+        m.text_preview_b = ingestion.text_preview_b.clone();
+        m.word_count_a = ingestion.word_count_a;
+        m.word_count_b = ingestion.word_count_b;
     });
     
     // Create merged interner: larger absorbs smaller, so larger's vocab is the base
@@ -375,6 +396,9 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         (&results_a_path, &impacted_larger, "A")
     };
     
+    // Pre-build HashSet for O(1) impact lookups instead of O(n×m) nested loops
+    let larger_impacted_set: HashSet<&Vec<usize>> = larger_impacted.iter().collect();
+    
     metrics.update_operation(|op| {
         op.status = format!("Processing Larger Archive {}", larger_name);
         op.progress_current = 0;
@@ -399,11 +423,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 ingestion.touch_heartbeat()?;
                 metrics.update_operation(|op| op.progress_current = total_from_larger);
                 metrics.record_seen_size(tracker.len());
-                metrics.record_results_count(merged_results.len());
             }
             
             // Check if this ortho is impacted - if so, add to work queue
-            if is_ortho_impacted(&ortho, larger_impacted) {
+            if is_ortho_impacted_fast(&ortho, &larger_impacted_set) {
                 work_queue.push(ortho)?;
                 impacted_from_larger += 1;
             }
@@ -416,6 +439,9 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     } else {
         (&results_b_path, &impacted_smaller, "B")
     };
+    
+    // Pre-build HashSet for O(1) impact lookups
+    let smaller_impacted_set: HashSet<&Vec<usize>> = smaller_impacted.iter().collect();
     
     metrics.update_operation(|op| {
         op.status = format!("Remapping Smaller Archive {}", smaller_name);
@@ -442,11 +468,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                     ingestion.touch_heartbeat()?;
                     metrics.update_operation(|op| op.progress_current = total_from_smaller);
                     metrics.record_seen_size(tracker.len());
-                    metrics.record_results_count(merged_results.len());
                 }
                 
                 // Check if this ortho is impacted - if so, add to work queue
-                if is_ortho_impacted(&ortho, smaller_impacted) {
+                if is_ortho_impacted_fast(&ortho, &smaller_impacted_set) {
                     work_queue.push(remapped)?;
                     impacted_from_smaller += 1;
                 }
@@ -490,7 +515,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             let queue_depth = work_queue.len();
             metrics.record_queue_depth(queue_depth);
             metrics.record_seen_size(tracker.len());
-            metrics.record_results_count(merged_results.len());
             let (volume, _) = calculate_score(&best_ortho);
             metrics.record_optimal_volume(volume);
             metrics.update_operation(|op| {
@@ -540,6 +564,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                     let global_score = (snapshot.optimal_ortho.volume, snapshot.optimal_ortho.fullness);
                     if candidate_score > global_score {
                         let (volume, fullness) = candidate_score;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
                         metrics.update_optimal_ortho(|opt| {
                             opt.volume = volume;
                             opt.dims = child.dims().clone();
@@ -547,6 +575,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                             opt.capacity = child.payload().len();
                             opt.payload = child.payload().clone();
                             opt.vocab = merged_interner.vocabulary().to_vec();
+                            opt.last_update_time = now;
                         });
                     }
                     
@@ -605,25 +634,14 @@ fn build_vocab_mapping(old_vocab: &[String], new_vocab: &[String]) -> Vec<usize>
     }).collect()
 }
 
-// Check if an ortho uses any of the impacted keys
-fn is_ortho_impacted(ortho: &Ortho, impacted_keys: &[Vec<usize>]) -> bool {
-    if impacted_keys.is_empty() {
+// Check if an ortho uses any of the impacted keys (optimized with HashSet)
+fn is_ortho_impacted_fast(ortho: &Ortho, impacted_set: &HashSet<&Vec<usize>>) -> bool {
+    if impacted_set.is_empty() {
         return false;
     }
     
-    // Get the requirement phrases from the ortho
     let requirement_phrases = ortho.get_requirement_phrases();
-    
-    // Check if any requirement phrase matches an impacted key
-    for req_phrase in &requirement_phrases {
-        for impacted_key in impacted_keys {
-            if req_phrase == impacted_key {
-                return true;
-            }
-        }
-    }
-    
-    false
+    requirement_phrases.iter().any(|phrase| impacted_set.contains(phrase))
 }
 
 fn print_optimal(_ortho: &Ortho, _interner: &Interner) {

@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_SAMPLES: usize = 1000;
+const MAX_SAMPLES: usize = 2000;
+const DOWNSAMPLE_THRESHOLD: usize = 1500;
 
 #[derive(Clone, Debug)]
 pub struct MetricSample {
@@ -26,6 +27,8 @@ pub struct GlobalMetrics {
     pub bloom_capacity: usize,
     pub num_shards: usize,
     pub max_shards_in_memory: usize,
+    pub queue_depth_pk: usize,
+    pub seen_size_pk: usize,
 }
 
 impl Default for GlobalMetrics {
@@ -49,6 +52,8 @@ impl Default for GlobalMetrics {
             bloom_capacity: 0,
             num_shards: 0,
             max_shards_in_memory: 0,
+            queue_depth_pk: 0,
+            seen_size_pk: 0,
         }
     }
 }
@@ -59,6 +64,8 @@ pub struct OperationStatus {
     pub status: String,
     pub progress_current: usize,
     pub progress_total: usize,
+    pub text_preview: String,
+    pub word_count: usize,
 }
 
 impl Default for OperationStatus {
@@ -68,6 +75,8 @@ impl Default for OperationStatus {
             status: "Idle".to_string(),
             progress_current: 0,
             progress_total: 0,
+            text_preview: String::new(),
+            word_count: 0,
         }
     }
 }
@@ -85,6 +94,10 @@ pub struct MergeStatus {
     pub impacted_queued_a: usize,
     pub impacted_queued_b: usize,
     pub new_orthos_from_merge: usize,
+    pub text_preview_a: String,
+    pub text_preview_b: String,
+    pub word_count_a: usize,
+    pub word_count_b: usize,
 }
 
 impl Default for MergeStatus {
@@ -101,6 +114,10 @@ impl Default for MergeStatus {
             impacted_queued_a: 0,
             impacted_queued_b: 0,
             new_orthos_from_merge: 0,
+            text_preview_a: String::new(),
+            text_preview_b: String::new(),
+            word_count_a: 0,
+            word_count_b: 0,
         }
     }
 }
@@ -130,6 +147,7 @@ pub struct OptimalOrtho {
     pub capacity: usize,
     pub payload: Vec<Option<usize>>,
     pub vocab: Vec<String>,
+    pub last_update_time: u64,
 }
 
 impl Default for OptimalOrtho {
@@ -141,6 +159,7 @@ impl Default for OptimalOrtho {
             capacity: 0,
             payload: vec![],
             vocab: vec![],
+            last_update_time: 0,
         }
     }
 }
@@ -164,7 +183,7 @@ struct MetricsInner {
     
     queue_depth_samples: VecDeque<MetricSample>,
     seen_size_samples: VecDeque<MetricSample>,
-    results_count_samples: VecDeque<MetricSample>,
+    seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
     
     logs: VecDeque<LogEntry>,
@@ -181,7 +200,7 @@ impl Metrics {
                 optimal_ortho: OptimalOrtho::default(),
                 queue_depth_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                results_count_samples: VecDeque::with_capacity(MAX_SAMPLES),
+                seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 logs: VecDeque::with_capacity(100),
             })),
@@ -227,15 +246,22 @@ impl Metrics {
     }
 
     pub fn record_queue_depth(&self, depth: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if depth > inner.global.queue_depth_pk {
+            inner.global.queue_depth_pk = depth;
+        }
+        drop(inner);
         self.record_sample(depth, |inner| &mut inner.queue_depth_samples);
     }
 
     pub fn record_seen_size(&self, size: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        if size > inner.global.seen_size_pk {
+            inner.global.seen_size_pk = size;
+        }
+        drop(inner);
         self.record_sample(size, |inner| &mut inner.seen_size_samples);
-    }
-
-    pub fn record_results_count(&self, count: usize) {
-        self.record_sample(count, |inner| &mut inner.results_count_samples);
+        self.record_sample(size, |inner| &mut inner.seen_history_samples);
     }
 
     pub fn record_optimal_volume(&self, volume: usize) {
@@ -255,9 +281,90 @@ impl Metrics {
         };
         
         samples.push_back(sample);
-        if samples.len() > MAX_SAMPLES {
-            samples.pop_front();
+        
+        // When we exceed threshold, downsample by time-based bucketing
+        // This preserves temporal distribution - always keeping oldest and newest data
+        if samples.len() > DOWNSAMPLE_THRESHOLD {
+            let target_size = DOWNSAMPLE_THRESHOLD / 2;
+            let new_samples = Self::downsample_by_time(samples, target_size);
+            *samples = new_samples;
         }
+    }
+    
+    fn downsample_by_time(samples: &VecDeque<MetricSample>, target_size: usize) -> VecDeque<MetricSample> {
+        if samples.len() <= target_size {
+            return samples.clone();
+        }
+        
+        let mut result = VecDeque::with_capacity(target_size);
+        
+        // Always keep first sample
+        if let Some(first) = samples.front() {
+            result.push_back(first.clone());
+        }
+        
+        if target_size <= 2 {
+            // Just keep first and last
+            if let Some(last) = samples.back() {
+                if result.len() < target_size {
+                    result.push_back(last.clone());
+                }
+            }
+            return result;
+        }
+        
+        // Divide the timeline into buckets and take one sample per bucket
+        let first_ts = samples.front().map(|s| s.timestamp).unwrap_or(0);
+        let last_ts = samples.back().map(|s| s.timestamp).unwrap_or(0);
+        let time_span = last_ts.saturating_sub(first_ts);
+        
+        if time_span == 0 {
+            // All samples at same timestamp - just take evenly spaced by index
+            let step = samples.len() / target_size;
+            for i in (step..samples.len()).step_by(step.max(1)) {
+                if result.len() < target_size - 1 {
+                    result.push_back(samples[i].clone());
+                }
+            }
+        } else {
+            // Time-based bucketing
+            let bucket_duration = time_span as f64 / (target_size - 1) as f64;
+            
+            for i in 1..target_size {
+                let target_ts = first_ts + (i as f64 * bucket_duration) as u64;
+                
+                // Find closest sample to this timestamp
+                let mut best_idx = 0;
+                let mut best_diff = u64::MAX;
+                
+                for (idx, sample) in samples.iter().enumerate() {
+                    let diff = if sample.timestamp >= target_ts {
+                        sample.timestamp - target_ts
+                    } else {
+                        target_ts - sample.timestamp
+                    };
+                    
+                    if diff < best_diff {
+                        best_diff = diff;
+                        best_idx = idx;
+                    }
+                }
+                
+                if best_idx < samples.len() && result.len() < target_size {
+                    result.push_back(samples[best_idx].clone());
+                }
+            }
+        }
+        
+        result
+    }
+
+    pub fn clear_chart_history(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue_depth_samples.clear();
+        inner.seen_size_samples.clear();
+        inner.optimal_volume_samples.clear();
+        // Note: seen_history_samples is NOT cleared - it persists across all chunks
     }
 
     pub fn add_log(&self, message: String) {
@@ -283,7 +390,7 @@ impl Metrics {
             optimal_ortho: inner.optimal_ortho.clone(),
             queue_depth_samples: inner.queue_depth_samples.iter().cloned().collect(),
             seen_size_samples: inner.seen_size_samples.iter().cloned().collect(),
-            results_count_samples: inner.results_count_samples.iter().cloned().collect(),
+            seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
             optimal_volume_samples: inner.optimal_volume_samples.iter().cloned().collect(),
             logs: inner.logs.iter().cloned().collect(),
         }
@@ -299,7 +406,7 @@ pub struct MetricsSnapshot {
     pub optimal_ortho: OptimalOrtho,
     pub queue_depth_samples: Vec<MetricSample>,
     pub seen_size_samples: Vec<MetricSample>,
-    pub results_count_samples: Vec<MetricSample>,
+    pub seen_history_samples: Vec<MetricSample>,
     pub optimal_volume_samples: Vec<MetricSample>,
     pub logs: Vec<LogEntry>,
 }

@@ -5,6 +5,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_GRACE_PERIOD_SECS: u64 = 600; // 10 minutes
 
+/// Count words in text (whitespace-separated tokens)
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+/// Create text preview: first N words and last N words
+fn create_text_preview(text: &str, first_n: usize, last_n: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    
+    if words.len() <= first_n + last_n {
+        return words.join(" ");
+    }
+    
+    let first_words = words.iter().take(first_n).cloned().collect::<Vec<_>>().join(" ");
+    let last_words = words.iter().rev().take(last_n).cloned().rev().collect::<Vec<_>>().join(" ");
+    
+    format!("{} ... {}", first_words, last_words)
+}
+
 /// Configuration for state directory locations
 #[derive(Clone)]
 pub struct StateConfig {
@@ -51,6 +70,12 @@ pub fn initialize_with_config(config: &StateConfig) -> Result<(), FoldError> {
     Ok(())
 }
 
+/// Check for and recover any stale work from crashed processes
+/// This should be called at the beginning of each worker loop iteration
+pub fn check_and_recover_stale_work(config: &StateConfig) -> Result<(), FoldError> {
+    recover_abandoned_files(config.input_dir().to_str().unwrap(), config.in_process_dir().to_str().unwrap())
+}
+
 fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
     let in_process_path = std::path::Path::new(in_process_dir);
     
@@ -82,26 +107,76 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                             fs::rename(&source_txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
                             // println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
                             
-                            // Remove the abandoned work folder
+                            // Delete the results_{filename} directory if it exists
+                            let base_dir = Path::new(in_process_dir).parent().unwrap_or_else(|| Path::new("."));
+                            let results_txt_path = base_dir.join(format!("results_{}", base_name));
+                            if results_txt_path.exists() {
+                                // println!("[fold] Removing partial txt processing results: {:?}", results_txt_path);
+                                let _ = fs::remove_dir_all(&results_txt_path);
+                            }
+                            
+                            // Remove the abandoned work folder (contains queue/ and seen_shards/)
                             fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
                             recovered_count += 1;
                         }
                     }
                 }
-                // If it's an archive folder with stale heartbeat, move it back to input
-                else if entry_path.to_string_lossy().ends_with(".bin") {
-                    let archive_name = entry_path.file_name().unwrap();
-                    let input_path = Path::new(input_dir).join(archive_name);
-                    // println!("[fold] Recovering stale archive: {:?} -> {:?}", entry_path, input_path);
-                    fs::rename(&entry_path, &input_path).map_err(|e| FoldError::Io(e))?;
-                    recovered_count += 1;
-                }
-                // If it's a merge_*.work folder with stale heartbeat, delete it
+                // Check other folders with stale heartbeats
                 else if let Some(folder_name) = entry_path.file_name() {
                     let folder_name_str = folder_name.to_str().unwrap_or("");
+                    // If it's a merge_*.work folder with stale heartbeat, recover the merge
                     if folder_name_str.starts_with("merge_") && folder_name_str.ends_with(".work") {
+                        // Extract PID to find related archives and results
+                        if let Some(pid_str) = folder_name_str.strip_prefix("merge_").and_then(|s| s.strip_suffix(".work")) {
+                            // Find and recover the two archive folders back to input
+                            // They should be in in_process as .bin folders
+                            if let Ok(entries) = fs::read_dir(in_process_path) {
+                                for bin_entry in entries {
+                                    if let Ok(bin_entry) = bin_entry {
+                                        let bin_path = bin_entry.path();
+                                        if bin_path.is_dir() && bin_path.extension().map(|e| e == "bin").unwrap_or(false) {
+                                            // Remove heartbeat from archive
+                                            let archive_heartbeat = bin_path.join("heartbeat");
+                                            if archive_heartbeat.exists() {
+                                                let _ = fs::remove_file(&archive_heartbeat);
+                                            }
+                                            
+                                            // Move archive back to input
+                                            let archive_name = bin_path.file_name().unwrap();
+                                            let input_path = Path::new(input_dir).join(archive_name);
+                                            // println!("[fold] Recovering merge archive: {:?} -> {:?}", bin_path, input_path);
+                                            let _ = fs::rename(&bin_path, &input_path);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Delete the results_merged_{pid} directory if it exists
+                            let base_dir = Path::new(in_process_dir).parent().unwrap_or_else(|| Path::new("."));
+                            let results_merged_path = base_dir.join(format!("results_merged_{}", pid_str));
+                            if results_merged_path.exists() {
+                                // println!("[fold] Removing partial merge results: {:?}", results_merged_path);
+                                let _ = fs::remove_dir_all(&results_merged_path);
+                            }
+                        }
+                        
+                        // Delete the merge work folder (contains queue/ and seen_shards/)
                         // println!("[fold] Removing abandoned merge work folder: {}", folder_name_str);
                         fs::remove_dir_all(&entry_path).map_err(|e| FoldError::Io(e))?;
+                        recovered_count += 1;
+                    }
+                    // If it's an archive folder with stale heartbeat (orphaned from failed merge recovery), move it back
+                    else if entry_path.to_string_lossy().ends_with(".bin") {
+                        // Remove the heartbeat before moving to input
+                        let heartbeat_to_remove = entry_path.join("heartbeat");
+                        if heartbeat_to_remove.exists() {
+                            fs::remove_file(&heartbeat_to_remove).map_err(|e| FoldError::Io(e))?;
+                        }
+                        
+                        let archive_name = entry_path.file_name().unwrap();
+                        let input_path = Path::new(input_dir).join(archive_name);
+                        // println!("[fold] Recovering orphaned archive: {:?} -> {:?}", entry_path, input_path);
+                        fs::rename(&entry_path, &input_path).map_err(|e| FoldError::Io(e))?;
                         recovered_count += 1;
                     }
                 }
@@ -214,6 +289,8 @@ fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> {
         return Ok(None);
     }
     
+    let mut largest_file: Option<(String, u64)> = None;
+    
     for entry in fs::read_dir(path).map_err(|e| FoldError::Io(e))? {
         let entry = entry.map_err(|e| FoldError::Io(e))?;
         let entry_path = entry.path();
@@ -223,14 +300,23 @@ fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> {
             if let Some(ext) = entry_path.extension() {
                 if ext == "txt" {
                     if let Some(path_str) = entry_path.to_str() {
-                        return Ok(Some(path_str.to_string()));
+                        if let Ok(metadata) = entry_path.metadata() {
+                            let size = metadata.len();
+                            if let Some((_, current_largest_size)) = largest_file {
+                                if size > current_largest_size {
+                                    largest_file = Some((path_str.to_string(), size));
+                                }
+                            } else {
+                                largest_file = Some((path_str.to_string(), size));
+                            }
+                        }
                     }
                 }
             }
         }
     }
     
-    Ok(None)
+    Ok(largest_file.map(|(path, _)| path))
 }
 
 fn find_archives(input_dir: &str) -> Result<Vec<(String, u64)>, FoldError> {
@@ -285,7 +371,9 @@ fn save_archive(
     results_path: &str,
     best_ortho: Option<&Ortho>,
     lineage: &str,
-    ortho_count: usize
+    ortho_count: usize,
+    text_preview: &str,
+    word_count: usize
 ) -> Result<(), FoldError> {
     // Flush and drop results to close file handles before rename
     results.flush()?;
@@ -326,9 +414,10 @@ fn save_archive(
     let metadata_path = format!("{}/metadata.txt", archive_path);
     fs::write(metadata_path, ortho_count.to_string()).map_err(|e| FoldError::Io(e))?;
     
-    // Create heartbeat file in the archive
-    let heartbeat_path = format!("{}/heartbeat", archive_path);
-    touch_heartbeat(&heartbeat_path)?;
+    // Write text metadata (preview and word count)
+    let text_meta_path = format!("{}/text_meta.txt", archive_path);
+    let text_meta_content = format!("{}\n{}", word_count, text_preview);
+    fs::write(text_meta_path, text_meta_content).map_err(|e| FoldError::Io(e))?;
     
     Ok(())
 }
@@ -374,6 +463,25 @@ fn load_metadata(archive_path: &str) -> Result<usize, FoldError> {
     let content = fs::read_to_string(&metadata_path).map_err(|e| FoldError::Io(e))?;
     content.trim().parse::<usize>()
         .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+/// Load text metadata (word count and preview) from archive
+/// Returns (word_count, text_preview)
+fn load_text_metadata(archive_path: &str) -> Result<(usize, String), FoldError> {
+    let text_meta_path = format!("{}/text_meta.txt", archive_path);
+    let content = fs::read_to_string(&text_meta_path).map_err(|e| FoldError::Io(e))?;
+    let mut lines = content.lines();
+    
+    let word_count = lines.next()
+        .ok_or_else(|| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing word count")))?
+        .parse::<usize>()
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    
+    let text_preview = lines.next()
+        .ok_or_else(|| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing text preview")))?
+        .to_string();
+    
+    Ok((word_count, text_preview))
 }
 
 /// Ensures a directory exists by creating it if needed
@@ -424,6 +532,10 @@ fn setup_archive_merge(archive_a_path: &str, archive_b_path: &str, in_process_di
     fs::rename(archive_a_path, &work_a_path).map_err(FoldError::Io)?;
     fs::rename(archive_b_path, &work_b_path).map_err(FoldError::Io)?;
     
+    // Create heartbeats for archives now that they're in_process
+    touch_heartbeat(&format!("{}/heartbeat", work_a_path))?;
+    touch_heartbeat(&format!("{}/heartbeat", work_b_path))?;
+    
     Ok((work_a_path, work_b_path))
 }
 
@@ -447,6 +559,8 @@ pub struct TxtIngestion {
     heartbeat_path: String,
     pub filename: String,
     pub text: String,
+    pub text_preview: String,
+    pub word_count: usize,
     config: StateConfig,
 }
 
@@ -488,7 +602,7 @@ impl TxtIngestion {
             self.filename, now.as_secs(), now.subsec_nanos()));
         let results_path = self.results_path();
         
-        save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage, ortho_count)?;
+        save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage, ortho_count, &self.text_preview, self.word_count)?;
         Ok((archive_path.to_string_lossy().to_string(), lineage))
     }
     
@@ -506,6 +620,10 @@ pub struct ArchiveIngestion {
     original_b_path: String,
     merge_work_folder: String,
     heartbeat_path: String,
+    pub text_preview_a: String,
+    pub text_preview_b: String,
+    pub word_count_a: usize,
+    pub word_count_b: usize,
     config: StateConfig,
 }
 
@@ -566,7 +684,11 @@ impl ArchiveIngestion {
         let archive_path = self.config.input_dir().join(format!("archive_merged_{}_{}_{}.bin", 
             now.as_secs(), now.subsec_nanos(), std::process::id()));
         
-        save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage, ortho_count)?;
+        // Compute merged text metadata (sum of word counts, combined previews)
+        let merged_word_count = self.word_count_a + self.word_count_b;
+        let merged_preview = format!("{} ... {}", self.text_preview_a, self.text_preview_b);
+        
+        save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage, ortho_count, &merged_preview, merged_word_count)?;
         Ok((archive_path.to_string_lossy().to_string(), merged_lineage))
     }
     
@@ -706,11 +828,17 @@ pub fn ingest_txt_file_with_config(file_path: &str, config: &StateConfig) -> Res
     // Read the text immediately as part of ingestion
     let text = read_source_text(&source_txt_path)?;
     
+    // Compute text metadata
+    let word_count = count_words(&text);
+    let text_preview = create_text_preview(&text, 4, 4); // First 4 and last 4 words for text blobs
+    
     Ok(TxtIngestion {
         work_folder,
         heartbeat_path,
         filename,
         text,
+        text_preview,
+        word_count,
         config: config.clone(),
     })
 }
@@ -723,6 +851,25 @@ pub fn ingest_archives(archive_a_path: &str, archive_b_path: &str) -> Result<Arc
 /// Ingest archives for merging with custom config
 pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, config: &StateConfig) -> Result<ArchiveIngestion, FoldError> {
     let in_process = config.in_process_dir();
+    
+    // Load text metadata before moving archives
+    let (word_count_a_orig, text_preview_a_orig) = load_text_metadata(archive_a_path)
+        .unwrap_or_else(|_| (0, String::new()));
+    let (word_count_b_orig, text_preview_b_orig) = load_text_metadata(archive_b_path)
+        .unwrap_or_else(|_| (0, String::new()));
+    
+    // Truncate previews to first 2 and last 2 words for merging display
+    let text_preview_a = if word_count_a_orig > 0 {
+        create_text_preview(&text_preview_a_orig, 2, 2)
+    } else {
+        String::new()
+    };
+    let text_preview_b = if word_count_b_orig > 0 {
+        create_text_preview(&text_preview_b_orig, 2, 2)
+    } else {
+        String::new()
+    };
+    
     let (work_a_path, work_b_path) = setup_archive_merge(archive_a_path, archive_b_path, in_process.to_str().unwrap())?;
     
     // Create merge work folder for isolated queue and seen_shards
@@ -740,6 +887,10 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
         original_b_path: archive_b_path.to_string(),
         merge_work_folder: merge_work_folder.to_string_lossy().to_string(),
         heartbeat_path: heartbeat_path.to_string_lossy().to_string(),
+        text_preview_a,
+        text_preview_b,
+        word_count_a: word_count_a_orig,
+        word_count_b: word_count_b_orig,
         config: config.clone(),
     })
 }
@@ -765,7 +916,7 @@ mod tests {
         results.push(ortho2).unwrap();
         
         // Save archive
-        save_archive(archive_path.to_str().unwrap(), &interner, results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"", 2).unwrap();
+        save_archive(archive_path.to_str().unwrap(), &interner, results, results_path.to_str().unwrap(), Some(&ortho1), "\"test\"", 2, "hello world ... test", 3).unwrap();
         
         // Verify archive directory exists
         assert!(archive_path.exists());
