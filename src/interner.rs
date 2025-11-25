@@ -180,6 +180,10 @@ impl Interner {
         &self.vocabulary
     }
 
+    pub fn vocab_size(&self) -> usize {
+        self.vocabulary.len()
+    }
+
     pub fn string_for_index(&self, index: usize) -> &str {
         self.vocabulary
             .get(index)

@@ -45,7 +45,7 @@ fn test_empty_text_produces_archive_with_no_results() -> Result<(), FoldError> {
     );
     
     // Seed with empty ortho
-    let seed_ortho = Ortho::new(version);
+    let seed_ortho = Ortho::new();
     let seed_id = seed_ortho.id();
     tracker.insert(seed_id);
     
@@ -66,7 +66,7 @@ fn test_empty_text_produces_archive_with_no_results() -> Result<(), FoldError> {
         
         // Generate child orthos
         for completion in completions {
-            let children = ortho.add(completion, version);
+            let children = ortho.add(completion);
             
             for child in children {
                 let child_id = child.id();
@@ -179,7 +179,7 @@ fn test_single_word_produces_minimal_results() -> Result<(), FoldError> {
         memory_config.max_shards_in_memory,
     );
     
-    let seed_ortho = Ortho::new(version);
+    let seed_ortho = Ortho::new();
     let seed_id = seed_ortho.id();
     tracker.insert(seed_id);
     
@@ -197,7 +197,7 @@ fn test_single_word_produces_minimal_results() -> Result<(), FoldError> {
         let completions = interner.intersect(&required, &forbidden);
         
         for completion in completions {
-            let children = ortho.add(completion, version);
+            let children = ortho.add(completion);
             
             for child in children {
                 let child_id = child.id();

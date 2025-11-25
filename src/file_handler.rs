@@ -340,7 +340,6 @@ fn format_optimal_ortho(ortho: &Ortho, interner: &Interner) -> String {
     let mut output = String::new();
     output.push_str("===== OPTIMAL ORTHO =====\n");
     output.push_str(&format!("Ortho ID: {}\n", ortho.id()));
-    output.push_str(&format!("Version: {}\n", ortho.version()));
     output.push_str(&format!("Dimensions: {:?}\n", ortho.dims()));
     output.push_str(&format!("Score: (volume={}, fullness={})\n", volume, fullness));
     output.push_str("\nGeometry:\n");
@@ -757,8 +756,8 @@ mod tests {
         let results_path = temp_dir.path().join("test_results");
         
         let interner = Interner::from_text("hello world test");
-        let ortho1 = Ortho::new(1);
-        let ortho2 = Ortho::new(2);
+        let ortho1 = Ortho::new();
+        let ortho2 = Ortho::new();
         
         // Create a DiskBackedQueue and add orthos
         let mut results = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10).unwrap();

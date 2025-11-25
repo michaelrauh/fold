@@ -41,7 +41,7 @@ fn test_txt_processing_results_path_mismatch() -> Result<(), FoldError> {
     // But simulate creating the queue at a DIFFERENT path (like if paths are computed differently)
     let wrong_results_path = config.results_dir("test_wrong");
     let mut results = DiskBackedQueue::new_from_path(wrong_results_path.to_str().unwrap(), 10)?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
     results.flush()?;
     
     println!("Actually created queue at: {}", wrong_results_path.display());
@@ -100,14 +100,16 @@ fn test_archive_recovery_with_process_id_change() -> Result<(), FoldError> {
     
     let interner = Interner::from_text("hello world");
     let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?;
-    fs::write(archive_path.join("interner.bin"), interner_bytes)?;
+    fs::write(archive_path.join("interner.bin"), &interner_bytes)?;
     fs::write(archive_path.join("lineage.txt"), "\"test\"")?;
     
     // Create results directory with files
     let archive_results = archive_path.join("results");
     let mut results = DiskBackedQueue::new_from_path(archive_results.to_str().unwrap(), 10)?;
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
+    let ortho1 = Ortho::new();
+    let ortho2 = ortho1.add(0).into_iter().next().unwrap();
+    results.push(ortho1.clone())?;
+    results.push(ortho2.clone())?;
     results.flush()?;
     drop(results);
     
@@ -115,10 +117,22 @@ fn test_archive_recovery_with_process_id_change() -> Result<(), FoldError> {
     println!("Archive initially has {} result files", files.len());
     assert!(files.len() > 0, "Archive should have results");
     
-    // Simulate ingestion for merge (moves to in_process)
+    // Create a second archive
+    let archive_path2 = config.input_dir().join("test_archive2.bin");
+    fs::create_dir_all(&archive_path2)?;
+    fs::write(archive_path2.join("interner.bin"), &interner_bytes)?;
+    fs::write(archive_path2.join("lineage.txt"), "\"test2\"")?;
+    let archive_results2 = archive_path2.join("results");
+    let mut results2 = DiskBackedQueue::new_from_path(archive_results2.to_str().unwrap(), 10)?;
+    results2.push(ortho1)?;
+    results2.push(ortho2)?;
+    results2.flush()?;
+    drop(results2);
+    
+    // Simulate ingestion for merge (moves both to in_process)
     let ingestion = file_handler::ingest_archives_with_config(
         archive_path.to_str().unwrap(),
-        archive_path.to_str().unwrap(), // Use same archive twice for simplicity
+        archive_path2.to_str().unwrap(),
         &config
     )?;
     
@@ -129,12 +143,9 @@ fn test_archive_recovery_with_process_id_change() -> Result<(), FoldError> {
     if Path::new(&results_a).exists() {
         let files: Vec<_> = fs::read_dir(&results_a)?.collect();
         println!("Results in in_process: {} files", files.len());
-        
-        if files.len() == 0 {
-            println!("BUG: Results directory moved but is empty!");
-        }
+        assert!(files.len() > 0, "Results should have moved with archive");
     } else {
-        println!("BUG: Results directory doesn't exist in in_process!");
+        panic!("Results directory should exist in in_process after ingestion!");
     }
     
     Ok(())
@@ -157,7 +168,7 @@ fn test_merge_results_path_with_pid_change() -> Result<(), FoldError> {
     
     // Create results at first path
     let mut results = DiskBackedQueue::new_from_path(first_results_path.to_str().unwrap(), 10)?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
     results.flush()?;
     
     let files: Vec<_> = fs::read_dir(&first_results_path)?.collect();

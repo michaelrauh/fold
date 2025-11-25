@@ -122,13 +122,12 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     
     // Build interner from the text
     let interner = Interner::from_text(&ingestion.text);
-    let version = interner.version();
     
     metrics.update_global(|g| {
-        g.interner_version = version;
+        g.interner_version = interner.version();
         g.vocab_size = interner.vocabulary().len();
     });
-    metrics.add_log(format!("Interner built: v{}, vocab={}", version, interner.vocabulary().len()));
+    metrics.add_log(format!("Interner built: v{}, vocab={}", interner.version(), interner.vocabulary().len()));
     
     // Calculate memory config for this file
     let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
@@ -159,7 +158,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     );
     
     // Seed with empty ortho
-    let seed_ortho = Ortho::new(version);
+    let seed_ortho = Ortho::new();
     let seed_id = seed_ortho.id();
     
     tracker.insert(seed_id);
@@ -211,7 +210,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
         
         // Generate child orthos
         for completion in completions {
-            let children = ortho.add(completion, version);
+            let children = ortho.add(completion);
             
             for child in children {
                 let child_id = child.id();
@@ -295,33 +294,42 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let merged_lineage_preview = format!("({} {})", lineage_a_early, lineage_b_early);
     metrics.update_global(|g| g.current_lineage = merged_lineage_preview);
     
-    // Find differences from a to b and from b to a
-    let impacted_a = interner_a.impacted_keys(&interner_b);
-    let impacted_b = interner_b.impacted_keys(&interner_a);
+    // Determine which interner is smaller to optimize remapping
+    // Only the smaller side needs remapping; larger side vocabulary becomes the base
+    let a_is_smaller = interner_a.vocab_size() <= interner_b.vocab_size();
+    
+    let (larger_interner, smaller_interner, impacted_larger, impacted_smaller) = if a_is_smaller {
+        let impacted_a = interner_a.impacted_keys(&interner_b);
+        let impacted_b = interner_b.impacted_keys(&interner_a);
+        (interner_b, interner_a, impacted_b, impacted_a)
+    } else {
+        let impacted_a = interner_a.impacted_keys(&interner_b);
+        let impacted_b = interner_b.impacted_keys(&interner_a);
+        (interner_a, interner_b, impacted_a, impacted_b)
+    };
     
     metrics.update_merge(|m| {
         m.current_merge = format!("merge_{}", std::process::id());
         m.archive_a_orthos = orthos_a;
         m.archive_b_orthos = orthos_b;
-        m.impacted_a = impacted_a.len();
-        m.impacted_b = impacted_b.len();
+        m.impacted_a = if a_is_smaller { impacted_smaller.len() } else { impacted_larger.len() };
+        m.impacted_b = if a_is_smaller { impacted_larger.len() } else { impacted_smaller.len() };
         m.seed_orthos_a = orthos_a;
         m.seed_orthos_b = orthos_b;
     });
     
-    // Create merged interner using proper merge method
-    let merged_interner = interner_a.merge(&interner_b);
-    let new_version = merged_interner.version();
+    // Create merged interner: larger absorbs smaller, so larger's vocab is the base
+    let merged_interner = larger_interner.merge(&smaller_interner);
     
     metrics.update_global(|g| {
-        g.interner_version = new_version;
+        g.interner_version = merged_interner.version();
         g.vocab_size = merged_interner.vocabulary().len();
     });
-    metrics.add_log(format!("Merged interner: v{}, vocab={}", new_version, merged_interner.vocabulary().len()));
+    metrics.add_log(format!("Merged interner: v{}, vocab={} (Archive {} is smaller, only remapping that side)", 
+        merged_interner.version(), merged_interner.vocabulary().len(), if a_is_smaller { "A" } else { "B" }));
     
-    // Build vocabulary mapping for A and B
-    let vocab_map_a = build_vocab_mapping(interner_a.vocabulary(), merged_interner.vocabulary());
-    let vocab_map_b = build_vocab_mapping(interner_b.vocabulary(), merged_interner.vocabulary());
+    // Build vocabulary mapping for the smaller side (full remapping needed)
+    let vocab_map_smaller = build_vocab_mapping(smaller_interner.vocabulary(), merged_interner.vocabulary());
     
     // Calculate memory config
     let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
@@ -350,105 +358,120 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     );
     
     // Seed with empty ortho
-    let seed_ortho = Ortho::new(new_version);
+    let seed_ortho = Ortho::new();
     let seed_id = seed_ortho.id();
     tracker.insert(seed_id);
     let mut best_ortho = seed_ortho.clone();
     let mut best_score = calculate_score(&best_ortho);
     work_queue.push(seed_ortho)?;
     
-    metrics.update_operation(|op| {
-        op.status = "Remapping Archive A".to_string();
-        op.progress_current = 0;
-    });
-    
     // Get results paths using method
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
     
-    // Process archive A results: remap ALL orthos to results
-    // Add impacted orthos to work queue for further processing
-    let mut results_a = DiskBackedQueue::new_from_path(&results_a_path, memory_config.queue_buffer_size)?;
-    
-    let total_a_count = results_a.len();
-    let mut total_from_a = 0;
-    let mut impacted_from_a = 0;
-    
-    metrics.update_operation(|op| op.progress_total = total_a_count);
-    
-    while let Some(ortho) = results_a.pop()? {
-        // Remap the ortho to new vocabulary
-        if let Some(remapped) = ortho.remap(&vocab_map_a, new_version) {
-            let remapped_id = remapped.id();
-            if !tracker.contains(&remapped_id) {
-                tracker.insert(remapped_id);
-                // Add ALL remapped orthos to merged results
-                merged_results.push(remapped.clone())?;
-                total_from_a += 1;
-                
-                // Log progress every 10k orthos and keep heartbeat fresh (zero-arity)
-                if total_from_a % 10000 == 0 {
-                    ingestion.touch_heartbeat()?;
-                    
-                    metrics.update_operation(|op| op.progress_current = total_from_a);
-                    metrics.record_seen_size(tracker.len());
-                    metrics.record_results_count(merged_results.len());
-                }
-                
-                // Check if this ortho is impacted - if so, add to work queue
-                if is_ortho_impacted(&ortho, &impacted_a) {
-                    work_queue.push(remapped)?;
-                    impacted_from_a += 1;
-                }
-            }
-        }
-    }
-    
-    metrics.update_merge(|m| m.impacted_queued_a = impacted_from_a);
+    // Process larger archive (no remapping needed - just version update)
+    let (larger_path, larger_impacted, larger_name) = if a_is_smaller {
+        (&results_b_path, &impacted_larger, "B")
+    } else {
+        (&results_a_path, &impacted_larger, "A")
+    };
     
     metrics.update_operation(|op| {
-        op.status = "Remapping Archive B".to_string();
+        op.status = format!("Processing Larger Archive {}", larger_name);
         op.progress_current = 0;
     });
     
-    // Process archive B results: remap ALL orthos to results
-    // Add impacted orthos to work queue for further processing
-    let mut results_b = DiskBackedQueue::new_from_path(&results_b_path, memory_config.queue_buffer_size)?;
+    let mut results_larger = DiskBackedQueue::new_from_path(larger_path, memory_config.queue_buffer_size)?;
+    let total_larger_count = results_larger.len();
+    let mut total_from_larger = 0;
+    let mut impacted_from_larger = 0;
     
-    let total_b_count = results_b.len();
-    let mut total_from_b = 0;
-    let mut impacted_from_b = 0;
+    metrics.update_operation(|op| op.progress_total = total_larger_count);
     
-    metrics.update_operation(|op| op.progress_total = total_b_count);
+    while let Some(ortho) = results_larger.pop()? {
+        // Larger archive orthos don't need remapping - their vocabulary is already the base
+        let ortho_id = ortho.id();
+        if !tracker.contains(&ortho_id) {
+            tracker.insert(ortho_id);
+            merged_results.push(ortho.clone())?;
+            total_from_larger += 1;
+            
+            if total_from_larger % 10000 == 0 {
+                ingestion.touch_heartbeat()?;
+                metrics.update_operation(|op| op.progress_current = total_from_larger);
+                metrics.record_seen_size(tracker.len());
+                metrics.record_results_count(merged_results.len());
+            }
+            
+            // Check if this ortho is impacted - if so, add to work queue
+            if is_ortho_impacted(&ortho, larger_impacted) {
+                work_queue.push(ortho)?;
+                impacted_from_larger += 1;
+            }
+        }
+    }
     
-    while let Some(ortho) = results_b.pop()? {
-        // Remap the ortho to new vocabulary
-        if let Some(remapped) = ortho.remap(&vocab_map_b, new_version) {
+    // Process smaller archive (needs remapping)
+    let (smaller_path, smaller_impacted, smaller_name) = if a_is_smaller {
+        (&results_a_path, &impacted_smaller, "A")
+    } else {
+        (&results_b_path, &impacted_smaller, "B")
+    };
+    
+    metrics.update_operation(|op| {
+        op.status = format!("Remapping Smaller Archive {}", smaller_name);
+        op.progress_current = 0;
+    });
+    
+    let mut results_smaller = DiskBackedQueue::new_from_path(smaller_path, memory_config.queue_buffer_size)?;
+    let total_smaller_count = results_smaller.len();
+    let mut total_from_smaller = 0;
+    let mut impacted_from_smaller = 0;
+    
+    metrics.update_operation(|op| op.progress_total = total_smaller_count);
+    
+    while let Some(ortho) = results_smaller.pop()? {
+        // Smaller archive orthos need remapping to merged vocabulary
+        if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
             let remapped_id = remapped.id();
             if !tracker.contains(&remapped_id) {
                 tracker.insert(remapped_id);
-                // Add ALL remapped orthos to merged results
                 merged_results.push(remapped.clone())?;
-                total_from_b += 1;
+                total_from_smaller += 1;
                 
-                // Log progress every 10k orthos and keep heartbeat fresh (zero-arity)
-                if total_from_b % 10000 == 0 {
+                if total_from_smaller % 10000 == 0 {
                     ingestion.touch_heartbeat()?;
-                    
-                    metrics.update_operation(|op| op.progress_current = total_from_b);
+                    metrics.update_operation(|op| op.progress_current = total_from_smaller);
                     metrics.record_seen_size(tracker.len());
                     metrics.record_results_count(merged_results.len());
                 }
                 
                 // Check if this ortho is impacted - if so, add to work queue
-                if is_ortho_impacted(&ortho, &impacted_b) {
+                if is_ortho_impacted(&ortho, smaller_impacted) {
                     work_queue.push(remapped)?;
-                    impacted_from_b += 1;
+                    impacted_from_smaller += 1;
                 }
             }
         }
     }
     
-    metrics.update_merge(|m| m.impacted_queued_b = impacted_from_b);
+    // Update metrics based on which archive was which
+    if a_is_smaller {
+        metrics.update_merge(|m| {
+            m.impacted_queued_a = impacted_from_smaller;
+            m.impacted_queued_b = impacted_from_larger;
+        });
+    } else {
+        metrics.update_merge(|m| {
+            m.impacted_queued_a = impacted_from_larger;
+            m.impacted_queued_b = impacted_from_smaller;
+        });
+    }
+    
+    let (total_from_a, total_from_b) = if a_is_smaller {
+        (total_from_smaller, total_from_larger)
+    } else {
+        (total_from_larger, total_from_smaller)
+    };
     
     metrics.add_log(format!("Remapping complete: A={}, B={}", total_from_a, total_from_b));
     
@@ -496,7 +519,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         let completions = merged_interner.intersect(&required, &forbidden);
         
         for completion in completions {
-            let children = ortho.add(completion, new_version);
+            let children = ortho.add(completion);
             
             for child in children {
                 let child_id = child.id();
@@ -613,7 +636,7 @@ mod tests {
     
     #[test]
     fn test_calculate_score() {
-        let ortho = Ortho::new(1);
+        let ortho = Ortho::new();
         let (volume, fullness) = calculate_score(&ortho);
         // Empty ortho with dims [2,2] has volume (2-1)*(2-1) = 1
         assert_eq!(volume, 1);

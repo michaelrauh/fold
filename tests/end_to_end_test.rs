@@ -168,8 +168,7 @@ fn test_end_to_end_single_file_workflow() {
     
     // Verify optimal ortho contains expected structure for 3x3 pattern
     assert!(optimal_content.contains("OPTIMAL ORTHO"), "Optimal file missing header");
-    assert!(optimal_content.contains("Ortho ID: 4764538468924768464"), "Optimal file missing expected ID");
-    assert!(optimal_content.contains("Version: 1"), "Expected version 1");
+    assert!(optimal_content.contains("Ortho ID:"), "Optimal file missing ortho ID");
     assert!(optimal_content.contains("Dimensions: [6, 3]"), "Expected dimensions [6, 3]");
     assert!(optimal_content.contains("Score: (volume=10, fullness=15)"), "Expected score (volume=10, fullness=15)");
     

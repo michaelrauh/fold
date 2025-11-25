@@ -31,7 +31,7 @@ fn test_incomplete_merge_recovery_causes_empty_archives() -> Result<(), FoldErro
     
     let archive_a_results = archive_a_path.join("results");
     let mut results_a = DiskBackedQueue::new_from_path(archive_a_results.to_str().unwrap(), 10)?;
-    results_a.push(Ortho::new(1))?;
+    results_a.push(Ortho::new())?;
     results_a.flush()?;
     drop(results_a);
     
@@ -51,7 +51,7 @@ fn test_incomplete_merge_recovery_causes_empty_archives() -> Result<(), FoldErro
     
     let archive_b_results = archive_b_path.join("results");
     let mut results_b = DiskBackedQueue::new_from_path(archive_b_results.to_str().unwrap(), 10)?;
-    results_b.push(Ortho::new(1))?;
+    results_b.push(Ortho::new())?;
     results_b.flush()?;
     drop(results_b);
     
@@ -75,7 +75,7 @@ fn test_incomplete_merge_recovery_causes_empty_archives() -> Result<(), FoldErro
     
     // Add some files to it (partial results)
     let mut partial_results = DiskBackedQueue::new_from_path(results_merged_path.to_str().unwrap(), 10)?;
-    partial_results.push(Ortho::new(1))?;
+    partial_results.push(Ortho::new())?;
     partial_results.flush()?;
     drop(partial_results);
     
@@ -221,7 +221,7 @@ fn test_recovery_should_clean_merge_artifacts() -> Result<(), FoldError> {
     let results_merged_1 = config.base_dir.join("results_merged_11111");
     fs::create_dir_all(&results_merged_1)?;
     let mut queue1 = DiskBackedQueue::new_from_path(results_merged_1.to_str().unwrap(), 10)?;
-    queue1.push(Ortho::new(1))?;
+    queue1.push(Ortho::new())?;
     queue1.flush()?;
     drop(queue1);
     
@@ -294,7 +294,7 @@ fn test_recovery_preserves_active_merge() -> Result<(), FoldError> {
     let results_merged = config.base_dir.join(format!("results_merged_{}", fake_pid));
     fs::create_dir_all(&results_merged)?;
     let mut queue = DiskBackedQueue::new_from_path(results_merged.to_str().unwrap(), 10)?;
-    queue.push(Ortho::new(1))?;
+    queue.push(Ortho::new())?;
     queue.flush()?;
     drop(queue);
     

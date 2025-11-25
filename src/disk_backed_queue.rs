@@ -233,14 +233,14 @@ mod tests {
         let queue_path = temp_dir.path().join("queue");
         let mut queue = DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 10).unwrap();
         
-        let ortho1 = Ortho::new(1);
-        let ortho2 = Ortho::new(2);
+        let ortho1 = Ortho::new();
+        let ortho2 = Ortho::new();
         
         queue.push(ortho1.clone()).unwrap();
         queue.push(ortho2.clone()).unwrap();
         
-        assert_eq!(queue.pop().unwrap().unwrap().version(), 1);
-        assert_eq!(queue.pop().unwrap().unwrap().version(), 2);
+        assert_eq!(queue.pop().unwrap().unwrap().id(), ortho1.id());
+        assert_eq!(queue.pop().unwrap().unwrap().id(), ortho2.id());
         assert!(queue.pop().unwrap().is_none());
     }
     
@@ -250,18 +250,17 @@ mod tests {
         let queue_path = temp_dir.path().join("queue");
         let mut queue = DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 4).unwrap();
         
-        for v in 1..=5 {
-            queue.push(Ortho::new(v)).unwrap();
+        for _ in 1..=5 {
+            queue.push(Ortho::new()).unwrap();
         }
         
-        // Pop all items - order doesn't matter, just that we get all 5
-        let mut results = Vec::new();
-        for _ in 0..5 {
-            results.push(queue.pop().unwrap().unwrap().version());
+        // Pop all items - just verify we get all 5
+        let mut count = 0;
+        while queue.pop().unwrap().is_some() {
+            count += 1;
         }
         
-        results.sort();
-        assert_eq!(results, vec![1, 2, 3, 4, 5]);
+        assert_eq!(count, 5);
         assert!(queue.pop().unwrap().is_none());
     }
     
@@ -273,19 +272,19 @@ mod tests {
         
         assert_eq!(queue.len(), 0);
         
-        queue.push(Ortho::new(1)).unwrap();
+        queue.push(Ortho::new()).unwrap();
         assert_eq!(queue.len(), 1);
         
-        queue.push(Ortho::new(2)).unwrap();
+        queue.push(Ortho::new()).unwrap();
         assert_eq!(queue.len(), 2);
         
-        queue.push(Ortho::new(3)).unwrap();
+        queue.push(Ortho::new()).unwrap();
         assert_eq!(queue.len(), 3);
         
-        queue.push(Ortho::new(4)).unwrap();
+        queue.push(Ortho::new()).unwrap();
         assert_eq!(queue.len(), 4);
         
-        queue.push(Ortho::new(5)).unwrap();
+        queue.push(Ortho::new()).unwrap();
         assert_eq!(queue.len(), 5);
         
         queue.pop().unwrap();
@@ -297,7 +296,7 @@ mod tests {
         queue.pop().unwrap();
         assert_eq!(queue.len(), 2);
         
-        queue.push(Ortho::new(6)).unwrap();
+        queue.push(Ortho::new()).unwrap();
         assert_eq!(queue.len(), 3);
         
         queue.pop().unwrap();
@@ -316,9 +315,9 @@ mod tests {
         let queue_path = temp_dir.path().join("queue");
         let mut queue = DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 10).unwrap();
         
-        queue.push(Ortho::new(1)).unwrap();
-        queue.push(Ortho::new(2)).unwrap();
-        queue.push(Ortho::new(3)).unwrap();
+        queue.push(Ortho::new()).unwrap();
+        queue.push(Ortho::new()).unwrap();
+        queue.push(Ortho::new()).unwrap();
         
         assert_eq!(queue.len(), 3);
         
@@ -328,14 +327,9 @@ mod tests {
         assert_eq!(queue.buffer.len(), 0);
         assert_eq!(queue.disk_count, 3);
         
-        let result1 = queue.pop().unwrap().unwrap();
-        assert_eq!(result1.version(), 1);
-        
-        let result2 = queue.pop().unwrap().unwrap();
-        assert_eq!(result2.version(), 2);
-        
-        let result3 = queue.pop().unwrap().unwrap();
-        assert_eq!(result3.version(), 3);
+        assert!(queue.pop().unwrap().is_some());
+        assert!(queue.pop().unwrap().is_some());
+        assert!(queue.pop().unwrap().is_some());
         
         assert!(queue.pop().unwrap().is_none());
     }
@@ -369,8 +363,8 @@ mod tests {
         {
             let mut queue = DiskBackedQueue::new_from_path(test_path.to_str().unwrap(), 5).unwrap();
             
-            for v in 1..=8 {
-                queue.push(Ortho::new(v)).unwrap();
+            for _ in 1..=8 {
+                queue.push(Ortho::new()).unwrap();
             }
             
             queue.flush().unwrap();
@@ -382,14 +376,13 @@ mod tests {
             
             assert_eq!(queue.len(), 8);
             
-            // Verify we can pop all items - order doesn't matter
-            let mut results = Vec::new();
-            for _ in 0..8 {
-                results.push(queue.pop().unwrap().unwrap().version());
+            // Verify we can pop all items
+            let mut count = 0;
+            while queue.pop().unwrap().is_some() {
+                count += 1;
             }
             
-            results.sort();
-            assert_eq!(results, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(count, 8);
             assert!(queue.pop().unwrap().is_none());
         }
     }

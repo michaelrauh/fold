@@ -18,9 +18,9 @@ fn test_save_with_wrong_results_path() -> Result<(), FoldError> {
     let actual_results_path = temp_dir.path().join("actual_results");
     let mut results = DiskBackedQueue::new_from_path(actual_results_path.to_str().unwrap(), 10)?;
     
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
     
     println!("Created DiskBackedQueue at: {}", actual_results_path.display());
     
@@ -102,7 +102,7 @@ fn test_stored_path_vs_method_call() -> Result<(), FoldError> {
     
     // Create queue with stored path
     let mut results = DiskBackedQueue::new_from_path(&stored_path, 10)?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
     results.flush()?;
     
     println!("Queue created with stored path: {}", stored_path);

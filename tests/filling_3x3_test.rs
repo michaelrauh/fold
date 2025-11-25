@@ -19,9 +19,9 @@ fn test_filling_3x3_with_diagonal_check() {
     let of_idx = vocab.iter().position(|w| w == "of").unwrap();
     
     // Build up to a [3,2] ortho first
-    let mut ortho = Ortho::new(1);
+    let mut ortho = Ortho::new();
     for &idx in &[the_idx, south_idx, and_idx, shoulders_idx, a_idx] {
-        let children = ortho.add(idx, 1);
+        let children = ortho.add(idx);
         ortho = children[0].clone();
     }
     
@@ -29,7 +29,7 @@ fn test_filling_3x3_with_diagonal_check() {
     println!("Payload: {:?}\n", ortho.payload());
     
     // Now add the 6th token to trigger expansion - one child should be [3,3]
-    let children = ortho.add(of_idx, 1);
+    let children = ortho.add(of_idx);
     println!("After adding 'of', got {} children:", children.len());
     for (i, child) in children.iter().enumerate() {
         println!("  Child {}: dims={:?}, filled={}, payload={:?}", 
@@ -89,7 +89,7 @@ fn test_filling_3x3_with_diagonal_check() {
             if and_in_payload && !and_is_forbidden {
                 println!("\n*** FORCING 'and' since it's not forbidden but also not a completion ***");
                 println!("This will demonstrate if the bug is in intersect() or get_requirements()");
-                let children = current.add(and_idx, 1);
+                let children = current.add(and_idx);
                 if !children.is_empty() {
                     current = children[0].clone();
                     println!("Successfully added 'and'! New payload: {:?}\n", current.payload());
@@ -104,7 +104,7 @@ fn test_filling_3x3_with_diagonal_check() {
         let token_to_add = if and_is_completion { and_idx } else { completions[0] };
         println!("Adding token: '{}'", vocab[token_to_add]);
         
-        let children = current.add(token_to_add, 1);
+        let children = current.add(token_to_add);
         if children.is_empty() {
             break;
         }

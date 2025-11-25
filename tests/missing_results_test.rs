@@ -39,7 +39,7 @@ fn test_archive_without_results_causes_empty_merge_side() -> Result<(), FoldErro
     )?;
     
     // Add an ortho to verify it has content initially
-    let ortho = Ortho::new(1);
+    let ortho = Ortho::new();
     results.push(ortho.clone())?;
     
     // Flush and drop to close handles
@@ -111,8 +111,8 @@ fn test_archive_should_require_results_directory() -> Result<(), FoldError> {
     )?;
     
     // Add orthos
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(2))?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
     
     results.flush()?;
     drop(results);

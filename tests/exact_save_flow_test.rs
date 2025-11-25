@@ -49,9 +49,9 @@ fn test_exact_txt_processing_save_flow() -> Result<(), FoldError> {
     })?;
     
     // Push some orthos
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
     
     println!("Results queue length before save: {}", results.len());
     println!("Results queue disk_path: {:?}", temp_dir.path().join("results"));
@@ -74,7 +74,7 @@ fn test_exact_txt_processing_save_flow() -> Result<(), FoldError> {
     }
     
     // Now call save_result - this is what happens in main.rs
-    let archive_path = ingestion.save_result(&interner, results, Some(&Ortho::new(1)))?;
+    let (archive_path, _lineage) = ingestion.save_result(&interner, results, Some(&Ortho::new()), 1)?;
     
     println!("Archive saved to: {}", archive_path);
     
@@ -122,8 +122,8 @@ fn test_results_directory_deleted_before_save() -> Result<(), FoldError> {
     let results_path = temp_dir.path().join("results");
     let mut results = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10)?;
     
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
     
     // Flush to disk
     results.flush()?;

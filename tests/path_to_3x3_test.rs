@@ -7,7 +7,7 @@ fn test_path_to_3x3() {
     let interner = Interner::from_text("a b c d e f g h i j k l m n");
     let vocab = interner.vocabulary();
     
-    let mut ortho = Ortho::new(1);
+    let mut ortho = Ortho::new();
     let mut step = 0;
     
     // Fill until we get various expansions
@@ -16,7 +16,7 @@ fn test_path_to_3x3() {
         println!("\n=== Step {}: Adding token '{}' ===", step, vocab[token_idx]);
         println!("Current ortho: dims={:?}, filled={}", ortho.dims(), ortho.get_current_position());
         
-        let children = ortho.add(token_idx, 1);
+        let children = ortho.add(token_idx);
         println!("Generated {} children:", children.len());
         for (i, child) in children.iter().enumerate() {
             println!("  Child {}: dims={:?}, capacity={}, filled={}", 

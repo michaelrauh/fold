@@ -21,15 +21,15 @@ fn test_and_duplicate_in_shell_2() {
     // Pos 0: 'the', Pos 1: 'south', Pos 2: 'shoulders', Pos 3: 'and', Pos 4-8: empty
     
     // First build a [2,2] with 'the' and 'south'
-    let mut ortho = Ortho::new(1);
-    ortho = ortho.add(the_idx, 1)[0].clone();
-    ortho = ortho.add(south_idx, 1)[0].clone();
-    ortho = ortho.add(shoulders_idx, 1)[0].clone();
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(the_idx)[0].clone();
+    ortho = ortho.add(south_idx)[0].clone();
+    ortho = ortho.add(shoulders_idx)[0].clone();
     
     println!("After 3 additions: dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
     
     // Add 'and' at position 3 - this will trigger expansion
-    let children = ortho.add(and_idx, 1);
+    let children = ortho.add(and_idx);
     println!("\nAfter adding 'and', got {} children:", children.len());
     for (i, child) in children.iter().enumerate() {
         println!("  Child {}: dims={:?}, payload={:?}", i, child.dims(), child.payload());
@@ -56,7 +56,7 @@ fn test_and_duplicate_in_shell_2() {
         }
         
         // Add first completion
-        let children = ortho.add(completions[0], 1);
+        let children = ortho.add(completions[0]);
         if children.is_empty() {
             break;
         }
@@ -96,7 +96,7 @@ fn test_and_duplicate_in_shell_2() {
             if completions.is_empty() {
                 break;
             }
-            let children = ortho.add(completions[0], 1);
+            let children = ortho.add(completions[0]);
             if children.is_empty() {
                 break;
             }

@@ -24,9 +24,9 @@ fn test_merge_scenario_with_actual_archives() -> Result<(), FoldError> {
     
     let results_a_path = temp_dir.path().join("results_a");
     let mut results_a = DiskBackedQueue::new_from_path(results_a_path.to_str().unwrap(), 10)?;
-    results_a.push(Ortho::new(1))?;
-    results_a.push(Ortho::new(1))?;
-    results_a.push(Ortho::new(1))?;
+    results_a.push(Ortho::new())?;
+    results_a.push(Ortho::new())?;
+    results_a.push(Ortho::new())?;
     results_a.flush()?;
     drop(results_a);
     
@@ -52,8 +52,8 @@ fn test_merge_scenario_with_actual_archives() -> Result<(), FoldError> {
     
     let results_b_path = temp_dir.path().join("results_b");
     let mut results_b = DiskBackedQueue::new_from_path(results_b_path.to_str().unwrap(), 10)?;
-    results_b.push(Ortho::new(1))?;
-    results_b.push(Ortho::new(1))?;
+    results_b.push(Ortho::new())?;
+    results_b.push(Ortho::new())?;
     results_b.flush()?;
     drop(results_b);
     

@@ -42,8 +42,8 @@ fn test_results_path_consistency() -> Result<(), FoldError> {
     
     // Create the DiskBackedQueue with the first path
     let mut results = DiskBackedQueue::new_from_path(&results_path_1, 10)?;
-    results.push(Ortho::new(1))?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
+    results.push(Ortho::new())?;
     
     println!("\nDiskBackedQueue created at: {}", results_path_1);
     
@@ -126,7 +126,7 @@ fn test_results_path_with_special_filename() -> Result<(), FoldError> {
     
     // Create queue and add items
     let mut results = DiskBackedQueue::new_from_path(&results_path_create, 10)?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
     results.flush()?;
     
     // Get path again for save
@@ -169,7 +169,7 @@ fn test_path_timing_issue() -> Result<(), FoldError> {
     
     // Create queue with stored path
     let mut results = DiskBackedQueue::new_from_path(&results_path, 10)?;
-    results.push(Ortho::new(1))?;
+    results.push(Ortho::new())?;
     results.flush()?;
     drop(results);
     

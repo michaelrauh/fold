@@ -11,12 +11,11 @@ fn test_optimal_ortho_saved_and_loaded() {
     
     // Create test interner
     let interner = Interner::from_text("the quick brown fox");
-    let version = interner.version();
     
     // Create a test ortho with some structure
-    let mut ortho = Ortho::new(version);
-    ortho = ortho.add(0, version).into_iter().next().unwrap();
-    ortho = ortho.add(1, version).into_iter().next().unwrap();
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(0).into_iter().next().unwrap();
+    ortho = ortho.add(1).into_iter().next().unwrap();
     
     // Create a DiskBackedQueue with results
     let mut results = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 100).unwrap();
@@ -64,7 +63,6 @@ fn test_optimal_ortho_saved_and_loaded() {
     assert_eq!(loaded_ortho.id(), ortho.id());
     assert_eq!(loaded_ortho.dims(), ortho.dims());
     assert_eq!(loaded_ortho.payload(), ortho.payload());
-    assert_eq!(loaded_ortho.version(), ortho.version());
     
     // Verify score calculation still works
     let loaded_volume = loaded_ortho.dims().iter().map(|&d| d - 1).product::<usize>();
