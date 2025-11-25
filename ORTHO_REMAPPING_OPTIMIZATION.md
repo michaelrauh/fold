@@ -403,11 +403,12 @@ fn concatenate_results_on_disk(
 // Option B: Use OS-level file concatenation (even faster, Unix)
 fn concatenate_results_unix(paths: &[&Path], output: &Path) -> io::Result<()> {
     use std::process::Command;
+    let output_file = File::create(output)?;
     Command::new("cat")
         .args(paths)
-        .stdout(File::create(output)?)
-        .status()?;
-    Ok(())
+        .stdout(output_file)
+        .status()
+        .map(|_| ())
 }
 ```
 
@@ -501,8 +502,11 @@ impl LayeredArchive {
     
     fn compact(&mut self, output_dir: &Path) -> io::Result<()> {
         // Background process: merge all layers into one
-        // This is when dedup happens, but not blocking merge
-        todo!("Merge layers, dedup, write single flat archive")
+        // 1. Iterate through all layers' results files
+        // 2. Build unified seen set while deduplicating
+        // 3. Write single flat results file
+        // 4. Replace layers vec with single compacted layer
+        unimplemented!("Compaction logic")
     }
 }
 ```
