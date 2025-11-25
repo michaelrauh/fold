@@ -25,11 +25,12 @@ The current implementation loop performs multiple operations per ortho:
 | **2. Parallel Remapping** | Use Rayon to remap orthos in parallel batches | Low | Medium (linear speedup) | Medium | Low | ✅ Yes |
 | **3. Eliminate Remapping via Stable Canonical Indices** | Use canonical vocabulary ordering so indices are stable across interners (bitset-compatible) | High | Medium (loop still required for seen/results) | Low | Medium | ⚠️ Maybe |
 | **4. Per-Ortho Remap Check** | Check if remap is identity for each ortho; skip if indices unchanged | Very Low | Variable (high when vocabs align) | None | Low | ✅ Yes |
-| **5. Incremental Merge** | Only remap orthos that are impacted by vocabulary changes | Medium | Variable (high when few changes) | Low | Medium | ⚠️ Maybe |
-| **6. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Medium (loop still required) | Low | Low | ⚠️ Maybe |
-| **7. Persist SeenTracker/Results in Archive** | Store seen set and results state in archive; merge via union/concat | Very High | Very High (eliminates O(n) loop) | High | Medium | ⚠️ Maybe |
-| **8. File Concatenation with Deferred Dedup** | Concatenate result files; rebuild seen set lazily or at query time | High | Very High (eliminates loop) | Low | Medium | ⚠️ Maybe |
-| **9. Structural Sharing / Copy-on-Write Archives** | Use immutable data structures; merge by referencing parent archives | Very High | Very High (O(1) merge) | Medium | High | ⚠️ Maybe |
+| **5. Smaller-Side-Only Remapping** | In linear merges, only remap the smaller archive; larger side keeps indices | Low | Very High (99% of orthos skip remap) | None | Low | ✅ Yes |
+| **6. Incremental Merge** | Only remap orthos that are impacted by vocabulary changes | Medium | Variable (high when few changes) | Low | Medium | ⚠️ Maybe |
+| **7. Streaming Archive Format** | Store orthos pre-indexed for merged vocabulary during archive save | High | Medium (loop still required) | Low | Low | ⚠️ Maybe |
+| **8. Persist SeenTracker/Results in Archive** | Store seen set and results state in archive; merge via union/concat | Very High | Very High (eliminates O(n) loop) | High | Medium | ⚠️ Maybe |
+| **9. File Concatenation with Deferred Dedup** | Concatenate result files; rebuild seen set lazily or at query time | High | Very High (eliminates loop) | Low | Medium | ⚠️ Maybe |
+| **10. Structural Sharing / Copy-on-Write Archives** | Use immutable data structures; merge by referencing parent archives | Very High | Very High (O(1) merge) | Medium | High | ⚠️ Maybe |
 
 ---
 
@@ -147,6 +148,60 @@ let remapped = if needs_remap(&ortho, &vocab_map_a) {
 };
 ```
 
+#### Strategies to Detect When Remapping is Unnecessary
+
+**1. Prefix Check (Fastest)**:
+```rust
+// If old vocab is a prefix of new vocab, no remapping needed for old archive
+fn vocab_is_prefix(old_vocab: &[String], new_vocab: &[String]) -> bool {
+    old_vocab.len() <= new_vocab.len() &&
+    old_vocab.iter().zip(new_vocab.iter()).all(|(a, b)| a == b)
+}
+
+// Compute once before loop
+let archive_a_needs_remap = !vocab_is_prefix(interner_a.vocabulary(), merged_interner.vocabulary());
+```
+
+**2. Identity Mapping Check (Per-Archive)**:
+```rust
+// Check if vocab_map is identity: [0, 1, 2, ..., n-1]
+fn is_identity_mapping(vocab_map: &[usize]) -> bool {
+    vocab_map.iter().enumerate().all(|(i, &v)| i == v)
+}
+
+// Compute once before loop
+let archive_a_skip_remap = is_identity_mapping(&vocab_map_a);
+```
+
+**3. Range-Based Check (For Incremental Growth)**:
+```rust
+// If only tokens beyond threshold were added, orthos using only tokens < threshold don't need remap
+fn max_token_index(ortho: &Ortho) -> Option<usize> {
+    ortho.payload().iter().filter_map(|opt| *opt).max()
+}
+
+let unchanged_threshold = find_first_changed_index(&vocab_map);
+// In loop:
+if max_token_index(&ortho).map_or(true, |max| max < unchanged_threshold) {
+    // Skip remap
+}
+```
+
+**4. Batch Categorization (Amortize Check Cost)**:
+```rust
+// Group orthos by their max token index, then batch-process groups that don't need remapping
+let mut needs_remap_queue = Vec::new();
+let mut no_remap_queue = Vec::new();
+
+for ortho in archive {
+    if max_token_index(&ortho).map_or(true, |m| m < unchanged_threshold) {
+        no_remap_queue.push(ortho);
+    } else {
+        needs_remap_queue.push(ortho);
+    }
+}
+```
+
 **When this helps**:
 - When archive A's vocabulary is a prefix of the merged vocabulary (append-only growth)
 - When merging archives with identical or overlapping vocabularies
@@ -166,7 +221,71 @@ let remapped = if needs_remap(&ortho, &vocab_map_a) {
 
 ---
 
-### Option 5: Incremental Merge (Impacted-Only Processing)
+### Option 5: Smaller-Side-Only Remapping (Linear Merge Optimization)
+
+**Description**: In a linear merge chain (the primary use case), one archive is typically much larger than the other. By structuring the merge so the larger archive's vocabulary becomes the base of the merged vocabulary, only the smaller archive's orthos need remapping.
+
+**Key Insight**: In linear merge chains, ~99% of orthos are in the accumulated "large" archive, while only ~1% come from each new "small" archive. If the large archive's indices remain unchanged, only the small archive needs remapping.
+
+**Implementation**:
+```rust
+// Determine which archive is larger
+let (large_archive, small_archive, large_interner, small_interner) = 
+    if archive_a_count > archive_b_count {
+        (archive_a, archive_b, interner_a, interner_b)
+    } else {
+        (archive_b, archive_a, interner_b, interner_a)
+    };
+
+// Build merged interner starting with large archive's vocabulary
+// This ensures large archive indices remain unchanged
+let merged_interner = large_interner.merge_preserving_base(&small_interner);
+
+// vocab_map_large is identity (no remapping needed)
+// vocab_map_small maps small archive indices to merged indices
+
+// Process large archive: no remapping, just rehydrate seen/results
+for ortho in large_archive {
+    let id = ortho.id(); // ID unchanged since vocab unchanged
+    if !tracker.contains(&id) {
+        tracker.insert(id);
+        merged_results.push(ortho)?; // No clone needed if moving
+    }
+}
+
+// Process small archive: remap required
+for ortho in small_archive {
+    if let Some(remapped) = ortho.remap(&vocab_map_small, new_version) {
+        let id = remapped.id();
+        if !tracker.contains(&id) {
+            tracker.insert(id);
+            merged_results.push(remapped)?;
+        }
+    }
+}
+```
+
+**When this helps most**:
+- Linear merge chains where each merge adds one new file to accumulated results
+- Any merge where one side is significantly larger than the other (10:1 ratio or more)
+- Typical fold workflow: processing files sequentially, merging each into accumulator
+
+**Pros**:
+- Extremely effective for linear merge patterns (99% of orthos skip remapping)
+- Low implementation complexity
+- No architectural changes required
+- Compatible with all other optimizations
+
+**Cons**:
+- Requires `Interner::merge_preserving_base()` method to preserve large archive indices
+- Less effective when archives are similar in size
+- Still requires O(n) loop for seen/results rehydration
+
+**Expected Speedup**: 90-99% reduction in remapping work for linear merge chains
+
+---
+
+### Option 6: Incremental Merge (Impacted-Only Processing)
 
 **Description**: Leverage the existing `impacted_keys` computation to skip remapping orthos whose vocabulary indices don't change.
 
@@ -189,7 +308,7 @@ let remapped = if needs_remap(&ortho, &vocab_map_a) {
 
 ---
 
-### Option 6: Streaming Archive Format
+### Option 7: Streaming Archive Format
 
 **Description**: When saving an archive, pre-compute and store the remapped orthos for all possible merge targets (or use a canonical vocabulary ordering).
 
@@ -221,7 +340,7 @@ let remapped = if needs_remap(&ortho, &vocab_map_a) {
 
 As noted in the Background, the current remapping loop also rehydrates the `SeenTracker` and `merged_results` queue. To truly eliminate the O(n) traversal (not just the remapping), consider these architectural changes:
 
-### Option 7: Persist SeenTracker and Results in Archive
+### Option 8: Persist SeenTracker and Results in Archive
 
 **Description**: Store the `SeenTracker` state (bloom filter + shards) and `merged_results` queue alongside the orthos in the archive format. On merge, union the seen sets and concatenate results without per-ortho iteration.
 
@@ -243,7 +362,7 @@ As noted in the Background, the current remapping loop also rehydrates the `Seen
 
 ---
 
-### Option 8: File Concatenation with Deferred Deduplication
+### Option 9: File Concatenation with Deferred Deduplication
 
 **Description**: Instead of eagerly deduplicating during merge, concatenate result files and defer deduplication to query time or a background compaction process.
 
@@ -253,10 +372,146 @@ As noted in the Background, the current remapping loop also rehydrates the `Seen
 - Deduplication happens lazily when orthos are accessed, or during background compaction
 - Query: iterate through layers, skip already-seen IDs
 
+#### Disk-Based Concatenation Without Streaming Through RAM
+
+**1. Results Queue Concatenation**:
+```rust
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+
+fn concatenate_results_on_disk(
+    archive_a_results: &Path,
+    archive_b_results: &Path,
+    merged_results: &Path,
+) -> io::Result<()> {
+    // Option A: Use filesystem copy + append (most efficient)
+    std::fs::copy(archive_a_results, merged_results)?;
+    
+    let mut merged = OpenOptions::new().append(true).open(merged_results)?;
+    let mut source_b = File::open(archive_b_results)?;
+    
+    // Stream in chunks without loading entire file
+    let mut buffer = [0u8; 64 * 1024]; // 64KB buffer
+    loop {
+        let bytes_read = source_b.read(&mut buffer)?;
+        if bytes_read == 0 { break; }
+        merged.write_all(&buffer[..bytes_read])?;
+    }
+    Ok(())
+}
+
+// Option B: Use OS-level file concatenation (even faster, Unix)
+fn concatenate_results_unix(paths: &[&Path], output: &Path) -> io::Result<()> {
+    use std::process::Command;
+    Command::new("cat")
+        .args(paths)
+        .stdout(File::create(output)?)
+        .status()?;
+    Ok(())
+}
+```
+
+**2. SeenTracker Concatenation/Union on Disk**:
+
+The `SeenTracker` consists of a bloom filter and sharded ID sets. Merging these on disk:
+
+```rust
+// Bloom filter union: bitwise OR of filter bytes
+fn union_bloom_filters_on_disk(
+    filter_a: &Path,
+    filter_b: &Path,
+    output: &Path,
+) -> io::Result<()> {
+    let mut a = File::open(filter_a)?;
+    let mut b = File::open(filter_b)?;
+    let mut out = File::create(output)?;
+    
+    let mut buf_a = [0u8; 4096];
+    let mut buf_b = [0u8; 4096];
+    
+    loop {
+        let n_a = a.read(&mut buf_a)?;
+        let n_b = b.read(&mut buf_b)?;
+        if n_a == 0 && n_b == 0 { break; }
+        
+        // Extend shorter buffer with zeros if needed
+        let n = n_a.max(n_b);
+        for i in 0..n {
+            let byte_a = if i < n_a { buf_a[i] } else { 0 };
+            let byte_b = if i < n_b { buf_b[i] } else { 0 };
+            buf_a[i] = byte_a | byte_b; // Bitwise OR for bloom union
+        }
+        out.write_all(&buf_a[..n])?;
+    }
+    Ok(())
+}
+
+// Shard concatenation: just append shard files
+// Shards are stored as sorted ID lists, so merge-sort during compaction
+fn concatenate_shards_on_disk(
+    shards_a_dir: &Path,
+    shards_b_dir: &Path,
+    output_dir: &Path,
+) -> io::Result<()> {
+    std::fs::create_dir_all(output_dir)?;
+    
+    for shard_id in 0..NUM_SHARDS {
+        let shard_a = shards_a_dir.join(format!("shard_{}.bin", shard_id));
+        let shard_b = shards_b_dir.join(format!("shard_{}.bin", shard_id));
+        let output = output_dir.join(format!("shard_{}.bin", shard_id));
+        
+        // Simple append - dedup happens during compaction
+        concatenate_results_on_disk(&shard_a, &shard_b, &output)?;
+    }
+    Ok(())
+}
+```
+
+**3. Layered Archive Format**:
+```rust
+// Archive metadata tracks layers
+struct LayeredArchive {
+    layers: Vec<LayerMetadata>,
+    interner: Interner,
+    // Layers are not deduplicated until compaction
+}
+
+struct LayerMetadata {
+    results_file: PathBuf,
+    seen_bloom: PathBuf,
+    seen_shards_dir: PathBuf,
+    ortho_count: usize,
+    vocab_version: usize,
+}
+
+impl LayeredArchive {
+    fn merge_without_streaming(a: &Self, b: &Self, output_dir: &Path) -> io::Result<Self> {
+        // Just record both archives as layers - O(1) operation
+        let mut layers = a.layers.clone();
+        layers.extend(b.layers.clone());
+        
+        // Merge interners (still required)
+        let merged_interner = a.interner.merge(&b.interner);
+        
+        Ok(LayeredArchive {
+            layers,
+            interner: merged_interner,
+        })
+    }
+    
+    fn compact(&mut self, output_dir: &Path) -> io::Result<()> {
+        // Background process: merge all layers into one
+        // This is when dedup happens, but not blocking merge
+        todo!("Merge layers, dedup, write single flat archive")
+    }
+}
+```
+
 **Pros**:
 - O(1) merge time (just file concat + metadata update)
 - Deduplication cost amortized over queries
 - Simple implementation for merge operation
+- No RAM streaming required for large archives
 
 **Cons**:
 - Query time increases with number of uncompacted layers
@@ -268,7 +523,7 @@ As noted in the Background, the current remapping loop also rehydrates the `Seen
 
 ---
 
-### Option 9: Structural Sharing / Copy-on-Write Archives
+### Option 10: Structural Sharing / Copy-on-Write Archives
 
 **Description**: Use immutable, content-addressed data structures where merge creates a new archive that references parent archives rather than copying data.
 
@@ -298,24 +553,25 @@ As noted in the Background, the current remapping loop also rehydrates the `Seen
 
 ## Recommendation
 
-**Key insight**: Under the current design, the O(n) loop cannot be eliminated because it rehydrates the `SeenTracker` and `merged_results` queue. Options 1-6 can only reduce per-ortho cost within the loop; Options 7-9 address eliminating the loop itself through architectural changes.
+**Key insight**: Under the current design, the O(n) loop cannot be eliminated because it rehydrates the `SeenTracker` and `merged_results` queue. Options 1-7 can only reduce per-ortho cost within the loop; Options 8-10 address eliminating the loop itself through architectural changes.
 
 ### Within-Loop Optimizations (Quick Wins)
 
 For **immediate improvement** with minimal risk:
-1. **Option 4 (Per-Ortho Remap Check)** - Very low implementation cost; skip remap when indices unchanged
-2. **Option 2 (Parallel Remapping)** - Quick win with Rayon, low risk
+1. **Option 5 (Smaller-Side-Only Remapping)** - Highest impact for linear merge chains; 99% of orthos skip remapping
+2. **Option 4 (Per-Ortho Remap Check)** - Very low implementation cost; skip remap when indices unchanged
+3. **Option 2 (Parallel Remapping)** - Quick win with Rayon, low risk
 
 For **medium-term optimization**:
-3. **Option 1 (Lazy Remapping)** - Reduces remapping cost but loop still required
-4. **Option 5 (Incremental Merge)** - Skip remapping for unchanged indices
+4. **Option 1 (Lazy Remapping)** - Reduces remapping cost but loop still required
+5. **Option 6 (Incremental Merge)** - Skip remapping for unchanged indices
 
 ### Loop Elimination (Architectural Changes)
 
 For **long-term architectural improvement** to eliminate the O(n) loop:
-5. **Option 8 (File Concatenation with Deferred Dedup)** - Simplest path to O(1) merge; shifts dedup to query/compaction
-6. **Option 7 (Persist SeenTracker/Results)** - Eliminates loop for non-impacted orthos; moderate complexity
-7. **Option 9 (Structural Sharing)** - Most flexible but highest complexity; enables new use cases like branching
+6. **Option 9 (File Concatenation with Deferred Dedup)** - Simplest path to O(1) merge; disk-based concat without RAM streaming
+7. **Option 8 (Persist SeenTracker/Results)** - Eliminates loop for non-impacted orthos; moderate complexity
+8. **Option 10 (Structural Sharing)** - Most flexible but highest complexity; enables new use cases like branching
 
 ---
 
