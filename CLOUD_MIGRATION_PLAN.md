@@ -9,7 +9,7 @@ This document outlines a plan to migrate the Fold text processing system to enab
 ### Core Principles
 
 1. **S3 Move Semantics** - Claim work by moving from `fold-input/` to `fold-in-process/` (mirrors local file-move)
-2. **Local Heartbeat** - Each worker maintains heartbeat for crash recovery (same as current)
+2. **S3 Heartbeat** - Each worker maintains heartbeat in S3 for cross-worker crash recovery
 3. **No Database** - S3 only, no PostgreSQL or other coordination services
 4. **Local Disk First** - All processing happens on local disk, S3 is only for input/output/claiming
 5. **Smallest/Largest Selection** - Workers pick smallest txt file or smallest+largest archives (like current)
@@ -254,30 +254,29 @@ Workers check memory at startup and will exit if insufficient:
 
 ## Heartbeat and Recovery
 
-### Local Heartbeat (Per-Worker)
+### S3-Based Heartbeat
 
-Each worker maintains a local heartbeat file during processing:
+Each worker maintains a heartbeat file in S3 during processing:
 
 ```
-/fold_state/in_process/{file}.txt.work/heartbeat
+s3://fold-in-process/{worker_id}/heartbeat
 ```
 
-This heartbeat serves **local recovery only** (not coordination):
-- Updated every 100,000 orthos processed
+This heartbeat enables **cross-worker recovery**:
+- Updated every 60 seconds during processing
+- Contains timestamp of last update
 - Grace period: 10 minutes
-- On worker restart: recover abandoned local jobs
+- Any worker can detect and recover stale work
 
 ### Worker Recovery Scenarios
 
 **Scenario 1: Worker Crash During Processing**
 ```
 1. Worker crashes while processing file1.txt
-2. Local heartbeat becomes stale
-3. On worker restart:
-   - Detect stale heartbeat in local fold_state/
-   - Move file1.txt back to local input/
-   - Resume processing
-4. S3 state unchanged (file1.txt still in fold-input/)
+2. S3 heartbeat becomes stale (no updates for >10 minutes)
+3. Another worker (or recovery task) detects stale heartbeat
+4. Stale worker's files moved from fold-in-process/{worker_id}/ back to fold-input/
+5. Another worker claims and processes the file
 ```
 
 **Scenario 2: Worker Shutdown (Graceful)**
@@ -285,7 +284,8 @@ This heartbeat serves **local recovery only** (not coordination):
 1. Operator sends SIGTERM
 2. Worker completes current job
 3. Uploads result to S3
-4. Worker exits cleanly
+4. Deletes files from fold-in-process/{worker_id}/
+5. Worker exits cleanly
 ```
 
 **Scenario 3: Droplet Destroyed Mid-Job**
@@ -298,14 +298,9 @@ This heartbeat serves **local recovery only** (not coordination):
 6. Another worker claims and processes it
 ```
 
-### Heartbeat-Based Recovery
+### S3 Recovery Process
 
-Each worker maintains a heartbeat file in S3 at `s3://fold-in-process/{worker_id}/heartbeat`:
-- Updated every 60 seconds during processing
-- Contains timestamp of last update
-- Grace period: 10 minutes (same as current local heartbeat)
-
-**Recovery Process** (can be run by any worker or scheduled task):
+Recovery can be run by any worker (on startup) or as a scheduled task:
 ```rust
 // Check all worker directories in fold-in-process/
 for worker_dir in list_worker_directories() {
@@ -759,11 +754,12 @@ The S3 move-to-claim model prevents duplicate work:
 ├── in_process/                 # Standard processing
 │   └── assigned_file.txt.work/
 │       ├── source.txt
-│       ├── heartbeat          # Local heartbeat for crash recovery
 │       ├── queue/             # DiskBackedQueue spill
 │       └── seen_shards/       # SeenTracker shards
 └── results_*/                  # Final results before upload
 ```
+
+Note: Heartbeat is maintained in S3 at `fold-in-process/{worker_id}/heartbeat`, not on local disk.
 
 ### Why Local Disk?
 
@@ -955,15 +951,15 @@ This migration plan enables distributed processing with a **worker pool model** 
 
 - **Per-worker monitoring**: TUI dashboard shows each worker's metrics (RAM, queue depth, progress)
 - **Dynamic sizing**: Workers can be resized based on runtime memory requirements from `MemoryConfig`
-- **Local recovery**: Heartbeat-based crash recovery within each worker (not cross-worker coordination)
+- **S3-based recovery**: Heartbeat-based crash recovery via S3 enables cross-worker recovery
 - **Manual scaling**: Add, remove, or resize workers based on workload needs
 - **Size/count trade-off**: Run fewer large workers or more small workers based on memory requirements
 
 The key principles:
 - **S3 move semantics** - Claim work by moving files, same as current local file-move
-- **Heartbeat-based recovery** - Stale workers' files recovered back to input
+- **S3 heartbeat-based recovery** - Stale workers' files recovered back to input by any worker
 - **Smallest/largest selection** - Archive merges use same logic as current
 - **Local disk first** - All processing happens on local SSD
 - **No duplicate work** - Move-to-claim ensures each file processed once
 
-This approach preserves the existing codebase (file_handler, disk_backed_queue, seen_tracker, memory_config, tui) while enabling horizontal scaling across multiple machines. The S3 move semantics mirror the local `input/` → `in_process/` pattern.
+This approach preserves the existing codebase (file_handler, disk_backed_queue, seen_tracker, memory_config, tui) while enabling horizontal scaling across multiple machines. The S3 move semantics mirror the local `input/` → `in_process/` pattern, while S3 heartbeats enable cross-worker recovery without a central database.
