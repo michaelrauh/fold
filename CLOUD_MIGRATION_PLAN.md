@@ -8,22 +8,21 @@ This document outlines a plan to migrate the Fold text processing system to enab
 
 ### Core Principles
 
-1. **No Coordination** - Workers never communicate with each other
-2. **No Locking** - No distributed locks, no heartbeats, no job claiming
+1. **S3 Move Semantics** - Claim work by moving from `fold-input/` to `fold-in-process/` (mirrors local file-move)
+2. **Local Heartbeat** - Each worker maintains heartbeat for crash recovery (same as current)
 3. **No Database** - S3 only, no PostgreSQL or other coordination services
-4. **Local Disk First** - All processing happens on local disk, S3 is only for input/output
-5. **Idempotent Results** - Duplicate work is acceptable; results are merged later
-6. **Simple Operations** - Download input → Process locally → Upload output
+4. **Local Disk First** - All processing happens on local disk, S3 is only for input/output/claiming
+5. **Smallest/Largest Selection** - Workers pick smallest txt file or smallest+largest archives (like current)
+6. **Simple Operations** - Move to in-process → Download → Process locally → Upload → Delete from in-process
 
-### Why No Coordination?
+### Work Claiming via S3 Move
 
-The original architecture uses file-move semantics for mutual exclusion. Rather than replicating this complexity in the cloud with databases and locks, we embrace a simpler model:
+The S3 API supports atomic move/rename operations via copy+delete. This mirrors the current local file-move semantics:
 
-- **Duplicate work is cheaper than coordination overhead**
-- **S3 eventual consistency is sufficient** for input/output
-- **No single point of failure** (database)
-- **Simpler deployment and operations**
-- **Lower cost** (no managed database)
+- **Claim work**: Move file from `s3://fold-input/` to `s3://fold-in-process/{worker_id}/`
+- **On completion**: Upload result to `s3://fold-archives/`, delete from in-process
+- **On crash recovery**: Stale heartbeats trigger move back to `fold-input/`
+- **No duplicate work**: Only one worker can successfully move a file
 
 ## Current Architecture
 
@@ -52,17 +51,19 @@ The current system relies heavily on local filesystem operations:
 ### Infrastructure Components
 
 #### 1. Digital Ocean Spaces (S3-Compatible Object Storage)
-- **Purpose**: Input/output storage only (not for intermediate state)
+- **Purpose**: Input, in-process tracking, and output storage
 - **Buckets**:
-  - `fold-input` - Text files to process
+  - `fold-input` - Text files and archives awaiting processing
+  - `fold-in-process` - Files currently being processed (with worker_id prefix)
   - `fold-archives` - Completed archive results
 - **Access**: S3-compatible API using Digital Ocean Spaces access keys
+- **Work Claiming**: Atomic move from input to in-process prevents duplicate work
 
 #### 2. Digital Ocean Droplets (Long-Running Worker Pools)
 - **Purpose**: Processing tasks with manual scaling
 - **Deployment**: Long-running worker pools (not one-off tasks)
 - **Configuration**: Environment variables for S3 credentials
-- **Lifecycle**: Continuous loop: check S3 for work → process → upload → repeat
+- **Lifecycle**: Continuous loop: claim work (S3 move) → process → upload → repeat
 - **Local Storage**: Use droplet's local SSD for all intermediate state
 - **Scaling**: Manual addition/removal/resizing of workers based on workload
 
@@ -72,24 +73,33 @@ The current system relies heavily on local filesystem operations:
 ┌─────────────────────────────────────────────────────────────────┐
 │                         S3 (fold-input)                         │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐               │
-│  │file1.txt│ │file2.txt│ │file3.txt│ │file4.txt│   ...         │
+│  │file1.txt│ │file2.txt│ │arc_sm.bin│ │arc_lg.bin│   ...        │
 │  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘               │
 └───────┼──────────┼──────────┼──────────┼───────────────────────┘
         │          │          │          │
+        │    MOVE TO CLAIM    │          │
         ▼          ▼          ▼          ▼
-   ┌─────────┐┌─────────┐┌─────────┐┌─────────┐
-   │Worker 1 ││Worker 2 ││Worker 3 ││Worker 4 │  (Long-Running Pool)
-   │ 2GB RAM ││ 4GB RAM ││ 2GB RAM ││ 8GB RAM │  (Mixed Sizes)
-   │ Local   ││ Local   ││ Local   ││ Local   │
-   │ Disk    ││ Disk    ││ Disk    ││ Disk    │
-   │ TUI ────││ TUI ────││ TUI ────││ TUI ────│  (Per-Worker View)
-   └────┬────┘└────┬────┘└────┬────┘└────┬────┘
-        │          │          │          │
-        ▼          ▼          ▼          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     S3 (fold-in-process)                        │
+│  ┌─────────────────────┐ ┌─────────────────────┐               │
+│  │ worker-1/file1.txt  │ │ worker-2/arc_sm.bin │               │
+│  │ worker-1/heartbeat  │ │ worker-2/arc_lg.bin │               │
+│  └──────────┬──────────┘ │ worker-2/heartbeat  │               │
+└─────────────┼────────────┴──────────┬──────────────────────────┘
+              │                       │
+              ▼                       ▼
+   ┌────────────────┐     ┌────────────────┐
+   │   Worker 1     │     │   Worker 2     │   (Long-Running Pool)
+   │   2GB RAM      │     │   4GB RAM      │   (Mixed Sizes)
+   │   Local Disk   │     │   Local Disk   │
+   │   TUI ─────    │     │   TUI ─────    │   (Per-Worker View)
+   └────────┬───────┘     └────────┬───────┘
+            │                      │
+            ▼                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                       S3 (fold-archives)                        │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
-│  │archive1.tar.zst│ │archive2.tar.zst│ │archive3.tar.zst│  ...     │
+│  │archive1.tar.zst│ │archive2.tar.zst│ │archive3.tar.zst│  ...    │
 │  └──────────────┘ └──────────────┘ └──────────────┘            │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -100,12 +110,15 @@ Each worker runs continuously in a loop:
 
 ```
 while true:
-    1. CHECK S3
-       - List available input files in s3://fold-input/
-       - Pick an unprocessed file (random selection to avoid coordination)
+    1. CHECK S3 AND CLAIM WORK
+       - List available files in s3://fold-input/
+       - For txt files: pick a random available file
+       - For archives: find smallest and largest archives (like current merge logic)
+       - CLAIM: Move selected file(s) to s3://fold-in-process/{worker_id}/
+       - Update heartbeat timestamp in S3
     
     2. DOWNLOAD
-       - Download selected input file to local disk
+       - Download claimed file(s) from s3://fold-in-process/{worker_id}/ to local disk
        - Initialize local fold_state/ directory
     
     3. PROCESS
@@ -113,10 +126,12 @@ while true:
        - TUI displays real-time metrics for this worker
        - All intermediate state on local disk
        - Memory requirements checked at startup (may require resize)
+       - Periodic heartbeat updates to S3
     
-    4. UPLOAD
+    4. UPLOAD AND COMPLETE
        - Compress result archive (tar.zst)
        - Upload to S3: s3://fold-archives/{input_name}_{worker_id}_{timestamp}.tar.zst
+       - Delete claimed files from s3://fold-in-process/{worker_id}/
     
     5. CLEANUP
        - Clear local fold_state/ directory
@@ -277,18 +292,44 @@ This heartbeat serves **local recovery only** (not coordination):
 ```
 1. Droplet destroyed (power failure, etc.)
 2. Local disk lost (ephemeral)
-3. File still in S3 fold-input/ (never removed)
-4. Another worker will eventually pick it up
-5. Duplicate work is acceptable (idempotent processing)
+3. File remains in s3://fold-in-process/{worker_id}/
+4. Heartbeat file becomes stale (no updates)
+5. Recovery process moves file back to s3://fold-input/
+6. Another worker claims and processes it
 ```
 
-### No Cross-Worker Coordination
+### Heartbeat-Based Recovery
 
-Unlike the original design, there is **no coordination between workers**:
-- No shared heartbeat directory
-- No file-move semantics for job claiming
-- Each worker operates on its local disk only
-- S3 is the only shared state (eventual consistency)
+Each worker maintains a heartbeat file in S3 at `s3://fold-in-process/{worker_id}/heartbeat`:
+- Updated every 60 seconds during processing
+- Contains timestamp of last update
+- Grace period: 10 minutes (same as current local heartbeat)
+
+**Recovery Process** (can be run by any worker or scheduled task):
+```rust
+// Check all worker directories in fold-in-process/
+for worker_dir in list_worker_directories() {
+    let heartbeat = read_heartbeat(worker_dir);
+    
+    if heartbeat.age() > GRACE_PERIOD {
+        // Worker is stale - move files back to input
+        for file in list_files(worker_dir) {
+            if file != "heartbeat" {
+                move_to_input(file);
+            }
+        }
+        delete_worker_directory(worker_dir);
+    }
+}
+```
+
+### Work Claiming (No Duplicate Work)
+
+Unlike simple "pick and download", workers **claim work** via S3 move:
+- Move from `s3://fold-input/file.txt` to `s3://fold-in-process/{worker_id}/file.txt`
+- S3 copy+delete is atomic per-object
+- Only one worker can successfully claim a file
+- Failed claims (file not found) mean another worker got it first
 
 ## TUI Dashboard (Per-Worker View)
 
@@ -664,38 +705,48 @@ doctl compute droplet delete "$DROPLET_ID" --force
 echo "Created snapshot: fold-worker-snapshot"
 ```
 
-## Handling Duplicate Work
+## Work Claiming and Selection
 
-Since workers don't coordinate, the same input might be processed multiple times. This is handled at the merge phase:
+### File Selection Strategy
 
-### Merge Strategy
+Workers use the same selection logic as the current local implementation:
+
+**For text files**:
+- List all `.txt` files in `s3://fold-input/`
+- Pick a random available file
+- Claim by moving to `s3://fold-in-process/{worker_id}/`
+
+**For archive merges**:
+- List all `.bin` archives in `s3://fold-input/`
+- Find the **smallest** archive by ortho count (metadata in filename or manifest)
+- Find the **largest** archive by ortho count
+- Claim both by moving to `s3://fold-in-process/{worker_id}/`
 
 ```rust
-// Archives from the same input file can be identified by name prefix
-// e.g., file1_1699900000.tar.zst, file1_1699900001.tar.zst
-
-fn merge_duplicate_archives(archives: Vec<Archive>) -> Archive {
-    // Group by input file
-    let grouped = group_by_input_file(archives);
+// Mirror of current get_smallest_and_largest_archives logic
+fn select_archives_for_merge(archives: Vec<ArchiveMetadata>) -> Option<(String, String)> {
+    if archives.len() < 2 {
+        return None;
+    }
     
-    // For each group, keep the one with highest ortho count
-    // (or merge if they have different results)
-    grouped.into_iter()
-        .map(|(input, archives)| {
-            archives.into_iter()
-                .max_by_key(|a| a.ortho_count)
-                .unwrap()
-        })
-        .collect()
+    // Sort by ortho count
+    let mut sorted = archives.clone();
+    sorted.sort_by_key(|a| a.ortho_count);
+    
+    let smallest = sorted.first()?.s3_key.clone();
+    let largest = sorted.last()?.s3_key.clone();
+    
+    Some((smallest, largest))
 }
 ```
 
-### Eventual Consistency
+### No Duplicate Work
 
-- Multiple workers may process the same file
-- All results are valid (deterministic processing)
-- Merge phase picks the best or combines results
-- **Duplicate work cost < coordination overhead**
+The S3 move-to-claim model prevents duplicate work:
+- Worker attempts to move file from `fold-input/` to `fold-in-process/{worker_id}/`
+- If file is already gone (moved by another worker), the move fails
+- Worker retries with another file
+- Only one worker can successfully claim each file
 
 ## Local Disk Usage
 
@@ -745,11 +796,14 @@ DO_SPACES_ENDPOINT=https://nyc3.digitaloceanspaces.com
 DO_SPACES_ACCESS_KEY=xxx
 DO_SPACES_SECRET_KEY=xxx
 DO_SPACES_INPUT_BUCKET=fold-input
+DO_SPACES_IN_PROCESS_BUCKET=fold-in-process
 DO_SPACES_ARCHIVE_BUCKET=fold-archives
 
 # Worker Configuration
 WORKER_ID=${HOSTNAME}          # Unique worker identifier
 LOCAL_STATE_DIR=/fold_state    # Local processing directory
+HEARTBEAT_INTERVAL=60          # Seconds between heartbeat updates
+HEARTBEAT_GRACE_PERIOD=600     # 10 minutes (same as local)
 ```
 
 ### Command-Line Arguments
@@ -843,21 +897,22 @@ LOCAL_STATE_DIR=/fold_state    # Local processing directory
 
 1. **Functional**:
    - ✓ Workers run as long-lived processes in a pool
-   - ✓ Workers pick up files from S3 autonomously
+   - ✓ Workers claim files via S3 move (no duplicate work)
+   - ✓ Archives selected using smallest/largest logic (like current)
    - ✓ Processing uses local disk only (no network during processing)
    - ✓ Archive uploaded to S3 on completion
    - ✓ TUI shows per-worker metrics correctly
    - ✓ Memory requirements enforced at startup
 
-2. **Performance**:
-   - ✓ No latency penalty vs local processing (network only at boundaries)
-   - ✓ Local disk performance same as current
-   - ✓ Memory-intensive jobs can be handled by resizing workers
+2. **Recovery**:
+   - ✓ Heartbeat updated during processing (to S3)
+   - ✓ Stale heartbeats detected (10 minute grace period)
+   - ✓ Abandoned files moved back to input for re-processing
+   - ✓ Crashed workers' work is not lost
 
 3. **Operations**:
    - ✓ Workers can be added/removed manually
    - ✓ Workers can be resized for memory requirements
-   - ✓ Crashed workers recover locally on restart
    - ✓ Per-worker TUI monitoring available
 
 4. **Cost**:
@@ -904,10 +959,11 @@ This migration plan enables distributed processing with a **worker pool model** 
 - **Manual scaling**: Add, remove, or resize workers based on workload needs
 - **Size/count trade-off**: Run fewer large workers or more small workers based on memory requirements
 
-The key principles remain:
-- **No coordination between workers** - Each operates independently
+The key principles:
+- **S3 move semantics** - Claim work by moving files, same as current local file-move
+- **Heartbeat-based recovery** - Stale workers' files recovered back to input
+- **Smallest/largest selection** - Archive merges use same logic as current
 - **Local disk first** - All processing happens on local SSD
-- **S3 for input/output only** - No intermediate state in S3
-- **Duplicate work is acceptable** - Simpler than distributed locking
+- **No duplicate work** - Move-to-claim ensures each file processed once
 
-This approach preserves the existing codebase (file_handler, disk_backed_queue, seen_tracker, memory_config, tui) while enabling horizontal scaling across multiple machines.
+This approach preserves the existing codebase (file_handler, disk_backed_queue, seen_tracker, memory_config, tui) while enabling horizontal scaling across multiple machines. The S3 move semantics mirror the local `input/` → `in_process/` pattern.
