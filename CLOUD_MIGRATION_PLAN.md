@@ -58,12 +58,13 @@ The current system relies heavily on local filesystem operations:
   - `fold-archives` - Completed archive results
 - **Access**: S3-compatible API using Digital Ocean Spaces access keys
 
-#### 2. Digital Ocean Droplets (Compute)
-- **Purpose**: One-off processing tasks
-- **Deployment**: Spawned with specific input file assignment
-- **Configuration**: Environment variables for S3 credentials + assigned input
-- **Lifecycle**: Start → Download input → Process on local disk → Upload output → Shutdown
+#### 2. Digital Ocean Droplets (Long-Running Worker Pools)
+- **Purpose**: Processing tasks with manual scaling
+- **Deployment**: Long-running worker pools (not one-off tasks)
+- **Configuration**: Environment variables for S3 credentials
+- **Lifecycle**: Continuous loop: check S3 for work → process → upload → repeat
 - **Local Storage**: Use droplet's local SSD for all intermediate state
+- **Scaling**: Manual addition/removal/resizing of workers based on workload
 
 ### Processing Model
 
@@ -77,10 +78,11 @@ The current system relies heavily on local filesystem operations:
         │          │          │          │
         ▼          ▼          ▼          ▼
    ┌─────────┐┌─────────┐┌─────────┐┌─────────┐
-   │Droplet 1││Droplet 2││Droplet 3││Droplet 4│  (Independent)
-   │         ││         ││         ││         │
+   │Worker 1 ││Worker 2 ││Worker 3 ││Worker 4 │  (Long-Running Pool)
+   │ 2GB RAM ││ 4GB RAM ││ 2GB RAM ││ 8GB RAM │  (Mixed Sizes)
    │ Local   ││ Local   ││ Local   ││ Local   │
    │ Disk    ││ Disk    ││ Disk    ││ Disk    │
+   │ TUI ────││ TUI ────││ TUI ────││ TUI ────│  (Per-Worker View)
    └────┬────┘└────┬────┘└────┬────┘└────┬────┘
         │          │          │          │
         ▼          ▼          ▼          ▼
@@ -92,31 +94,253 @@ The current system relies heavily on local filesystem operations:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Worker Lifecycle
+### Worker Lifecycle (Long-Running)
 
-Each droplet follows this simple lifecycle:
+Each worker runs continuously in a loop:
 
 ```
-1. STARTUP
-   - Droplet spawned with environment: INPUT_FILE=s3://fold-input/file1.txt
-   - Initialize local fold_state/ directory on local SSD
+while true:
+    1. CHECK S3
+       - List available input files in s3://fold-input/
+       - Pick an unprocessed file (random selection to avoid coordination)
+    
+    2. DOWNLOAD
+       - Download selected input file to local disk
+       - Initialize local fold_state/ directory
+    
+    3. PROCESS
+       - Run standard fold processing (unchanged from current)
+       - TUI displays real-time metrics for this worker
+       - All intermediate state on local disk
+       - Memory requirements checked at startup (may require resize)
+    
+    4. UPLOAD
+       - Compress result archive (tar.zst)
+       - Upload to S3: s3://fold-archives/{input_name}_{worker_id}_{timestamp}.tar.zst
+    
+    5. CLEANUP
+       - Clear local fold_state/ directory
+       - Loop back to step 1
+```
 
-2. DOWNLOAD
-   - Download assigned input file from S3 to local disk
-   - Place in local fold_state/input/
+## Worker Pool Management
 
-3. PROCESS
-   - Run standard fold processing (unchanged from current)
-   - All intermediate state (queues, shards, etc.) on local disk
-   - No network calls during processing
+### Pool Architecture
 
-4. UPLOAD
-   - Compress result archive (tar.zst)
-   - Upload to S3: s3://fold-archives/{input_name}_{timestamp}.tar.zst
+Workers run as long-lived processes, not one-off tasks. This enables:
+- **Per-worker TUI monitoring** - Each worker shows its own metrics dashboard
+- **Dynamic memory adjustment** - Resize workers as needed based on runtime requirements
+- **Cost efficiency** - No startup/shutdown overhead per job
 
-5. SHUTDOWN
-   - Droplet terminates
-   - Local disk is discarded
+### Manual Scaling Operations
+
+**Add Worker**:
+```bash
+# Create new worker droplet
+doctl compute droplet create "fold-worker-$(date +%s)" \
+    --image fold-worker-snapshot \
+    --size s-2vcpu-4gb \
+    --region nyc3 \
+    --user-data "#!/bin/bash
+export DO_SPACES_ACCESS_KEY='...'
+export DO_SPACES_SECRET_KEY='...'
+cd /opt/fold && ./target/release/fold --mode cloud-worker"
+```
+
+**Remove Worker**:
+```bash
+# Graceful shutdown: wait for current job to complete
+ssh worker-ip "pkill -SIGTERM fold"
+# Then destroy droplet
+doctl compute droplet delete <droplet-id>
+```
+
+**Resize Worker** (for memory-intensive jobs):
+```bash
+# Power off and resize
+doctl compute droplet-action resize <droplet-id> --size s-4vcpu-8gb --wait
+doctl compute droplet-action power-on <droplet-id>
+```
+
+### Size/Count Trade-off
+
+As RAM requirements increase, trade off worker count for worker size:
+
+| Workload | Worker Config | Monthly Cost |
+|----------|--------------|--------------|
+| Light (vocab <100K) | 4 × 2GB ($12/ea) | $48/month |
+| Medium (vocab 100K-500K) | 2 × 4GB ($24/ea) | $48/month |
+| Heavy (vocab >500K) | 1 × 8GB ($48/ea) | $48/month |
+
+The total monthly budget can remain constant while adapting to workload requirements.
+
+## Memory Requirements and Droplet Sizing
+
+### Runtime Memory Detection
+
+The `MemoryConfig::calculate()` function determines memory requirements at startup:
+
+```rust
+// From src/memory_config.rs
+pub fn calculate(interner_bytes: usize, expected_results: usize) -> Self {
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    
+    let total_memory = sys.total_memory() as usize;
+    let target_memory = (total_memory * 75) / 100;  // Target 75% of RAM
+    
+    // Minimum requirements:
+    // - Bloom filter: ~2 bytes per item
+    // - Queue buffer: 100k orthos minimum (~20MB per queue)
+    // - Shards in memory: 50% of total shards
+    
+    // EXITS if minimum requirements cannot be met
+    if available_for_caches < min_required_memory {
+        eprintln!("INSUFFICIENT MEMORY");
+        std::process::exit(1);
+    }
+}
+```
+
+### Memory Budget Breakdown
+
+| Component | Size Formula | Minimum | Notes |
+|-----------|-------------|---------|-------|
+| Interner | ~vocabulary size × 50 bytes | Varies | Serialized vocabulary + prefix maps |
+| Queue buffers | 2 × 100K × 200 bytes | ~40MB | Work queue + results queue |
+| Bloom filter | capacity × 2 bytes | ~2MB | 1M capacity default |
+| Seen shards | shards × 10K × 12 bytes | ~7.7MB | 50% of shards in memory |
+| Runtime overhead | 20% of total | Varies | Working memory for ortho processing |
+
+### Droplet Size Recommendations
+
+Based on memory requirements, select appropriate droplet size:
+
+| Droplet Size | Total RAM | Available (75%) | Recommended For |
+|--------------|-----------|-----------------|-----------------|
+| s-1vcpu-1gb | 1GB | 750MB | Small vocab (<50K words) |
+| s-1vcpu-2gb | 2GB | 1.5GB | Medium vocab (50K-200K words) |
+| s-2vcpu-4gb | 4GB | 3GB | Large vocab (200K-500K words) |
+| s-4vcpu-8gb | 8GB | 6GB | Very large vocab (>500K words) |
+
+### Automatic Sizing Check
+
+Workers check memory at startup and will exit if insufficient:
+
+```bash
+# Worker startup script checks memory
+./target/release/fold --mode cloud-worker
+
+# If output contains "INSUFFICIENT MEMORY":
+#   1. Note the required memory from error message
+#   2. Resize droplet to appropriate size
+#   3. Restart worker
+```
+
+## Heartbeat and Recovery
+
+### Local Heartbeat (Per-Worker)
+
+Each worker maintains a local heartbeat file during processing:
+
+```
+/fold_state/in_process/{file}.txt.work/heartbeat
+```
+
+This heartbeat serves **local recovery only** (not coordination):
+- Updated every 100,000 orthos processed
+- Grace period: 10 minutes
+- On worker restart: recover abandoned local jobs
+
+### Worker Recovery Scenarios
+
+**Scenario 1: Worker Crash During Processing**
+```
+1. Worker crashes while processing file1.txt
+2. Local heartbeat becomes stale
+3. On worker restart:
+   - Detect stale heartbeat in local fold_state/
+   - Move file1.txt back to local input/
+   - Resume processing
+4. S3 state unchanged (file1.txt still in fold-input/)
+```
+
+**Scenario 2: Worker Shutdown (Graceful)**
+```
+1. Operator sends SIGTERM
+2. Worker completes current job
+3. Uploads result to S3
+4. Worker exits cleanly
+```
+
+**Scenario 3: Droplet Destroyed Mid-Job**
+```
+1. Droplet destroyed (power failure, etc.)
+2. Local disk lost (ephemeral)
+3. File still in S3 fold-input/ (never removed)
+4. Another worker will eventually pick it up
+5. Duplicate work is acceptable (idempotent processing)
+```
+
+### No Cross-Worker Coordination
+
+Unlike the original design, there is **no coordination between workers**:
+- No shared heartbeat directory
+- No file-move semantics for job claiming
+- Each worker operates on its local disk only
+- S3 is the only shared state (eventual consistency)
+
+## TUI Dashboard (Per-Worker View)
+
+### Dashboard Design
+
+The TUI is designed to show **one worker's state**, not a global view:
+
+```
+┌─ FOLD Dashboard [Time: 1h 23m │ RAM: 1,234 MB / 75%] ─────────┐
+│ Mode: Processing Text │ Interner: v3 │ Vocab: 45,678         │
+│ Chunks: 10 │ Processed: 3 │ Remaining: 7                      │
+│ QBuf: 100,000 │ Bloom: 3,000,000 │ Shards: 32/64 in mem       │
+├───────────────────────────────────────────────────────────────┤
+│ Current Operation                                              │
+│ Processing: chapter_05.txt                                    │
+│ Status: Processing orthos                                      │
+│ 1,234,567 / 2,000,000 [████████████░░░░░░░░] 62%              │
+├───────────────────────────────────────────────────────────────┤
+│ Merge Progress │ Optimal Ortho │ Largest Archive              │
+│ Completed: 2   │ Volume: 125   │ archive_ch01.bin             │
+│ ...            │ Dims: [6,5,5] │ 45,678 orthos                │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Key Metrics Displayed
+
+| Metric | Description | Source |
+|--------|-------------|--------|
+| RAM Usage | Current memory consumption | `sysinfo::System` |
+| Queue Buffer | Configured buffer size | `MemoryConfig` |
+| Bloom Capacity | Bloom filter size | `MemoryConfig` |
+| Shards in Memory | LRU shard count | `MemoryConfig` |
+| Queue Depth | Current work queue size | Real-time |
+| Seen Size | Total deduplicated IDs | Real-time |
+| Optimal Volume | Best ortho found | Real-time |
+
+### Monitoring Multiple Workers
+
+To monitor multiple workers, use separate terminal sessions:
+
+```bash
+# Terminal 1 - Worker on droplet-1
+ssh fold-worker-1 "cd /opt/fold && ./target/release/fold --mode cloud-worker"
+
+# Terminal 2 - Worker on droplet-2
+ssh fold-worker-2 "cd /opt/fold && ./target/release/fold --mode cloud-worker"
+
+# Or use tmux/screen for multiple panes
+tmux new-session \; split-window -h \; \
+    send-keys 'ssh fold-worker-1 "cd /opt/fold && ./target/release/fold"' Enter \; \
+    select-pane -L \; \
+    send-keys 'ssh fold-worker-2 "cd /opt/fold && ./target/release/fold"' Enter
 ```
 
 ## Migration Strategy
@@ -269,15 +493,17 @@ fn decompress_archive(archive_path: &Path, output_dir: &Path) -> Result<(), Fold
 
 ### Phase 4: Deployment Scripts
 
-**Droplet Setup Script** (`deploy/worker.sh`):
+**Worker Setup Script** (`deploy/worker.sh`):
 
 ```bash
 #!/bin/bash
 set -e
 
-INPUT_FILE="$1"
-DO_SPACES_ACCESS_KEY="$2"
-DO_SPACES_SECRET_KEY="$3"
+# Long-running worker script
+# Run as: ./worker.sh
+
+DO_SPACES_ACCESS_KEY="${DO_SPACES_ACCESS_KEY:?Required}"
+DO_SPACES_SECRET_KEY="${DO_SPACES_SECRET_KEY:?Required}"
 
 # Install Rust (if not using pre-built image)
 if ! command -v cargo &> /dev/null; then
@@ -285,46 +511,157 @@ if ! command -v cargo &> /dev/null; then
     source $HOME/.cargo/env
 fi
 
-# Clone and build
-git clone https://github.com/michaelrauh/fold.git
-cd fold
-cargo build --release
+# Clone and build (if needed)
+if [ ! -d "/opt/fold" ]; then
+    git clone https://github.com/michaelrauh/fold.git /opt/fold
+    cd /opt/fold
+    cargo build --release
+fi
+
+cd /opt/fold
 
 # Set environment
 export DO_SPACES_REGION=nyc3
 export DO_SPACES_ENDPOINT=https://nyc3.digitaloceanspaces.com
 export DO_SPACES_ACCESS_KEY="$DO_SPACES_ACCESS_KEY"
 export DO_SPACES_SECRET_KEY="$DO_SPACES_SECRET_KEY"
-export INPUT_FILE="$INPUT_FILE"
 
-# Run in cloud worker mode
+# Run in cloud worker mode (long-running loop)
 ./target/release/fold --mode cloud-worker
-
-# Shutdown
-shutdown -h now
 ```
 
-**Orchestrator Script** (`deploy/spawn_workers.sh`):
+**Pool Management Script** (`deploy/manage_pool.sh`):
 
 ```bash
 #!/bin/bash
-# Spawns droplets for each input file in S3
+# Manage worker pool: add, remove, resize, list workers
 
-# List input files
-INPUT_FILES=$(aws s3 ls s3://fold-input/ --endpoint-url https://nyc3.digitaloceanspaces.com | awk '{print $4}')
+ACTION="$1"
+WORKER_ID="$2"
+SIZE="${3:-s-1vcpu-2gb}"
 
-for file in $INPUT_FILES; do
-    echo "Spawning worker for: $file"
+case "$ACTION" in
+    add)
+        echo "Adding worker with size $SIZE..."
+        doctl compute droplet create "fold-worker-$(date +%s)" \
+            --image fold-worker-snapshot \
+            --size "$SIZE" \
+            --region nyc3 \
+            --ssh-keys "$(doctl compute ssh-key list --format ID --no-header | head -1)" \
+            --user-data "#!/bin/bash
+export DO_SPACES_ACCESS_KEY='$DO_SPACES_ACCESS_KEY'
+export DO_SPACES_SECRET_KEY='$DO_SPACES_SECRET_KEY'
+/opt/fold/deploy/worker.sh" \
+            --wait
+        ;;
     
-    # Create droplet via DO API
-    doctl compute droplet create "fold-worker-$(date +%s)" \
-        --image ubuntu-22-04-x64 \
-        --size s-1vcpu-1gb \
-        --region nyc3 \
-        --user-data "#!/bin/bash
-curl -s https://raw.githubusercontent.com/michaelrauh/fold/main/deploy/worker.sh | bash -s '$file' '$DO_SPACES_ACCESS_KEY' '$DO_SPACES_SECRET_KEY'" \
-        --wait
-done
+    remove)
+        if [ -z "$WORKER_ID" ]; then
+            echo "Usage: $0 remove <droplet-id>"
+            exit 1
+        fi
+        echo "Removing worker $WORKER_ID..."
+        # Signal graceful shutdown first
+        WORKER_IP=$(doctl compute droplet get "$WORKER_ID" --format PublicIPv4 --no-header)
+        ssh "root@$WORKER_IP" "pkill -SIGTERM fold" || true
+        sleep 30  # Wait for graceful shutdown
+        doctl compute droplet delete "$WORKER_ID" --force
+        ;;
+    
+    resize)
+        if [ -z "$WORKER_ID" ] || [ -z "$3" ]; then
+            echo "Usage: $0 resize <droplet-id> <new-size>"
+            exit 1
+        fi
+        NEW_SIZE="$3"
+        echo "Resizing worker $WORKER_ID to $NEW_SIZE..."
+        # Graceful shutdown
+        WORKER_IP=$(doctl compute droplet get "$WORKER_ID" --format PublicIPv4 --no-header)
+        ssh "root@$WORKER_IP" "pkill -SIGTERM fold" || true
+        sleep 30
+        # Power off
+        doctl compute droplet-action power-off "$WORKER_ID" --wait
+        # Resize
+        doctl compute droplet-action resize "$WORKER_ID" --size "$NEW_SIZE" --wait
+        # Power on
+        doctl compute droplet-action power-on "$WORKER_ID" --wait
+        # Restart worker
+        sleep 10
+        ssh "root@$WORKER_IP" "nohup /opt/fold/deploy/worker.sh > /var/log/fold.log 2>&1 &"
+        ;;
+    
+    list)
+        echo "Current worker pool:"
+        doctl compute droplet list --tag-name fold-worker --format ID,Name,Memory,VCPUs,Status,PublicIPv4
+        ;;
+    
+    *)
+        echo "Usage: $0 {add|remove|resize|list} [worker-id] [size]"
+        echo ""
+        echo "Commands:"
+        echo "  add [size]           - Add new worker (default: s-1vcpu-2gb)"
+        echo "  remove <id>          - Remove worker (graceful shutdown)"
+        echo "  resize <id> <size>   - Resize worker"
+        echo "  list                 - List all workers"
+        echo ""
+        echo "Sizes:"
+        echo "  s-1vcpu-1gb  - 1GB RAM  (\$6/month)"
+        echo "  s-1vcpu-2gb  - 2GB RAM  (\$12/month)"
+        echo "  s-2vcpu-4gb  - 4GB RAM  (\$24/month)"
+        echo "  s-4vcpu-8gb  - 8GB RAM  (\$48/month)"
+        exit 1
+        ;;
+esac
+```
+
+**Worker Image Creation** (`deploy/create_image.sh`):
+
+```bash
+#!/bin/bash
+# Create a snapshot image with Rust and fold pre-installed
+# This speeds up worker startup significantly
+
+# Create base droplet
+doctl compute droplet create "fold-base-$(date +%s)" \
+    --image ubuntu-22-04-x64 \
+    --size s-1vcpu-1gb \
+    --region nyc3 \
+    --wait
+
+DROPLET_ID=$(doctl compute droplet list --format ID,Name --no-header | grep fold-base | awk '{print $1}')
+DROPLET_IP=$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header)
+
+# Wait for SSH to be ready
+sleep 30
+
+# Install dependencies
+ssh "root@$DROPLET_IP" << 'EOF'
+apt-get update
+apt-get install -y build-essential curl git
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+
+# Clone and build fold
+git clone https://github.com/michaelrauh/fold.git /opt/fold
+cd /opt/fold
+cargo build --release
+
+# Create worker script
+mkdir -p /opt/fold/deploy
+EOF
+
+scp deploy/worker.sh "root@$DROPLET_IP:/opt/fold/deploy/"
+
+# Power off and snapshot
+doctl compute droplet-action power-off "$DROPLET_ID" --wait
+doctl compute droplet-action snapshot "$DROPLET_ID" --snapshot-name "fold-worker-snapshot" --wait
+
+# Cleanup base droplet
+doctl compute droplet delete "$DROPLET_ID" --force
+
+echo "Created snapshot: fold-worker-snapshot"
 ```
 
 ## Handling Duplicate Work
@@ -371,7 +708,7 @@ fn merge_duplicate_archives(archives: Vec<Archive>) -> Archive {
 ├── in_process/                 # Standard processing
 │   └── assigned_file.txt.work/
 │       ├── source.txt
-│       ├── heartbeat          # Local heartbeat (not for coordination)
+│       ├── heartbeat          # Local heartbeat for crash recovery
 │       ├── queue/             # DiskBackedQueue spill
 │       └── seen_shards/       # SeenTracker shards
 └── results_*/                  # Final results before upload
@@ -383,14 +720,19 @@ fn merge_duplicate_archives(archives: Vec<Archive>) -> Archive {
 2. **Cost**: No S3 API charges for intermediate operations
 3. **Simplicity**: Existing DiskBackedQueue and SeenTracker work unchanged
 4. **Reliability**: No network failures during processing
+5. **Memory Extension**: Disk-backed structures allow processing larger datasets than RAM alone
 
-### Droplet Sizing
+### Disk Space Requirements
 
-- **Minimum**: 1GB RAM, 25GB SSD ($6/month or $0.009/hour)
-- **Recommended**: 2GB RAM, 50GB SSD ($12/month or $0.018/hour)
-- **Large jobs**: 4GB RAM, 80GB SSD ($24/month or $0.036/hour)
+| Component | Typical Size | Notes |
+|-----------|-------------|-------|
+| Input file | 1-100MB | Downloaded from S3 |
+| Queue spill | 10-500MB | Depends on work queue depth |
+| Seen shards | 50-500MB | Depends on total orthos generated |
+| Results | 100MB-5GB | All generated orthos |
+| **Total** | **200MB-6GB** | Per job |
 
-Local SSD is ephemeral (lost on shutdown) which is perfect for this model.
+Recommended local disk: 25-80GB depending on expected job sizes.
 
 ## Configuration
 
@@ -406,7 +748,7 @@ DO_SPACES_INPUT_BUCKET=fold-input
 DO_SPACES_ARCHIVE_BUCKET=fold-archives
 
 # Worker Configuration
-INPUT_FILE=file1.txt           # Assigned input file
+WORKER_ID=${HOSTNAME}          # Unique worker identifier
 LOCAL_STATE_DIR=/fold_state    # Local processing directory
 ```
 
@@ -414,7 +756,7 @@ LOCAL_STATE_DIR=/fold_state    # Local processing directory
 
 ```bash
 ./fold --mode local           # Default: existing behavior
-./fold --mode cloud-worker    # Cloud: download → process → upload
+./fold --mode cloud-worker    # Cloud: long-running worker loop
 ```
 
 ## Change Points Summary
@@ -423,7 +765,7 @@ LOCAL_STATE_DIR=/fold_state    # Local processing directory
 
 1. **`src/main.rs`**
    - Add `--mode` argument parsing
-   - Add `run_cloud_worker()` function
+   - Add `run_cloud_worker()` function with continuous loop
    - Keep existing `run_local()` as default
 
 2. **`Cargo.toml`**
@@ -434,43 +776,51 @@ LOCAL_STATE_DIR=/fold_state    # Local processing directory
 
 1. **`src/s3_io.rs`** - S3 download/upload operations
 2. **`src/compression.rs`** - Archive compression/decompression
-3. **`deploy/worker.sh`** - Droplet worker script
-4. **`deploy/spawn_workers.sh`** - Orchestrator script
+3. **`deploy/worker.sh`** - Long-running worker script
+4. **`deploy/manage_pool.sh`** - Pool management (add/remove/resize)
+5. **`deploy/create_image.sh`** - Create worker snapshot image
 
 ### Unchanged Files
 
 - `src/file_handler.rs` - No changes needed
 - `src/disk_backed_queue.rs` - No changes needed
 - `src/seen_tracker.rs` - No changes needed
+- `src/memory_config.rs` - No changes needed (already handles sizing)
+- `src/tui.rs` - No changes needed (already shows per-worker metrics)
+- `src/metrics.rs` - No changes needed
 - `src/interner.rs` - No changes needed
 - `src/ortho.rs` - No changes needed
 
 ## Cost Estimation
 
-### Monthly Costs (1000 jobs/month)
+### Monthly Costs (Worker Pool Model)
 
 **Assumptions**:
 - 1000 jobs/month
 - Average 100MB input per job
 - Average 500MB output per job
-- Each job takes 2 hours average
+- Worker pool running 50% of the month (on-demand scaling)
 
 **Spaces (S3 Storage)**:
 - Storage: 500GB × $0.02/GB = $10/month
 - Transfer: 600GB out × $0.01/GB = $6/month
 - **Spaces Total**: ~$16/month
 
-**Droplets (Compute)**:
-- $0.009/hour (1GB RAM droplet)
-- 1000 jobs × 2 hours × $0.009 = $18/month
-- **Compute Total**: ~$18/month
+**Droplets (Worker Pool)**:
 
-**Total Estimated Cost**: ~$34/month
+| Pool Configuration | Hourly Cost | Monthly (50% utilization) |
+|-------------------|-------------|---------------------------|
+| 2 × 2GB workers | $0.024/hr | ~$18/month |
+| 1 × 4GB worker | $0.036/hr | ~$13/month |
+| Mixed (1×2GB + 1×4GB) | $0.048/hr | ~$18/month |
 
-**Comparison to Coordinated Approach**:
-- No PostgreSQL: saves $15/month
-- Simpler architecture: lower maintenance cost
-- Some duplicate work: adds ~10-20% compute cost
+**Total Estimated Cost**: $30-35/month
+
+**Cost Optimization Strategies**:
+1. Scale down worker pool during off-peak hours
+2. Use smaller workers for light workloads
+3. Temporarily add large workers only for heavy jobs
+4. Monitor memory requirements and right-size workers
 
 ## Testing Strategy
 
@@ -492,24 +842,28 @@ LOCAL_STATE_DIR=/fold_state    # Local processing directory
 ## Success Criteria
 
 1. **Functional**:
-   - ✓ Worker downloads assigned input from S3
+   - ✓ Workers run as long-lived processes in a pool
+   - ✓ Workers pick up files from S3 autonomously
    - ✓ Processing uses local disk only (no network during processing)
    - ✓ Archive uploaded to S3 on completion
-   - ✓ Droplet shuts down after completion
+   - ✓ TUI shows per-worker metrics correctly
+   - ✓ Memory requirements enforced at startup
 
 2. **Performance**:
    - ✓ No latency penalty vs local processing (network only at boundaries)
    - ✓ Local disk performance same as current
+   - ✓ Memory-intensive jobs can be handled by resizing workers
 
-3. **Simplicity**:
-   - ✓ No database to manage
-   - ✓ No distributed locking
-   - ✓ No heartbeat coordination
-   - ✓ Workers are completely stateless
+3. **Operations**:
+   - ✓ Workers can be added/removed manually
+   - ✓ Workers can be resized for memory requirements
+   - ✓ Crashed workers recover locally on restart
+   - ✓ Per-worker TUI monitoring available
 
 4. **Cost**:
-   - ✓ Lower than coordinated approach
-   - ✓ Pay only for active processing
+   - ✓ No database fees (S3 only)
+   - ✓ Pool can be scaled down when idle
+   - ✓ Right-size workers to actual memory needs
 
 ## Timeline Estimate
 
@@ -542,13 +896,18 @@ LOCAL_STATE_DIR=/fold_state    # Local processing directory
 
 ## Conclusion
 
-This simplified migration plan eliminates coordination complexity by embracing independent worker processing. Each droplet operates in isolation, downloading its assigned input, processing entirely on local disk, and uploading results. No databases, no locks, no heartbeats.
+This migration plan enables distributed processing with a **worker pool model** that provides:
 
-The key insight is that **duplicate work is acceptable** in exchange for simpler architecture. When processing is deterministic, running the same job twice produces identical results - one can simply be discarded at merge time.
+- **Per-worker monitoring**: TUI dashboard shows each worker's metrics (RAM, queue depth, progress)
+- **Dynamic sizing**: Workers can be resized based on runtime memory requirements from `MemoryConfig`
+- **Local recovery**: Heartbeat-based crash recovery within each worker (not cross-worker coordination)
+- **Manual scaling**: Add, remove, or resize workers based on workload needs
+- **Size/count trade-off**: Run fewer large workers or more small workers based on memory requirements
 
-This approach:
-- **Reduces operational complexity** (no database to manage)
-- **Lowers cost** (no managed database fees)
-- **Improves reliability** (no coordination failures)
-- **Simplifies debugging** (each worker is independent)
-- **Preserves existing code** (minimal changes to core processing)
+The key principles remain:
+- **No coordination between workers** - Each operates independently
+- **Local disk first** - All processing happens on local SSD
+- **S3 for input/output only** - No intermediate state in S3
+- **Duplicate work is acceptable** - Simpler than distributed locking
+
+This approach preserves the existing codebase (file_handler, disk_backed_queue, seen_tracker, memory_config, tui) while enabling horizontal scaling across multiple machines.
