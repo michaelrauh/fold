@@ -1,8 +1,29 @@
-# Cloud Migration Plan: File-Based to Cloud S3/DB Operations
+# Cloud Migration Plan: Coordination-Free Distributed Processing
 
 ## Executive Summary
 
-This document outlines a detailed plan to migrate the Fold text processing system from local file-based operations to cloud-based operations using Digital Ocean services. The migration will enable multiple independent droplet runners to process work without requiring coordination or shared filesystem access.
+This document outlines a plan to migrate the Fold text processing system to enable distributed processing across multiple Digital Ocean droplets. The key design principle is **no coordination between workers** - each droplet operates completely independently, pulling work from S3 and pushing results back. All intermediate processing uses local disk only, with S3 serving purely as input/output storage.
+
+## Design Philosophy
+
+### Core Principles
+
+1. **No Coordination** - Workers never communicate with each other
+2. **No Locking** - No distributed locks, no heartbeats, no job claiming
+3. **No Database** - S3 only, no PostgreSQL or other coordination services
+4. **Local Disk First** - All processing happens on local disk, S3 is only for input/output
+5. **Idempotent Results** - Duplicate work is acceptable; results are merged later
+6. **Simple Operations** - Download input → Process locally → Upload output
+
+### Why No Coordination?
+
+The original architecture uses file-move semantics for mutual exclusion. Rather than replicating this complexity in the cloud with databases and locks, we embrace a simpler model:
+
+- **Duplicate work is cheaper than coordination overhead**
+- **S3 eventual consistency is sufficient** for input/output
+- **No single point of failure** (database)
+- **Simpler deployment and operations**
+- **Lower cost** (no managed database)
 
 ## Current Architecture
 
@@ -14,747 +35,520 @@ The current system relies heavily on local filesystem operations:
    - `input/` - Text files (.txt) and archive directories (.bin) awaiting processing
    - `in_process/` - Work folders for active processing with heartbeat files
    - `results_*/` - DiskBackedQueue directories for ortho results
-   - `checkpoint/` - Atomic checkpoints (no longer actively used in latest version)
    - `seen_shards/` - Disk-backed bloom filter shards for deduplication
 
 2. **Processing Model**
    - Single machine, multiple process concurrency
    - File-move semantics for mutual exclusion (move file to `in_process/`)
-   - Heartbeat files for crash detection (10 minute grace period)
+   - Heartbeat files for crash detection
    - Recovery through file movement back to `input/`
 
-3. **Key File Operations** (from `file_handler.rs`)
-   - `fs::read_dir()` - List files in directories
-   - `fs::rename()` - Atomic move for mutual exclusion
-   - `fs::create_dir_all()` - Create work folders
-   - `fs::remove_dir_all()` - Cleanup after processing
-   - `fs::read()` / `fs::write()` - Read/write binary data (interner, metadata, lineage)
-   - `fs::metadata()` - Check heartbeat timestamps
-
-4. **Data Structures Using Disk**
+3. **Data Structures Using Disk**
    - **DiskBackedQueue** - Spills orthos to disk files when memory buffer fills
    - **SeenTracker** - LRU sharded HashMap with disk backing
-   - **Checkpoint System** - Three-queue strategy with atomic saves
 
-## Target Architecture: Digital Ocean Cloud
+## Target Architecture: Coordination-Free Cloud
 
 ### Infrastructure Components
 
 #### 1. Digital Ocean Spaces (S3-Compatible Object Storage)
-- **Purpose**: Replace filesystem for all persistent data
+- **Purpose**: Input/output storage only (not for intermediate state)
 - **Buckets**:
-  - `fold-input` - Input files and archives awaiting processing
-  - `fold-results` - Completed archive results
-  - `fold-temp` - Temporary work data (with lifecycle policies)
+  - `fold-input` - Text files to process
+  - `fold-archives` - Completed archive results
 - **Access**: S3-compatible API using Digital Ocean Spaces access keys
 
-#### 2. Digital Ocean Managed PostgreSQL Database
-- **Purpose**: Job coordination, work queue, and metadata
-- **Tables**:
-  - `jobs` - Work items (text files or archive pairs to process)
-  - `job_locks` - Distributed locking with heartbeat
-  - `archives` - Archive metadata (ortho_count, lineage, size)
-  - `processing_runs` - Audit log of processing history
-- **Features**:
-  - Connection pooling
-  - Automated backups
-  - High availability option
-
-#### 3. Digital Ocean Droplets (Compute)
+#### 2. Digital Ocean Droplets (Compute)
 - **Purpose**: One-off processing tasks
-- **Deployment**: Ad-hoc spawned droplets
-- **Configuration**: Environment variables for DB/S3 credentials
-- **Lifecycle**: Start → Process one job → Shutdown
-- **OS**: Ubuntu 22.04 LTS with Rust toolchain
+- **Deployment**: Spawned with specific input file assignment
+- **Configuration**: Environment variables for S3 credentials + assigned input
+- **Lifecycle**: Start → Download input → Process on local disk → Upload output → Shutdown
+- **Local Storage**: Use droplet's local SSD for all intermediate state
+
+### Processing Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         S3 (fold-input)                         │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐               │
+│  │file1.txt│ │file2.txt│ │file3.txt│ │file4.txt│   ...         │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘               │
+└───────┼──────────┼──────────┼──────────┼───────────────────────┘
+        │          │          │          │
+        ▼          ▼          ▼          ▼
+   ┌─────────┐┌─────────┐┌─────────┐┌─────────┐
+   │Droplet 1││Droplet 2││Droplet 3││Droplet 4│  (Independent)
+   │         ││         ││         ││         │
+   │ Local   ││ Local   ││ Local   ││ Local   │
+   │ Disk    ││ Disk    ││ Disk    ││ Disk    │
+   └────┬────┘└────┬────┘└────┬────┘└────┬────┘
+        │          │          │          │
+        ▼          ▼          ▼          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       S3 (fold-archives)                        │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
+│  │archive1.tar.zst│ │archive2.tar.zst│ │archive3.tar.zst│  ...     │
+│  └──────────────┘ └──────────────┘ └──────────────┘            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Worker Lifecycle
+
+Each droplet follows this simple lifecycle:
+
+```
+1. STARTUP
+   - Droplet spawned with environment: INPUT_FILE=s3://fold-input/file1.txt
+   - Initialize local fold_state/ directory on local SSD
+
+2. DOWNLOAD
+   - Download assigned input file from S3 to local disk
+   - Place in local fold_state/input/
+
+3. PROCESS
+   - Run standard fold processing (unchanged from current)
+   - All intermediate state (queues, shards, etc.) on local disk
+   - No network calls during processing
+
+4. UPLOAD
+   - Compress result archive (tar.zst)
+   - Upload to S3: s3://fold-archives/{input_name}_{timestamp}.tar.zst
+
+5. SHUTDOWN
+   - Droplet terminates
+   - Local disk is discarded
+```
 
 ## Migration Strategy
 
-### Phase 1: Add Cloud Abstractions (No Breaking Changes)
+### Phase 1: Add S3 Input/Output Layer
 
-Create new storage abstraction layer alongside existing file operations:
+Minimal changes to existing code - just add S3 download/upload at boundaries:
 
-**New Modules**:
-- `src/storage/mod.rs` - Storage trait and factory
-- `src/storage/local.rs` - LocalStorage (wraps existing file_handler)
-- `src/storage/cloud.rs` - CloudStorage (S3 + PostgreSQL)
-- `src/storage/types.rs` - Common types (StorageConfig, JobInfo, etc.)
+**New Module**: `src/s3_io.rs`
 
-**Key Trait**:
 ```rust
-pub trait Storage {
-    // Job queue operations
-    fn claim_next_job(&mut self) -> Result<Option<JobInfo>, FoldError>;
-    fn update_heartbeat(&mut self, job_id: &str) -> Result<(), FoldError>;
-    fn complete_job(&mut self, job_id: &str) -> Result<(), FoldError>;
-    fn abandon_job(&mut self, job_id: &str) -> Result<(), FoldError>;
-    
-    // File operations
-    fn read_text_file(&self, path: &str) -> Result<String, FoldError>;
-    fn write_archive(&mut self, archive: &Archive) -> Result<String, FoldError>;
-    fn read_interner(&self, archive_id: &str) -> Result<Interner, FoldError>;
-    fn list_archives(&self) -> Result<Vec<ArchiveMetadata>, FoldError>;
-    
-    // Queue operations
-    fn create_queue(&self, name: &str) -> Result<Box<dyn Queue>, FoldError>;
-    fn create_tracker(&self, name: &str) -> Result<Box<dyn Tracker>, FoldError>;
+use aws_sdk_s3::Client;
+
+pub struct S3IO {
+    client: Client,
+    input_bucket: String,
+    archive_bucket: String,
 }
-```
 
-### Phase 2: Implement Cloud Storage Layer
-
-#### 2.1 S3 Integration (Digital Ocean Spaces)
-
-**Dependencies** (add to `Cargo.toml`):
-```toml
-aws-sdk-s3 = "1.0"  # Works with DO Spaces via endpoint override
-aws-config = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-```
-
-**Key Operations**:
-- Upload/download using streaming to handle large files
-- Multipart uploads for archives > 100MB
-- Presigned URLs for temporary access
-- Lifecycle rules for temp data cleanup (30 days)
-
-**Implementation** (`src/storage/cloud.rs`):
-```rust
-pub struct CloudStorage {
-    s3_client: aws_sdk_s3::Client,
-    db_pool: sqlx::PgPool,
-    bucket_input: String,
-    bucket_results: String,
-    bucket_temp: String,
-    job_id: Option<String>,
-}
-```
-
-#### 2.2 PostgreSQL Integration
-
-**Dependencies**:
-```toml
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
-uuid = { version = "1.0", features = ["v4"] }
-chrono = "0.4"
-```
-
-**Schema** (`migrations/001_initial.sql`):
-```sql
--- Jobs table: represents work items
-CREATE TABLE jobs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_type VARCHAR(20) NOT NULL, -- 'txt_file' or 'archive_merge'
-    status VARCHAR(20) NOT NULL,   -- 'pending', 'processing', 'completed', 'failed'
-    input_path VARCHAR(500) NOT NULL, -- S3 key for input
-    input_path_b VARCHAR(500),     -- For merges, second archive
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    heartbeat_at TIMESTAMPTZ,
-    worker_id VARCHAR(100),        -- Droplet ID
-    error_message TEXT,
-    retry_count INT NOT NULL DEFAULT 0
-);
-
-CREATE INDEX idx_jobs_status ON jobs(status);
-CREATE INDEX idx_jobs_heartbeat ON jobs(heartbeat_at) WHERE status = 'processing';
-
--- Job locks with distributed locking
-CREATE TABLE job_locks (
-    job_id UUID PRIMARY KEY REFERENCES jobs(id),
-    worker_id VARCHAR(100) NOT NULL,
-    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-);
-
--- Archives metadata
-CREATE TABLE archives (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    s3_key VARCHAR(500) NOT NULL UNIQUE,
-    ortho_count BIGINT NOT NULL,
-    lineage TEXT NOT NULL,
-    size_bytes BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE
-);
-
-CREATE INDEX idx_archives_ortho_count ON archives(ortho_count) WHERE NOT is_deleted;
-
--- Processing runs audit log
-CREATE TABLE processing_runs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID NOT NULL REFERENCES jobs(id),
-    worker_id VARCHAR(100) NOT NULL,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-    orthos_processed BIGINT,
-    result_archive_id UUID REFERENCES archives(id)
-);
-```
-
-#### 2.3 Distributed Locking Strategy
-
-**Heartbeat Protocol**:
-1. Worker claims job: `UPDATE jobs SET status='processing', worker_id=?, heartbeat_at=NOW() WHERE id=? AND status='pending'`
-2. Worker updates heartbeat every 60 seconds
-3. Stale job detection query (run by all workers on startup):
-   ```sql
-   UPDATE jobs SET status='pending', worker_id=NULL 
-   WHERE status='processing' 
-   AND heartbeat_at < NOW() - INTERVAL '5 minutes'
-   RETURNING id;
-   ```
-4. Job completion: `UPDATE jobs SET status='completed', completed_at=NOW()`
-
-**Advantages over File-Based**:
-- No shared filesystem required
-- Proper transaction isolation
-- Atomic updates via SQL transactions
-- Built-in timestamp precision
-- Database-level heartbeat monitoring
-
-### Phase 3: Adapt Core Components
-
-#### 3.1 DiskBackedQueue → CloudBackedQueue
-
-**Current**: Spills to local filesystem
-**Target**: Spills to S3 with local disk cache
-
-```rust
-pub struct CloudBackedQueue {
-    buffer: Vec<Ortho>,
-    buffer_size: usize,
-    s3_client: aws_sdk_s3::Client,
-    bucket: String,
-    job_id: String,
-    chunk_counter: usize,
-    local_cache_dir: PathBuf, // /tmp/fold_cache/
-}
-```
-
-**Strategy**:
-- Keep in-memory buffer (10K items)
-- Spill to local disk first (`/tmp/fold_cache/queue_{job_id}_{chunk}.bin`)
-- Background upload to S3 (`s3://{bucket}/{job_id}/queue/chunk_{chunk}.bin`)
-- Delete local file after successful upload
-- On pop: check memory → check local cache → download from S3 if needed
-
-**Benefits**:
-- Lower latency than pure S3 (local cache)
-- Survives network hiccups
-- Same memory characteristics as current design
-
-#### 3.2 SeenTracker → CloudBackedTracker
-
-**Current**: Sharded HashMap with local disk LRU
-**Target**: Sharded with S3 backing + PostgreSQL approximate counts
-
-```rust
-pub struct CloudBackedTracker {
-    bloom: Bloom<usize>,
-    loaded_shards: Vec<Shard>,
-    s3_client: aws_sdk_s3::Client,
-    bucket: String,
-    job_id: String,
-    num_shards: usize,
-    max_shards_in_memory: usize,
-}
-```
-
-**Strategy**:
-- Keep bloom filter in memory (critical path)
-- LRU shards in memory (32 shards)
-- Cold shards upload to S3 (`s3://{bucket}/{job_id}/shards/shard_{id}.bin`)
-- Use local temp directory as cache
-- PostgreSQL tracks approximate counts for sizing
-
-**Optimization**: For merge operations, previous shards can be discarded (fresh start with new interner version)
-
-#### 3.3 Archive Format Changes
-
-**Current**: Directory with multiple files
-```
-archive_name.bin/
-  ├── interner.bin
-  ├── results/
-  │   ├── queue_*.bin
-  ├── optimal.txt
-  ├── lineage.txt
-  ├── metadata.txt
-  └── heartbeat
-```
-
-**Target**: Single compressed archive file + metadata in DB
-```
-S3 Key: archives/{uuid}.tar.zst
-Contains:
-  ├── interner.bin
-  ├── results/queue_*.bin (files)
-  ├── optimal.txt
-  └── manifest.json (includes lineage, metadata)
-
-PostgreSQL Record:
-  - id: UUID
-  - s3_key: archives/{uuid}.tar.zst
-  - ortho_count: 12345
-  - lineage: "(file1 file2)"
-  - size_bytes: 1024000
-```
-
-**Benefits**:
-- Single S3 object = atomic upload/download
-- Compression reduces storage costs
-- Metadata in DB enables fast queries
-- No directory listing required
-
-### Phase 4: Configuration and Deployment
-
-#### 4.1 Environment Configuration
-
-```bash
-# Digital Ocean Spaces credentials
-DO_SPACES_REGION=nyc3
-DO_SPACES_ENDPOINT=https://nyc3.digitaloceanspaces.com
-DO_SPACES_ACCESS_KEY=xxx
-DO_SPACES_SECRET_KEY=xxx
-DO_SPACES_BUCKET_INPUT=fold-input
-DO_SPACES_BUCKET_RESULTS=fold-results
-DO_SPACES_BUCKET_TEMP=fold-temp
-
-# PostgreSQL connection
-DATABASE_URL=postgresql://fold_user:password@db-host:25060/fold?sslmode=require
-
-# Worker configuration
-WORKER_ID=droplet-${DROPLET_ID}
-STORAGE_BACKEND=cloud  # or 'local' for backwards compatibility
-LOCAL_CACHE_DIR=/tmp/fold_cache
-```
-
-#### 4.2 Droplet Setup Script
-
-```bash
-#!/bin/bash
-# deploy_droplet.sh
-
-# Install dependencies
-apt-get update
-apt-get install -y build-essential curl
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source $HOME/.cargo/env
-
-# Clone repository
-git clone https://github.com/michaelrauh/fold.git
-cd fold
-
-# Build release binary
-cargo build --release
-
-# Set environment variables from DO metadata service
-export WORKER_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-export DO_SPACES_ACCESS_KEY=$1
-export DO_SPACES_SECRET_KEY=$2
-export DATABASE_URL=$3
-export STORAGE_BACKEND=cloud
-
-# Run one job
-./target/release/fold --mode one-shot
-
-# Shutdown droplet (handled by DO API)
-shutdown -h now
-```
-
-#### 4.3 Job Submission Tool
-
-New utility: `fold-submit` for uploading work to cloud queue
-
-```rust
-// src/bin/fold_submit.rs
-// Upload text file to S3 and create job in PostgreSQL
-
-fn main() -> Result<(), FoldError> {
-    let args = parse_args();
-    let storage = CloudStorage::new_from_env()?;
+impl S3IO {
+    /// Download a file from S3 to local path
+    pub async fn download_input(&self, s3_key: &str, local_path: &Path) -> Result<(), FoldError> {
+        let resp = self.client.get_object()
+            .bucket(&self.input_bucket)
+            .key(s3_key)
+            .send()
+            .await?;
+        
+        let mut file = File::create(local_path)?;
+        let bytes = resp.body.collect().await?.into_bytes();
+        file.write_all(&bytes)?;
+        Ok(())
+    }
     
-    // Upload file to S3
-    let s3_key = storage.upload_file(&args.input_file).await?;
+    /// Upload archive to S3
+    pub async fn upload_archive(&self, local_path: &Path, s3_key: &str) -> Result<(), FoldError> {
+        let body = ByteStream::from_path(local_path).await?;
+        self.client.put_object()
+            .bucket(&self.archive_bucket)
+            .key(s3_key)
+            .body(body)
+            .send()
+            .await?;
+        Ok(())
+    }
     
-    // Create job in database
-    storage.create_job("txt_file", &s3_key, None).await?;
-    
-    println!("Job created: {}", s3_key);
-    Ok(())
-}
-```
-
-### Phase 5: Migration Path
-
-#### Option A: Big Bang Migration
-- Deploy all changes at once
-- Migrate existing local state to cloud
-- Shutdown local processing, start cloud processing
-
-**Pros**: Clean cut, simpler code
-**Cons**: Risky, requires downtime, all-or-nothing
-
-#### Option B: Gradual Migration (Recommended)
-- Keep both storage backends
-- Use feature flag to control which backend
-- Run hybrid mode: some workers local, some cloud
-- Gradually migrate data and workload
-
-**Pros**: Lower risk, allows testing, no downtime
-**Cons**: More complex code temporarily
-
-**Implementation**:
-```rust
-pub fn create_storage(config: &StorageConfig) -> Box<dyn Storage> {
-    match config.backend {
-        StorageBackend::Local => Box::new(LocalStorage::new(config)),
-        StorageBackend::Cloud => Box::new(CloudStorage::new(config)),
+    /// List available input files
+    pub async fn list_inputs(&self) -> Result<Vec<String>, FoldError> {
+        let resp = self.client.list_objects_v2()
+            .bucket(&self.input_bucket)
+            .send()
+            .await?;
+        
+        Ok(resp.contents()
+            .iter()
+            .filter_map(|obj| obj.key().map(String::from))
+            .collect())
     }
 }
 ```
 
-## Key Decisions and Tradeoffs
+**Dependencies** (add to `Cargo.toml`):
+```toml
+aws-sdk-s3 = "1.0"
+aws-config = "1.0"
+tokio = { version = "1.0", features = ["rt-multi-thread"] }
+zstd = "0.13"
+```
 
-### Decision 1: S3 vs Database for Queue Storage
+### Phase 2: Modify Main Entry Point
 
-**Choice**: S3 for queue data, PostgreSQL for metadata and coordination
+Add cloud mode to main.rs:
 
-**Rationale**:
-- S3: Better for large binary blobs (queue files, interners)
-- PostgreSQL: Better for transactional coordination and queries
-- Hybrid approach plays to each service's strengths
+```rust
+fn main() -> Result<(), FoldError> {
+    let args = parse_args();
+    
+    match args.mode {
+        Mode::Local => run_local(args)?,      // Existing behavior
+        Mode::CloudWorker => run_cloud_worker(args)?,  // New
+    }
+    
+    Ok(())
+}
 
-**Tradeoff**: More complex architecture, but better scalability
+fn run_cloud_worker(args: Args) -> Result<(), FoldError> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    
+    runtime.block_on(async {
+        let s3 = S3IO::from_env()?;
+        
+        // 1. Download assigned input
+        let input_file = std::env::var("INPUT_FILE")?;
+        let local_input = PathBuf::from("./fold_state/input/").join(&input_file);
+        s3.download_input(&input_file, &local_input).await?;
+        
+        // 2. Process using existing local logic (synchronous)
+        // This uses all existing DiskBackedQueue, SeenTracker, etc.
+        let config = StateConfig::default();
+        file_handler::initialize_with_config(&config)?;
+        
+        // Process the single file
+        process_single_file(&local_input, &config)?;
+        
+        // 3. Find and upload result archive
+        let archives = find_archives(&config)?;
+        for archive in archives {
+            let compressed = compress_archive(&archive)?;
+            let s3_key = format!("{}_{}.tar.zst", 
+                input_file.trim_end_matches(".txt"),
+                chrono::Utc::now().timestamp());
+            s3.upload_archive(&compressed, &s3_key).await?;
+        }
+        
+        Ok(())
+    })
+}
+```
 
-### Decision 2: Compression Format
+### Phase 3: Archive Compression
 
-**Choice**: Zstandard (.zst) compression for archives
+Add compression for efficient S3 storage:
 
-**Rationale**:
-- 40-60% smaller than uncompressed
-- Fast decompression (critical for processing)
-- Good compression ratio vs speed balance
-- Better than gzip for binary data
+```rust
+fn compress_archive(archive_dir: &Path) -> Result<PathBuf, FoldError> {
+    let output_path = archive_dir.with_extension("tar.zst");
+    
+    // Create tar archive
+    let tar_file = File::create(&output_path)?;
+    let zstd_encoder = zstd::Encoder::new(tar_file, 3)?;
+    let mut tar = tar::Builder::new(zstd_encoder);
+    
+    tar.append_dir_all(".", archive_dir)?;
+    
+    let zstd_encoder = tar.into_inner()?;
+    zstd_encoder.finish()?;
+    
+    Ok(output_path)
+}
 
-**Tradeoff**: Adds CPU overhead, but saves 40-60% on storage and transfer
+fn decompress_archive(archive_path: &Path, output_dir: &Path) -> Result<(), FoldError> {
+    let file = File::open(archive_path)?;
+    let zstd_decoder = zstd::Decoder::new(file)?;
+    let mut tar = tar::Archive::new(zstd_decoder);
+    
+    tar.unpack(output_dir)?;
+    Ok(())
+}
+```
 
-### Decision 3: Heartbeat Frequency
+### Phase 4: Deployment Scripts
 
-**Choice**: 60-second heartbeat, 5-minute grace period
+**Droplet Setup Script** (`deploy/worker.sh`):
 
-**Rationale**:
-- More frequent than local (was 100K orthos = variable time)
-- Shorter grace period enabled by reliable network
-- Faster failure detection
-- Lower chance of duplicate work
+```bash
+#!/bin/bash
+set -e
 
-**Tradeoff**: More database writes, but negligible with connection pooling
+INPUT_FILE="$1"
+DO_SPACES_ACCESS_KEY="$2"
+DO_SPACES_SECRET_KEY="$3"
 
-### Decision 4: Local Cache Strategy
+# Install Rust (if not using pre-built image)
+if ! command -v cargo &> /dev/null; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source $HOME/.cargo/env
+fi
 
-**Choice**: Mandatory local disk cache at `/tmp/fold_cache`
+# Clone and build
+git clone https://github.com/michaelrauh/fold.git
+cd fold
+cargo build --release
 
-**Rationale**:
-- Reduces S3 API calls (cost)
-- Improves latency for hot data
-- Survives temporary network issues
-- Droplets have fast local SSD
+# Set environment
+export DO_SPACES_REGION=nyc3
+export DO_SPACES_ENDPOINT=https://nyc3.digitaloceanspaces.com
+export DO_SPACES_ACCESS_KEY="$DO_SPACES_ACCESS_KEY"
+export DO_SPACES_SECRET_KEY="$DO_SPACES_SECRET_KEY"
+export INPUT_FILE="$INPUT_FILE"
 
-**Tradeoff**: Requires disk space, but droplets have ample /tmp space
+# Run in cloud worker mode
+./target/release/fold --mode cloud-worker
 
-### Decision 5: Archive Format
+# Shutdown
+shutdown -h now
+```
 
-**Choice**: Single compressed tar archive per result
+**Orchestrator Script** (`deploy/spawn_workers.sh`):
 
-**Rationale**:
-- Atomic upload/download
-- No directory listing overhead
-- Simpler S3 lifecycle management
-- Better compression ratio
+```bash
+#!/bin/bash
+# Spawns droplets for each input file in S3
 
-**Tradeoff**: Must compress/decompress entire archive (but fast with zstd)
+# List input files
+INPUT_FILES=$(aws s3 ls s3://fold-input/ --endpoint-url https://nyc3.digitaloceanspaces.com | awk '{print $4}')
+
+for file in $INPUT_FILES; do
+    echo "Spawning worker for: $file"
+    
+    # Create droplet via DO API
+    doctl compute droplet create "fold-worker-$(date +%s)" \
+        --image ubuntu-22-04-x64 \
+        --size s-1vcpu-1gb \
+        --region nyc3 \
+        --user-data "#!/bin/bash
+curl -s https://raw.githubusercontent.com/michaelrauh/fold/main/deploy/worker.sh | bash -s '$file' '$DO_SPACES_ACCESS_KEY' '$DO_SPACES_SECRET_KEY'" \
+        --wait
+done
+```
+
+## Handling Duplicate Work
+
+Since workers don't coordinate, the same input might be processed multiple times. This is handled at the merge phase:
+
+### Merge Strategy
+
+```rust
+// Archives from the same input file can be identified by name prefix
+// e.g., file1_1699900000.tar.zst, file1_1699900001.tar.zst
+
+fn merge_duplicate_archives(archives: Vec<Archive>) -> Archive {
+    // Group by input file
+    let grouped = group_by_input_file(archives);
+    
+    // For each group, keep the one with highest ortho count
+    // (or merge if they have different results)
+    grouped.into_iter()
+        .map(|(input, archives)| {
+            archives.into_iter()
+                .max_by_key(|a| a.ortho_count)
+                .unwrap()
+        })
+        .collect()
+}
+```
+
+### Eventual Consistency
+
+- Multiple workers may process the same file
+- All results are valid (deterministic processing)
+- Merge phase picks the best or combines results
+- **Duplicate work cost < coordination overhead**
+
+## Local Disk Usage
+
+### All Intermediate State is Local
+
+```
+/fold_state/                    # Local SSD on droplet
+├── input/                      # Downloaded from S3
+│   └── assigned_file.txt
+├── in_process/                 # Standard processing
+│   └── assigned_file.txt.work/
+│       ├── source.txt
+│       ├── heartbeat          # Local heartbeat (not for coordination)
+│       ├── queue/             # DiskBackedQueue spill
+│       └── seen_shards/       # SeenTracker shards
+└── results_*/                  # Final results before upload
+```
+
+### Why Local Disk?
+
+1. **Performance**: Local SSD is 100x faster than S3 for random access
+2. **Cost**: No S3 API charges for intermediate operations
+3. **Simplicity**: Existing DiskBackedQueue and SeenTracker work unchanged
+4. **Reliability**: No network failures during processing
+
+### Droplet Sizing
+
+- **Minimum**: 1GB RAM, 25GB SSD ($6/month or $0.009/hour)
+- **Recommended**: 2GB RAM, 50GB SSD ($12/month or $0.018/hour)
+- **Large jobs**: 4GB RAM, 80GB SSD ($24/month or $0.036/hour)
+
+Local SSD is ephemeral (lost on shutdown) which is perfect for this model.
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# S3 Configuration (required)
+DO_SPACES_REGION=nyc3
+DO_SPACES_ENDPOINT=https://nyc3.digitaloceanspaces.com
+DO_SPACES_ACCESS_KEY=xxx
+DO_SPACES_SECRET_KEY=xxx
+DO_SPACES_INPUT_BUCKET=fold-input
+DO_SPACES_ARCHIVE_BUCKET=fold-archives
+
+# Worker Configuration
+INPUT_FILE=file1.txt           # Assigned input file
+LOCAL_STATE_DIR=/fold_state    # Local processing directory
+```
+
+### Command-Line Arguments
+
+```bash
+./fold --mode local           # Default: existing behavior
+./fold --mode cloud-worker    # Cloud: download → process → upload
+```
 
 ## Change Points Summary
 
-### Files Requiring Major Changes
+### Files Requiring Changes
 
-1. **`src/file_handler.rs`** → **`src/storage/local.rs`**
-   - Extract existing logic into LocalStorage trait implementation
-   - Keep file-based operations for backward compatibility
+1. **`src/main.rs`**
+   - Add `--mode` argument parsing
+   - Add `run_cloud_worker()` function
+   - Keep existing `run_local()` as default
 
-2. **`src/main.rs`**
-   - Add storage factory at startup
-   - Replace direct file_handler calls with storage trait calls
-   - Add `--mode one-shot` flag for droplet workers
-
-3. **`src/disk_backed_queue.rs`** → **`src/storage/cloud_queue.rs`**
-   - Add S3 upload/download logic
-   - Implement local cache layer
-   - Keep same API surface
-
-4. **`src/seen_tracker.rs`** → **`src/storage/cloud_tracker.rs`**
-   - Add S3 shard persistence
-   - Keep bloom filter in memory (critical path)
-
-5. **`Cargo.toml`**
-   - Add aws-sdk-s3, sqlx, tokio, zstd
-   - Make async runtime available
+2. **`Cargo.toml`**
+   - Add `aws-sdk-s3`, `aws-config`, `tokio`, `zstd`, `tar`
+   - Feature flag for cloud support (optional)
 
 ### New Files
 
-1. **`src/storage/mod.rs`** - Storage trait and factory
-2. **`src/storage/local.rs`** - LocalStorage implementation
-3. **`src/storage/cloud.rs`** - CloudStorage implementation
-4. **`src/storage/types.rs`** - Common types and helpers
-5. **`src/storage/cloud_queue.rs`** - CloudBackedQueue
-6. **`src/storage/cloud_tracker.rs`** - CloudBackedTracker
-7. **`src/bin/fold_submit.rs`** - Job submission CLI tool
-8. **`migrations/*.sql`** - Database schema migrations
-9. **`deploy/droplet_setup.sh`** - Droplet initialization script
-10. **`deploy/spawn_worker.sh`** - Spawn droplet for job
+1. **`src/s3_io.rs`** - S3 download/upload operations
+2. **`src/compression.rs`** - Archive compression/decompression
+3. **`deploy/worker.sh`** - Droplet worker script
+4. **`deploy/spawn_workers.sh`** - Orchestrator script
 
-### Configuration Changes
+### Unchanged Files
 
-1. **Environment Variables**
-   - Add DO Spaces credentials
-   - Add PostgreSQL connection string
-   - Add storage backend selector
+- `src/file_handler.rs` - No changes needed
+- `src/disk_backed_queue.rs` - No changes needed
+- `src/seen_tracker.rs` - No changes needed
+- `src/interner.rs` - No changes needed
+- `src/ortho.rs` - No changes needed
 
-2. **Command-Line Flags**
-   - `--storage-backend <local|cloud>` - Select storage
-   - `--mode <continuous|one-shot>` - Worker mode
-   - `--job-id <uuid>` - Process specific job (cloud mode)
+## Cost Estimation
 
-## Testing Strategy
-
-### Unit Tests
-- Mock Storage trait for existing tests
-- Test LocalStorage against temp directories
-- Test CloudStorage with LocalStack (S3 emulator) + test PostgreSQL
-
-### Integration Tests
-- End-to-end test with local backend (existing tests)
-- End-to-end test with cloud backend + mocks
-- Test job claiming race conditions
-- Test heartbeat timeout scenarios
-- Test archive upload/download integrity
-
-### Load Tests
-- Spawn 10 droplets concurrently
-- Process 100 text files simultaneously
-- Verify no duplicate work
-- Measure latency vs local filesystem
-
-## Performance Considerations
-
-### Expected Latencies
-
-| Operation | Local | Cloud (no cache) | Cloud (cached) |
-|-----------|-------|------------------|----------------|
-| Read text file | 1-5ms | 50-100ms | 5-10ms |
-| Write archive | 10-50ms | 200-500ms | 50-100ms + async upload |
-| Queue spill | 5-20ms | 100-200ms | 10-30ms + async upload |
-| Heartbeat update | N/A | 10-20ms | 10-20ms |
-| Job claim | N/A | 20-50ms | 20-50ms |
-
-### Optimization Strategies
-
-1. **Aggressive Local Caching**
-   - Cache all S3 reads in `/tmp` for session duration
-   - Only upload to S3, never delete until cleanup
-
-2. **Async Uploads**
-   - Upload to S3 in background while continuing processing
-   - Only block on critical path (job completion)
-
-3. **Connection Pooling**
-   - Reuse PostgreSQL connections
-   - Keep S3 client alive across operations
-
-4. **Batch Operations**
-   - Batch multiple heartbeat updates if processing is fast
-   - Upload multiple queue chunks in parallel
-
-## Cost Estimation (Digital Ocean)
-
-### Monthly Costs (example workload)
+### Monthly Costs (1000 jobs/month)
 
 **Assumptions**:
 - 1000 jobs/month
 - Average 100MB input per job
 - Average 500MB output per job
-- 10 concurrent workers peak
 - Each job takes 2 hours average
 
 **Spaces (S3 Storage)**:
 - Storage: 500GB × $0.02/GB = $10/month
 - Transfer: 600GB out × $0.01/GB = $6/month
-- API calls: ~100K operations = negligible
 - **Spaces Total**: ~$16/month
 
-**Managed PostgreSQL**:
-- Basic tier (1GB RAM, 10GB storage) = $15/month
-- No backup tier sufficient for this use case
-- **Database Total**: $15/month
-
 **Droplets (Compute)**:
-- $0.007/hour (1GB RAM, 1 vCPU)
-- 1000 jobs × 2 hours × $0.007 = $14/month
-- With parallelism: ~$14-50/month depending on concurrency
-- **Compute Total**: ~$15-50/month
+- $0.009/hour (1GB RAM droplet)
+- 1000 jobs × 2 hours × $0.009 = $18/month
+- **Compute Total**: ~$18/month
 
-**Total Estimated Cost**: $46-81/month
+**Total Estimated Cost**: ~$34/month
 
-**Comparison to Single Server**:
-- Single droplet (8GB RAM, 4 vCPU) = $48/month
-- Cloud approach scales up/down automatically
-- No idle costs when no work to process
+**Comparison to Coordinated Approach**:
+- No PostgreSQL: saves $15/month
+- Simpler architecture: lower maintenance cost
+- Some duplicate work: adds ~10-20% compute cost
 
-## Rollback Plan
+## Testing Strategy
 
-If migration fails or issues arise:
+### Unit Tests
+- Test S3IO with mocked S3 client
+- Test compression round-trip
+- Test archive listing/filtering
 
-1. **Immediate Rollback**:
-   - Set `STORAGE_BACKEND=local` for all workers
-   - Stop all cloud workers
-   - Restart local workers
+### Integration Tests
+- End-to-end cloud worker test (LocalStack for S3)
+- Test with various input sizes
+- Test failure scenarios (S3 unavailable, etc.)
 
-2. **Data Recovery**:
-   - Download all S3 data back to local filesystem
-   - Reconstruct `fold_state/` directory structure
-   - Run local workers to complete jobs
-
-3. **Database Cleanup**:
-   - Mark all cloud jobs as 'failed'
-   - Export job metadata for debugging
-   - Optionally drop cloud tables
-
-## Timeline Estimate
-
-- **Phase 1** (Abstractions): 1-2 weeks
-- **Phase 2** (Cloud Storage): 2-3 weeks
-- **Phase 3** (Core Components): 2-3 weeks
-- **Phase 4** (Deployment): 1 week
-- **Phase 5** (Testing & Migration): 2-3 weeks
-
-**Total Estimated Time**: 8-12 weeks
+### Acceptance Tests
+- Deploy test droplet with sample input
+- Verify archive uploaded correctly
+- Download and verify archive contents
 
 ## Success Criteria
 
 1. **Functional**:
-   - ✓ Multiple droplets process jobs concurrently without coordination
-   - ✓ No duplicate work processed
-   - ✓ Archives correctly uploaded and downloadable
-   - ✓ Heartbeat system detects and recovers failed jobs
+   - ✓ Worker downloads assigned input from S3
+   - ✓ Processing uses local disk only (no network during processing)
+   - ✓ Archive uploaded to S3 on completion
+   - ✓ Droplet shuts down after completion
 
 2. **Performance**:
-   - ✓ Throughput >= 90% of local filesystem approach
-   - ✓ End-to-end latency < 2x local filesystem approach
-   - ✓ Memory usage same as current (no regression)
+   - ✓ No latency penalty vs local processing (network only at boundaries)
+   - ✓ Local disk performance same as current
 
-3. **Reliability**:
-   - ✓ Zero data loss during normal operations
-   - ✓ Graceful handling of network failures
-   - ✓ Automatic recovery from worker crashes
-   - ✓ Database transactions prevent race conditions
+3. **Simplicity**:
+   - ✓ No database to manage
+   - ✓ No distributed locking
+   - ✓ No heartbeat coordination
+   - ✓ Workers are completely stateless
 
 4. **Cost**:
-   - ✓ Total monthly cost < single large server for same workload
-   - ✓ Cost scales linearly with work volume
-   - ✓ Zero cost when idle
+   - ✓ Lower than coordinated approach
+   - ✓ Pay only for active processing
 
-## Appendix: Alternative Approaches Considered
+## Timeline Estimate
 
-### A1: Pure S3 (No PostgreSQL)
+- **Phase 1** (S3 I/O): 3-5 days
+- **Phase 2** (Main entry point): 2-3 days
+- **Phase 3** (Compression): 1-2 days
+- **Phase 4** (Deployment): 2-3 days
 
-**Approach**: Use S3 object metadata for coordination
+**Total Estimated Time**: 2-3 weeks
 
-**Rejected Because**:
-- S3 lacks transaction support
-- No atomic compare-and-swap
-- Race conditions inevitable with multiple writers
-- Heartbeat monitoring difficult
-
-### A2: Redis for Coordination
-
-**Approach**: Use Redis instead of PostgreSQL for job queue
-
-**Rejected Because**:
-- Digital Ocean doesn't offer managed Redis
-- Self-managed Redis adds operational complexity
-- PostgreSQL sufficient for this workload
-- Database provides better audit trail
-
-### A3: Kubernetes StatefulSet
-
-**Approach**: Use K8s with persistent volumes
-
-**Rejected Because**:
-- Overkill for simple one-shot jobs
-- Persistent volumes defeat purpose (still tied to location)
-- Added complexity of K8s management
-- Higher costs than simple droplets
-
-### A4: Message Queue (RabbitMQ/SQS)
-
-**Approach**: Use message queue for work distribution
-
-**Rejected Because**:
-- Digital Ocean doesn't offer managed queues
-- PostgreSQL sufficient for this workload
-- Message queue doesn't provide metadata storage
-- Still need database for archives table
-
-## Appendix: Security Considerations
+## Security Considerations
 
 ### Credentials Management
 
-1. **Digital Ocean Spaces**:
-   - Use API keys with minimum necessary permissions
-   - Rotate keys every 90 days
-   - Separate keys per environment (dev/prod)
+1. **S3 Access Keys**:
+   - Use minimum permissions (read input, write archives)
+   - Inject via environment variables only
+   - Never commit to repository
 
-2. **PostgreSQL**:
-   - Use SSL/TLS for all connections
-   - Separate user per worker type
-   - Restrict IP access to droplet VPC
+2. **Droplet Security**:
+   - Use private VPC if available
+   - Firewall: block all inbound traffic
+   - Auto-terminate after timeout
 
-3. **Droplet Access**:
-   - Inject credentials via environment variables only
-   - Never commit credentials to repository
-   - Use DO metadata service for worker identification
+### Data Protection
 
-### Data Encryption
-
-1. **At Rest**:
-   - DO Spaces: Encryption by default
-   - PostgreSQL: Encryption at rest enabled
-   - Local cache: Encrypted filesystem for /tmp
-
-2. **In Transit**:
-   - HTTPS for all S3 operations
-   - SSL/TLS for all PostgreSQL connections
-   - No unencrypted data transfer
-
-### Access Control
-
-1. **Least Privilege**:
-   - Each worker can only access its own job data
-   - Shared archives in results bucket readable by all
-   - Temp bucket has 30-day auto-cleanup
-
-2. **Audit Logging**:
-   - All job state changes logged to `processing_runs` table
-   - S3 access logs enabled
-   - PostgreSQL query logs for debugging
+1. **At Rest**: S3 encryption by default
+2. **In Transit**: HTTPS for all S3 operations
+3. **Local Disk**: Ephemeral (lost on shutdown)
 
 ## Conclusion
 
-This migration plan provides a comprehensive path to convert Fold from a single-machine file-based system to a distributed cloud-based system running on Digital Ocean infrastructure. The approach maintains backward compatibility through a storage abstraction layer, minimizes risk through gradual migration, and enables true horizontal scaling through stateless droplet workers.
+This simplified migration plan eliminates coordination complexity by embracing independent worker processing. Each droplet operates in isolation, downloading its assigned input, processing entirely on local disk, and uploading results. No databases, no locks, no heartbeats.
 
-The key insight is that the existing architecture already uses disk-backed data structures for memory management, making the transition to cloud storage a natural extension. By replacing local disk with S3 and file-based mutual exclusion with PostgreSQL transactions, we achieve the same correctness guarantees with better scalability.
+The key insight is that **duplicate work is acceptable** in exchange for simpler architecture. When processing is deterministic, running the same job twice produces identical results - one can simply be discarded at merge time.
+
+This approach:
+- **Reduces operational complexity** (no database to manage)
+- **Lowers cost** (no managed database fees)
+- **Improves reliability** (no coordination failures)
+- **Simplifies debugging** (each worker is independent)
+- **Preserves existing code** (minimal changes to core processing)
