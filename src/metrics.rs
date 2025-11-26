@@ -44,6 +44,7 @@ pub struct GlobalMetrics {
     pub max_shards_in_memory: usize,
     pub queue_depth_pk: usize,
     pub seen_size_pk: usize,
+    pub distinct_jobs_count: usize,
 }
 
 impl Default for GlobalMetrics {
@@ -69,6 +70,7 @@ impl Default for GlobalMetrics {
             max_shards_in_memory: 0,
             queue_depth_pk: 0,
             seen_size_pk: 0,
+            distinct_jobs_count: 0,
         }
     }
 }

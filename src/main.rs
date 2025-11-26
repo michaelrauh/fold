@@ -63,6 +63,10 @@ fn main() -> Result<(), FoldError> {
             opt.vocab = interner.vocabulary().to_vec();
             opt.last_update_time = now;
         });
+        metrics.update_global(|g| {
+            g.vocab_size = interner.vocabulary().len();
+            g.interner_version = interner.version();
+        });
         metrics.add_log(format!("Restored optimal ortho from archive: volume={}", volume));
     }
     
@@ -72,6 +76,10 @@ fn main() -> Result<(), FoldError> {
     loop {
         // Check for stale heartbeats and recover abandoned work from crashed processes
         file_handler::check_and_recover_stale_work(&config)?;
+        
+        // Update the count of distinct running jobs
+        let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
+        metrics.update_global(|g| g.distinct_jobs_count = jobs_count);
         
         // Check for existing archives
         let archive_pair = file_handler::get_smallest_and_largest_archives_with_config(&config)?;
@@ -190,11 +198,15 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
                 op.progress_current = processed_count;
             });
             
-            // Update RAM usage
+            // Update RAM usage and jobs count
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let used_mb = sys.used_memory() / 1_048_576;
-            metrics.update_global(|g| g.ram_mb = used_mb as usize);
+            let jobs_count = file_handler::count_running_jobs_with_config(config).unwrap_or(0);
+            metrics.update_global(|g| {
+                g.ram_mb = used_mb as usize;
+                g.distinct_jobs_count = jobs_count;
+            });
         }
         
         if processed_count % 50000 == 0 {
@@ -395,14 +407,12 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     metrics.set_operation_status(format!("Processing Larger Archive {}", larger_name));
     metrics.update_operation(|op| {
         op.progress_current = 0;
+        op.progress_total = 0;
     });
     
     let mut results_larger = DiskBackedQueue::new_from_path(larger_path, memory_config.queue_buffer_size)?;
-    let total_larger_count = results_larger.len();
     let mut total_from_larger = 0;
     let mut impacted_from_larger = 0;
-    
-    metrics.update_operation(|op| op.progress_total = total_larger_count);
     
     while let Some(ortho) = results_larger.pop()? {
         // Larger archive orthos don't need remapping - their vocabulary is already the base
@@ -439,14 +449,12 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     metrics.set_operation_status(format!("Remapping Smaller Archive {}", smaller_name));
     metrics.update_operation(|op| {
         op.progress_current = 0;
+        op.progress_total = 0;
     });
     
     let mut results_smaller = DiskBackedQueue::new_from_path(smaller_path, memory_config.queue_buffer_size)?;
-    let total_smaller_count = results_smaller.len();
     let mut total_from_smaller = 0;
     let mut impacted_from_smaller = 0;
-    
-    metrics.update_operation(|op| op.progress_total = total_smaller_count);
     
     while let Some(ortho) = results_smaller.pop()? {
         // Smaller archive orthos need remapping to merged vocabulary
@@ -514,11 +522,15 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 op.progress_total = processed_count + queue_depth;
             });
             
-            // Update RAM usage
+            // Update RAM usage and jobs count
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let used_mb = sys.used_memory() / 1_048_576;
-            metrics.update_global(|g| g.ram_mb = used_mb as usize);
+            let jobs_count = file_handler::count_running_jobs_with_config(config).unwrap_or(0);
+            metrics.update_global(|g| {
+                g.ram_mb = used_mb as usize;
+                g.distinct_jobs_count = jobs_count;
+            });
         }
         
         if processed_count % 50000 == 0 {

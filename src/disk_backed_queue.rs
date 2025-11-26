@@ -41,7 +41,6 @@ impl DiskBackedQueue {
         
         // Find existing disk files
         let mut disk_files = Vec::new();
-        let mut disk_count = 0;
         let mut max_counter = 0;
         
         if disk_path.is_dir() {
@@ -50,20 +49,6 @@ impl DiskBackedQueue {
                 let path = entry.path();
                 
                 if path.is_file() && path.extension().map_or(false, |ext| ext == "bin") {
-                    // Count items in this file
-                    let file = File::open(&path).map_err(FoldError::Io)?;
-                    let mut reader = BufReader::new(file);
-                    let config = bincode::config::standard();
-                    
-                    let mut count = 0;
-                    loop {
-                        match bincode::decode_from_std_read::<Ortho, _, _>(&mut reader, config) {
-                            Ok(_) => count += 1,
-                            Err(_) => break,
-                        }
-                    }
-                    
-                    disk_count += count;
                     disk_files.push(path.clone());
                     
                     // Extract counter from filename
@@ -89,7 +74,7 @@ impl DiskBackedQueue {
             disk_path,
             disk_file_counter: max_counter + 1,
             disk_files,
-            disk_count,
+            disk_count: 0,
         })
     }
     

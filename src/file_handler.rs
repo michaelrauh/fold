@@ -616,8 +616,6 @@ impl TxtIngestion {
 pub struct ArchiveIngestion {
     work_a_path: String,
     work_b_path: String,
-    original_a_path: String,
-    original_b_path: String,
     merge_work_folder: String,
     heartbeat_path: String,
     pub text_preview_a: String,
@@ -698,7 +696,8 @@ impl ArchiveIngestion {
         if Path::new(&self.merge_work_folder).exists() {
             fs::remove_dir_all(&self.merge_work_folder).map_err(FoldError::Io)?;
         }
-        cleanup_archives(&[&self.original_a_path, &self.original_b_path])
+        // Clean up the work paths (archives in in_process), not the original paths
+        cleanup_archives(&[&self.work_a_path, &self.work_b_path])
     }
 }
 
@@ -710,6 +709,40 @@ pub fn count_txt_files_remaining() -> Result<usize, FoldError> {
 /// Count remaining text files in input with custom config
 pub fn count_txt_files_remaining_with_config(config: &StateConfig) -> Result<usize, FoldError> {
     count_txt_files(config.input_dir().to_str().unwrap())
+}
+
+/// Count distinct running jobs in the in_process folder
+pub fn count_running_jobs_with_config(config: &StateConfig) -> Result<usize, FoldError> {
+    let in_process_path = config.in_process_dir();
+    
+    if !in_process_path.exists() {
+        return Ok(0);
+    }
+    
+    let mut job_count = 0;
+    
+    for entry in fs::read_dir(&in_process_path).map_err(|e| FoldError::Io(e))? {
+        let entry = entry.map_err(|e| FoldError::Io(e))?;
+        let entry_path = entry.path();
+        
+        if entry_path.is_dir() {
+            let heartbeat_path = entry_path.join("heartbeat");
+            
+            if heartbeat_path.exists() {
+                if let Some(folder_name) = entry_path.file_name() {
+                    let folder_name_str = folder_name.to_str().unwrap_or("");
+                    
+                    // Count txt.work and merge.work folders (these are distinct jobs)
+                    if folder_name_str.ends_with(".txt.work") || 
+                       (folder_name_str.starts_with("merge_") && folder_name_str.ends_with(".work")) {
+                        job_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(job_count)
 }
 
 /// Find the next text file to process (uses default config)
@@ -883,8 +916,6 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
     Ok(ArchiveIngestion {
         work_a_path,
         work_b_path,
-        original_a_path: archive_a_path.to_string(),
-        original_b_path: archive_b_path.to_string(),
         merge_work_folder: merge_work_folder.to_string_lossy().to_string(),
         heartbeat_path: heartbeat_path.to_string_lossy().to_string(),
         text_preview_a,
@@ -1058,5 +1089,53 @@ mod tests {
         // Test cleanup with non-existent archive (should not error)
         let non_existent = temp_dir.path().join("non_existent.bin");
         cleanup_archives(&[non_existent.to_str().unwrap()]).unwrap();
+    }
+    
+    #[test]
+    fn test_count_running_jobs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        
+        // Initialize directories
+        initialize_with_config(&config).unwrap();
+        
+        // Initially, no jobs running
+        let count = count_running_jobs_with_config(&config).unwrap();
+        assert_eq!(count, 0);
+        
+        // Create a txt.work folder with heartbeat
+        let txt_work = config.in_process_dir().join("test.txt.work");
+        fs::create_dir_all(&txt_work).unwrap();
+        create_heartbeat(txt_work.to_str().unwrap()).unwrap();
+        
+        // Should count 1 job
+        let count = count_running_jobs_with_config(&config).unwrap();
+        assert_eq!(count, 1);
+        
+        // Create a merge.work folder with heartbeat
+        let merge_work = config.in_process_dir().join("merge_12345.work");
+        fs::create_dir_all(&merge_work).unwrap();
+        create_heartbeat(merge_work.to_str().unwrap()).unwrap();
+        
+        // Should count 2 jobs
+        let count = count_running_jobs_with_config(&config).unwrap();
+        assert_eq!(count, 2);
+        
+        // Create an archive .bin folder with heartbeat (should NOT be counted as a job)
+        let archive_bin = config.in_process_dir().join("archive_test.bin");
+        fs::create_dir_all(&archive_bin).unwrap();
+        create_heartbeat(archive_bin.to_str().unwrap()).unwrap();
+        
+        // Should still count 2 jobs (archive folders don't count)
+        let count = count_running_jobs_with_config(&config).unwrap();
+        assert_eq!(count, 2);
+        
+        // Create a folder without a heartbeat
+        let no_heartbeat = config.in_process_dir().join("test2.txt.work");
+        fs::create_dir_all(&no_heartbeat).unwrap();
+        
+        // Should still count 2 jobs (no heartbeat means not active)
+        let count = count_running_jobs_with_config(&config).unwrap();
+        assert_eq!(count, 2);
     }
 }

@@ -135,10 +135,11 @@ impl Tui {
             snapshot.global.interner_version,
             format_number(snapshot.global.vocab_size)
         );
-        let line3 = format!("Chunks: {} │ Processed: {} │ Remaining: {}",
+        let line3 = format!("Chunks: {} │ Processed: {} │ Remaining: {} │ Jobs: {}",
             snapshot.global.total_chunks,
             snapshot.global.processed_chunks,
-            snapshot.global.remaining_chunks
+            snapshot.global.remaining_chunks,
+            snapshot.global.distinct_jobs_count
         );
         let line4 = format!("QBuf: {} │ Bloom: {} │ Shards: {}/{} in mem",
             format_number(snapshot.global.queue_buffer_size),
