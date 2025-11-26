@@ -490,3 +490,277 @@ fn test_shell_violation_detection() {
         println!("Detected shell violation: positions {} and {} both have value {}", pos1, pos2, val);
     }
 }
+
+// ============================================================================
+// WHITESPACE AND PUNCTUATION INVESTIGATION
+// ============================================================================
+// 
+// The TUI displayed tokens that appeared to be duplicates in the same shell,
+// but they might actually be different tokens that LOOK the same due to:
+// 1. Unicode whitespace characters that appear invisible
+// 2. Non-printable characters surviving the filter
+// 3. Unicode homoglyphs (different code points that look identical)
+// 4. Trailing/leading whitespace in vocabulary
+// ============================================================================
+
+/// Test that Unicode non-breaking space creates a different token than regular space
+#[test]
+fn test_unicode_nbsp_creates_different_tokens() {
+    // Non-breaking space (U+00A0) vs regular space (U+0020)
+    let text_with_nbsp = "hello\u{00A0}world"; // hello[NBSP]world - appears as one word
+    let text_with_space = "hello world"; // hello world - two words
+    
+    let interner_nbsp = Interner::from_text(text_with_nbsp);
+    let interner_space = Interner::from_text(text_with_space);
+    
+    println!("Text with NBSP: '{}'", text_with_nbsp);
+    println!("Text with space: '{}'", text_with_space);
+    println!("NBSP vocab: {:?}", interner_nbsp.vocabulary());
+    println!("Space vocab: {:?}", interner_space.vocabulary());
+    
+    // The NBSP might be treated differently
+    // If it's treated as whitespace: we get ["hello", "world"]
+    // If it's not: we might get ["hello\u{00A0}world"] as a single token
+}
+
+/// Test that various Unicode whitespace characters are handled correctly
+#[test]
+fn test_unicode_whitespace_handling() {
+    use fold::splitter::Splitter;
+    
+    let splitter = Splitter::new();
+    
+    // Various Unicode whitespace characters
+    let test_cases = vec![
+        ("regular space", "hello world"),
+        ("tab", "hello\tworld"),
+        ("non-breaking space", "hello\u{00A0}world"),
+        ("en space", "hello\u{2002}world"),
+        ("em space", "hello\u{2003}world"),
+        ("thin space", "hello\u{2009}world"),
+        ("zero-width space", "hello\u{200B}world"),
+        ("zero-width joiner", "hello\u{200D}world"),
+        ("ideographic space", "hello\u{3000}world"),
+    ];
+    
+    println!("\nUnicode whitespace handling:");
+    for (name, text) in &test_cases {
+        let vocab = splitter.vocabulary(text);
+        let word_count = vocab.len();
+        println!("  {} ({} chars): {} words -> {:?}", 
+                 name, text.len(), word_count, vocab);
+        
+        // Check if any word contains invisible characters
+        for word in &vocab {
+            let printable_len = word.chars().filter(|c| !c.is_whitespace() && c.is_alphabetic()).count();
+            if printable_len != word.len() {
+                println!("    WARNING: Word '{}' has {} chars but only {} are printable alphabetic", 
+                         word, word.len(), printable_len);
+            }
+        }
+    }
+}
+
+/// Test that homoglyphs (visually identical but different codepoints) create different tokens
+#[test]
+fn test_homoglyph_tokens_look_same_but_differ() {
+    // Latin 'a' (U+0061) vs Cyrillic 'а' (U+0430) - look identical!
+    let latin_a = "cat";
+    let cyrillic_a = "c\u{0430}t"; // Uses Cyrillic 'а' instead of Latin 'a'
+    
+    let interner_latin = Interner::from_text(latin_a);
+    let interner_cyrillic = Interner::from_text(cyrillic_a);
+    
+    println!("\nHomoglyph test:");
+    println!("  Latin 'cat': {:?}", interner_latin.vocabulary());
+    println!("  Cyrillic 'cаt': {:?}", interner_cyrillic.vocabulary());
+    
+    // These should produce different vocabularies
+    assert_ne!(
+        interner_latin.vocabulary(),
+        interner_cyrillic.vocabulary(),
+        "Latin and Cyrillic homoglyphs should create different tokens"
+    );
+    
+    // But when displayed, they look identical
+    // This could cause the appearance of duplicates in the TUI
+    println!("  Visual comparison: '{}' vs '{}'", 
+             interner_latin.vocabulary()[0], 
+             interner_cyrillic.vocabulary()[0]);
+    println!("  They look the same but are different!");
+}
+
+/// Test that combining characters don't create false duplicates
+#[test]
+fn test_combining_characters() {
+    // 'é' can be represented as:
+    // 1. Single codepoint: U+00E9 (LATIN SMALL LETTER E WITH ACUTE)
+    // 2. Two codepoints: U+0065 + U+0301 (LATIN SMALL LETTER E + COMBINING ACUTE ACCENT)
+    
+    let single_codepoint = "caf\u{00E9}"; // café with precomposed é
+    let combining = "cafe\u{0301}"; // café with combining accent
+    
+    let interner_single = Interner::from_text(single_codepoint);
+    let interner_combining = Interner::from_text(combining);
+    
+    println!("\nCombining characters test:");
+    println!("  Precomposed café: {:?}", interner_single.vocabulary());
+    println!("  Combining café: {:?}", interner_combining.vocabulary());
+    
+    // Note: These might or might not be normalized to the same form
+    // If they're different, they could appear as duplicates in the TUI
+}
+
+/// Test that text from stage.sh might introduce whitespace issues
+#[test]
+fn test_stage_script_whitespace_edge_cases() {
+    use fold::splitter::Splitter;
+    
+    let splitter = Splitter::new();
+    
+    // Simulate text that might come from stage.sh processing
+    let test_cases = vec![
+        // Leading/trailing whitespace
+        ("leading space", " hello world"),
+        ("trailing space", "hello world "),
+        ("both spaces", " hello world "),
+        
+        // Multiple spaces
+        ("double space", "hello  world"),
+        ("many spaces", "hello     world"),
+        
+        // Tabs mixed with spaces
+        ("tab and space", "hello \t world"),
+        
+        // Windows line endings
+        ("windows newline", "hello\r\nworld"),
+        
+        // Newlines within text
+        ("single newline", "hello\nworld"),
+        
+        // Trailing newline
+        ("trailing newline", "hello world\n"),
+        
+        // Empty lines between words
+        ("empty line", "hello\n\nworld"),
+    ];
+    
+    println!("\nStage script edge cases:");
+    for (name, text) in &test_cases {
+        let vocab = splitter.vocabulary(text);
+        println!("  {}: {:?}", name, vocab);
+        
+        // All these should produce clean words without extra whitespace
+        for word in &vocab {
+            assert!(
+                !word.chars().any(|c| c.is_whitespace()),
+                "Word '{}' from '{}' contains whitespace", word, name
+            );
+        }
+    }
+}
+
+/// Test that special punctuation doesn't create invisible differences
+#[test]
+fn test_special_punctuation_handling() {
+    use fold::splitter::Splitter;
+    
+    let splitter = Splitter::new();
+    
+    // Various types of apostrophes and quotes
+    let test_cases = vec![
+        ("straight apostrophe", "it's"),
+        ("curly apostrophe", "it\u{2019}s"), // RIGHT SINGLE QUOTATION MARK
+        ("grave accent", "it\u{0060}s"),
+        ("acute accent", "it\u{00B4}s"),
+        ("prime", "it\u{2032}s"),
+    ];
+    
+    println!("\nApostrophe/quote variations:");
+    for (name, text) in &test_cases {
+        let vocab = splitter.vocabulary(text);
+        println!("  {} '{}': {:?}", name, text, vocab);
+    }
+    
+    // Check if they produce visually similar but different tokens
+    let interner1 = Interner::from_text("it's");
+    let interner2 = Interner::from_text("it\u{2019}s");
+    
+    if interner1.vocabulary() != interner2.vocabulary() {
+        println!("\n  WARNING: Different apostrophe types create different tokens!");
+        println!("  Straight: {:?}", interner1.vocabulary());
+        println!("  Curly: {:?}", interner2.vocabulary());
+        println!("  These would appear as duplicates in the TUI!");
+    }
+}
+
+/// Test that merged vocabularies with homoglyphs could cause apparent duplicates
+#[test]
+fn test_merged_vocab_with_homoglyphs() {
+    // Simulate two archives that were processed from different sources
+    // where one used Latin characters and one used Cyrillic homoglyphs
+    
+    let latin_text = "the cat sat on the mat";
+    let cyrillic_text = "the c\u{0430}t sat on the mat"; // Cyrillic 'а' in 'cat'
+    
+    let interner_latin = Interner::from_text(latin_text);
+    let interner_cyrillic = Interner::from_text(cyrillic_text);
+    
+    println!("\nMerged vocab homoglyph test:");
+    println!("  Latin vocab: {:?}", interner_latin.vocabulary());
+    println!("  Cyrillic vocab: {:?}", interner_cyrillic.vocabulary());
+    
+    // Merge them
+    let merged = interner_latin.merge(&interner_cyrillic);
+    println!("  Merged vocab: {:?}", merged.vocabulary());
+    
+    // Check for visually similar entries
+    let vocab = merged.vocabulary();
+    for i in 0..vocab.len() {
+        for j in (i+1)..vocab.len() {
+            if vocab[i].chars().count() == vocab[j].chars().count() {
+                // Same length - might be homoglyphs
+                let v1_lower = vocab[i].to_lowercase();
+                let v2_lower = vocab[j].to_lowercase();
+                if v1_lower != v2_lower {
+                    // Different content but same length - worth checking
+                    println!("  Potential homoglyph pair: '{}' ({} bytes) vs '{}' ({} bytes)",
+                             vocab[i], vocab[i].len(), vocab[j], vocab[j].len());
+                }
+            }
+        }
+    }
+}
+
+/// Test that the filter_char function handles edge cases correctly
+#[test]
+fn test_filter_char_edge_cases() {
+    use fold::splitter::Splitter;
+    
+    let splitter = Splitter::new();
+    
+    // Characters that might survive filtering unexpectedly
+    let edge_cases = vec![
+        ("zero width joiner", "hello\u{200D}world"),
+        ("soft hyphen", "hello\u{00AD}world"),
+        ("word joiner", "hello\u{2060}world"),
+        ("byte order mark", "hello\u{FEFF}world"),
+        ("object replacement", "hello\u{FFFC}world"),
+    ];
+    
+    println!("\nFilter edge cases:");
+    for (name, text) in &edge_cases {
+        let vocab = splitter.vocabulary(text);
+        println!("  {} ({} chars in text): {:?}", name, text.chars().count(), vocab);
+        
+        // Check each word for non-printable characters
+        for word in &vocab {
+            for (i, c) in word.chars().enumerate() {
+                if !c.is_alphabetic() && c != '\'' {
+                    println!("    WARNING: Word '{}' char {} is U+{:04X} ({})", 
+                             word, i, c as u32, c);
+                }
+            }
+        }
+    }
+}
