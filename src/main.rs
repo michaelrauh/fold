@@ -5,12 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-fn calculate_score(ortho: &Ortho) -> (usize, usize) {
-    let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
-    let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
-    (volume, fullness)
-}
-
 fn main() -> Result<(), FoldError> {
     // Check for test environment variable
     let config = if let Ok(test_dir) = std::env::var("FOLD_STATE_DIR") {
@@ -55,7 +49,7 @@ fn main() -> Result<(), FoldError> {
         let optimal_ortho = file_handler::load_optimal_ortho(&largest.path)?;
         let interner = file_handler::load_interner(&largest.path)?;
         
-        let (volume, fullness) = calculate_score(&optimal_ortho);
+        let (volume, fullness) = optimal_ortho.score();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -123,10 +117,10 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     
     metrics.update_operation(|op| {
         op.current_file = ingestion.filename.clone();
-        op.status = "Building interner".to_string();
         op.text_preview = ingestion.text_preview.clone();
         op.word_count = ingestion.word_count;
     });
+    metrics.set_operation_status("Building interner".to_string());
     metrics.update_global(|g| {
         g.remaining_chunks = remaining;
         g.current_lineage = format!("\"{}\"", ingestion.filename);
@@ -176,11 +170,11 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     
     tracker.insert(seed_id);
     let mut best_ortho = seed_ortho.clone();
-    let mut best_score = calculate_score(&best_ortho);
+    let mut best_score = best_ortho.score();
     
     work_queue.push(seed_ortho)?;
     
-    metrics.update_operation(|op| op.status = "Processing orthos".to_string());
+    metrics.set_operation_status("Processing orthos".to_string());
     
     // Process work queue until empty
     let mut processed_count = 0;
@@ -191,8 +185,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
             // Update metrics
             metrics.record_queue_depth(work_queue.len());
             metrics.record_seen_size(tracker.len());
-            let (volume, _) = calculate_score(&best_ortho);
-            metrics.record_optimal_volume(volume);
+            metrics.record_optimal_volume(best_ortho.volume());
             metrics.update_operation(|op| {
                 op.progress_current = processed_count;
             });
@@ -231,7 +224,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
                 if !tracker.contains(&child_id) {
                     tracker.insert(child_id);
                     
-                    let candidate_score = calculate_score(&child);
+                    let candidate_score = child.score();
                     
                     // Update local best for this operation
                     if candidate_score > best_score {
@@ -301,7 +294,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     // Ingest archives for merging
     let ingestion = file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)?;
     
-    metrics.update_operation(|op| op.status = "Loading interners".to_string());
+    metrics.set_operation_status("Loading interners".to_string());
     
     // Load both interners using method
     let (interner_a, interner_b) = ingestion.load_interners()?;
@@ -383,7 +376,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let seed_id = seed_ortho.id();
     tracker.insert(seed_id);
     let mut best_ortho = seed_ortho.clone();
-    let mut best_score = calculate_score(&best_ortho);
+    let mut best_score = best_ortho.score();
     work_queue.push(seed_ortho)?;
     
     // Get results paths using method
@@ -399,8 +392,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     // Pre-build HashSet for O(1) impact lookups instead of O(n×m) nested loops
     let larger_impacted_set: HashSet<&Vec<usize>> = larger_impacted.iter().collect();
     
+    metrics.set_operation_status(format!("Processing Larger Archive {}", larger_name));
     metrics.update_operation(|op| {
-        op.status = format!("Processing Larger Archive {}", larger_name);
         op.progress_current = 0;
     });
     
@@ -443,8 +436,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     // Pre-build HashSet for O(1) impact lookups
     let smaller_impacted_set: HashSet<&Vec<usize>> = smaller_impacted.iter().collect();
     
+    metrics.set_operation_status(format!("Remapping Smaller Archive {}", smaller_name));
     metrics.update_operation(|op| {
-        op.status = format!("Remapping Smaller Archive {}", smaller_name);
         op.progress_current = 0;
     });
     
@@ -500,8 +493,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     
     metrics.add_log(format!("Remapping complete: A={}, B={}", total_from_a, total_from_b));
     
+    metrics.set_operation_status("Processing merged space".to_string());
     metrics.update_operation(|op| {
-        op.status = "Processing merged space".to_string();
         op.progress_current = 0;
         op.progress_total = work_queue.len();
     });
@@ -515,8 +508,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             let queue_depth = work_queue.len();
             metrics.record_queue_depth(queue_depth);
             metrics.record_seen_size(tracker.len());
-            let (volume, _) = calculate_score(&best_ortho);
-            metrics.record_optimal_volume(volume);
+            metrics.record_optimal_volume(best_ortho.volume());
             metrics.update_operation(|op| {
                 op.progress_current = processed_count;
                 op.progress_total = processed_count + queue_depth;
@@ -551,7 +543,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 if !tracker.contains(&child_id) {
                     tracker.insert(child_id);
                     
-                    let candidate_score = calculate_score(&child);
+                    let candidate_score = child.score();
                     
                     // Update local best for this operation
                     if candidate_score > best_score {
@@ -653,9 +645,9 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_calculate_score() {
+    fn test_score() {
         let ortho = Ortho::new();
-        let (volume, fullness) = calculate_score(&ortho);
+        let (volume, fullness) = ortho.score();
         // Empty ortho with dims [2,2] has volume (2-1)*(2-1) = 1
         assert_eq!(volume, 1);
         // All 4 slots are None

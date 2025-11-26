@@ -47,7 +47,7 @@ fn test_and_duplicate_in_shell_2() {
     while ortho.get_current_position() < ortho.payload().len() && steps < 20 {
         steps += 1;
         
-        let pos = ortho.get_current_position();
+        let _pos = ortho.get_current_position();
         let (forbidden, required) = ortho.get_requirements();
         let completions = interner.intersect(&required, &forbidden);
         

@@ -1,5 +1,4 @@
 use fold::spatial;
-use fold::ortho::Ortho;
 use fold::interner::Interner;
 
 #[test]

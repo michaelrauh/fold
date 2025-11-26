@@ -62,6 +62,7 @@ impl Default for GlobalMetrics {
 pub struct OperationStatus {
     pub current_file: String,
     pub status: String,
+    pub status_start_time: u64,
     pub progress_current: usize,
     pub progress_total: usize,
     pub text_preview: String,
@@ -70,9 +71,14 @@ pub struct OperationStatus {
 
 impl Default for OperationStatus {
     fn default() -> Self {
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         Self {
             current_file: String::new(),
             status: "Idle".to_string(),
+            status_start_time: start_time,
             progress_current: 0,
             progress_total: 0,
             text_preview: String::new(),
@@ -228,6 +234,12 @@ impl Metrics {
     pub fn update_operation(&self, update: impl FnOnce(&mut OperationStatus)) {
         let mut inner = self.inner.lock().unwrap();
         update(&mut inner.operation);
+    }
+
+    pub fn set_operation_status(&self, status: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.status = status;
+        inner.operation.status_start_time = Self::current_timestamp();
     }
 
     pub fn update_merge(&self, update: impl FnOnce(&mut MergeStatus)) {

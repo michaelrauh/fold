@@ -1,12 +1,10 @@
 use fold::{
     file_handler::{self, StateConfig},
-    interner::Interner,
     disk_backed_queue::DiskBackedQueue,
     ortho::Ortho,
     FoldError,
 };
 use std::fs;
-use std::path::Path;
 
 /// Test what happens when save_archive is passed a DIFFERENT path than where
 /// the DiskBackedQueue actually stored its files

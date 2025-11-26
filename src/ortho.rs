@@ -9,6 +9,8 @@ use bincode::Decode;
 pub struct Ortho {
     dims: Vec<usize>,
     payload: Vec<Option<usize>>,
+    volume: usize,
+    fullness: usize,
 }
 
 impl Ortho {
@@ -21,7 +23,9 @@ impl Ortho {
     pub fn new() -> Self {
         let dims = vec![2,2];
         let payload = vec![None; 4];
-        Ortho { dims, payload }
+        let volume = 1; // (2-1) * (2-1) = 1
+        let fullness = 0;
+        Ortho { dims, payload, volume, fullness }
     }
     
 
@@ -47,13 +51,13 @@ impl Ortho {
             if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
                 if second > third { new_payload[1] = Some(third); new_payload[2] = Some(second); }
             }
-            return vec![Ortho { dims: self.dims.clone(), payload: new_payload }];
+            return vec![Ortho { dims: self.dims.clone(), payload: new_payload, volume: self.volume, fullness: self.fullness + 1 }];
         }
         let len = self.payload.len();
         let mut new_payload: Vec<Option<usize>> = Vec::with_capacity(len);
         unsafe { new_payload.set_len(len); std::ptr::copy_nonoverlapping(self.payload.as_ptr(), new_payload.as_mut_ptr(), len); }
         if insertion_index < new_payload.len() { new_payload[insertion_index] = Some(value); }
-        vec![Ortho { dims: self.dims.clone(), payload: new_payload }]
+        vec![Ortho { dims: self.dims.clone(), payload: new_payload, volume: self.volume, fullness: self.fullness + 1 }]
     }
     fn expand(
         ortho: &Ortho,
@@ -63,6 +67,7 @@ impl Ortho {
         let mut old_payload_with_value = ortho.payload.clone();
         let insert_pos = old_payload_with_value.iter().position(|x| x.is_none()).unwrap();
         old_payload_with_value[insert_pos] = Some(value);
+        let new_fullness = ortho.fullness + 1;
         
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
@@ -70,7 +75,8 @@ impl Ortho {
             for (i, &pos) in reorg.iter().enumerate() { 
                 new_payload[pos] = old_payload_with_value.get(i).cloned().flatten(); 
             }
-            out.push(Ortho { dims: new_dims_vec, payload: new_payload });
+            let new_volume = new_dims_vec.iter().map(|x| x.saturating_sub(1)).product::<usize>();
+            out.push(Ortho { dims: new_dims_vec, payload: new_payload, volume: new_volume, fullness: new_fullness });
         }
         out
     }
@@ -117,10 +123,12 @@ impl Ortho {
             opt_idx.map(|old_idx| vocab_map[old_idx])
         }).collect();
         
-        // Create new ortho with remapped payload
+        // Create new ortho with remapped payload (volume and fullness unchanged)
         Some(Ortho {
             dims: self.dims.clone(),
             payload: new_payload,
+            volume: self.volume,
+            fullness: self.fullness,
         })
     }
     
@@ -156,6 +164,9 @@ impl Ortho {
     }
     pub fn dims(&self) -> &Vec<usize> { &self.dims }
     pub fn payload(&self) -> &Vec<Option<usize>> { &self.payload }
+    pub fn volume(&self) -> usize { self.volume }
+    pub fn fullness(&self) -> usize { self.fullness }
+    pub fn score(&self) -> (usize, usize) { (self.volume, self.fullness) }
     
     fn get_index_at_coord(&self, coord: &[usize]) -> Option<usize> {
         spatial::get_location_to_index(self.dims.as_slice()).get(coord).copied()
@@ -264,11 +275,20 @@ impl Ortho {
 mod tests {
     use super::*;
 
+    fn compute_score(dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> (usize, usize) {
+        let volume = dims.iter().map(|x| x.saturating_sub(1)).product::<usize>();
+        let fullness = payload.iter().filter(|x| x.is_some()).count();
+        (volume, fullness)
+    }
+
     #[test]
     fn test_new() {
         let ortho = Ortho::new();
         assert_eq!(ortho.dims, vec![2,2]);
         assert_eq!(ortho.payload, vec![None, None, None, None]);
+        assert_eq!(ortho.volume, 1, "volume should be (2-1)*(2-1) = 1");
+        assert_eq!(ortho.fullness, 0, "fullness should be 0 (no filled slots)");
+        assert_eq!(ortho.score(), (1, 0));
     }
 
     #[test]
@@ -280,6 +300,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![None, None, None, None],
+                volume: 1,
+                fullness: 0,
             }
             .get_current_position(),
             0
@@ -289,6 +311,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(1), None, None, None],
+                volume: 1,
+                fullness: 1,
             }
             .get_current_position(),
             1
@@ -298,6 +322,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(1), Some(2), None, None],
+                volume: 1,
+                fullness: 2,
             }
             .get_current_position(),
             2
@@ -307,6 +333,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(1), Some(2), Some(3), None],
+                volume: 1,
+                fullness: 3,
             }
             .get_current_position(),
             3
@@ -322,6 +350,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(0), Some(15), None, None],
+                volume: 1,
+                fullness: 2,
             }
             .get_insert_position(14),
             0
@@ -331,6 +361,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(0), Some(15), None, None],
+                volume: 1,
+                fullness: 2,
             }
             .get_insert_position(20),
             1
@@ -340,6 +372,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(0), Some(10), Some(20), None],
+                volume: 1,
+                fullness: 3,
             }
             .get_insert_position(5),
             0
@@ -349,6 +383,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(0), Some(10), Some(20), None],
+                volume: 1,
+                fullness: 3,
             }
             .get_insert_position(15),
             1
@@ -358,6 +394,8 @@ mod tests {
             Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(0), Some(10), Some(20), None],
+                volume: 1,
+                fullness: 3,
             }
             .get_insert_position(1000),
             2
@@ -373,6 +411,8 @@ mod tests {
             vec![Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(10), None, None, None],
+                volume: 1,
+                fullness: 1,
             }]
         );
     }
@@ -388,6 +428,8 @@ mod tests {
             vec![Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(1), Some(2), None, None],
+                volume: 1,
+                fullness: 2,
             }]
         );
     }
@@ -439,10 +481,14 @@ mod tests {
                 Ortho {
                     dims: vec![3, 2],
                     payload: vec![Some(1), Some(2), Some(3), Some(4), None, None],
+                    volume: 2,
+                    fullness: 4,
                 },
                 Ortho {
                     dims: vec![2, 2, 2],
                     payload: vec![Some(1), Some(2), Some(3), None, Some(4), None, None, None],
+                    volume: 1,
+                    fullness: 4,
                 }
             ]
         );
@@ -453,6 +499,8 @@ mod tests {
         let ortho = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(10), Some(20), None, None],
+            volume: 1,
+            fullness: 2,
         };
         let orthos = ortho.add(15);
         assert_eq!(
@@ -460,6 +508,8 @@ mod tests {
             vec![Ortho {
                 dims: vec![2, 2],
                 payload: vec![Some(10), Some(15), Some(20), None],
+                volume: 1,
+                fullness: 3,
             }]
         );
     }
@@ -469,6 +519,8 @@ mod tests {
         let ortho = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(10), None, Some(20), Some(30)],
+            volume: 1,
+            fullness: 3,
         };
 
         let mut orthos = ortho.add(15);
@@ -488,10 +540,14 @@ mod tests {
                         Some(30),
                         None
                     ],
+                    volume: 1,
+                    fullness: 4,
                 },
                 Ortho {
                     dims: vec![3, 2],
                     payload: vec![Some(10), Some(15), Some(20), Some(30), None, None],
+                    volume: 2,
+                    fullness: 4,
                 },
             ]
         );
@@ -571,10 +627,14 @@ mod tests {
         let ortho_with_content_1 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(10), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho_with_content_2 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(10), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         assert_eq!(ortho_with_content_1.id(), ortho_with_content_2.id());
 
@@ -582,10 +642,14 @@ mod tests {
         let ortho_content_a = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(10), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho_content_b = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(20), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         assert_ne!(ortho_content_a.id(), ortho_content_b.id());
     }
@@ -597,26 +661,38 @@ mod tests {
         let ortho0 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(0), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho1 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(1), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho2 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(2), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho3 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(3), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho4 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(4), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ortho5 = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(5), None, None, None],
+            volume: 1,
+            fullness: 1,
         };
         let ids = vec![
             ortho0.id(),
@@ -673,6 +749,8 @@ mod tests {
         let ortho = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(0), Some(1), Some(2), Some(3)],
+            volume: 1,
+            fullness: 4,
         };
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "   a    b\n   c    d");
@@ -685,6 +763,8 @@ mod tests {
         let ortho = Ortho {
             dims: vec![2, 2],
             payload: vec![Some(0), Some(1), None, None],
+            volume: 1,
+            fullness: 2,
         };
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "hello world\n    ·     ·");
@@ -697,6 +777,8 @@ mod tests {
         let ortho = Ortho {
             dims: vec![3, 2],
             payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), None],
+            volume: 2,
+            fullness: 5,
         };
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "   a    b\n   c    d\n   e    ·");
@@ -709,6 +791,8 @@ mod tests {
         let ortho = Ortho {
             dims: vec![2, 2, 2],
             payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), None],
+            volume: 1,
+            fullness: 7,
         };
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "[dim0=0]\n   a    b\n   c    e\n\n[dim0=1]\n   d    f\n   g    ·");
@@ -738,6 +822,51 @@ mod tests {
         
         let phrases = ortho.get_requirement_phrases();
         assert_eq!(phrases, vec![vec![2], vec![3]]);
+    }
+    
+    #[test]
+    fn test_cached_score_matches_computed() {
+        // Helper to compute score the old way
+        fn compute_score_old_way(ortho: &Ortho) -> (usize, usize) {
+            let volume = ortho.dims().iter().map(|x| x.saturating_sub(1)).product::<usize>();
+            let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
+            (volume, fullness)
+        }
+        
+        // Test new ortho
+        let ortho = Ortho::new();
+        assert_eq!(ortho.score(), compute_score_old_way(&ortho), "New ortho score mismatch");
+        
+        // Test after adding values
+        let ortho = ortho.add(1).pop().unwrap();
+        assert_eq!(ortho.score(), compute_score_old_way(&ortho), "After add(1) score mismatch");
+        
+        let ortho = ortho.add(2).pop().unwrap();
+        assert_eq!(ortho.score(), compute_score_old_way(&ortho), "After add(2) score mismatch");
+        
+        let ortho = ortho.add(3).pop().unwrap();
+        assert_eq!(ortho.score(), compute_score_old_way(&ortho), "After add(3) score mismatch");
+        
+        // Test expansion - this returns multiple orthos
+        let expansions = ortho.add(4);
+        for (i, expanded_ortho) in expansions.iter().enumerate() {
+            assert_eq!(
+                expanded_ortho.score(), 
+                compute_score_old_way(expanded_ortho),
+                "Expansion {} score mismatch", i
+            );
+        }
+        
+        // Test remap
+        let ortho_to_remap = Ortho::new().add(5).pop().unwrap();
+        let vocab_map = vec![0, 1, 2, 3, 4, 5];
+        if let Some(remapped) = ortho_to_remap.remap(&vocab_map) {
+            assert_eq!(
+                remapped.score(),
+                compute_score_old_way(&remapped),
+                "Remapped ortho score mismatch"
+            );
+        }
     }
 }
 

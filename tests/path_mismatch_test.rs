@@ -1,6 +1,5 @@
 use fold::{
     file_handler::{self, StateConfig},
-    interner::Interner,
     disk_backed_queue::DiskBackedQueue,
     ortho::Ortho,
     FoldError,

@@ -117,7 +117,7 @@ fn test_exact_txt_processing_save_flow() -> Result<(), FoldError> {
 fn test_results_directory_deleted_before_save() -> Result<(), FoldError> {
     let temp_dir = tempfile::tempdir().unwrap();
     
-    let interner = Interner::from_text("hello world");
+    let _interner = Interner::from_text("hello world");
     
     let results_path = temp_dir.path().join("results");
     let mut results = DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10)?;

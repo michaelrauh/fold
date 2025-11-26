@@ -201,6 +201,20 @@ impl Tui {
         let label_width = 12; // "Processing: "
         let available = max_width.saturating_sub(label_width);
 
+        // Calculate elapsed time for current status
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let elapsed = now.saturating_sub(snapshot.operation.status_start_time);
+        let elapsed_str = format_elapsed(elapsed);
+        
+        let progress_pct = if snapshot.operation.progress_total > 0 {
+            (snapshot.operation.progress_current * 100) / snapshot.operation.progress_total
+        } else {
+            0
+        };
+
         let lines = vec![
             Line::from(vec![
                 Span::styled("Processing: ", Style::default().fg(Color::DarkGray)),
@@ -209,13 +223,15 @@ impl Tui {
             Line::from(vec![
                 Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(truncate_string(&snapshot.operation.status, available.saturating_sub(8)), Style::default().fg(Color::Cyan)),
+                Span::styled(format!(" ({})", elapsed_str), Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(""),
             Line::from(vec![
                 Span::raw(format!(
-                    "{} / {}",
+                    "{} / {} ({}%)",
                     format_number(snapshot.operation.progress_current),
-                    format_number(snapshot.operation.progress_total)
+                    format_number(snapshot.operation.progress_total),
+                    progress_pct
                 )),
             ]),
         ];
@@ -451,15 +467,13 @@ impl Tui {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Length(6),
-                Constraint::Length(6),
                 Constraint::Min(10),
             ])
             .split(area);
 
         self.render_queue_depth_chart(f, right_chunks[0], snapshot);
         self.render_seen_size_chart(f, right_chunks[1], snapshot);
-        self.render_seen_history_chart(f, right_chunks[2], snapshot);
-        self.render_optimal_ortho_display(f, right_chunks[3], snapshot);
+        self.render_optimal_ortho_display(f, right_chunks[2], snapshot);
     }
 
     fn render_queue_depth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -539,49 +553,6 @@ impl Tui {
                     .title(truncate_string(&title, max_width)),
             )
             .data(&data)
-            .style(Style::default().fg(Color::Green));
-
-        f.render_widget(sparkline, area);
-    }
-
-    fn render_seen_history_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        // Use all available width for maximum historical resolution
-        let max_points = area.width.saturating_sub(2) as usize;
-        let sampled_data = sample_data(&snapshot.seen_history_samples, max_points);
-        
-        let (peak, duration_secs) = if !snapshot.seen_history_samples.is_empty() {
-            let peak = snapshot.global.seen_size_pk;
-            let first_ts = snapshot.seen_history_samples.first().map(|s| s.timestamp).unwrap_or(0);
-            let last_ts = snapshot.seen_history_samples.last().map(|s| s.timestamp).unwrap_or(0);
-            let duration = last_ts.saturating_sub(first_ts);
-            (peak, duration)
-        } else {
-            (0, 0)
-        };
-
-        // Normalize all data points to peak for consistent visualization
-        let max_val = peak.max(1);
-        let normalized_data: Vec<u64> = sampled_data
-            .iter()
-            .map(|s| (s.value as u64 * 100) / max_val as u64)
-            .collect();
-
-        let duration_str = format_elapsed(duration_secs);
-        let title = format!(
-            "Seen History │ Pk:{} │ Duration:{} │ {} samples",
-            format_number(peak),
-            duration_str,
-            format_number(snapshot.seen_history_samples.len())
-        );
-        let max_width = area.width.saturating_sub(2) as usize;
-
-        let sparkline = Sparkline::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(truncate_string(&title, max_width)),
-            )
-            .data(&normalized_data)
             .style(Style::default().fg(Color::Green));
 
         f.render_widget(sparkline, area);

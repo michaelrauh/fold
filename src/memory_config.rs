@@ -127,7 +127,7 @@ impl MemoryConfig {
         let queue_memory = 2 * self.queue_buffer_size * bytes_per_ortho;
         let bloom_memory = self.bloom_capacity * bytes_per_bloom_item;
         let shard_memory = self.max_shards_in_memory * target_items_per_shard * bytes_per_shard_item;
-        let total_estimated = interner_bytes + queue_memory + bloom_memory + shard_memory + runtime_reserve;
+        let _total_estimated = interner_bytes + queue_memory + bloom_memory + shard_memory + runtime_reserve;
         
         // println!("\n[memory_config] ===== MEMORY CONFIGURATION =====");
         // println!("[memory_config] Queue buffer size: {} orthos (~{} MB per queue)", 

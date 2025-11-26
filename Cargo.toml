@@ -29,3 +29,33 @@ path = "benches/spatial_bench.rs"
 name = "ortho_bench"
 harness = false
 path = "benches/ortho_bench.rs"
+
+[[bench]]
+name = "interner_bench"
+harness = false
+path = "benches/interner_bench.rs"
+
+[[bench]]
+name = "disk_backed_queue_bench"
+harness = false
+path = "benches/disk_backed_queue_bench.rs"
+
+[[bench]]
+name = "seen_tracker_bench"
+harness = false
+path = "benches/seen_tracker_bench.rs"
+
+[[bench]]
+name = "splitter_bench"
+harness = false
+path = "benches/splitter_bench.rs"
+
+[[bench]]
+name = "checkpoint_manager_bench"
+harness = false
+path = "benches/checkpoint_manager_bench.rs"
+
+[[bench]]
+name = "memory_config_bench"
+harness = false
+path = "benches/memory_config_bench.rs"

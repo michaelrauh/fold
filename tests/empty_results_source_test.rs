@@ -22,7 +22,7 @@ fn test_empty_text_produces_archive_with_no_results() -> Result<(), FoldError> {
     // Create an interner from EMPTY or minimal text that produces no completions
     // An empty string produces an interner with no vocabulary
     let interner = Interner::from_text("");
-    let version = interner.version();
+    let _version = interner.version();
     
     println!("Interner vocab size: {}", interner.vocabulary().len());
     
@@ -158,7 +158,7 @@ fn test_single_word_produces_minimal_results() -> Result<(), FoldError> {
     
     // Single word should produce a small vocab
     let interner = Interner::from_text("a");
-    let version = interner.version();
+    let _version = interner.version();
     
     println!("Single-word interner vocab size: {}", interner.vocabulary().len());
     

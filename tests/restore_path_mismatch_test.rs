@@ -7,7 +7,6 @@ use fold::{
 };
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, Duration};
 
 /// Test what happens when a txt file is processed, results are created,
 /// then archive is saved but results_path points to wrong location
@@ -47,7 +46,7 @@ fn test_txt_processing_results_path_mismatch() -> Result<(), FoldError> {
     println!("Actually created queue at: {}", wrong_results_path.display());
     
     // Now save_result will look for files at correct_results_path
-    let interner = Interner::from_text(&ingestion.text);
+    let _interner = Interner::from_text(&ingestion.text);
     
     // Manually call save_archive like save_result does
     let archive_path = input_dir.join("archive_test.bin");

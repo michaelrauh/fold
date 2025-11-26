@@ -6,7 +6,6 @@ use fold::{
     FoldError,
 };
 use std::fs;
-use std::path::PathBuf;
 
 /// Test that archives without results directories are handled correctly
 /// 
