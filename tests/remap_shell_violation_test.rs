@@ -67,7 +67,14 @@ use fold::spatial;
 /// 4. Expansion reorganization preserves shell validity
 /// 5. Systematic exploration of expansion patterns
 
-/// Helper function to check if an ortho has shell violations
+/// Helper function to check if an ortho has shell violations.
+/// 
+/// Returns `Some((pos, diag_pos, value))` if a violation is found, where:
+/// - `pos`: the position where the duplicate was found
+/// - `diag_pos`: the diagonal position with the same value
+/// - `value`: the duplicate token value
+/// 
+/// Returns `None` if no shell violations are detected.
 fn has_shell_violation(ortho: &Ortho) -> Option<(usize, usize, usize)> {
     let dims = ortho.dims();
     let payload = ortho.payload();
@@ -182,11 +189,14 @@ fn test_remap_with_non_bijective_mapping_shows_bug() {
     
     // Verify original is valid
     assert_ne!(ortho.payload()[1], ortho.payload()[2], "Original should have different tokens at pos 1 and 2");
+    assert!(has_shell_violation(&ortho).is_none(), "Original ortho should have no shell violations");
     
     println!("Original payload: {:?}", ortho.payload());
     
-    // Create a NON-bijective mapping that maps both beta and gamma to the same index
-    // This simulates what would happen if the vocabulary merge had a bug
+    // Create a NON-bijective mapping that maps both beta and gamma to the same index.
+    // This simulates what would happen if the vocabulary merge had a bug.
+    // NOTE: In normal operation, vocabulary merging always produces bijective mappings
+    // because words are unique in both vocabularies.
     let mut vocab_map = vec![0; vocab.len()];
     vocab_map[alpha_idx] = 0;
     vocab_map[beta_idx] = 1;  // beta -> 1
@@ -196,6 +206,12 @@ fn test_remap_with_non_bijective_mapping_shows_bug() {
     let remapped = ortho.remap(&vocab_map).expect("Remap should succeed");
     
     println!("Remapped payload with non-bijective map: {:?}", remapped.payload());
+    
+    // Verify that the remapped ortho now has a shell violation
+    assert!(
+        has_shell_violation(&remapped).is_some(),
+        "Remapped ortho with non-bijective mapping should have shell violations"
+    );
     
     // Now positions 1 and 2 would both have value 1!
     if let (Some(val1), Some(val2)) = (remapped.payload()[1], remapped.payload()[2]) {
@@ -456,7 +472,9 @@ fn test_shell_violation_detection() {
     // This ortho should be valid
     assert!(has_shell_violation(&ortho).is_none(), "Valid ortho should have no shell violations");
     
-    // Now create an invalid ortho using non-bijective remap
+    // Now create an invalid ortho using non-bijective remap.
+    // This simulates a bug scenario where vocabulary merging produces a 
+    // non-bijective mapping - this is NOT expected to occur in normal operation.
     let mut vocab_map = vec![0; vocab.len()];
     vocab_map[0] = 0;
     vocab_map[1] = 1; 
