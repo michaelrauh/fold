@@ -551,10 +551,11 @@ fn test_unicode_whitespace_handling() {
                  name, text.len(), word_count, vocab);
         
         // Check if any word contains invisible characters
+        // (uses same rules as filter_char: alphabetic or apostrophe)
         for word in &vocab {
-            let printable_len = word.chars().filter(|c| !c.is_whitespace() && c.is_alphabetic()).count();
+            let printable_len = word.chars().filter(|c| c.is_alphabetic() || *c == '\'').count();
             if printable_len != word.len() {
-                println!("    WARNING: Word '{}' has {} chars but only {} are printable alphabetic", 
+                println!("    WARNING: Word '{}' has {} chars but only {} are printable", 
                          word, word.len(), printable_len);
             }
         }
@@ -754,6 +755,7 @@ fn test_filter_char_edge_cases() {
         println!("  {} ({} chars in text): {:?}", name, text.chars().count(), vocab);
         
         // Check each word for non-printable characters
+        // (uses same rules as Splitter::filter_char: alphabetic or apostrophe)
         for word in &vocab {
             for (i, c) in word.chars().enumerate() {
                 if !c.is_alphabetic() && c != '\'' {
