@@ -12,6 +12,21 @@ pub struct MetricSample {
 }
 
 #[derive(Clone, Debug)]
+pub struct StatusHistoryEntry {
+    pub status: String,
+    pub start_time: u64,
+    pub duration: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StatusDurationStats {
+    pub total_count: usize,
+    pub total_duration: u64,
+    pub min_duration: u64,
+    pub max_duration: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct GlobalMetrics {
     pub mode: String,
     pub interner_version: usize,
@@ -192,6 +207,9 @@ struct MetricsInner {
     seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
     
+    status_history: VecDeque<StatusHistoryEntry>,
+    status_duration_stats: StatusDurationStats,
+    
     logs: VecDeque<LogEntry>,
 }
 
@@ -208,6 +226,8 @@ impl Metrics {
                 seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
+                status_history: VecDeque::with_capacity(100),
+                status_duration_stats: StatusDurationStats::default(),
                 logs: VecDeque::with_capacity(100),
             })),
         }
@@ -238,8 +258,37 @@ impl Metrics {
 
     pub fn set_operation_status(&self, status: String) {
         let mut inner = self.inner.lock().unwrap();
+        let now = Self::current_timestamp();
+        let prev_start = inner.operation.status_start_time;
+        let duration = now.saturating_sub(prev_start);
+        
+        // Record previous status if it had non-zero duration
+        if duration > 0 && !inner.operation.status.is_empty() {
+            let entry = StatusHistoryEntry {
+                status: inner.operation.status.clone(),
+                start_time: prev_start,
+                duration,
+            };
+            inner.status_history.push_back(entry);
+            if inner.status_history.len() > 100 {
+                inner.status_history.pop_front();
+            }
+            
+            // Update all-time statistics
+            let stats = &mut inner.status_duration_stats;
+            stats.total_count += 1;
+            stats.total_duration += duration;
+            if stats.total_count == 1 {
+                stats.min_duration = duration;
+                stats.max_duration = duration;
+            } else {
+                stats.min_duration = stats.min_duration.min(duration);
+                stats.max_duration = stats.max_duration.max(duration);
+            }
+        }
+        
         inner.operation.status = status;
-        inner.operation.status_start_time = Self::current_timestamp();
+        inner.operation.status_start_time = now;
     }
 
     pub fn update_merge(&self, update: impl FnOnce(&mut MergeStatus)) {
@@ -404,6 +453,8 @@ impl Metrics {
             seen_size_samples: inner.seen_size_samples.iter().cloned().collect(),
             seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
             optimal_volume_samples: inner.optimal_volume_samples.iter().cloned().collect(),
+            status_history: inner.status_history.iter().cloned().collect(),
+            status_duration_stats: inner.status_duration_stats.clone(),
             logs: inner.logs.iter().cloned().collect(),
         }
     }
@@ -420,5 +471,7 @@ pub struct MetricsSnapshot {
     pub seen_size_samples: Vec<MetricSample>,
     pub seen_history_samples: Vec<MetricSample>,
     pub optimal_volume_samples: Vec<MetricSample>,
+    pub status_history: Vec<StatusHistoryEntry>,
+    pub status_duration_stats: StatusDurationStats,
     pub logs: Vec<LogEntry>,
 }

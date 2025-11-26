@@ -1,4 +1,4 @@
-use crate::metrics::{Metrics, MetricsSnapshot, MetricSample};
+use crate::metrics::{Metrics, MetricsSnapshot, MetricSample, StatusHistoryEntry};
 use crate::spatial;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -11,7 +11,7 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline,
+        Bar, BarChart, BarGroup, Block, Borders, Gauge, List, ListItem, Paragraph, Sparkline,
     },
     Frame, Terminal,
 };
@@ -467,13 +467,15 @@ impl Tui {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Min(10),
             ])
             .split(area);
 
         self.render_queue_depth_chart(f, right_chunks[0], snapshot);
         self.render_seen_size_chart(f, right_chunks[1], snapshot);
-        self.render_optimal_ortho_display(f, right_chunks[2], snapshot);
+        self.render_status_duration_chart(f, right_chunks[2], snapshot);
+        self.render_optimal_ortho_display(f, right_chunks[3], snapshot);
     }
 
     fn render_queue_depth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -556,6 +558,70 @@ impl Tui {
             .style(Style::default().fg(Color::Green));
 
         f.render_widget(sparkline, area);
+    }
+
+    fn render_status_duration_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let stats = &snapshot.status_duration_stats;
+        
+        // Calculate statistics
+        let avg = if stats.total_count > 0 {
+            stats.total_duration / stats.total_count as u64
+        } else {
+            0
+        };
+        let min = if stats.total_count > 0 { stats.min_duration } else { 0 };
+        let max = if stats.total_count > 0 { stats.max_duration } else { 0 };
+        
+        // Format title with statistics
+        let title = format!(
+            "Status Duration │ Avg:{}s Min:{}s Max:{}s",
+            avg, min, max
+        );
+        
+        if snapshot.status_history.is_empty() {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(title);
+            f.render_widget(block, area);
+            return;
+        }
+
+        // Take last N entries that fit in the available width
+        let max_bars = (area.width.saturating_sub(2) / 2).max(1) as usize;
+        let entries: Vec<&StatusHistoryEntry> = snapshot.status_history
+            .iter()
+            .rev()
+            .take(max_bars)
+            .collect();
+        
+        // Reverse back to chronological order for display
+        let entries: Vec<&StatusHistoryEntry> = entries.into_iter().rev().collect();
+
+        // Build bar data without labels or text values
+        let bars: Vec<Bar> = entries
+            .iter()
+            .map(|entry| {
+                Bar::default()
+                    .value(entry.duration)
+                    .style(Style::default().fg(Color::Cyan))
+            })
+            .collect();
+
+        let max_duration = entries.iter().map(|e| e.duration).max().unwrap_or(1);
+        let bar_group = BarGroup::default().bars(&bars);
+
+        let chart = BarChart::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title),
+            )
+            .data(bar_group)
+            .bar_width(1)
+            .bar_gap(0)
+            .max(max_duration);
+
+        f.render_widget(chart, area);
     }
 
     fn render_logs(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
