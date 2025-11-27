@@ -823,7 +823,9 @@ hook by which air sailors are hung to the sides and bottoms of their
 craft for various purposes of repair, and by means of which landing
 parties are lowered to the ground from the battleships.",
         
-        // Chunk 6 (duplicate of chunk 5)
+        // Chunk 6 is an intentional duplicate of Chunk 5.
+        // This matches the bug report exactly - the text appears twice in the source
+        // because it was copy-pasted in the original Project Gutenberg file.
         "Clinging to the wall with my feet and one hand, I unloosened one of the
 long leather straps of my trappings at the end of which dangled a great
 hook by which air sailors are hung to the sides and bottoms of their
