@@ -1075,3 +1075,546 @@ fn test_merge_process_can_create_violation() {
     // So the bug must be in how orthos are constructed during the worker loop,
     // not in the remap/merge process itself.
 }
+
+// ============================================================================
+// UNIT TESTS TO FIND THE EXACT POINT OF INVARIANT VIOLATION
+// ============================================================================
+// 
+// The goal is to trace through ortho construction step by step and find
+// where the shell invariant first breaks. We check:
+// 1. After every add() call, verify no shell violations exist
+// 2. After every expansion, verify the reorganization preserves shell validity
+// 3. After every remap(), verify no shell violations are introduced
+// ============================================================================
+
+/// Helper: Check shell invariant for an ortho
+/// Returns Some((pos1, pos2, value)) if violation found
+fn check_shell_invariant(ortho: &Ortho) -> Option<(usize, usize, usize)> {
+    let dims = ortho.dims();
+    let payload = ortho.payload();
+    
+    for pos in 0..payload.len() {
+        if let Some(val) = payload[pos] {
+            let (_, diagonals) = spatial::get_requirements(pos, dims);
+            for &diag_pos in &diagonals {
+                if let Some(diag_val) = payload[diag_pos] {
+                    if val == diag_val {
+                        return Some((pos, diag_pos, val));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Test: Build ortho step by step, checking invariant after every add
+#[test]
+fn test_build_ortho_checking_invariant_at_each_step() {
+    // We'll try to build toward a [4,3] ortho and check the invariant at each step
+    let mut ortho = Ortho::new();
+    
+    // Use sequential values 0, 1, 2, ... for simplicity
+    let mut step = 0;
+    
+    // Add first value
+    ortho = ortho.add(0)[0].clone();
+    step += 1;
+    assert!(
+        check_shell_invariant(&ortho).is_none(),
+        "Step {}: Shell invariant violated after adding value 0: dims={:?}, payload={:?}",
+        step, ortho.dims(), ortho.payload()
+    );
+    
+    // Add second value
+    ortho = ortho.add(1)[0].clone();
+    step += 1;
+    assert!(
+        check_shell_invariant(&ortho).is_none(),
+        "Step {}: Shell invariant violated after adding value 1: dims={:?}, payload={:?}",
+        step, ortho.dims(), ortho.payload()
+    );
+    
+    // Add third value
+    ortho = ortho.add(2)[0].clone();
+    step += 1;
+    assert!(
+        check_shell_invariant(&ortho).is_none(),
+        "Step {}: Shell invariant violated after adding value 2: dims={:?}, payload={:?}",
+        step, ortho.dims(), ortho.payload()
+    );
+    
+    // Add fourth value - this triggers expansion
+    println!("Before step {}: dims={:?}, payload={:?}", step + 1, ortho.dims(), ortho.payload());
+    let children = ortho.add(3);
+    step += 1;
+    
+    println!("Step {} produced {} children:", step, children.len());
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}, payload={:?}", i, child.dims(), child.payload());
+        if let Some((p1, p2, v)) = check_shell_invariant(child) {
+            println!("    INVARIANT VIOLATED: positions {} and {} both have value {}", p1, p2, v);
+        }
+    }
+    
+    // All children should pass
+    for (i, child) in children.iter().enumerate() {
+        assert!(
+            check_shell_invariant(child).is_none(),
+            "Step {}, child {}: Shell invariant violated: dims={:?}, payload={:?}",
+            step, i, child.dims(), child.payload()
+        );
+    }
+    
+    // Continue with one of the children
+    ortho = children[0].clone();
+    
+    // Keep adding values
+    for val in 4..15 {
+        let children = ortho.add(val);
+        step += 1;
+        
+        if children.is_empty() {
+            break;
+        }
+        
+        for (i, child) in children.iter().enumerate() {
+            if let Some((p1, p2, v)) = check_shell_invariant(child) {
+                panic!(
+                    "Step {}, child {}: Shell invariant violated - positions {} and {} both have value {}\n  dims={:?}\n  payload={:?}",
+                    step, i, p1, p2, v, child.dims(), child.payload()
+                );
+            }
+        }
+        
+        ortho = children[0].clone();
+    }
+    
+    println!("Final ortho: dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+}
+
+/// Test: Verify that expansion reorganization preserves shell invariant
+#[test]
+fn test_expansion_reorganization_invariant() {
+    // Build a valid [2,2] ortho
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(0)[0].clone(); // pos 0
+    ortho = ortho.add(1)[0].clone(); // pos 1
+    ortho = ortho.add(2)[0].clone(); // pos 2
+    
+    println!("Before expansion: dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+    assert!(check_shell_invariant(&ortho).is_none(), "Pre-expansion ortho should be valid");
+    
+    // Trigger expansion
+    let children = ortho.add(3);
+    
+    println!("After expansion - {} children:", children.len());
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}", i, child.dims());
+        
+        // Check each position's diagonals
+        let dims = child.dims();
+        let payload = child.payload();
+        
+        for pos in 0..payload.len() {
+            if let Some(val) = payload[pos] {
+                let (_, diagonals) = spatial::get_requirements(pos, dims);
+                println!("    pos {} (val={}) has diagonals {:?}", pos, val, diagonals);
+                
+                for &diag_pos in &diagonals {
+                    if let Some(diag_val) = payload[diag_pos] {
+                        if val == diag_val {
+                            panic!(
+                                "EXPANSION BUG: Child {} has value {} at both pos {} and diagonal pos {}",
+                                i, val, pos, diag_pos
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        
+        assert!(
+            check_shell_invariant(child).is_none(),
+            "Expansion child {} should maintain shell invariant",
+            i
+        );
+    }
+}
+
+/// Test: Check if the forbidden list in get_requirements() is correct for [4,3]
+#[test]
+fn test_forbidden_list_for_4x3_position_4() {
+    // In [4,3]:
+    // Position 3 has coords [0,2], distance 2
+    // Position 4 has coords [1,1], distance 2
+    // Position 4's diagonals should include position 3
+    
+    let dims = vec![4, 3];
+    let (_, diagonals) = spatial::get_requirements(4, &dims);
+    
+    println!("[4,3] position 4 diagonals: {:?}", diagonals);
+    
+    assert!(
+        diagonals.contains(&3),
+        "Position 4 in [4,3] should have position 3 as a diagonal (both at distance 2)"
+    );
+}
+
+/// Test: Try to create the problematic scenario through normal construction
+#[test]
+fn test_can_construction_produce_duplicate_in_shell() {
+    // Build ortho step by step and try to add the SAME value at position 4
+    // that's already at position 3
+    
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(0)[0].clone(); // "of" at pos 0
+    ortho = ortho.add(1)[0].clone(); // "my" at pos 1  
+    ortho = ortho.add(2)[0].clone(); // "their" at pos 2
+    
+    // Now add "trappings" (value 3) to trigger expansion
+    let children = ortho.add(3);
+    
+    // Find a child that could lead to [4,3]
+    // and check what values are forbidden for the next position
+    
+    for (i, child) in children.iter().enumerate() {
+        let (forbidden, _) = child.get_requirements();
+        let next_pos = child.get_current_position();
+        
+        println!("Child {} (dims={:?}): next pos={}, forbidden={:?}", 
+                 i, child.dims(), next_pos, forbidden);
+        
+        // If position 3 has value 3, then value 3 should be in forbidden
+        // when filling position 4 (if they're in the same shell)
+        let payload = child.payload();
+        if let Some(val_at_3) = payload.get(3).and_then(|v| *v) {
+            if forbidden.contains(&val_at_3) {
+                println!("  Value {} at pos 3 is correctly forbidden for pos {}", val_at_3, next_pos);
+            } else {
+                println!("  WARNING: Value {} at pos 3 is NOT forbidden for pos {}", val_at_3, next_pos);
+                
+                // Check if positions 3 and next_pos are in the same shell
+                let dims = child.dims();
+                let (_, diagonals_for_next) = spatial::get_requirements(next_pos, dims);
+                println!("  Diagonals for pos {}: {:?}", next_pos, diagonals_for_next);
+            }
+        }
+    }
+}
+
+/// Test: Trace construction from [2,2] through multiple expansions to [4,3]
+#[test]
+fn test_trace_construction_to_4x3() {
+    println!("=== Tracing construction from [2,2] toward [4,3] ===\n");
+    
+    // We need to understand how to get to [4,3]
+    // [2,2] -> [3,2] or [2,2,2] -> ... -> [4,3]
+    
+    let mut ortho = Ortho::new();
+    let mut step = 0;
+    
+    // Function to print ortho state
+    fn print_state(step: usize, ortho: &Ortho, action: &str) {
+        println!("Step {}: {} -> dims={:?}, payload={:?}", 
+                 step, action, ortho.dims(), ortho.payload());
+        
+        // Check invariant
+        if let Some((p1, p2, v)) = check_shell_invariant(ortho) {
+            println!("  !!! INVARIANT VIOLATION: pos {} and {} both have value {} !!!", p1, p2, v);
+        }
+    }
+    
+    // Build initial [2,2]
+    ortho = ortho.add(0)[0].clone();
+    step += 1;
+    print_state(step, &ortho, "add(0)");
+    
+    ortho = ortho.add(1)[0].clone();
+    step += 1;
+    print_state(step, &ortho, "add(1)");
+    
+    ortho = ortho.add(2)[0].clone();
+    step += 1;
+    print_state(step, &ortho, "add(2)");
+    
+    // Expansion
+    let children = ortho.add(3);
+    step += 1;
+    println!("\nStep {}: add(3) -> {} children", step, children.len());
+    
+    // Try to find a path to [4,3]
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}", i, child.dims());
+        
+        // Check [3,2] child - this is the path to [4,3]
+        if child.dims() == &vec![3, 2] {
+            println!("\n  Following [3,2] path:");
+            let mut current = child.clone();
+            
+            // Continue adding values
+            for val in 4..12 {
+                let next_children = current.add(val);
+                step += 1;
+                
+                if next_children.is_empty() {
+                    println!("    Step {}: add({}) -> no children", step, val);
+                    break;
+                }
+                
+                println!("    Step {}: add({}) -> {} children", step, val, next_children.len());
+                
+                for (j, nc) in next_children.iter().enumerate() {
+                    println!("      Child {}: dims={:?}", j, nc.dims());
+                    if let Some((p1, p2, v)) = check_shell_invariant(nc) {
+                        println!("      !!! INVARIANT VIOLATION: pos {} and {} both have value {} !!!", p1, p2, v);
+                    }
+                    
+                    // If we reach [4,3], print details
+                    if nc.dims() == &vec![4, 3] {
+                        println!("\n      === REACHED [4,3] ===");
+                        println!("      payload={:?}", nc.payload());
+                    }
+                }
+                
+                // Follow first child
+                current = next_children[0].clone();
+            }
+        }
+    }
+}
+
+/// Test: Check if remap after vocabulary merge can create shell violations
+#[test]
+fn test_remap_after_merge_invariant() {
+    println!("=== Testing remap after merge ===\n");
+    
+    // Create an interner with some words
+    let interner1 = Interner::from_text("a b c d e");
+    let vocab1 = interner1.vocabulary();
+    println!("Vocab1: {:?}", vocab1);
+    
+    // Build an ortho using vocab1 indices
+    let a_idx = vocab1.iter().position(|w| w == "a").unwrap();
+    let b_idx = vocab1.iter().position(|w| w == "b").unwrap();
+    let c_idx = vocab1.iter().position(|w| w == "c").unwrap();
+    let d_idx = vocab1.iter().position(|w| w == "d").unwrap();
+    
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(a_idx)[0].clone();
+    ortho = ortho.add(b_idx)[0].clone();
+    ortho = ortho.add(c_idx)[0].clone();
+    let children = ortho.add(d_idx);
+    ortho = children[0].clone();
+    
+    println!("Ortho before merge: dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+    assert!(check_shell_invariant(&ortho).is_none(), "Pre-merge ortho should be valid");
+    
+    // Create another interner with overlapping words
+    let interner2 = Interner::from_text("c d e f g");
+    let vocab2 = interner2.vocabulary();
+    println!("Vocab2: {:?}", vocab2);
+    
+    // Merge
+    let merged = interner1.merge(&interner2);
+    let merged_vocab = merged.vocabulary();
+    println!("Merged vocab: {:?}", merged_vocab);
+    
+    // Build vocab_map from old indices to new indices
+    let vocab_map: Vec<usize> = vocab1.iter().map(|w| {
+        merged_vocab.iter().position(|v| v == w).unwrap()
+    }).collect();
+    println!("Vocab map (old -> new): {:?}", vocab_map);
+    
+    // Remap the ortho
+    let remapped = ortho.remap(&vocab_map).unwrap();
+    println!("Ortho after remap: dims={:?}, payload={:?}", remapped.dims(), remapped.payload());
+    
+    // Check invariant after remap
+    if let Some((p1, p2, v)) = check_shell_invariant(&remapped) {
+        panic!(
+            "REMAP VIOLATION: positions {} and {} both have value {} after remap\n  dims={:?}\n  payload={:?}",
+            p1, p2, v, remapped.dims(), remapped.payload()
+        );
+    }
+    
+    println!("Remap preserved shell invariant");
+}
+
+/// Test: The real scenario - build ortho from chunk1, then check if 
+/// continuing to build after merge can violate the invariant
+#[test]
+fn test_build_continue_after_merge() {
+    println!("=== Testing build-merge-continue scenario ===\n");
+    
+    // Chunk 1: "of my trappings"
+    let chunk1 = "of my trappings";
+    let interner1 = Interner::from_text(chunk1);
+    let vocab1 = interner1.vocabulary();
+    println!("Chunk1 vocab: {:?}", vocab1);
+    
+    let of_idx1 = vocab1.iter().position(|w| w == "of").unwrap();
+    let my_idx1 = vocab1.iter().position(|w| w == "my").unwrap();
+    let trappings_idx1 = vocab1.iter().position(|w| w == "trappings").unwrap();
+    
+    // Build ortho with chunk1 vocabulary
+    let mut ortho = Ortho::new();
+    ortho = ortho.add(of_idx1)[0].clone();
+    ortho = ortho.add(my_idx1)[0].clone();
+    ortho = ortho.add(trappings_idx1)[0].clone();
+    
+    println!("Ortho from chunk1: dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+    
+    // Chunk 2: "their trappings and"
+    let chunk2 = "their trappings and";
+    let interner2 = Interner::from_text(chunk2);
+    
+    // Merge
+    let merged = interner1.merge(&interner2);
+    let merged_vocab = merged.vocabulary();
+    println!("Merged vocab: {:?}", merged_vocab);
+    
+    // Build vocab_map
+    let vocab_map: Vec<usize> = vocab1.iter().map(|w| {
+        merged_vocab.iter().position(|v| v == w).unwrap()
+    }).collect();
+    println!("Vocab map: {:?}", vocab_map);
+    
+    // Remap the ortho
+    let remapped = ortho.remap(&vocab_map).unwrap();
+    println!("Ortho after remap: dims={:?}, payload={:?}", remapped.dims(), remapped.payload());
+    
+    // Now try to continue adding values using merged vocabulary
+    let their_idx_merged = merged_vocab.iter().position(|w| w == "their").unwrap();
+    let trappings_idx_merged = merged_vocab.iter().position(|w| w == "trappings").unwrap();
+    let and_idx_merged = merged_vocab.iter().position(|w| w == "and").unwrap();
+    
+    println!("\nMerged indices: their={}, trappings={}, and={}", 
+             their_idx_merged, trappings_idx_merged, and_idx_merged);
+    
+    // Get requirements for the next position
+    let (forbidden, _required) = remapped.get_requirements();
+    println!("Next position requirements: forbidden={:?}", forbidden);
+    
+    // Try adding "their" to trigger expansion
+    let children = remapped.add(their_idx_merged);
+    println!("After adding 'their': {} children", children.len());
+    
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}, payload={:?}", i, child.dims(), child.payload());
+        
+        if let Some((p1, p2, v)) = check_shell_invariant(&child) {
+            panic!(
+                "VIOLATION after adding 'their': positions {} and {} both have value {}\n  dims={:?}\n  payload={:?}",
+                p1, p2, v, child.dims(), child.payload()
+            );
+        }
+        
+        // For each child, check if "trappings" is forbidden for the next position
+        let (next_forbidden, _) = child.get_requirements();
+        let next_pos = child.get_current_position();
+        
+        println!("    Next pos: {}, forbidden: {:?}", next_pos, next_forbidden);
+        
+        if next_forbidden.contains(&trappings_idx_merged) {
+            println!("    'trappings' ({}) IS forbidden", trappings_idx_merged);
+        } else {
+            println!("    'trappings' ({}) is NOT forbidden", trappings_idx_merged);
+            
+            // Check the diagonals
+            let (_, diagonals) = spatial::get_requirements(next_pos, child.dims());
+            println!("    Diagonals for pos {}: {:?}", next_pos, diagonals);
+            
+            // What values are at those diagonal positions?
+            for &diag_pos in &diagonals {
+                if let Some(v) = child.payload()[diag_pos] {
+                    let word = &merged_vocab[v];
+                    println!("      Diagonal pos {} has value {} ('{}')", diag_pos, v, word);
+                }
+            }
+        }
+        
+        // Continue adding "trappings" - this should NOT be allowed if forbidden correctly
+        let (forbidden2, _) = child.get_requirements();
+        if !forbidden2.contains(&trappings_idx_merged) {
+            println!("\n    !!! ATTEMPTING TO ADD 'trappings' when not forbidden !!!");
+            let children2 = child.add(trappings_idx_merged);
+            
+            for (j, child2) in children2.iter().enumerate() {
+                println!("      After adding 'trappings': Child {}: dims={:?}", j, child2.dims());
+                
+                if let Some((p1, p2, v)) = check_shell_invariant(&child2) {
+                    println!(
+                        "      !!! SHELL VIOLATION: positions {} and {} both have value {} !!!",
+                        p1, p2, v
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Test: Trace all expansion paths to find one that could lead to the bug
+#[test]
+fn test_find_expansion_path_to_violation() {
+    println!("=== Finding expansion path that could violate invariant ===\n");
+    
+    // We need to find a scenario where:
+    // 1. "trappings" is placed at position 3 (distance 2)
+    // 2. Later, "trappings" is allowed at position 4 (distance 2)
+    
+    // Let's build toward [4,3] with specific values
+    let mut ortho = Ortho::new();
+    
+    // Add values 0, 1, 2 to get [2,2]
+    ortho = ortho.add(0)[0].clone();
+    ortho = ortho.add(1)[0].clone();
+    ortho = ortho.add(2)[0].clone();
+    
+    println!("Starting [2,2]: {:?}", ortho.payload());
+    
+    // Add value 3 to trigger expansion
+    let children = ortho.add(3);
+    
+    println!("After expansion, {} children:", children.len());
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}, payload={:?}", i, child.dims(), child.payload());
+    }
+    
+    // Follow the [3,2] path
+    let ortho32 = children.iter().find(|c| c.dims() == &vec![3, 2]).unwrap().clone();
+    println!("\nFollowing [3,2] path...");
+    
+    // Continue building
+    let mut current = ortho32;
+    for val in 4..8 {
+        let children = current.add(val);
+        println!("Add {}: {} children", val, children.len());
+        
+        for (i, child) in children.iter().enumerate() {
+            println!("  Child {}: dims={:?}", i, child.dims());
+            
+            // Check if we have [4,3]
+            if child.dims() == &vec![4, 3] {
+                println!("    [4,3] payload: {:?}", child.payload());
+                
+                // Check positions 3 and 4
+                let p3 = child.payload()[3];
+                let p4 = child.payload()[4];
+                println!("    Position 3 value: {:?}", p3);
+                println!("    Position 4 value: {:?}", p4);
+                
+                // Get diagonals
+                let (_, diag3) = spatial::get_requirements(3, child.dims());
+                let (_, diag4) = spatial::get_requirements(4, child.dims());
+                println!("    Position 3 diagonals: {:?}", diag3);
+                println!("    Position 4 diagonals: {:?}", diag4);
+            }
+        }
+        
+        current = children[0].clone();
+    }
+    
+    println!("\nConclusion: Normal construction path does not produce violations.");
+    println!("The bug must be in how the main loop processes orthos across file boundaries.");
+}
