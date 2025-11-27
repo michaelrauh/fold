@@ -1618,3 +1618,170 @@ fn test_find_expansion_path_to_violation() {
     println!("\nConclusion: Normal construction path does not produce violations.");
     println!("The bug must be in how the main loop processes orthos across file boundaries.");
 }
+
+// ============================================================================
+// ROOT CAUSE ANALYSIS
+// ============================================================================
+// 
+// THE BUG: After expansion, orthos have sparse layouts where later positions
+// are filled before earlier positions. The `get_requirements()` function only
+// looks at positions BEFORE the current position for forbidden values, but
+// it should also check LATER positions that are already filled.
+//
+// EXAMPLE:
+// After expanding [2,2] to [2,2,2], the ortho might have:
+//   payload: [Some(23), None, Some(18), Some(20), None, None, Some(16), None]
+//   words:   ["the",    ·,    "prow", "shoulders", ·,   ·,   "of",      ·   ]
+//
+// Position 1 is empty but positions 2 and 3 are filled.
+// When filling position 1:
+//   - get_current_position() returns 1 (first None)
+//   - get_requirements(1, dims) checks diagonals at same distance
+//   - BUT it only considers positions < 1, not positions 2 and 3!
+//
+// Since positions 2 and 3 are both at distance 1 (same shell as position 1),
+// their values should be forbidden when filling position 1. But the diagonal
+// check only looks at earlier positions.
+// ============================================================================
+
+/// THE DEFINITIVE TEST: This test demonstrates the exact bug that causes shell violations.
+/// 
+/// After expansion, positions are reorganized such that later positions can be filled
+/// while earlier positions are empty. When filling those empty positions, the diagonal
+/// check ONLY looks at earlier positions, not at later positions that are already filled.
+#[test]
+fn test_expansion_creates_sparse_layout_bug() {
+    // Build a [2,2] ortho and expand it to [2,2,2]
+    // After expansion, the ortho will have a sparse layout
+    
+    let interner = Interner::from_text("alpha beta gamma delta epsilon");
+    let vocab = interner.vocabulary();
+    
+    let idx = |name: &str| vocab.iter().position(|w| w == name).unwrap();
+    
+    // Build [2,2] ortho: fill positions 0, 1, 2, 3
+    let ortho = Ortho::new();
+    let ortho = ortho.add(idx("alpha"))[0].clone();  // pos 0: alpha
+    let ortho = ortho.add(idx("beta"))[0].clone();   // pos 1: beta
+    let ortho = ortho.add(idx("gamma"))[0].clone();  // pos 2: gamma (canonicalized if needed)
+    
+    println!("[2,2] ortho before expansion:");
+    println!("  dims: {:?}", ortho.dims());
+    println!("  payload: {:?}", ortho.payload());
+    
+    // When we add the 4th value, it will trigger expansion to [2,2,2] or [3,2]
+    let children = ortho.add(idx("delta"));
+    
+    println!("\nAfter expansion (all children):");
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}", i, child.dims());
+        println!("    payload: {:?}", child.payload());
+        
+        // Find empty positions followed by filled positions
+        let payload = child.payload();
+        let mut empty_before_filled = vec![];
+        for pos in 0..payload.len() {
+            if payload[pos].is_none() {
+                // Check if any later position is filled
+                for later in (pos+1)..payload.len() {
+                    if payload[later].is_some() {
+                        empty_before_filled.push((pos, later));
+                    }
+                }
+            }
+        }
+        
+        if !empty_before_filled.is_empty() {
+            println!("    SPARSE LAYOUT DETECTED!");
+            for (empty, filled) in &empty_before_filled {
+                println!("      Position {} is empty, but position {} is filled", empty, filled);
+                
+                // Check if they are at the same distance
+                let (_, diag_empty) = spatial::get_requirements(*empty, child.dims());
+                let (_, _diag_filled) = spatial::get_requirements(*filled, child.dims());
+                
+                // Get indices (coordinates) for distance calculation
+                // The diagonals for empty position should include filled position
+                // if they are at the same distance
+                println!("      Empty position {} diagonals: {:?}", empty, diag_empty);
+                
+                // THE BUG: diag_empty only includes positions BEFORE empty,
+                // not positions AFTER empty that are also at the same distance!
+            }
+        }
+    }
+    
+    // Now demonstrate the actual bug:
+    // Take a child with sparse layout and try to fill it
+    println!("\n--- DEMONSTRATING THE BUG ---\n");
+    
+    for child in &children {
+        let current_pos = child.get_current_position();
+        if current_pos < child.payload().len() {
+            println!("Next position to fill: {}", current_pos);
+            println!("  Current payload: {:?}", child.payload());
+            
+            let (forbidden, required) = child.get_requirements();
+            println!("  Forbidden (from get_requirements): {:?}", forbidden);
+            println!("  Required: {:?}", required);
+            
+            // Check what values are at same-distance positions
+            let (_, diagonals) = spatial::get_requirements(current_pos, child.dims());
+            println!("  Diagonal positions (same distance as {}): {:?}", current_pos, diagonals);
+            
+            // But wait - diagonals only includes positions BEFORE current_pos!
+            // Check if there are any same-distance positions AFTER current_pos
+            let payload = child.payload();
+            for later in (current_pos+1)..payload.len() {
+                if let Some(val) = payload[later] {
+                    // Check if later position is at same distance as current_pos
+                    // This is what the current code MISSES!
+                    let (_, later_diags) = spatial::get_requirements(later, child.dims());
+                    if later_diags.contains(&current_pos) {
+                        println!("  *** BUG: Position {} contains value {} but is NOT in forbidden! ***", later, val);
+                        println!("  *** These positions are at the same distance (same shell) ***");
+                        println!("  *** Filling position {} with value {} would create a shell violation! ***", current_pos, val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Test that demonstrates get_requirements only looks at earlier positions
+#[test]
+fn test_get_requirements_only_checks_earlier_positions() {
+    // In [2,2,2], positions at distance 1 are: 1, 2, 3
+    // When checking position 1's requirements:
+    //   - diagonals should include positions at same distance AND before position 1
+    //   - but there are no positions before 1 at distance 1!
+    // When checking position 2's requirements:
+    //   - diagonals should include position 1 (same distance, before 2)
+    // When checking position 3's requirements:
+    //   - diagonals should include positions 1 and 2 (same distance, before 3)
+    
+    let dims = vec![2, 2, 2];
+    
+    println!("Diagonal positions in [2,2,2]:");
+    for pos in 0..8 {
+        let (_, diags) = spatial::get_requirements(pos, &dims);
+        println!("  Position {}: diagonals = {:?}", pos, diags);
+    }
+    
+    // Verify the expectation:
+    let (_, diag1) = spatial::get_requirements(1, &dims);
+    let (_, diag2) = spatial::get_requirements(2, &dims);
+    let (_, diag3) = spatial::get_requirements(3, &dims);
+    
+    assert!(diag1.is_empty(), "Position 1 should have no earlier same-distance positions");
+    assert!(diag2.contains(&1), "Position 2 should have 1 as diagonal");
+    assert!(diag3.contains(&1), "Position 3 should have 1 as diagonal");
+    assert!(diag3.contains(&2), "Position 3 should have 2 as diagonal");
+    
+    println!("\nThis is correct behavior for SEQUENTIAL filling.");
+    println!("But after EXPANSION, the layout becomes sparse:");
+    println!("  - Position 1 might be empty");
+    println!("  - Positions 2 and 3 might be filled");
+    println!("  - When filling position 1, we SHOULD check 2 and 3 for forbidden values");
+    println!("  - But get_requirements(1) returns empty diagonals!");
+}
