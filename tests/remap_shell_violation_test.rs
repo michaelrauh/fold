@@ -1,149 +1,120 @@
-//! Test demonstrating shell violation bug caused by sparse layouts after expansion.
+//! Tests verifying that the shell violation fix works correctly.
 //!
-//! ## ROOT CAUSE
+//! ## THE BUG (FIXED)
 //!
 //! After expansion (e.g., [2,2] → [2,2,2]), orthos have **sparse layouts** where
-//! later positions can be filled while earlier positions are empty. The
-//! `get_requirements()` function only checks positions **BEFORE** the current
+//! later positions can be filled while earlier positions are empty. The old
+//! `get_requirements()` function only checked positions **BEFORE** the current
 //! position for forbidden values, but later positions that are pre-filled from
 //! reorganization should also be checked.
 //!
-//! The bug is in `spatial::get_diagonals_compute()`:
-//! ```rust
-//! .filter(|index| *index < current_index && index.iter().sum::<usize>() == current_distance)
-//! ```
+//! ## THE FIX
 //!
-//! This only considers indices lexicographically less than current, but after
-//! expansion, later indices may already be filled.
+//! Modified `spatial::get_diagonals_compute()` to include prefilled positions
+//! from the predecessor dims. Now diagonals include both earlier positions
+//! AND later positions that are prefilled from reorganization.
 
-use fold::interner::Interner;
-use fold::ortho::Ortho;
 use fold::spatial;
 
-/// Test that demonstrates the actual sparse layout bug after expansion.
-/// 
-/// When a [2,2] ortho is expanded to [2,2,2], the payload becomes sparse:
-/// positions at later indices may be filled while earlier positions are empty.
-/// 
-/// The `get_requirements()` function only checks positions BEFORE the current
-/// position for forbidden values, missing the pre-filled later positions.
+/// Test that the fix correctly includes prefilled positions in diagonals.
+///
+/// After expansion to [2,2,2], positions 0,2,3,6 are prefilled from [2,2].
+/// For position 1 (empty after expansion), diagonals should include
+/// positions 2 and 3 (same distance = 1) since they are prefilled.
 #[test]
-fn test_expansion_creates_sparse_layout_bug() {
-    // Build a [2,2] ortho and expand it to [2,2,2]
-    // After expansion, the ortho will have a sparse layout
-    
-    let interner = Interner::from_text("alpha beta gamma delta epsilon");
-    let vocab = interner.vocabulary();
-    
-    let idx = |name: &str| vocab.iter().position(|w| w == name).unwrap();
-    
-    // Build [2,2] ortho: fill positions 0, 1, 2, 3
-    let ortho = Ortho::new();
-    let ortho = ortho.add(idx("alpha"))[0].clone();  // pos 0: alpha
-    let ortho = ortho.add(idx("beta"))[0].clone();   // pos 1: beta
-    let ortho = ortho.add(idx("gamma"))[0].clone();  // pos 2: gamma (canonicalized if needed)
-    
-    println!("[2,2] ortho before expansion:");
-    println!("  dims: {:?}", ortho.dims());
-    println!("  payload: {:?}", ortho.payload());
-    
-    // When we add the 4th value, it will trigger expansion to [2,2,2] or [3,2]
-    let children = ortho.add(idx("delta"));
-    
-    println!("\nAfter expansion (all children):");
-    
-    // Find the [2,2,2] child - it demonstrates the sparse layout
-    let sparse_child = children.iter().find(|c| c.dims() == &[2, 2, 2]);
-    
-    if let Some(child) = sparse_child {
-        println!("  [2,2,2] child found:");
-        println!("    payload: {:?}", child.payload());
-        
-        // Verify sparse layout exists
-        let payload = child.payload();
-        let has_sparse = (0..payload.len()).any(|pos| {
-            payload[pos].is_none() && (pos+1..payload.len()).any(|later| payload[later].is_some())
-        });
-        
-        assert!(has_sparse, "Expected sparse layout after expansion");
-        
-        // Now demonstrate the bug
-        let current_pos = child.get_current_position();
-        let (forbidden, _) = child.get_requirements();
-        let (_, diagonals) = spatial::get_requirements(current_pos, child.dims());
-        
-        println!("  Next position to fill: {}", current_pos);
-        println!("  Forbidden: {:?}", forbidden);
-        println!("  Diagonals (from spatial): {:?}", diagonals);
-        
-        // Check if there are same-distance positions AFTER current that are filled
-        // but NOT in the forbidden list
-        let mut bug_found = false;
-        for later in (current_pos+1)..payload.len() {
-            if let Some(val) = payload[later] {
-                let (_, later_diags) = spatial::get_requirements(later, child.dims());
-                if later_diags.contains(&current_pos) && !forbidden.contains(&val) {
-                    println!("  *** BUG: Position {} has value {} (same shell as {}) but NOT forbidden! ***", 
-                             later, val, current_pos);
-                    bug_found = true;
-                }
-            }
-        }
-        
-        assert!(bug_found, "Expected to find the sparse layout bug");
-    } else {
-        println!("  No [2,2,2] child found - expansion went to [3,2] only");
-        // That's also valid, just means we need different test data
-    }
-}
-
-/// Test that demonstrates get_requirements only looks at earlier positions.
-/// 
-/// This shows the fundamental issue: positions at the same distance (shell)
-/// are only included if they come BEFORE the current position lexicographically.
-#[test]
-fn test_get_requirements_only_checks_earlier_positions() {
-    // In [2,2,2], the coordinate-to-index mapping is:
-    // [0,0,0] -> 0, [1,0,0] -> 1, [0,1,0] -> 2, [1,1,0] -> 3
-    // [0,0,1] -> 4, [1,0,1] -> 5, [0,1,1] -> 6, [1,1,1] -> 7
+fn test_fix_includes_prefilled_positions_in_diagonals() {
+    // [2,2,2] comes from expand_up of [2,2]
+    // remap_for_up([2,2], 0) gives prefilled positions: [0, 2, 3, 6]
     //
-    // Distances (sum of coordinates):
-    // 0: position 0
-    // 1: positions 1, 2, 4
-    // 2: positions 3, 5, 6
-    // 3: position 7
+    // The sorted order by (distance, then lexicographic) for [2,2,2]:
+    // idx=0: [0,0,0] distance 0
+    // idx=1: [0,0,1] distance 1 (NOT prefilled)
+    // idx=2: [0,1,0] distance 1 (prefilled)
+    // idx=3: [1,0,0] distance 1 (prefilled)
+    // idx=4: [0,1,1] distance 2 (NOT prefilled)
+    // idx=5: [1,0,1] distance 2 (NOT prefilled)
+    // idx=6: [1,1,0] distance 2 (prefilled)
+    // idx=7: [1,1,1] distance 3 (NOT prefilled)
     
     let dims = vec![2, 2, 2];
     
-    println!("Diagonal positions in [2,2,2]:");
-    for pos in 0..8 {
-        let (_, diags) = spatial::get_requirements(pos, &dims);
-        println!("  Position {}: diagonals = {:?}", pos, diags);
-    }
+    // Position 1 (NOT prefilled) should include positions 2 and 3 (prefilled, same distance)
+    let (_, diag1) = spatial::get_requirements(1, &dims);
+    println!("Position 1 diagonals: {:?}", diag1);
+    assert!(diag1.contains(&2), "Position 1 should include prefilled position 2 in diagonals");
+    assert!(diag1.contains(&3), "Position 1 should include prefilled position 3 in diagonals");
     
-    // The key observation: diagonals only include positions BEFORE the current one.
-    // So for position 2 (distance 1), only position 1 is included (not position 4).
-    // For position 4 (distance 1), NO positions are included (1 and 2 are before but not included!).
+    // Position 4 (NOT prefilled, distance 2) should include position 6 (prefilled, same distance)
+    let (_, diag4) = spatial::get_requirements(4, &dims);
+    println!("Position 4 diagonals: {:?}", diag4);
+    assert!(diag4.contains(&6), "Position 4 should include prefilled position 6 in diagonals");
     
+    // Position 5 (NOT prefilled, distance 2) should include positions 4 and 6
+    // (4 is earlier, 6 is prefilled)
+    let (_, diag5) = spatial::get_requirements(5, &dims);
+    println!("Position 5 diagonals: {:?}", diag5);
+    assert!(diag5.contains(&4), "Position 5 should include position 4 in diagonals");
+    assert!(diag5.contains(&6), "Position 5 should include prefilled position 6 in diagonals");
+}
+
+/// Test that [2,2] base case has no prefilled positions (no predecessor).
+#[test]
+fn test_base_dims_have_no_prefilled() {
+    let dims = vec![2, 2];
+    
+    // In [2,2], there's no predecessor so no prefilled positions.
+    // Diagonals should only include earlier positions.
+    
+    // Distance 1: positions 1, 2
     let (_, diag1) = spatial::get_requirements(1, &dims);
     let (_, diag2) = spatial::get_requirements(2, &dims);
+    
+    println!("[2,2] Position 1 diagonals: {:?}", diag1);
+    println!("[2,2] Position 2 diagonals: {:?}", diag2);
+    
+    // Position 1 should have no diagonals (no earlier same-distance positions)
+    assert!(diag1.is_empty(), "Position 1 in [2,2] should have no diagonals");
+    
+    // Position 2 should include position 1 (earlier, same distance)
+    assert!(diag2.contains(&1), "Position 2 in [2,2] should include position 1");
+}
+
+/// Test that [3,2] (from expand_over) correctly handles prefilled positions.
+#[test]
+fn test_expand_over_prefilled() {
+    // [3,2] comes from expand_over of [2,2]
+    // remap([2,2], [3,2]) gives prefilled positions: [0, 1, 2, 3]
+    //
+    // Distance layout in [3,2]:
+    // Distance 0: position 0
+    // Distance 1: positions 1, 2
+    // Distance 2: positions 3, 4
+    // Distance 3: position 5
+    
+    let dims = vec![3, 2];
+    
+    // Position 4 (empty after expansion) should include position 3 (prefilled, same distance)
     let (_, diag4) = spatial::get_requirements(4, &dims);
+    println!("[3,2] Position 4 diagonals: {:?}", diag4);
+    assert!(diag4.contains(&3), "Position 4 should include prefilled position 3 in diagonals");
     
-    // Position 1 has no earlier same-distance positions
-    assert!(diag1.is_empty(), "Position 1 should have no earlier same-distance positions");
+    // Position 5 (empty after expansion) has no same-distance prefilled positions
+    let (_, diag5) = spatial::get_requirements(5, &dims);
+    println!("[3,2] Position 5 diagonals: {:?}", diag5);
+    // Position 5 is the only position at distance 3, so no diagonals
+}
+
+/// Test no regression: earlier positions at same distance are still included.
+#[test]
+fn test_earlier_positions_still_included() {
+    let dims = vec![3, 3];
     
-    // Position 2 should have position 1 (same distance, earlier)
-    assert!(diag2.contains(&1), "Position 2 should have 1 as diagonal");
+    // In [3,3], position 5 (coords [1,1]) has distance 2
+    // Other distance-2 positions: 3, 4 (coords [0,2], [2,0])
+    // Both 3 and 4 are earlier than 5, so should be in diagonals
     
-    // Position 4 should have positions 1 and 2 (same distance, earlier)
-    // BUT: the current implementation returns EMPTY for position 4!
-    // This is the bug - it only looks at positions < 4 that are at the same distance,
-    // but the filter uses lexicographic ordering which doesn't match distance ordering.
-    
-    println!("\nPosition 4's diagonals: {:?}", diag4);
-    println!("Expected: [1, 2] (same distance as 4)");
-    println!("This difference shows the filter is using index ordering, not distance shells.");
-    
-    // The fix should ensure that when filling a sparse ortho where position 4 is empty
-    // but positions 1, 2 are filled, we check those positions for forbidden values.
+    let (_, diag5) = spatial::get_requirements(5, &dims);
+    println!("[3,3] Position 5 diagonals: {:?}", diag5);
+    assert!(diag5.contains(&3), "Position 5 should include position 3");
+    assert!(diag5.contains(&4), "Position 5 should include position 4");
 }
