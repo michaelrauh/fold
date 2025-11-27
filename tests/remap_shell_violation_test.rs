@@ -766,3 +766,310 @@ fn test_filter_char_edge_cases() {
         }
     }
 }
+
+// ============================================================================
+// PRINCESS OF MARS SHELL VIOLATION REPRODUCTION
+// ============================================================================
+// 
+// The following test reproduces a shell violation observed in an actual
+// ortho generated from "A Princess of Mars" by Edgar Rice Burroughs.
+// 
+// The ortho had dimensions [4, 3] with the following layout:
+//          of        my trappings
+//       their trappings       and
+//       craft        at         ·
+//         for       the         ·
+//
+// The word "trappings" appears at:
+// - Position 3: coords [0,2], distance=2
+// - Position 4: coords [1,1], distance=2
+//
+// Both positions are in the same shell (distance 2), which violates the
+// "no repeats in same shell" rule.
+// ============================================================================
+
+/// Test that reproduces the actual [4,3] shell violation from Princess of Mars
+#[test]
+fn test_princess_of_mars_shell_violation() {
+    // The text chunks that produced the problematic ortho
+    let chunks = vec![
+        // Chunk 1
+        "Unseen we reached a rear window and with the straps
+and leather of my trappings I lowered, first Sola and then Dejah Thoris
+to the ground below.",
+        
+        // Chunk 2
+        "All were mounted upon the small domestic bull
+thoats of the red Martians, and their trappings and ornamentation bore
+such a quantity of gorgeously colored feathers that I could not but be
+struck with the startling resemblance the concourse bore to a band of
+the red Indians of my own Earth.",
+        
+        // Chunk 3
+        "Driving my fleet air craft at high speed directly behind the warriors I
+soon overtook them and without diminishing my speed I rammed the prow
+of my little flier between the shoulders of the nearest.",
+        
+        // Chunk 4
+        "My companion signaled that I slow down, and running his machine close
+beside mine suggested that we approach and watch the ceremony, which,
+he said, was for the purpose of conferring honors on individual
+officers and men for bravery and other distinguished service.",
+        
+        // Chunk 5
+        "Clinging to the wall with my feet and one hand, I unloosened one of the
+long leather straps of my trappings at the end of which dangled a great
+hook by which air sailors are hung to the sides and bottoms of their
+craft for various purposes of repair, and by means of which landing
+parties are lowered to the ground from the battleships.",
+        
+        // Chunk 6 (duplicate of chunk 5)
+        "Clinging to the wall with my feet and one hand, I unloosened one of the
+long leather straps of my trappings at the end of which dangled a great
+hook by which air sailors are hung to the sides and bottoms of their
+craft for various purposes of repair, and by means of which landing
+parties are lowered to the ground from the battleships.",
+        
+        // Chunk 7
+        "Donning my trappings and weapons I hastened to the sheds, and soon had
+out both my machine and Kantos Kan's.",
+    ];
+    
+    // Process chunks like main.rs does - merge them one by one
+    let mut interner = Interner::from_text(chunks[0]);
+    for chunk in chunks.iter().skip(1) {
+        let next_interner = Interner::from_text(chunk);
+        interner = interner.merge(&next_interner);
+    }
+    
+    println!("Vocabulary size: {}", interner.vocabulary().len());
+    println!("Vocabulary: {:?}", interner.vocabulary());
+    
+    // Check if "trappings" is in the vocabulary
+    let trappings_idx = interner.vocabulary().iter().position(|w| w == "trappings");
+    println!("'trappings' is at index: {:?}", trappings_idx);
+    
+    // The ortho from the bug report has:
+    // - "of" at position 0
+    // - "my" at position 1
+    // - "trappings" at position 3 (coords [0,2])
+    // - "their" at position 2
+    // - "trappings" at position 4 (coords [1,1]) <- DUPLICATE IN SAME SHELL
+    // - "and" at position 6
+    // - "craft" at position 5
+    // - "at" at position 7
+    // - "for" at position 8
+    // - "the" at position 10
+    
+    // Position 4's diagonals are [3], so when filling position 4, the value at 
+    // position 3 should be forbidden. If "trappings" is at position 3, then
+    // "trappings" should NOT be allowed at position 4.
+    
+    // Check the diagonals for position 4 in [4,3]
+    let dims = vec![4, 3];
+    let (_, diagonals_4) = spatial::get_requirements(4, &dims);
+    println!("Position 4 diagonals: {:?}", diagonals_4);
+    assert!(diagonals_4.contains(&3), "Position 4 should have position 3 as a diagonal");
+    
+    // Show the position layout for [4,3]
+    println!("\nPosition layout for [4,3]:");
+    let location_to_index = spatial::get_location_to_index(&dims);
+    for row in 0..4 {
+        for col in 0..3 {
+            let coords = vec![row, col];
+            let pos = location_to_index.get(&coords).unwrap();
+            let distance: usize = coords.iter().sum();
+            print!("pos{:2}(d{}) ", pos, distance);
+        }
+        println!();
+    }
+    
+    // Now let's trace the issue: if the ortho was built correctly, position 4
+    // should have "trappings" forbidden because position 3 already has "trappings"
+    // 
+    // The bug must be in how the ortho was constructed or how the requirements
+    // are computed/used during construction.
+}
+
+/// Test that verifies diagonal checking during ortho construction
+#[test]
+fn test_diagonal_check_during_construction() {
+    // Create a vocabulary with a few words
+    let interner = Interner::from_text("of my trappings their and");
+    let vocab = interner.vocabulary();
+    
+    println!("Vocabulary: {:?}", vocab);
+    
+    // Get indices
+    let of_idx = vocab.iter().position(|w| w == "of").unwrap();
+    let my_idx = vocab.iter().position(|w| w == "my").unwrap();
+    let trappings_idx = vocab.iter().position(|w| w == "trappings").unwrap();
+    let their_idx = vocab.iter().position(|w| w == "their").unwrap();
+    let _and_idx = vocab.iter().position(|w| w == "and").unwrap();
+    
+    println!("of={}, my={}, trappings={}, their={}", of_idx, my_idx, trappings_idx, their_idx);
+    
+    // Build an ortho step by step
+    let mut ortho = Ortho::new();
+    println!("\nBuilding ortho step by step:");
+    
+    // Position 0: of
+    ortho = ortho.add(of_idx)[0].clone();
+    println!("After adding 'of': dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+    
+    // Position 1: my (distance 1)
+    ortho = ortho.add(my_idx)[0].clone();
+    println!("After adding 'my': dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+    
+    // Position 2: their (distance 1, same shell as 'my')
+    ortho = ortho.add(their_idx)[0].clone();
+    println!("After adding 'their': dims={:?}, payload={:?}", ortho.dims(), ortho.payload());
+    
+    // Position 3: trappings (distance 2)
+    let children = ortho.add(trappings_idx);
+    println!("After adding 'trappings': {} children generated", children.len());
+    for (i, child) in children.iter().enumerate() {
+        println!("  Child {}: dims={:?}, payload={:?}", i, child.dims(), child.payload());
+        
+        // For each child, check what the requirements are for the next position
+        let (forbidden, _required) = child.get_requirements();
+        println!("    Next pos requirements: forbidden={:?}", forbidden);
+        
+        // Check if trappings is in the forbidden list
+        if forbidden.contains(&trappings_idx) {
+            println!("    'trappings' (index {}) IS forbidden for next position", trappings_idx);
+        } else {
+            println!("    'trappings' (index {}) is NOT forbidden for next position", trappings_idx);
+        }
+    }
+}
+
+/// Test that tries to build an ortho with the exact layout from the bug report
+/// by directly constructing the payload and checking if it violates shell rules
+#[test]
+fn test_verify_reported_ortho_has_shell_violation() {
+    // Create vocabulary matching the ortho
+    let interner = Interner::from_text("of my trappings their and craft at for the");
+    let vocab = interner.vocabulary();
+    
+    println!("Vocabulary: {:?}", vocab);
+    
+    // Get indices for each word
+    let of_idx = vocab.iter().position(|w| w == "of").unwrap();
+    let my_idx = vocab.iter().position(|w| w == "my").unwrap();
+    let trappings_idx = vocab.iter().position(|w| w == "trappings").unwrap();
+    let their_idx = vocab.iter().position(|w| w == "their").unwrap();
+    let and_idx = vocab.iter().position(|w| w == "and").unwrap();
+    let craft_idx = vocab.iter().position(|w| w == "craft").unwrap();
+    let at_idx = vocab.iter().position(|w| w == "at").unwrap();
+    let for_idx = vocab.iter().position(|w| w == "for").unwrap();
+    let the_idx = vocab.iter().position(|w| w == "the").unwrap();
+    
+    println!("Indices: of={}, my={}, trappings={}, their={}, and={}, craft={}, at={}, for={}, the={}",
+             of_idx, my_idx, trappings_idx, their_idx, and_idx, craft_idx, at_idx, for_idx, the_idx);
+    
+    // The reported ortho has this layout for [4,3]:
+    // Position 0 (d0): "of"
+    // Position 1 (d1): "my"
+    // Position 2 (d1): "their"
+    // Position 3 (d2): "trappings"  <- First
+    // Position 4 (d2): "trappings"  <- Duplicate!
+    // Position 5 (d2): "craft"
+    // Position 6 (d3): "and"
+    // Position 7 (d3): "at"
+    // Position 8 (d3): "for"
+    // Position 9 (d4): None
+    // Position 10 (d4): "the"
+    // Position 11 (d5): None
+    
+    let dims = vec![4, 3];
+    let payload: Vec<Option<usize>> = vec![
+        Some(of_idx),        // 0: of
+        Some(my_idx),        // 1: my
+        Some(their_idx),     // 2: their
+        Some(trappings_idx), // 3: trappings (first)
+        Some(trappings_idx), // 4: trappings (DUPLICATE!)
+        Some(craft_idx),     // 5: craft
+        Some(and_idx),       // 6: and
+        Some(at_idx),        // 7: at
+        Some(for_idx),       // 8: for
+        None,                // 9: empty
+        Some(the_idx),       // 10: the
+        None,                // 11: empty
+    ];
+    
+    println!("\nChecking for shell violations in reported ortho layout...");
+    
+    // Check if this payload has a shell violation
+    for pos in 0..payload.len() {
+        if let Some(my_val) = payload[pos] {
+            let (_, diagonals) = spatial::get_requirements(pos, &dims);
+            for &diag_pos in &diagonals {
+                if let Some(diag_val) = payload[diag_pos] {
+                    if my_val == diag_val {
+                        println!("SHELL VIOLATION CONFIRMED:");
+                        println!("  Position {} (value={}, word='{}') duplicates", 
+                                 pos, my_val, vocab[my_val]);
+                        println!("  Position {} (value={}, word='{}')", 
+                                 diag_pos, diag_val, vocab[diag_val]);
+                        
+                        // Get coordinates for both positions
+                        let location_to_index = spatial::get_location_to_index(&dims);
+                        for (loc, &idx) in location_to_index.iter() {
+                            if idx == pos {
+                                println!("  Position {} has coords {:?}, distance {}", 
+                                         pos, loc, loc.iter().sum::<usize>());
+                            }
+                            if idx == diag_pos {
+                                println!("  Position {} has coords {:?}, distance {}", 
+                                         diag_pos, loc, loc.iter().sum::<usize>());
+                            }
+                        }
+                        
+                        // This confirms the bug - the reported ortho does violate shell rules
+                        // Don't panic - we want to continue investigating
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    
+    panic!("Expected to find a shell violation but none was found!");
+}
+
+/// Test simulating the merge process to see if it can create shell violations
+#[test]
+fn test_merge_process_can_create_violation() {
+    // The key insight: the ortho was created from merged chunks.
+    // Let's trace how the ortho building and merging process works.
+    
+    // Create interners from different chunks
+    let chunk1 = "of my trappings";  // Contains "of my trappings"
+    let chunk2 = "their trappings and";  // Contains "their trappings and"
+    
+    let interner1 = Interner::from_text(chunk1);
+    let interner2 = Interner::from_text(chunk2);
+    
+    println!("Chunk1 vocab: {:?}", interner1.vocabulary());
+    println!("Chunk2 vocab: {:?}", interner2.vocabulary());
+    
+    // Merge the interners
+    let merged = interner1.merge(&interner2);
+    println!("Merged vocab: {:?}", merged.vocabulary());
+    
+    // Check that the vocabulary mapping is bijective for both
+    let vocab1_to_merged: Vec<usize> = interner1.vocabulary().iter().map(|w| {
+        merged.vocabulary().iter().position(|v| v == w).unwrap()
+    }).collect();
+    let vocab2_to_merged: Vec<usize> = interner2.vocabulary().iter().map(|w| {
+        merged.vocabulary().iter().position(|v| v == w).unwrap()
+    }).collect();
+    
+    println!("Vocab1 mapping: {:?}", vocab1_to_merged);
+    println!("Vocab2 mapping: {:?}", vocab2_to_merged);
+    
+    // The mapping is bijective - each word maps to one index
+    // So the bug must be in how orthos are constructed during the worker loop,
+    // not in the remap/merge process itself.
+}
