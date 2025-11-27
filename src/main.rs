@@ -1,133 +1,9 @@
-use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, StateConfig}, interner::Interner, memory_config::MemoryConfig, metrics::Metrics, ortho::Ortho, seen_tracker::SeenTracker, spatial, tui::Tui, FoldError};
+use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, StateConfig}, interner::Interner, memory_config::MemoryConfig, metrics::Metrics, ortho::Ortho, seen_tracker::SeenTracker, tui::Tui, FoldError};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-
-/// Check if ortho violates shell invariant (same value in same-distance positions)
-fn check_shell_invariant(ortho: &Ortho) -> Option<(usize, usize, usize)> {
-    let dims = ortho.dims();
-    let payload = ortho.payload();
-    
-    for pos in 0..payload.len() {
-        if let Some(val) = payload[pos] {
-            let (_, diagonals) = spatial::get_requirements(pos, dims);
-            for &diag_pos in &diagonals {
-                if let Some(diag_val) = payload.get(diag_pos).and_then(|v| *v) {
-                    if val == diag_val {
-                        return Some((pos, diag_pos, val));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Format ortho for detailed logging
-fn format_ortho_detailed(ortho: &Ortho, interner: &Interner) -> String {
-    let vocab = interner.vocabulary();
-    let payload_words: Vec<String> = ortho.payload().iter().map(|v| {
-        match v {
-            Some(i) => vocab.get(*i).map(|s| s.as_str()).unwrap_or("?").to_string(),
-            None => "·".to_string(),
-        }
-    }).collect();
-    format!(
-        "Ortho {{ id: {}, dims: {:?}, payload_indices: {:?}, payload_words: {:?} }}",
-        ortho.id(), ortho.dims(), ortho.payload(), payload_words
-    )
-}
-
-/// Check and optionally panic on shell violation
-fn check_and_maybe_panic(
-    child: &Ortho, 
-    parent: Option<&Ortho>, 
-    completion: usize, 
-    interner: &Interner,
-    context: &str
-) {
-    if let Some((p1, p2, val)) = check_shell_invariant(child) {
-        let vocab = interner.vocabulary();
-        let word = vocab.get(val).map(|s| s.as_str()).unwrap_or("?");
-        
-        eprintln!("\n[VIOLATION] ========================================");
-        eprintln!("[VIOLATION] SHELL INVARIANT BROKEN!");
-        eprintln!("[VIOLATION] Context: {}", context);
-        eprintln!("[VIOLATION] Positions {} and {} both have '{}' (idx={})", p1, p2, word, val);
-        eprintln!("[VIOLATION] ----------------------------------------");
-        eprintln!("[VIOLATION] Child ortho:");
-        eprintln!("[VIOLATION]   {}", format_ortho_detailed(child, interner));
-        eprintln!("[VIOLATION]   Completion value: {} ('{}')", completion, vocab.get(completion).map(|s| s.as_str()).unwrap_or("?"));
-        
-        if let Some(p) = parent {
-            eprintln!("[VIOLATION] Parent ortho:");
-            eprintln!("[VIOLATION]   {}", format_ortho_detailed(p, interner));
-            
-            // Show the requirements from parent
-            let (forbidden, required) = p.get_requirements();
-            let forbidden_words: Vec<String> = forbidden.iter()
-                .map(|&i| vocab.get(i).map(|s| s.as_str()).unwrap_or("?").to_string())
-                .collect();
-            let required_phrases: Vec<Vec<String>> = required.iter()
-                .map(|phrase| phrase.iter()
-                    .map(|&i| vocab.get(i).map(|s| s.as_str()).unwrap_or("?").to_string())
-                    .collect())
-                .collect();
-            eprintln!("[VIOLATION]   forbidden (diagonal): {:?} = {:?}", forbidden, forbidden_words);
-            eprintln!("[VIOLATION]   required (prefixes): {:?}", required_phrases);
-        }
-        eprintln!("[VIOLATION] ========================================\n");
-        
-        // Check if we should panic
-        if std::env::var("PANIC_ON_VIOLATION").is_ok() {
-            panic!(
-                "Shell invariant violated: positions {} and {} both have '{}' (idx={}). \
-                 Set PANIC_ON_VIOLATION=0 to disable panic.",
-                p1, p2, word, val
-            );
-        }
-    }
-}
-
-/// Log ortho details if it contains a specific word and TRACE_VOCAB is set
-fn trace_ortho_if_matches(ortho: &Ortho, interner: &Interner, context: &str) {
-    // Check if tracing is enabled via environment variable
-    let trace_word = match std::env::var("TRACE_VOCAB") {
-        Ok(w) if !w.is_empty() => w,
-        _ => return,
-    };
-    
-    let vocab = interner.vocabulary();
-    let word_idx = vocab.iter().position(|w| w == &trace_word);
-    
-    if let Some(idx) = word_idx {
-        // Check if this ortho contains the traced word
-        if ortho.payload().iter().any(|v| *v == Some(idx)) {
-            let payload_words: Vec<String> = ortho.payload().iter().map(|v| {
-                match v {
-                    Some(i) => vocab.get(*i).map(|s| s.as_str()).unwrap_or("?").to_string(),
-                    None => "·".to_string(),
-                }
-            }).collect();
-            
-            eprintln!("[TRACE] {}", context);
-            eprintln!("[TRACE]   ortho id: {}", ortho.id());
-            eprintln!("[TRACE]   dims: {:?}", ortho.dims());
-            eprintln!("[TRACE]   payload indices: {:?}", ortho.payload());
-            eprintln!("[TRACE]   payload words: {:?}", payload_words);
-            
-            // Check for shell violations
-            if let Some((p1, p2, v)) = check_shell_invariant(ortho) {
-                let word = vocab.get(v).map(|s| s.as_str()).unwrap_or("?");
-                eprintln!("[TRACE]   !!! SHELL VIOLATION: positions {} and {} both have '{}' (idx={}) !!!", p1, p2, word, v);
-            }
-            
-            eprintln!("[TRACE]   ---");
-        }
-    }
-}
 
 fn main() -> Result<(), FoldError> {
     // Check for test environment variable
@@ -356,12 +232,6 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
             for child in children {
                 let child_id = child.id();
                 
-                // Check for shell violations with panic option
-                check_and_maybe_panic(&child, Some(&ortho), completion, &interner, "Mode 2 construction");
-                
-                // Trace construction if enabled
-                trace_ortho_if_matches(&child, &interner, &format!("Created child (Mode 2, completion={})", completion));
-                
                 // Use tracker for bloom-filtered deduplication check
                 if !tracker.contains(&child_id) {
                     tracker.insert(child_id);
@@ -545,12 +415,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let mut impacted_from_larger = 0;
     
     while let Some(ortho) = results_larger.pop()? {
-        // Check for shell violations in loaded ortho
-        check_and_maybe_panic(&ortho, None, 0, &merged_interner, "Loaded from larger archive");
-        
-        // Trace loaded ortho
-        trace_ortho_if_matches(&ortho, &merged_interner, "Loaded from larger archive");
-        
         // Larger archive orthos don't need remapping - their vocabulary is already the base
         let ortho_id = ortho.id();
         if !tracker.contains(&ortho_id) {
@@ -593,18 +457,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let mut impacted_from_smaller = 0;
     
     while let Some(ortho) = results_smaller.pop()? {
-        // Check for shell violations before remap
-        check_and_maybe_panic(&ortho, None, 0, &merged_interner, "Before remap (smaller archive)");
-        
         // Smaller archive orthos need remapping to merged vocabulary
         if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
-            // Check for shell violations after remap
-            check_and_maybe_panic(&remapped, None, 0, &merged_interner, "After remap (smaller archive)");
-            
-            // Trace before and after remap
-            trace_ortho_if_matches(&ortho, &merged_interner, "Before remap (smaller archive)");
-            trace_ortho_if_matches(&remapped, &merged_interner, "After remap (smaller archive)");
-            
             let remapped_id = remapped.id();
             if !tracker.contains(&remapped_id) {
                 tracker.insert(remapped_id);
@@ -697,12 +551,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             
             for child in children {
                 let child_id = child.id();
-                
-                // Check for shell violations with panic option
-                check_and_maybe_panic(&child, Some(&ortho), completion, &merged_interner, "Merge construction");
-                
-                // Trace construction if enabled
-                trace_ortho_if_matches(&child, &merged_interner, &format!("Created child (Merge, completion={})", completion));
                 
                 if !tracker.contains(&child_id) {
                     tracker.insert(child_id);
