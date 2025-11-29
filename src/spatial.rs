@@ -65,9 +65,12 @@ pub fn meta_stats() -> (usize, usize) { (META_HITS.load(AtomicOrdering::Relaxed)
 
 pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
     let meta = get_meta(dims);
+    // Return all same-shell positions (not just diagonals which are < loc).
+    // This allows ortho to properly forbid tokens from any same-shell position that has content,
+    // including "forward" positions that may be filled from reorg after expansion.
     (
         meta.impacted_phrase_locations[loc].clone(),
-        meta.diagonals[loc].clone(),
+        get_same_shell_positions(loc, dims),
     )
 }
 

@@ -93,15 +93,8 @@ impl Ortho {
     }
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
         let pos = self.get_current_position();
-        let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims);
-        
-        // Get all same-shell positions (including those >= pos that might be filled from reorg)
-        let same_shell = spatial::get_same_shell_positions(pos, &self.dims);
-        
-        // Forbidden tokens come from same-shell positions that are filled.
-        // A position is considered filled if it's < pos OR if it has content (from reorg).
-        // For same-shell positions, we include any position that has content.
-        let forbidden: Vec<usize> = same_shell
+        let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
+        let forbidden: Vec<usize> = diagonals
             .into_iter()
             .filter_map(|i| self.payload.get(i).and_then(|v| *v))
             .collect();
