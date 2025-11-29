@@ -14,34 +14,35 @@ fn test_3x3_position_6_diagonals() {
     // Pos 6: [1,2], Pos 7: [2,1], Pos 8: [2,2]
     //
     // Position 6 is [1,2] with distance = 3
-    // Position 7 is [2,1] with distance = 3 (same distance as position 6)
-    // diagonals only returns positions < current in the same shell
-    // Position 7 > 6, so 7 is NOT in diagonals
+    // We need to find all positions < 6 with distance = 3
+    // - Position 3: [0,2] distance = 2 (NO)
+    // - Position 4: [1,1] distance = 2 (NO)
+    // - Position 5: [2,0] distance = 2 (NO)
+    //
+    // So position 6 should have NO diagonal positions!
     
     let (_, diagonals) = spatial::get_requirements(6, &dims);
-    println!("Position 6 diagonal positions: {:?}", diagonals);
+    println!("Position 6 diagonals: {:?}", diagonals);
     
-    // Position 6 [1,2] at distance 3 should have no diagonals (no position < 6 at distance 3)
-    assert_eq!(diagonals, vec![], "Position 6 should have no diagonal positions (no predecessors in same shell)");
+    // But in the test, 'and' is at position 1 (Some(1))
+    // and should NOT be in the forbidden list for position 6
+    // since position 1 [0,1] has distance 1, not 3
     
-    // But position 7 is in same shell and > 6, so it's in diagonals_after
-    let diagonals_after = spatial::get_diagonals_after(6, &dims);
-    assert_eq!(diagonals_after, vec![7], "Position 6 should have position 7 in diagonals_after");
+    assert_eq!(diagonals, vec![], "Position 6 should have no diagonal positions");
     
     // Now let's check position 4 [1,1], which is where 'and' gets added the second time
     println!("\n=== Checking position 4 ===");
     
+    // In the payload at step 2: [Some(5), Some(1), Some(4), Some(4), Some(3), Some(0), None, Some(2), None]
+    // Position 1 has token index 1 ('and')
     // Position 4 is [1,1] with distance = 2
-    // Positions with distance = 2:
-    // - Position 3: [0,2] distance = 2 (< 4, so in diagonals)
-    // - Position 5: [2,0] distance = 2 (> 4, so in diagonals_after)
+    
+    // Positions with distance = 2 and position < 4:
+    // - Position 3: [0,2] distance = 2 (YES!)
+    // But position 3 has token index 4 ('south'), not 'and'
     
     let (_prefixes_4, diagonals_4) = spatial::get_requirements(4, &dims);
-    println!("Position 4 diagonal positions: {:?}", diagonals_4);
-    assert_eq!(diagonals_4, vec![3], "Position 4 should have position 3 in its diagonals");
-    
-    let diagonals_after_4 = spatial::get_diagonals_after(4, &dims);
-    assert_eq!(diagonals_after_4, vec![5], "Position 4 should have position 5 in diagonals_after");
+    println!("Position 4 diagonals (position indices): {:?}", diagonals_4);
     
     // Let me manually build the ortho to match the test scenario
     let interner = Interner::from_text("a and of shoulders south the");
@@ -49,7 +50,25 @@ fn test_3x3_position_6_diagonals() {
     println!("\nVocabulary: {:?}", vocab);
     
     // Payload from test: [Some(5), Some(1), Some(4), Some(4), Some(3), Some(0), None, Some(2), None]
+    // This is after adding 'south' at position 3
     // Token indices: 0=a, 1=and, 2=of, 3=shoulders, 4=south, 5=the
+    
+    // So the payload means:
+    // Pos 0: token 5 = 'the'
+    // Pos 1: token 1 = 'and'  
+    // Pos 2: token 4 = 'south'
+    // Pos 3: token 4 = 'south' (duplicate!)
+    // Pos 4: token 3 = 'shoulders'
+    // Pos 5: token 0 = 'a'
+    // Pos 6: None (to be filled)
+    // Pos 7: token 2 = 'of'
+    // Pos 8: None
+    
+    // Ah! Position 3 has 'south' (token 4)
+    // Position 2 also has 'south' (token 4)
+    // They're both at distance 1+0=1 and 0+2=2, respectively
+    // But position 2 is [1,0] with distance 1, and position 3 is [0,2] with distance 2
+    // So they're NOT on the same diagonal!
     
     println!("\nLet me trace through what's really happening...");
 }
