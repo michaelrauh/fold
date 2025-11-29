@@ -44,7 +44,6 @@ thread_local! {
     static DIM_META_CACHE: RefCell<FxHashMap<Vec<usize>, Rc<DimMeta>>> = RefCell::new(FxHashMap::default());
     static EXPAND_UP_CACHE: RefCell<FxHashMap<(Vec<usize>, usize), Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
     static EXPAND_OVER_CACHE: RefCell<FxHashMap<Vec<usize>, Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
-    static SAME_SHELL_CACHE: RefCell<FxHashMap<Vec<usize>, Vec<Vec<usize>>>> = RefCell::new(FxHashMap::default());
 }
 
 static META_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -65,47 +64,10 @@ pub fn meta_stats() -> (usize, usize) { (META_HITS.load(AtomicOrdering::Relaxed)
 
 pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
     let meta = get_meta(dims);
-    // Return all same-shell positions (not just diagonals which are < loc).
-    // This allows ortho to properly forbid tokens from any same-shell position that has content,
-    // including "forward" positions that may be filled from reorg after expansion.
     (
         meta.impacted_phrase_locations[loc].clone(),
-        get_same_shell_positions(loc, dims),
+        meta.diagonals[loc].clone(),
     )
-}
-
-/// Returns all positions in the same shell (same Manhattan distance from origin) as the given location.
-/// Unlike `diagonals`, this includes positions both before AND after `loc` in indices_in_order.
-pub fn get_same_shell_positions(loc: usize, dims: &[usize]) -> Vec<usize> {
-    SAME_SHELL_CACHE.with(|cache| {
-        let key = dims.to_vec();
-        let mut cache = cache.borrow_mut();
-        if !cache.contains_key(&key) {
-            let same_shell_data = compute_same_shell_positions(dims);
-            cache.insert(key.clone(), same_shell_data);
-        }
-        cache.get(&key).unwrap()[loc].clone()
-    })
-}
-
-fn compute_same_shell_positions(dims: &[usize]) -> Vec<Vec<usize>> {
-    let meta = get_meta(dims);
-    let total_positions = dims.iter().product::<usize>();
-    
-    // Pre-compute distances to avoid redundant calculations
-    let distances: Vec<usize> = meta.indices_in_order
-        .iter()
-        .map(|coord| coord.iter().sum())
-        .collect();
-    
-    (0..total_positions)
-        .map(|location| {
-            let current_distance = distances[location];
-            (0..total_positions)
-                .filter(|&idx| distances[idx] == current_distance && idx != location)
-                .collect()
-        })
-        .collect()
 }
 
 pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> { get_meta(dims).axis_positions.clone() }
@@ -287,7 +249,7 @@ fn get_diagonals_compute(
             let current_distance: usize = current_index.iter().sum();
             indices
                 .iter()
-                .filter(|index| *index < current_index && index.iter().sum::<usize>() == current_distance)
+                .filter(|index| *index != current_index && index.iter().sum::<usize>() == current_distance)
                 .map(|x| location_to_index[x])
                 .collect_vec()
         })
@@ -481,20 +443,24 @@ mod tests {
     }
 
     #[test]
-    fn it_gets_same_shell_positions_2x2() {
+    fn it_gets_diagonals_2x2() {
         // In [2,2]:
         // Position 0: [0,0] distance 0 - no other positions at distance 0
         // Position 1: [0,1] distance 1 - position 2 [1,0] is also at distance 1
         // Position 2: [1,0] distance 1 - position 1 [0,1] is also at distance 1
         // Position 3: [1,1] distance 2 - no other positions at distance 2
-        assert_eq!(get_same_shell_positions(0, &[2,2]), Vec::<usize>::new());
-        assert_eq!(get_same_shell_positions(1, &[2,2]), vec![2]);
-        assert_eq!(get_same_shell_positions(2, &[2,2]), vec![1]);
-        assert_eq!(get_same_shell_positions(3, &[2,2]), Vec::<usize>::new());
+        let (_, diagonals_0) = get_requirements(0, &[2,2]);
+        let (_, diagonals_1) = get_requirements(1, &[2,2]);
+        let (_, diagonals_2) = get_requirements(2, &[2,2]);
+        let (_, diagonals_3) = get_requirements(3, &[2,2]);
+        assert_eq!(diagonals_0, Vec::<usize>::new());
+        assert_eq!(diagonals_1, vec![2]);
+        assert_eq!(diagonals_2, vec![1]);
+        assert_eq!(diagonals_3, Vec::<usize>::new());
     }
 
     #[test]
-    fn it_gets_same_shell_positions_2x3() {
+    fn it_gets_diagonals_2x3() {
         // In [2,3]:
         // [[0,0], [0,1], [1,0], [0,2], [1,1], [1,2]]
         // Positions:  0      1      2      3      4      5
@@ -502,11 +468,17 @@ mod tests {
         // Distance 1: positions 1 [0,1], 2 [1,0]
         // Distance 2: positions 3 [0,2], 4 [1,1]
         // Distance 3: position 5 [1,2]
-        assert_eq!(get_same_shell_positions(0, &[2,3]), Vec::<usize>::new());
-        assert_eq!(get_same_shell_positions(1, &[2,3]), vec![2]);
-        assert_eq!(get_same_shell_positions(2, &[2,3]), vec![1]);
-        assert_eq!(get_same_shell_positions(3, &[2,3]), vec![4]);
-        assert_eq!(get_same_shell_positions(4, &[2,3]), vec![3]);
-        assert_eq!(get_same_shell_positions(5, &[2,3]), Vec::<usize>::new());
+        let (_, diagonals_0) = get_requirements(0, &[2,3]);
+        let (_, diagonals_1) = get_requirements(1, &[2,3]);
+        let (_, diagonals_2) = get_requirements(2, &[2,3]);
+        let (_, diagonals_3) = get_requirements(3, &[2,3]);
+        let (_, diagonals_4) = get_requirements(4, &[2,3]);
+        let (_, diagonals_5) = get_requirements(5, &[2,3]);
+        assert_eq!(diagonals_0, Vec::<usize>::new());
+        assert_eq!(diagonals_1, vec![2]);
+        assert_eq!(diagonals_2, vec![1]);
+        assert_eq!(diagonals_3, vec![4]);
+        assert_eq!(diagonals_4, vec![3]);
+        assert_eq!(diagonals_5, Vec::<usize>::new());
     }
 }

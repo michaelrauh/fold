@@ -14,14 +14,14 @@ fn test_3x3_position_6_diagonals() {
     // Pos 6: [1,2], Pos 7: [2,1], Pos 8: [2,2]
     //
     // Position 6 is [1,2] with distance = 3
-    // Position 7 is [2,1] with distance = 3 (same shell as position 6)
-    // With the new same-shell logic, position 7 should be returned
+    // Position 7 is [2,1] with distance = 3 (same distance as position 6)
+    // Diagonals now include all positions at the same distance
     
-    let (_, same_shell) = spatial::get_requirements(6, &dims);
-    println!("Position 6 same-shell positions: {:?}", same_shell);
+    let (_, diagonals) = spatial::get_requirements(6, &dims);
+    println!("Position 6 diagonal positions: {:?}", diagonals);
     
-    // Position 6 [1,2] at distance 3 should have position 7 [2,1] in its same-shell
-    assert_eq!(same_shell, vec![7], "Position 6 should have position 7 in its same-shell (both at distance 3)");
+    // Position 6 [1,2] at distance 3 should have position 7 [2,1] in its diagonals
+    assert_eq!(diagonals, vec![7], "Position 6 should have position 7 in its diagonals (both at distance 3)");
     
     // Now let's check position 4 [1,1], which is where 'and' gets added the second time
     println!("\n=== Checking position 4 ===");
@@ -30,10 +30,10 @@ fn test_3x3_position_6_diagonals() {
     // Positions with distance = 2:
     // - Position 3: [0,2] distance = 2
     // - Position 5: [2,0] distance = 2
-    // Both should be in the same-shell for position 4
+    // Both should be in the diagonals for position 4
     
-    let (_prefixes_4, same_shell_4) = spatial::get_requirements(4, &dims);
-    println!("Position 4 same-shell positions: {:?}", same_shell_4);
+    let (_prefixes_4, diagonals_4) = spatial::get_requirements(4, &dims);
+    println!("Position 4 diagonal positions: {:?}", diagonals_4);
     
     // Let me manually build the ortho to match the test scenario
     let interner = Interner::from_text("a and of shoulders south the");
