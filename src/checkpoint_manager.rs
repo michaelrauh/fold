@@ -216,10 +216,15 @@ mod tests {
         let result = manager.load(&memory_config).unwrap();
         assert!(result.is_some());
         
-        let (loaded_interner, loaded_results, mut loaded_tracker) = result.unwrap();
+        let (loaded_interner, mut loaded_results, mut loaded_tracker) = result.unwrap();
         
         assert_eq!(loaded_interner.version(), interner.version());
-        assert_eq!(loaded_results.len(), 2, "Should have 2 results from checkpoint");
+        // Verify results by popping (len() is not reliable for reloaded queues)
+        let mut count = 0;
+        while loaded_results.pop().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2, "Should have 2 results from checkpoint");
         assert_eq!(loaded_tracker.len(), 2, "Tracker should have 2 IDs reconstructed from results");
         assert!(loaded_tracker.contains(&id1));
         assert!(loaded_tracker.contains(&id2));

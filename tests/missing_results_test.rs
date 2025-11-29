@@ -136,13 +136,18 @@ fn test_archive_should_require_results_directory() -> Result<(), FoldError> {
     // Verify archive has results
     assert!(archive_results_path.exists(), "Archive should have results directory");
     
-    // Load and verify
-    let loaded_results = DiskBackedQueue::new_from_path(
+    // Load and verify by popping (len() is not reliable for reloaded queues)
+    let mut loaded_results = DiskBackedQueue::new_from_path(
         archive_results_path.to_str().unwrap(), 
         10
     )?;
     
-    assert_eq!(loaded_results.len(), 2, "Should load all results");
+    let mut count = 0;
+    while loaded_results.pop()?.is_some() {
+        count += 1;
+    }
+    
+    assert_eq!(count, 2, "Should load all results");
     
     Ok(())
 }

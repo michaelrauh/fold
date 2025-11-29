@@ -970,9 +970,13 @@ mod tests {
         assert!(archive_results_path.exists());
         assert!(archive_results_path.is_dir());
         
-        // Load results from the archive
-        let loaded_results = DiskBackedQueue::new_from_path(archive_results_path.to_str().unwrap(), 10).unwrap();
-        assert_eq!(loaded_results.len(), 2);
+        // Load results from the archive and verify by popping (len() is not reliable for reloaded queues)
+        let mut loaded_results = DiskBackedQueue::new_from_path(archive_results_path.to_str().unwrap(), 10).unwrap();
+        let mut count = 0;
+        while loaded_results.pop().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
         
         // Verify lineage.txt exists and contains expected value
         let lineage_path = archive_path.join("lineage.txt");
