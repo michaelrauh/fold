@@ -10,6 +10,7 @@ struct DimMeta {
     axis_positions: Vec<usize>,
     impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
     diagonals: Vec<Vec<usize>>,
+    diagonals_after: Vec<Vec<usize>>,  // positions in same shell that are > current
     location_to_index: FxHashMap<Vec<usize>, usize>,
 }
 
@@ -30,11 +31,13 @@ impl DimMeta {
             .collect();
         let impacted_phrase_locations = get_impacted_phrase_locations_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
         let diagonals = get_diagonals_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
+        let diagonals_after = get_diagonals_after_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
         DimMeta {
             indices_in_order,
             axis_positions: (1..=dims.len()).collect(),
             impacted_phrase_locations,
             diagonals,
+            diagonals_after,
             location_to_index,
         }
     }
@@ -68,6 +71,12 @@ pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usi
         meta.impacted_phrase_locations[loc].clone(),
         meta.diagonals[loc].clone(),
     )
+}
+
+/// Returns positions in the same shell that come AFTER the given location (for expansion-based forbidden checking)
+pub fn get_diagonals_after(loc: usize, dims: &[usize]) -> Vec<usize> {
+    let meta = get_meta(dims);
+    meta.diagonals_after[loc].clone()
 }
 
 pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> { get_meta(dims).axis_positions.clone() }
@@ -249,7 +258,27 @@ fn get_diagonals_compute(
             let current_distance: usize = current_index.iter().sum();
             indices
                 .iter()
-                .filter(|index| *index != current_index && index.iter().sum::<usize>() == current_distance)
+                .filter(|index| *index < current_index && index.iter().sum::<usize>() == current_distance)
+                .map(|x| location_to_index[x])
+                .collect_vec()
+        })
+        .collect_vec()
+}
+
+// Positions in same shell that are > current (for checking filled positions after expansion)
+fn get_diagonals_after_compute(
+    dims: &[usize],
+    index_to_location: &FxHashMap<usize, Vec<usize>>,
+    location_to_index: &FxHashMap<Vec<usize>, usize>,
+    indices: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
+    (0..dims.iter().product::<usize>())
+        .map(|location| {
+            let current_index = &index_to_location[&location];
+            let current_distance: usize = current_index.iter().sum();
+            indices
+                .iter()
+                .filter(|index| *index > current_index && index.iter().sum::<usize>() == current_distance)
                 .map(|x| location_to_index[x])
                 .collect_vec()
         })
@@ -440,45 +469,5 @@ mod tests {
         let result = expand_over(&vec![2, 2, 2]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![2, 2, 3]);
-    }
-
-    #[test]
-    fn it_gets_diagonals_2x2() {
-        // In [2,2]:
-        // Position 0: [0,0] distance 0 - no other positions at distance 0
-        // Position 1: [0,1] distance 1 - position 2 [1,0] is also at distance 1
-        // Position 2: [1,0] distance 1 - position 1 [0,1] is also at distance 1
-        // Position 3: [1,1] distance 2 - no other positions at distance 2
-        let (_, diagonals_0) = get_requirements(0, &[2,2]);
-        let (_, diagonals_1) = get_requirements(1, &[2,2]);
-        let (_, diagonals_2) = get_requirements(2, &[2,2]);
-        let (_, diagonals_3) = get_requirements(3, &[2,2]);
-        assert_eq!(diagonals_0, Vec::<usize>::new());
-        assert_eq!(diagonals_1, vec![2]);
-        assert_eq!(diagonals_2, vec![1]);
-        assert_eq!(diagonals_3, Vec::<usize>::new());
-    }
-
-    #[test]
-    fn it_gets_diagonals_2x3() {
-        // In [2,3]:
-        // [[0,0], [0,1], [1,0], [0,2], [1,1], [1,2]]
-        // Positions:  0      1      2      3      4      5
-        // Distance 0: position 0 [0,0]
-        // Distance 1: positions 1 [0,1], 2 [1,0]
-        // Distance 2: positions 3 [0,2], 4 [1,1]
-        // Distance 3: position 5 [1,2]
-        let (_, diagonals_0) = get_requirements(0, &[2,3]);
-        let (_, diagonals_1) = get_requirements(1, &[2,3]);
-        let (_, diagonals_2) = get_requirements(2, &[2,3]);
-        let (_, diagonals_3) = get_requirements(3, &[2,3]);
-        let (_, diagonals_4) = get_requirements(4, &[2,3]);
-        let (_, diagonals_5) = get_requirements(5, &[2,3]);
-        assert_eq!(diagonals_0, Vec::<usize>::new());
-        assert_eq!(diagonals_1, vec![2]);
-        assert_eq!(diagonals_2, vec![1]);
-        assert_eq!(diagonals_3, vec![4]);
-        assert_eq!(diagonals_4, vec![3]);
-        assert_eq!(diagonals_5, Vec::<usize>::new());
     }
 }

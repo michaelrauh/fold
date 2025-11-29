@@ -94,10 +94,23 @@ impl Ortho {
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
         let pos = self.get_current_position();
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
-        let forbidden: Vec<usize> = diagonals
+        let diagonals_after = spatial::get_diagonals_after(pos, &self.dims);
+        
+        // Forbidden tokens come from:
+        // 1. Positions in the same shell that are < current (original diagonals)
+        // 2. Positions in the same shell that are > current AND have content (filled from reorg after expansion)
+        let mut forbidden: Vec<usize> = diagonals
             .into_iter()
             .filter_map(|i| self.payload.get(i).and_then(|v| *v))
             .collect();
+        
+        // Add forbidden tokens from after-positions that have content
+        let forbidden_after: Vec<usize> = diagonals_after
+            .into_iter()
+            .filter_map(|i| self.payload.get(i).and_then(|v| *v))
+            .collect();
+        forbidden.extend(forbidden_after);
+        
         let required: Vec<Vec<usize>> = prefixes
             .into_iter()
             .filter(|prefix| !prefix.is_empty())
@@ -597,6 +610,42 @@ mod tests {
         let (forbidden, required) = ortho.get_requirements();
         assert_eq!(forbidden, vec![40]);
         assert_eq!(required, vec![vec![10, 20]]);
+    }
+
+    #[test]
+    fn test_get_requirements_only_includes_filled_after_positions() {
+        // This test proves that positions after the current position are only included
+        // in the forbidden set if they are actually filled (from reorg).
+        // Positions after current that are empty are NOT included.
+        
+        // Create an ortho that expands to [2,3] with some positions filled and some empty
+        let ortho = Ortho::new();
+        let ortho = &ortho.add(10)[0]; // Position 0
+        let ortho = &ortho.add(20)[0]; // Position 1
+        let ortho = &ortho.add(30)[0]; // Position 2
+        let ortho = &ortho.add(40)[0]; // Position 4 (after reorg)
+        
+        // Now we're at position 3 in a [2,3] shape
+        // payload = [Some(10), Some(20), Some(30), None, Some(40), None]
+        // Position 3: [0,2] distance 2 - current position (None)
+        // Position 4: [1,1] distance 2 - filled with 40 from reorg
+        // Position 5: [1,2] distance 3 - empty (None)
+        
+        // The forbidden set should include:
+        // - Positions < 3 in same shell (distance 2): none, because positions 0,1,2 have distances 0,1,1
+        // - Positions > 3 in same shell that are filled: position 4 has 40
+        // So forbidden should be [40]
+        
+        let (forbidden, _) = ortho.get_requirements();
+        
+        // Verify that only position 4's token (40) is forbidden
+        // Position 5 is also in the same shape but it's empty (None), so nothing from there
+        assert_eq!(forbidden, vec![40], 
+            "Only filled positions should be in forbidden, empty positions after current should not be included");
+        
+        // Verify that the forbidden set doesn't contain any tokens from empty positions
+        // If the code incorrectly included empty after-positions, this would fail
+        assert!(!forbidden.is_empty(), "There should be at least one forbidden token from position 4");
     }
 
     #[test]
