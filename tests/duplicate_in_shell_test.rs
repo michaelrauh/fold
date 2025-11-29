@@ -51,7 +51,7 @@ fn test_duplicate_token_in_same_shell_forbidden() {
     );
 }
 
-/// Test that diagonal restrictions work correctly in a 3x3 grid
+/// Test that diagonal restrictions work correctly in a 2x3 grid (sorted dims)
 #[test] 
 fn test_display_shows_correct_structure() {
     let interner = Interner::from_text("a b c d e f");
@@ -61,21 +61,32 @@ fn test_display_shows_correct_structure() {
     let c_idx = vocab.iter().position(|w| w == "c").unwrap();
     let d_idx = vocab.iter().position(|w| w == "d").unwrap();
     
-    // Build to a 3x3 ortho to test diagonal at distance 2
+    // Build to a [2,3] ortho (from a full 2x2 that expands)
+    // With sorted dims [2,3], indices_in_order is:
+    // [[0,0], [0,1], [1,0], [0,2], [1,1], [1,2]]
+    // Positions:  0      1      2      3      4      5
     let ortho = Ortho::new();
     let ortho = ortho.add(a_idx)[0].clone();
     let ortho = ortho.add(b_idx)[0].clone();
     let ortho = ortho.add(c_idx)[0].clone();
     
-    // Position 3 [0,2] with 'd' - distance 2
+    // Adding 'd' triggers expansion from [2,2] to [2,3]
+    // Remap [0,1,2,4] places 'd' at position 4
+    // payload = [Some(a), Some(b), Some(c), None, Some(d), None]
     let ortho = ortho.add(d_idx)[0].clone();
     
-    // Now at position 4 [1,1] - also distance 2
-    // Position 3 should be on the diagonal and 'd' should be forbidden
+    // Current position is 3 (first None)
+    // Position 3 = index [0,2], distance 2
+    // For diagonals at position 3: indices with distance 2 and < [0,2]
+    // [1,1] has distance 2 but [1,1] > [0,2], so no diagonals
+    // Thus 'd' at position 4 is NOT in forbidden for position 3
     let (forbidden, _) = ortho.get_requirements();
     
+    // With the new sorted dims layout, there are no diagonals at position 3
+    // because [1,1] (position 4) comes AFTER [0,2] (position 3) in the order
     assert!(
-        forbidden.contains(&d_idx),
-        "Token 'd' at position 3 [0,2] should forbid 'd' at position 4 [1,1] (same diagonal, distance 2)"
+        forbidden.is_empty(),
+        "At position 3 [0,2], there are no diagonal predecessors in [2,3] layout, but got: {:?}",
+        forbidden
     );
 }

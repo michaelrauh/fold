@@ -129,17 +129,56 @@ fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
         .collect()
 }
 
-fn next_dims_over(dims: &[usize]) -> Vec<Vec<usize>> {
-    let mut results = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (i, &val) in dims.iter().enumerate() {
-        if seen.insert(val) {
-            let mut new_dims = dims.to_vec();
-            new_dims[i] += 1;
-            results.push(new_dims);
+fn parent(dims: &[usize]) -> Option<Vec<usize>> {
+    // Root shape [2,2] has no parent
+    if dims == &[2, 2] {
+        return None;
+    }
+    
+    // If all entries are 2 and dims.len() > 2: remove one 2, then sort
+    if dims.iter().all(|&x| x == 2) && dims.len() > 2 {
+        let mut p = dims.to_vec();
+        p.pop(); // Remove any element (all are 2, so choice doesn't matter)
+        p.sort();
+        return Some(p);
+    }
+    
+    // Otherwise (some entry > 2): replace one occurrence of max with max-1, sort
+    let m = *dims.iter().max().unwrap();
+    let mut p = dims.to_vec();
+    // Find and replace first occurrence of m with m-1
+    for i in 0..p.len() {
+        if p[i] == m {
+            p[i] = m - 1;
+            break;
         }
     }
-    results
+    p.sort();
+    Some(p)
+}
+
+fn next_dims_over(old_dims: &[usize]) -> Vec<Vec<usize>> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    
+    // Generate candidates by incrementing each index by 1, then sorting
+    for i in 0..old_dims.len() {
+        let mut new_dims = old_dims.to_vec();
+        new_dims[i] += 1;
+        new_dims.sort();
+        
+        // Deduplicate
+        if seen.insert(new_dims.clone()) {
+            // Keep only if parent(new_dims) == old_dims
+            if let Some(p) = parent(&new_dims) {
+                if p == old_dims {
+                    candidates.push(new_dims);
+                }
+            }
+        }
+    }
+    
+    candidates
 }
 
 fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
@@ -332,7 +371,7 @@ mod tests {
 
     #[test]
     fn it_expands_for_over() {
-        assert_eq!(expand_over(&vec![2,2]), vec![(vec![3,2],6,vec![0,1,2,3])]);
+        assert_eq!(expand_over(&vec![2,2]), vec![(vec![2,3],6,vec![0,1,2,4])]);
     }
 
     #[test]
@@ -343,5 +382,63 @@ mod tests {
     #[test]
     fn it_gets_axis_positions() {
         assert_eq!(get_axis_positions(&[2,2]), vec![1,2]);
+    }
+
+    #[test]
+    fn parent_of_root_is_none() {
+        assert_eq!(parent(&[2, 2]), None);
+    }
+
+    #[test]
+    fn parent_of_all_twos_removes_one_two() {
+        // [2,2,2] with all 2s and len > 2 → remove one 2 → [2,2]
+        assert_eq!(parent(&[2, 2, 2]), Some(vec![2, 2]));
+        // [2,2,2,2] → [2,2,2]
+        assert_eq!(parent(&[2, 2, 2, 2]), Some(vec![2, 2, 2]));
+    }
+
+    #[test]
+    fn parent_of_shape_with_entry_greater_than_two_decrements_max() {
+        // [2,3]: max=3, replace 3 with 2 → [2,2] sorted
+        assert_eq!(parent(&[2, 3]), Some(vec![2, 2]));
+        // [2,4]: max=4, replace 4 with 3 → [2,3] sorted
+        assert_eq!(parent(&[2, 4]), Some(vec![2, 3]));
+        // [3,3]: max=3, replace one 3 with 2 → [2,3] sorted
+        assert_eq!(parent(&[3, 3]), Some(vec![2, 3]));
+        // [2,2,3]: max=3, replace 3 with 2 → [2,2,2] sorted
+        assert_eq!(parent(&[2, 2, 3]), Some(vec![2, 2, 2]));
+        // [2,3,3]: max=3, replace one 3 with 2 → [2,2,3] sorted
+        assert_eq!(parent(&[2, 3, 3]), Some(vec![2, 2, 3]));
+    }
+
+    #[test]
+    fn expand_over_generates_children_matching_parent_rule() {
+        // From [2,2]: increment each dimension, sort, keep if parent matches [2,2]
+        // Increment 0th: [3,2] → sorted [2,3], parent([2,3]) = [2,2] ✓
+        // Increment 1st: [2,3] → sorted [2,3], parent([2,3]) = [2,2] ✓
+        // Deduplicated: [2,3]
+        let result = expand_over(&vec![2, 2]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![2, 3]);
+        
+        // From [2,3]: increment each dimension, sort, keep if parent matches [2,3]
+        // Increment 0th: [3,3] → sorted [3,3], parent([3,3]) = [2,3] ✓
+        // Increment 1st: [2,4] → sorted [2,4], parent([2,4]) = [2,3] ✓
+        let result = expand_over(&vec![2, 3]);
+        assert_eq!(result.len(), 2);
+        // Results should be [3,3] and [2,4]
+        let dims: Vec<_> = result.iter().map(|r| r.0.clone()).collect();
+        assert!(dims.contains(&vec![2, 4]));
+        assert!(dims.contains(&vec![3, 3]));
+    }
+
+    #[test]
+    fn expand_over_from_all_twos_three_dim() {
+        // From [2,2,2]: increment each dimension, sort, keep if parent matches [2,2,2]
+        // Increment 0th: [3,2,2] → sorted [2,2,3], parent([2,2,3]) = [2,2,2] ✓
+        // All increments give [2,2,3] after sorting
+        let result = expand_over(&vec![2, 2, 2]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![2, 2, 3]);
     }
 }

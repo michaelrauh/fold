@@ -479,8 +479,8 @@ mod tests {
             expansions,
             vec![
                 Ortho {
-                    dims: vec![3, 2],
-                    payload: vec![Some(1), Some(2), Some(3), Some(4), None, None],
+                    dims: vec![2, 3],
+                    payload: vec![Some(1), Some(2), Some(3), None, Some(4), None],
                     volume: 2,
                     fullness: 4,
                 },
@@ -544,8 +544,8 @@ mod tests {
                     fullness: 4,
                 },
                 Ortho {
-                    dims: vec![3, 2],
-                    payload: vec![Some(10), Some(15), Some(20), Some(30), None, None],
+                    dims: vec![2, 3],
+                    payload: vec![Some(10), Some(15), Some(20), None, Some(30), None],
                     volume: 2,
                     fullness: 4,
                 },
@@ -588,9 +588,13 @@ mod tests {
         let ortho = &ortho.add(30)[0];
         let ortho = &ortho.add(40)[0];
 
+        // With sorted dims [2,3] instead of old [3,2]:
+        // payload = [Some(10), Some(20), Some(30), None, Some(40), None]
+        // current_position = 3 (first None)
+        // At position 3 (index [0,2]), no diagonals exist
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, vec![40]);
-        assert_eq!(required, vec![vec![10, 30]]);
+        assert_eq!(forbidden, Vec::<usize>::new());
+        assert_eq!(required, vec![vec![10, 20]]);
     }
 
     #[test]
@@ -809,8 +813,9 @@ mod tests {
         
         let ortho = &ortho.add(30)[0];
         let ortho = &ortho.add(40)[0];
+        // With sorted dims [2,3], the required phrases at position 3 are [[10, 20]]
         let phrases = ortho.get_requirement_phrases();
-        assert_eq!(phrases, vec![vec![10, 30]]);
+        assert_eq!(phrases, vec![vec![10, 20]]);
     }
 
     #[test]
