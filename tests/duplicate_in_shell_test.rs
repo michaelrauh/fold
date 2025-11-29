@@ -51,7 +51,8 @@ fn test_duplicate_token_in_same_shell_forbidden() {
     );
 }
 
-/// Test that diagonal restrictions work correctly in a 2x3 grid (sorted dims)
+/// Test that same-shell restrictions work correctly in a 2x3 grid (sorted dims)
+/// With the fixed forbidden logic, positions filled from reorg are included
 #[test] 
 fn test_display_shows_correct_structure() {
     let interner = Interner::from_text("a b c d e f");
@@ -77,16 +78,15 @@ fn test_display_shows_correct_structure() {
     
     // Current position is 3 (first None)
     // Position 3 = index [0,2], distance 2
-    // For diagonals at position 3: indices with distance 2 and < [0,2]
-    // [1,1] has distance 2 but [1,1] > [0,2], so no diagonals
-    // Thus 'd' at position 4 is NOT in forbidden for position 3
+    // Position 4 = index [1,1], distance 2 (same shell)
+    // Position 4 has content (d_idx) from reorg, so d_idx is in forbidden
     let (forbidden, _) = ortho.get_requirements();
     
-    // With the new sorted dims layout, there are no diagonals at position 3
-    // because [1,1] (position 4) comes AFTER [0,2] (position 3) in the order
+    // With the fixed forbidden logic, same-shell positions that are filled
+    // (even if they are "ahead" in the order) are now included in forbidden
     assert!(
-        forbidden.is_empty(),
-        "At position 3 [0,2], there are no diagonal predecessors in [2,3] layout, but got: {:?}",
+        forbidden.contains(&d_idx),
+        "At position 3 [0,2], position 4 [1,1] is in the same shell and has content 'd', so 'd' should be forbidden, but forbidden was: {:?}",
         forbidden
     );
 }

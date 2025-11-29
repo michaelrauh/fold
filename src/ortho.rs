@@ -93,8 +93,15 @@ impl Ortho {
     }
     pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
         let pos = self.get_current_position();
-        let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims);
-        let forbidden: Vec<usize> = diagonals
+        let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims);
+        
+        // Get all same-shell positions (including those >= pos that might be filled from reorg)
+        let same_shell = spatial::get_same_shell_positions(pos, &self.dims);
+        
+        // Forbidden tokens come from same-shell positions that are filled.
+        // A position is considered filled if it's < pos OR if it has content (from reorg).
+        // For same-shell positions, we include any position that has content.
+        let forbidden: Vec<usize> = same_shell
             .into_iter()
             .filter_map(|i| self.payload.get(i).and_then(|v| *v))
             .collect();
@@ -591,9 +598,11 @@ mod tests {
         // With sorted dims [2,3] instead of old [3,2]:
         // payload = [Some(10), Some(20), Some(30), None, Some(40), None]
         // current_position = 3 (first None)
-        // At position 3 (index [0,2]), no diagonals exist
+        // At position 3 (index [0,2], distance 2):
+        // Position 4 (index [1,1], also distance 2) is in the same shell
+        // Position 4 has content (40) from the reorg, so 40 is forbidden
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, Vec::<usize>::new());
+        assert_eq!(forbidden, vec![40]);
         assert_eq!(required, vec![vec![10, 20]]);
     }
 
