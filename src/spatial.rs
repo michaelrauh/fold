@@ -2,15 +2,15 @@ use std::{cell::RefCell, cmp::Ordering};
 use itertools::Itertools;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use rustc_hash::FxHashMap; // use concrete name
+use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 
-// Consolidated metadata per dims
+// Consolidated metadata per dims (cached by shape only)
 struct DimMeta {
     indices_in_order: Vec<Vec<usize>>,
     axis_positions: Vec<usize>,
     impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
-    diagonals: Vec<Vec<usize>>,
+    diagonals: Vec<Vec<usize>>,  // Base diagonals (positions < current in same shell)
     location_to_index: FxHashMap<Vec<usize>, usize>,
 }
 
@@ -30,7 +30,10 @@ impl DimMeta {
             .map(|(i, loc)| (i, loc))
             .collect();
         let impacted_phrase_locations = get_impacted_phrase_locations_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
+        
+        // Compute base diagonals only (positions < current in same shell)
         let diagonals = get_diagonals_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
+        
         DimMeta {
             indices_in_order,
             axis_positions: (1..=dims.len()).collect(),
@@ -63,41 +66,57 @@ fn get_meta(dims: &[usize]) -> Rc<DimMeta> {
 
 pub fn meta_stats() -> (usize, usize) { (META_HITS.load(AtomicOrdering::Relaxed), META_MISSES.load(AtomicOrdering::Relaxed)) }
 
-pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
+pub fn get_requirements(loc: usize, dims: &[usize], up_axis: Option<usize>) -> (Vec<Vec<usize>>, Vec<usize>) {
     let meta = get_meta(dims);
-    // Combine diagonals (position indices < loc in same shell) with
-    // diagonals from parent (position indices > loc in same shell that were filled from parent)
-    let mut combined_diagonals = meta.diagonals[loc].clone();
     
-    // Add positions from parent that have index > loc and are in same shell
-    // Only for "over" expansions where dimensionality is the same
+    // Start with base diagonals
+    let mut diagonals = meta.diagonals[loc].clone();
+    
+    // Enrich with parent-filled forward positions if parent exists
     if let Some(parent_dims) = parent(dims) {
-        // Only use remap for "over" expansions (same number of dimensions)
-        if parent_dims.len() == dims.len() {
-            let filled_positions: FxHashSet<usize> = remap(&parent_dims, dims).into_iter().collect();
+        // Get positions filled from parent
+        let filled_from_parent: FxHashSet<usize> = match up_axis {
+            None => {
+                // Over expansion: parent has same number of dimensions
+                if parent_dims.len() == dims.len() {
+                    remap(&parent_dims, dims).into_iter().collect()
+                } else {
+                    FxHashSet::default()
+                }
+            }
+            Some(axis) => {
+                // Up expansion: parent has one fewer dimension
+                if parent_dims.len() + 1 == dims.len() {
+                    remap_for_up(&parent_dims, axis).into_iter().collect()
+                } else {
+                    FxHashSet::default()
+                }
+            }
+        };
+        
+        if !filled_from_parent.is_empty() {
             let current_index = &meta.indices_in_order[loc];
             let current_distance: usize = current_index.iter().sum();
             
-            let extra_diagonals: Vec<usize> = meta.indices_in_order
-                .iter()
-                .enumerate()
-                .filter(|(pos, index)| {
-                    *pos > loc &&  // position index is after current position index
-                    index.iter().sum::<usize>() == current_distance &&  // same shell
-                    filled_positions.contains(pos)  // filled from parent
-                })
-                .map(|(pos, _)| pos)
-                .collect();
+            // Add forward positions that are in same shell and filled from parent
+            for (pos, index) in meta.indices_in_order.iter().enumerate() {
+                if pos > loc  // forward position
+                    && index.iter().sum::<usize>() == current_distance  // same shell
+                    && filled_from_parent.contains(&pos)  // filled from parent
+                {
+                    diagonals.push(pos);
+                }
+            }
             
-            combined_diagonals.extend(extra_diagonals);
+            // Sort and deduplicate
+            diagonals.sort();
+            diagonals.dedup();
         }
-        // TODO: For "up" expansions (parent has fewer dimensions), we would need remap_for_up
-        // but we don't know which position was used for the expansion
     }
     
     (
         meta.impacted_phrase_locations[loc].clone(),
-        combined_diagonals,
+        diagonals,
     )
 }
 
@@ -361,13 +380,13 @@ mod tests {
 
     #[test]
     fn it_gets_impacted_phrase_locations() {
-        let (phrases, _diag) = get_requirements(3, &[2,2]);
+        let (phrases, _diag) = get_requirements(3, &[2,2], None);
         assert_eq!(phrases, vec![vec![1], vec![2]]);
     }
 
     #[test]
     fn it_gets_impacted_diagonals() {
-        let (_, diag) = get_requirements(5, &[3,3]);
+        let (_, diag) = get_requirements(5, &[3,3], None);
         assert_eq!(diag, vec![3,4]);
     }
 
