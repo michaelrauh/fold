@@ -138,8 +138,7 @@ fn parent(dims: &[usize]) -> Option<Vec<usize>> {
     // If all entries are 2 and dims.len() > 2: remove one 2, then sort
     if dims.iter().all(|&x| x == 2) && dims.len() > 2 {
         let mut p = dims.to_vec();
-        // Remove one 2 (it doesn't matter which since all are 2)
-        p.remove(0);
+        p.pop(); // Remove any element (all are 2, so choice doesn't matter)
         p.sort();
         return Some(p);
     }
