@@ -88,15 +88,18 @@ pub fn get_same_shell_positions(loc: usize, dims: &[usize]) -> Vec<usize> {
 fn compute_same_shell_positions(dims: &[usize]) -> Vec<Vec<usize>> {
     let meta = get_meta(dims);
     let total_positions = dims.iter().product::<usize>();
+    
+    // Pre-compute distances to avoid redundant calculations
+    let distances: Vec<usize> = meta.indices_in_order
+        .iter()
+        .map(|coord| coord.iter().sum())
+        .collect();
+    
     (0..total_positions)
         .map(|location| {
-            let current_coord = &meta.indices_in_order[location];
-            let current_distance: usize = current_coord.iter().sum();
-            meta.indices_in_order
-                .iter()
-                .enumerate()
-                .filter(|(_, coord)| coord.iter().sum::<usize>() == current_distance && *coord != current_coord)
-                .map(|(idx, _)| idx)
+            let current_distance = distances[location];
+            (0..total_positions)
+                .filter(|&idx| distances[idx] == current_distance && idx != location)
                 .collect()
         })
         .collect()
