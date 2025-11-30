@@ -192,11 +192,46 @@ impl Tui {
     }
 
     fn render_current_operation(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let progress_ratio = if snapshot.operation.progress_total > 0 {
+        let percent_from_ratio = |ratio: f64| -> usize {
+            (ratio.clamp(0.0, 1.0) * 100.0).round() as usize
+        };
+
+        let mut progress_ratio = if snapshot.operation.progress_total > 0 {
             snapshot.operation.progress_current as f64 / snapshot.operation.progress_total as f64
         } else {
             0.0
         };
+
+        let mut progress_text = format!(
+            "{} / {} ({}%)",
+            format_number(snapshot.operation.progress_current),
+            format_number(snapshot.operation.progress_total),
+            percent_from_ratio(progress_ratio)
+        );
+
+        // During the larger-archive pass, treat seen growth as the best progress signal.
+        if snapshot
+            .operation
+            .status
+            .starts_with("Processing Larger Archive")
+        {
+            let seen_current = snapshot
+                .seen_size_samples
+                .last()
+                .map(|s| s.value)
+                .unwrap_or(0);
+            let seen_peak = snapshot.global.seen_size_pk;
+
+            if seen_peak > 0 {
+                progress_ratio = seen_current as f64 / seen_peak as f64;
+                progress_text = format!(
+                    "Seen: {} / {} ({}%)",
+                    format_number(seen_current),
+                    format_number(seen_peak),
+                    percent_from_ratio(progress_ratio)
+                );
+            }
+        }
 
         let max_width = area.width.saturating_sub(2) as usize;
         let label_width = 12; // "Processing: "
@@ -210,12 +245,6 @@ impl Tui {
         let elapsed = now.saturating_sub(snapshot.operation.status_start_time);
         let elapsed_str = format_elapsed(elapsed);
         
-        let progress_pct = if snapshot.operation.progress_total > 0 {
-            (snapshot.operation.progress_current * 100) / snapshot.operation.progress_total
-        } else {
-            0
-        };
-
         let lines = vec![
             Line::from(vec![
                 Span::styled("Processing: ", Style::default().fg(Color::DarkGray)),
@@ -228,12 +257,7 @@ impl Tui {
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::raw(format!(
-                    "{} / {} ({}%)",
-                    format_number(snapshot.operation.progress_current),
-                    format_number(snapshot.operation.progress_total),
-                    progress_pct
-                )),
+                Span::raw(progress_text),
             ]),
         ];
 
@@ -261,7 +285,7 @@ impl Tui {
 
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(progress_ratio);
+            .ratio(progress_ratio.clamp(0.0, 1.0));
         f.render_widget(gauge, gauge_area);
     }
 
@@ -604,6 +628,7 @@ impl Tui {
             .map(|entry| {
                 Bar::default()
                     .value(entry.duration)
+                    .text_value(String::new())
                     .style(Style::default().fg(Color::Cyan))
             })
             .collect();
