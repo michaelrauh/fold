@@ -1,11 +1,12 @@
 use crate::ortho::Ortho;
 use crate::FoldError;
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 pub struct DiskBackedQueue {
-    buffer: Vec<Ortho>,
+    buffer: VecDeque<Ortho>,
     buffer_size: usize,
     disk_path: PathBuf,
     disk_file_counter: usize,
@@ -23,7 +24,7 @@ impl DiskBackedQueue {
         fs::create_dir_all(&disk_path).map_err(FoldError::Io)?;
         
         Ok(Self {
-            buffer: Vec::with_capacity(buffer_size),
+            buffer: VecDeque::with_capacity(buffer_size),
             buffer_size,
             disk_path,
             disk_file_counter: 0,
@@ -69,7 +70,7 @@ impl DiskBackedQueue {
         disk_files.sort();
         
         Ok(Self {
-            buffer: Vec::with_capacity(buffer_size),
+            buffer: VecDeque::with_capacity(buffer_size),
             buffer_size,
             disk_path,
             disk_file_counter: max_counter + 1,
@@ -79,7 +80,7 @@ impl DiskBackedQueue {
     }
     
     pub fn push(&mut self, ortho: Ortho) -> Result<(), FoldError> {
-        self.buffer.push(ortho);
+        self.buffer.push_back(ortho);
         
         if self.buffer.len() >= self.buffer_size {
             // Spill ALL to disk, not just half
@@ -96,11 +97,7 @@ impl DiskBackedQueue {
             self.load_from_disk()?;
         }
         
-        if self.buffer.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(self.buffer.remove(0)))
-        }
+        Ok(self.buffer.pop_front())
     }
     
     pub fn len(&self) -> usize {
@@ -147,7 +144,7 @@ impl DiskBackedQueue {
         // Spill the NEWEST half (from the end) to disk
         // Keep OLDEST half (at front) in buffer ready to pop
         let split_point = self.buffer.len().saturating_sub(half);
-        let to_spill: Vec<Ortho> = self.buffer.drain(split_point..).collect();
+        let mut to_spill = self.buffer.split_off(split_point);
         
         let spill_count = to_spill.len();
         let file_path = self.disk_path.join(format!("queue_{:08}.bin", self.disk_file_counter));
@@ -159,7 +156,7 @@ impl DiskBackedQueue {
         let mut writer = BufWriter::new(file);
         
         let config = bincode::config::standard();
-        for ortho in to_spill {
+        for ortho in to_spill.drain(..) {
             bincode::encode_into_std_write(&ortho, &mut writer, config)?;
         }
         writer.flush().map_err(FoldError::Io)?;
@@ -185,12 +182,12 @@ impl DiskBackedQueue {
         let mut reader = BufReader::new(file);
         
         let config = bincode::config::standard();
-        let mut loaded = Vec::new();
+        let mut loaded = VecDeque::new();
         
         loop {
             match bincode::decode_from_std_read::<Ortho, _, _>(&mut reader, config) {
                 Ok(ortho) => {
-                    loaded.push(ortho);
+                    loaded.push_back(ortho);
                 }
                 Err(_) => break,
             }

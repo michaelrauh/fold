@@ -59,3 +59,8 @@ path = "benches/checkpoint_manager_bench.rs"
 name = "memory_config_bench"
 harness = false
 path = "benches/memory_config_bench.rs"
+
+[[bench]]
+name = "search_pipeline_bench"
+harness = false
+path = "benches/search_pipeline_bench.rs"
