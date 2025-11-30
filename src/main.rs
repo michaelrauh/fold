@@ -71,7 +71,7 @@ fn main() -> Result<(), FoldError> {
     }
     
     // Main processing loop - two modes:
-    // Mode 1: If there are 2+ result archives, merge smallest with largest
+    // Mode 1: If there are 2+ result archives, merge the two largest
     // Mode 2: If there are not 2 results, process txt into result
     loop {
         // Check for stale heartbeats and recover abandoned work from crashed processes
@@ -82,16 +82,16 @@ fn main() -> Result<(), FoldError> {
         metrics.update_global(|g| g.distinct_jobs_count = jobs_count);
         
         // Check for existing archives
-        let archive_pair = file_handler::get_smallest_and_largest_archives_with_config(&config)?;
+        let archive_pair = file_handler::get_two_largest_archives_with_config(&config)?;
         
-        if let Some((smallest, largest)) = archive_pair {
+        if let Some((second_largest, largest)) = archive_pair {
             // Mode 1: Merge archives
             metrics.update_global(|g| g.mode = "Merging Archives".to_string());
             metrics.clear_chart_history();
             metrics.add_log("MODE 1: Merging archives".to_string());
-            metrics.add_log(format!("Merging: {} + {}", smallest, largest));
+            metrics.add_log(format!("Merging: {} + {}", second_largest, largest));
             
-            merge_archives(&smallest, &largest, &config, &metrics)?;
+            merge_archives(&second_largest, &largest, &config, &metrics)?;
             
         } else {
             // Mode 2: Process txt file

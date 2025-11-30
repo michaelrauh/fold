@@ -755,13 +755,13 @@ pub fn find_txt_file_with_config(config: &StateConfig) -> Result<Option<String>,
     find_next_txt_file(config.input_dir().to_str().unwrap())
 }
 
-/// Get the smallest and largest archives (uses default config)
-pub fn get_smallest_and_largest_archives() -> Result<Option<(String, String)>, FoldError> {
-    get_smallest_and_largest_archives_with_config(&StateConfig::default())
+/// Get the two largest archives (uses default config)
+pub fn get_two_largest_archives() -> Result<Option<(String, String)>, FoldError> {
+    get_two_largest_archives_with_config(&StateConfig::default())
 }
 
-/// Get the smallest and largest archives with custom config
-pub fn get_smallest_and_largest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
+/// Get the two largest archives with custom config
+pub fn get_two_largest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
     let archives = find_archives(config.input_dir().to_str().unwrap())?;
     
     if archives.len() < 2 {
@@ -781,10 +781,10 @@ pub fn get_smallest_and_largest_archives_with_config(config: &StateConfig) -> Re
     }
     
     archives_with_counts.sort_by_key(|(_, count)| *count);
-    let smallest = archives_with_counts[0].0.clone();
     let largest = archives_with_counts[archives_with_counts.len() - 1].0.clone();
+    let second_largest = archives_with_counts[archives_with_counts.len() - 2].0.clone();
     
-    Ok(Some((smallest, largest)))
+    Ok(Some((second_largest, largest)))
 }
 
 /// Archive metadata for initialization
