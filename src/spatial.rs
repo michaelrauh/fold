@@ -2,19 +2,23 @@ use std::{cell::RefCell, cmp::Ordering};
 use itertools::Itertools;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use rustc_hash::FxHashMap; // use concrete name
+use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 
-// Consolidated metadata per dims
+// Cache key: (dims, up_axis)
+type MetaCacheKey = (Vec<usize>, Option<usize>);
+
+// Consolidated metadata per (dims, up_axis) pair - fully cached
 struct DimMeta {
     indices_in_order: Vec<Vec<usize>>,
     axis_positions: Vec<usize>,
     impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
-    diagonals: Vec<Vec<usize>>,
+    diagonals: Vec<Vec<usize>>,  // Enriched diagonals (base + parent-filled forward positions)
     location_to_index: FxHashMap<Vec<usize>, usize>,
 }
 
 impl DimMeta {
-    fn new(dims: &[usize]) -> Self {
+    fn new(dims: &[usize], up_axis: Option<usize>) -> Self {
         let indices_in_order = indices_in_order_compute(dims);
         let location_to_index: FxHashMap<Vec<usize>, usize> = indices_in_order
             .iter()
@@ -29,7 +33,13 @@ impl DimMeta {
             .map(|(i, loc)| (i, loc))
             .collect();
         let impacted_phrase_locations = get_impacted_phrase_locations_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
-        let diagonals = get_diagonals_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
+        
+        // Compute base diagonals (positions < current in same shell)
+        let base_diagonals = get_diagonals_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
+        
+        // Enrich with parent-filled forward positions
+        let diagonals = enrich_diagonals(dims, up_axis, &base_diagonals, &indices_in_order, &location_to_index);
+        
         DimMeta {
             indices_in_order,
             axis_positions: (1..=dims.len()).collect(),
@@ -40,8 +50,93 @@ impl DimMeta {
     }
 }
 
+/// Enriches base diagonals with forward positions filled from parent.
+/// [2,2] has no parent -> empty enrichment.
+/// up_axis = None -> over expansion.
+/// up_axis = Some(axis) -> up expansion at that axis.
+fn enrich_diagonals(
+    dims: &[usize],
+    up_axis: Option<usize>,
+    base_diagonals: &[Vec<usize>],
+    indices_in_order: &[Vec<usize>],
+    location_to_index: &FxHashMap<Vec<usize>, usize>,
+) -> Vec<Vec<usize>> {
+    // [2,2] has no parent - just return base diagonals
+    if dims == [2, 2] {
+        return base_diagonals.to_vec();
+    }
+    
+    // Get parent dims
+    let parent_dims = match parent(dims) {
+        Some(p) => p,
+        None => return base_diagonals.to_vec(),
+    };
+    
+    // Get positions filled from parent based on up_axis
+    let filled_from_parent: FxHashSet<usize> = match up_axis {
+        None => {
+            // Over expansion: parent has same dimensionality
+            remap_internal(&parent_dims, location_to_index).into_iter().collect()
+        }
+        Some(axis) => {
+            // Up expansion: parent has one fewer dimension
+            remap_for_up_internal(&parent_dims, axis, location_to_index).into_iter().collect()
+        }
+    };
+    
+    if filled_from_parent.is_empty() {
+        return base_diagonals.to_vec();
+    }
+    
+    // Enrich each position's diagonals
+    let total = dims.iter().product::<usize>();
+    (0..total)
+        .map(|loc| {
+            let mut diagonals = base_diagonals[loc].clone();
+            let current_index = &indices_in_order[loc];
+            let current_distance: usize = current_index.iter().sum();
+            
+            // Add forward positions that are in same shell and filled from parent
+            for (pos, index) in indices_in_order.iter().enumerate() {
+                if pos > loc  // forward position
+                    && index.iter().sum::<usize>() == current_distance  // same shell
+                    && filled_from_parent.contains(&pos)  // filled from parent
+                {
+                    diagonals.push(pos);
+                }
+            }
+            
+            // Sort and deduplicate
+            diagonals.sort();
+            diagonals.dedup();
+            diagonals
+        })
+        .collect()
+}
+
+/// Internal remap that doesn't call get_meta to avoid nested borrow
+fn remap_internal(old_dims: &[usize], new_location_to_index: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
+    let old_positions = indices_in_order_compute(old_dims);
+    old_positions.iter().filter_map(|pos| new_location_to_index.get(pos).copied()).collect()
+}
+
+/// Internal remap_for_up that doesn't call get_meta to avoid nested borrow
+fn remap_for_up_internal(old_dims: &[usize], position: usize, new_location_to_index: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
+    let padded_positions = pad_internal(old_dims, position);
+    padded_positions.iter().filter_map(|pos| new_location_to_index.get(pos).copied()).collect()
+}
+
+/// Internal pad that doesn't call get_meta to avoid nested borrow
+fn pad_internal(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
+    let indices = indices_in_order_compute(dims);
+    let insert_pos = dims.len().saturating_sub(position);
+    indices.into_iter()
+        .map(|mut loc| { loc.insert(insert_pos, 0); loc })
+        .collect()
+}
+
 thread_local! {
-    static DIM_META_CACHE: RefCell<FxHashMap<Vec<usize>, Rc<DimMeta>>> = RefCell::new(FxHashMap::default());
+    static DIM_META_CACHE: RefCell<FxHashMap<MetaCacheKey, Rc<DimMeta>>> = RefCell::new(FxHashMap::default());
     static EXPAND_UP_CACHE: RefCell<FxHashMap<(Vec<usize>, usize), Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
     static EXPAND_OVER_CACHE: RefCell<FxHashMap<Vec<usize>, Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
 }
@@ -49,21 +144,31 @@ thread_local! {
 static META_HITS: AtomicUsize = AtomicUsize::new(0);
 static META_MISSES: AtomicUsize = AtomicUsize::new(0);
 
-fn get_meta(dims: &[usize]) -> Rc<DimMeta> {
+fn get_meta_with_axis(dims: &[usize], up_axis: Option<usize>) -> Rc<DimMeta> {
     DIM_META_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(m) = cache.get(dims) { META_HITS.fetch_add(1, AtomicOrdering::Relaxed); return m.clone(); }
+        let key = (dims.to_vec(), up_axis);
+        if let Some(m) = cache.get(&key) { 
+            META_HITS.fetch_add(1, AtomicOrdering::Relaxed); 
+            return m.clone(); 
+        }
         META_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
-        let meta = Rc::new(DimMeta::new(dims));
-        cache.insert(dims.to_vec(), meta.clone());
+        let meta = Rc::new(DimMeta::new(dims, up_axis));
+        cache.insert(key, meta.clone());
         meta
     })
 }
 
+// Helper for APIs that don't depend on up_axis (axis positions, location-to-index, etc.)
+fn get_meta(dims: &[usize]) -> Rc<DimMeta> {
+    get_meta_with_axis(dims, None)
+}
+
 pub fn meta_stats() -> (usize, usize) { (META_HITS.load(AtomicOrdering::Relaxed), META_MISSES.load(AtomicOrdering::Relaxed)) }
 
-pub fn get_requirements(loc: usize, dims: &[usize]) -> (Vec<Vec<usize>>, Vec<usize>) {
-    let meta = get_meta(dims);
+/// Get requirements for a position - fully cached lookup
+pub fn get_requirements(loc: usize, dims: &[usize], up_axis: Option<usize>) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let meta = get_meta_with_axis(dims, up_axis);
     (
         meta.impacted_phrase_locations[loc].clone(),
         meta.diagonals[loc].clone(),
@@ -330,13 +435,13 @@ mod tests {
 
     #[test]
     fn it_gets_impacted_phrase_locations() {
-        let (phrases, _diag) = get_requirements(3, &[2,2]);
+        let (phrases, _diag) = get_requirements(3, &[2,2], None);
         assert_eq!(phrases, vec![vec![1], vec![2]]);
     }
 
     #[test]
     fn it_gets_impacted_diagonals() {
-        let (_, diag) = get_requirements(5, &[3,3]);
+        let (_, diag) = get_requirements(5, &[3,3], None);
         assert_eq!(diag, vec![3,4]);
     }
 

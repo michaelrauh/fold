@@ -77,16 +77,16 @@ fn test_display_shows_correct_structure() {
     
     // Current position is 3 (first None)
     // Position 3 = index [0,2], distance 2
-    // For diagonals at position 3: indices with distance 2 and < [0,2]
-    // [1,1] has distance 2 but [1,1] > [0,2], so no diagonals
-    // Thus 'd' at position 4 is NOT in forbidden for position 3
+    // Position 4 = index [1,1], distance 2 (same shell!)
+    // Position 4 has content 'd' from the reorg mapping
+    // With the new logic, position 4 is in the forbidden set for position 3
     let (forbidden, _) = ortho.get_requirements();
     
-    // With the new sorted dims layout, there are no diagonals at position 3
-    // because [1,1] (position 4) comes AFTER [0,2] (position 3) in the order
+    // With the new enriched diagonals, position 4 (containing 'd') is in forbidden
+    // because it's at the same distance AND was filled from the parent shape
     assert!(
-        forbidden.is_empty(),
-        "At position 3 [0,2], there are no diagonal predecessors in [2,3] layout, but got: {:?}",
+        forbidden.contains(&d_idx),
+        "At position 3 [0,2], position 4 [1,1] (same distance 2, filled from parent) should be in forbidden, but got: {:?}",
         forbidden
     );
 }

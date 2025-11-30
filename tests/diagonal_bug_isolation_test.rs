@@ -21,7 +21,7 @@ fn test_3x3_position_6_diagonals() {
     //
     // So position 6 should have NO diagonal positions!
     
-    let (_, diagonals) = spatial::get_requirements(6, &dims);
+    let (_, diagonals) = spatial::get_requirements(6, &dims, None);
     println!("Position 6 diagonals: {:?}", diagonals);
     
     // But in the test, 'and' is at position 1 (Some(1))
@@ -41,7 +41,7 @@ fn test_3x3_position_6_diagonals() {
     // - Position 3: [0,2] distance = 2 (YES!)
     // But position 3 has token index 4 ('south'), not 'and'
     
-    let (_prefixes_4, diagonals_4) = spatial::get_requirements(4, &dims);
+    let (_prefixes_4, diagonals_4) = spatial::get_requirements(4, &dims, None);
     println!("Position 4 diagonals (position indices): {:?}", diagonals_4);
     
     // Let me manually build the ortho to match the test scenario
