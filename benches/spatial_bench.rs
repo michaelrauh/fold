@@ -6,7 +6,7 @@ use fold::spatial::{
 
 fn bench_get_requirements(c: &mut Criterion) {
     c.bench_function("get_requirements", |b| {
-        b.iter(|| get_requirements(black_box(3), black_box(&[2, 2])))
+        b.iter(|| get_requirements(black_box(3), black_box(&[2, 2]), black_box(None)))
     });
 }
 
@@ -69,7 +69,7 @@ fn bench_cached_vs_uncached(c: &mut Criterion) {
     c.bench_function("repeated_calls_get_requirements", |b| {
         b.iter(|| {
             for i in 0..4 {
-                get_requirements(black_box(i), black_box(&[2, 2]));
+                get_requirements(black_box(i), black_box(&[2, 2]), black_box(None));
             }
         })
     });
