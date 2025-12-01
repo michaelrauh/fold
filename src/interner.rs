@@ -283,24 +283,67 @@ impl Interner {
     }
 
     pub fn impacted_keys(&self, new_interner: &Interner) -> Vec<Vec<usize>> {
-        let new_vocab_len = new_interner.vocabulary.len();
-        let mut impacted = Vec::new();
-        
-        for key in new_interner.prefix_to_completions.keys() {
-            let old_bitset = self.get_padded_bitset(self, key, new_vocab_len);
-            let new_bitset = self.get_padded_bitset(new_interner, key, new_vocab_len);
-            
-            let is_impacted = match (old_bitset, new_bitset) {
-                (None, Some(bs)) => bs.count_ones(..) > 0,
-                (Some(old_bs), Some(new_bs)) => old_bs != new_bs,
-                _ => false,
+        let self_vocab_len = self.vocabulary.len();
+        let self_index_by_word: HashMap<&str, usize> = self
+            .vocabulary
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.as_str(), i))
+            .collect();
+
+        let map_prefix =
+            |prefix: &Vec<usize>, vocab: &[String], target: &HashMap<&str, usize>| -> Option<Vec<usize>> {
+                prefix
+                    .iter()
+                    .map(|idx| vocab.get(*idx).and_then(|w| target.get(w.as_str()).copied()))
+                    .collect::<Option<Vec<usize>>>()
             };
-            
-            if is_impacted {
-                impacted.push(key.clone());
+
+        let translate_bitset = |bitset: &FixedBitSet, target: &HashMap<&str, usize>| -> (FixedBitSet, bool) {
+            let mut translated = FixedBitSet::with_capacity(self_vocab_len);
+            translated.grow(self_vocab_len);
+            let mut had_unmapped = false;
+            for idx in bitset.ones() {
+                if let Some(word) = new_interner.vocabulary.get(idx) {
+                    if let Some(&target_idx) = target.get(word.as_str()) {
+                        translated.insert(target_idx);
+                    } else {
+                        had_unmapped = true;
+                    }
+                }
+            }
+            (translated, had_unmapped)
+        };
+
+        let mut impacted = Vec::new();
+
+        // Consider prefixes present in the new interner that map into self's vocabulary.
+        for (new_prefix, new_bitset) in &new_interner.prefix_to_completions {
+            if let Some(mapped_prefix) = map_prefix(new_prefix, &new_interner.vocabulary, &self_index_by_word) {
+                let (translated_new, had_unmapped_completion) = translate_bitset(new_bitset, &self_index_by_word);
+                let old_bitset = self
+                    .prefix_to_completions
+                    .get(&mapped_prefix)
+                    .cloned()
+                    .map(|mut bs| {
+                        bs.grow(self_vocab_len);
+                        bs
+                    });
+
+                let is_impacted = had_unmapped_completion
+                    || match old_bitset {
+                        None => translated_new.count_ones(..) > 0,
+                        Some(old_bs) => old_bs != translated_new,
+                    };
+
+                if is_impacted {
+                    impacted.push(mapped_prefix);
+                }
             }
         }
-        
+
+        impacted.sort();
+        impacted.dedup();
         impacted
     }
 
@@ -605,9 +648,15 @@ mod version_compare_tests {
 
     #[test]
     fn test_impacted_keys_new_key() {
-        let (low, high) = build_low_high("a b", "c d");
+        // New interner introduces a new prefix [a,b] -> c that did not exist before.
+        let (low, high) = build_low_high("a b", "a b c");
+        let a_idx = low.vocabulary().iter().position(|w| w == "a").unwrap();
+        let b_idx = low.vocabulary().iter().position(|w| w == "b").unwrap();
         let impacted = low.impacted_keys(&high);
-        assert!(impacted.len() > 0);
+        assert!(
+            impacted.contains(&vec![a_idx, b_idx]),
+            "New longer prefix [a,b] should be marked impacted even if completion word is new"
+        );
     }
 
     #[test]
@@ -618,6 +667,35 @@ mod version_compare_tests {
         let a_idx = low.vocabulary().iter().position(|w| w == "a").unwrap();
         let prefix = vec![a_idx];
         assert!(impacted.contains(&prefix));
+    }
+
+    #[test]
+    fn test_impacted_keys_disjoint_vocab_not_impacted() {
+        let low = Interner::from_text("a b");
+        let high = Interner::from_text("c d");
+
+        let impacted = low.impacted_keys(&high);
+        assert!(
+            impacted.is_empty(),
+            "Disjoint vocabularies should not mark any prefixes impacted"
+        );
+    }
+
+    #[test]
+    fn test_impacted_keys_detects_vocab_mismatch() {
+        // Base interner has prefix "b" -> "c"; other interner has prefix "b" -> "a"
+        // Vocabulary indices differ ("b" is 0 vs 1), so impacted keys must be mapped back
+        // into the base interner's index space to catch the change.
+        let base = Interner::from_text("b c");
+        let other = Interner::from_text("b a");
+
+        let b_idx_in_base = base.vocabulary().iter().position(|w| w == "b").unwrap();
+        let impacted = base.impacted_keys(&other);
+
+        assert!(
+            impacted.contains(&vec![b_idx_in_base]),
+            "Impact on prefix \"b\" should be detected even when vocab indices differ"
+        );
     }
 
     #[test]
