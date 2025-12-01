@@ -5,9 +5,12 @@ A text processing system that finds optimal orthogonal structures in text using 
 ## Overview
 
 Fold processes text files by:
-1. Building an interner (vocabulary and phrase completion mappings) from input text
-2. Generating orthogonal structures (orthos) through a work queue
-3. Finding the optimal ortho based on dimensional scoring
+1. Staging raw text into processable chunks (`stage.sh` → `fold_state/input/`)
+2. Building an interner (vocabulary and phrase completion mappings) from staged text
+3. Generating orthogonal structures (orthos) through a work queue
+4. Selecting the optimal ortho based on dimensional scoring
+
+See `ARCHITECTURE.md` for the full pipeline and component details.
 
 ## Usage
 
@@ -16,19 +19,19 @@ Fold processes text files by:
 Use `stage.sh` to split a large text file into chunks:
 
 ```bash
-./stage.sh <input_file> <delimiter> [min_length]
+./stage.sh <input_file> [min_length] [state_dir]
 ```
 
 Example:
 ```bash
-./stage.sh book.txt "CHAPTER" 50000
+./stage.sh book.txt 10 ./fold_state
 ```
 
-This splits `book.txt` by "CHAPTER" delimiter, filtering out chunks smaller than 50000 characters, and places the results in `./fold_state/input/`.
+This splits `book.txt` into sentence-level chunks (paragraphs, then `. ? ; ! ,` delimiters), removes chunks shorter than `min_length` words (default 2), and places the results in `./fold_state/input/`.
 
 ### Run Fold
 
-Process all files in the input directory:
+Process staged files and merge archives:
 
 ```bash
 cargo run --release
@@ -36,22 +39,20 @@ cargo run --release
 
 The program will:
 - Check `fold_state/in_process/` for any abandoned `.txt` files or stale heartbeats from previous runs and recover them
-- Loop through `fold_state/input/` to find `.txt` files
-- Move each `.txt` file to `fold_state/in_process/` before processing (prevents other processes from picking it up)
-- Create a heartbeat file that is updated every 100,000 orthos processed
-- Process each file independently (one at a time)
-- Build a separate interner for each file
-- Generate and track orthos for each file
-- Print optimal ortho after each file
-- Save an archive directory (`.bin`) in `fold_state/in_process/`
-- Delete the `.txt` file and heartbeat file after successful archiving
-- Continue looping until no `.txt` files remain
+- If two or more archives exist, merge the two largest by ortho count (rehydrate interners/results, remap the smaller vocab, replay impacted orthos)
+- Otherwise, pull the next-largest `.txt`, move it to `fold_state/in_process/`, and ingest it
+- Create a heartbeat file for each job that is updated every 100,000 orthos processed
+- Build an interner, explore orthos via disk-backed work/results queues, and update the TUI as work progresses
+- Save each finished archive (`archive_*.bin/`) back into `fold_state/input/` (ready to be merged); delete the work folder (including the original txt) after success
+- Continue looping until no `.txt` files remain and fewer than two archives are present
 
 Each archive is a directory containing:
 - `interner.bin`: The interner built from that specific file
 - `results/`: DiskBackedQueue directory with all ortho results
 - `optimal.txt`: Formatted text of the optimal ortho (ID, version, dimensions, score, geometry)
 - `lineage.txt`: S-expression tracking which source TXT files contributed to this archive
+- `metadata.txt`: Count of orthos in the archive
+- `text_meta.txt`: Word count and text preview
 
 ### Process Safety
 
