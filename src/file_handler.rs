@@ -1,6 +1,13 @@
-use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, ortho::Ortho, FoldError};
+use crate::{
+    disk_backed_queue::DiskBackedQueue,
+    interner::Interner,
+    ortho::Ortho,
+    s3_state::S3State,
+    FoldError,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_GRACE_PERIOD_SECS: u64 = 600; // 10 minutes
@@ -28,19 +35,27 @@ fn create_text_preview(text: &str, first_n: usize, last_n: usize) -> String {
 #[derive(Clone)]
 pub struct StateConfig {
     pub base_dir: PathBuf,
+    pub remote: Option<Arc<S3State>>,
 }
 
 impl StateConfig {
     /// Default configuration for production use
     pub fn default() -> Self {
-        Self {
+        Self::with_remote(PathBuf::from("./fold_state")).unwrap_or(Self {
             base_dir: PathBuf::from("./fold_state"),
-        }
+            remote: None,
+        })
     }
     
+    /// Attempt to attach remote state from env to a specific base dir
+    pub fn with_remote(base_dir: PathBuf) -> Result<Self, FoldError> {
+        let remote = S3State::try_from_env()?.map(Arc::new);
+        Ok(Self { base_dir, remote })
+    }
+
     /// Custom configuration for tests
     pub fn custom(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self { base_dir, remote: None }
     }
     
     pub fn input_dir(&self) -> PathBuf {
@@ -65,18 +80,34 @@ pub fn initialize() -> Result<(), FoldError> {
 pub fn initialize_with_config(config: &StateConfig) -> Result<(), FoldError> {
     let in_process = config.in_process_dir();
     let input = config.input_dir();
+
+    if let Some(remote) = &config.remote {
+        remote.recover_stale_leases(HEARTBEAT_GRACE_PERIOD_SECS)?;
+    }
+
     ensure_directory_exists(in_process.to_str().unwrap())?;
-    recover_abandoned_files(input.to_str().unwrap(), in_process.to_str().unwrap())?;
+    recover_abandoned_files(input.to_str().unwrap(), in_process.to_str().unwrap(), config.remote.clone())?;
     Ok(())
 }
 
 /// Check for and recover any stale work from crashed processes
 /// This should be called at the beginning of each worker loop iteration
 pub fn check_and_recover_stale_work(config: &StateConfig) -> Result<(), FoldError> {
-    recover_abandoned_files(config.input_dir().to_str().unwrap(), config.in_process_dir().to_str().unwrap())
+    if let Some(remote) = &config.remote {
+        remote.recover_stale_leases(HEARTBEAT_GRACE_PERIOD_SECS)?;
+    }
+    recover_abandoned_files(
+        config.input_dir().to_str().unwrap(),
+        config.in_process_dir().to_str().unwrap(),
+        config.remote.clone(),
+    )
 }
 
-fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
+fn recover_abandoned_files(
+    input_dir: &str,
+    in_process_dir: &str,
+    remote: Option<Arc<S3State>>,
+) -> Result<(), FoldError> {
     let in_process_path = std::path::Path::new(in_process_dir);
     
     if !in_process_path.exists() {
@@ -106,6 +137,10 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                             let target_path = format!("{}/{}.txt", input_dir, base_name);
                             fs::rename(&source_txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
                             // println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
+
+                            if let Some(r) = &remote {
+                                let _ = r.release_lease(&format!("input/{}.txt", base_name));
+                            }
                             
                             // Delete the results_{filename} directory if it exists
                             let base_dir = Path::new(in_process_dir).parent().unwrap_or_else(|| Path::new("."));
@@ -146,6 +181,12 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                                             let input_path = Path::new(input_dir).join(archive_name);
                                             // println!("[fold] Recovering merge archive: {:?} -> {:?}", bin_path, input_path);
                                             let _ = fs::rename(&bin_path, &input_path);
+
+                                            if let Some(r) = &remote {
+                                                if let Some(name_str) = archive_name.to_str() {
+                                                    let _ = r.release_lease(&format!("input/{}", name_str));
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -177,6 +218,11 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                         let input_path = Path::new(input_dir).join(archive_name);
                         // println!("[fold] Recovering orphaned archive: {:?} -> {:?}", entry_path, input_path);
                         fs::rename(&entry_path, &input_path).map_err(|e| FoldError::Io(e))?;
+                        if let Some(r) = &remote {
+                            if let Some(name_str) = archive_name.to_str() {
+                                let _ = r.release_lease(&format!("input/{}", name_str));
+                            }
+                        }
                         recovered_count += 1;
                     }
                 }
@@ -562,12 +608,26 @@ pub struct TxtIngestion {
     pub text_preview: String,
     pub word_count: usize,
     config: StateConfig,
+    remote: Option<RemoteTxtHandle>,
+}
+
+struct RemoteTxtHandle {
+    s3: Arc<S3State>,
+    job_key: String,
 }
 
 impl TxtIngestion {
     /// Touch the heartbeat file (zero-arity as requested)
     pub fn touch_heartbeat(&self) -> Result<(), FoldError> {
-        touch_heartbeat(&self.heartbeat_path)
+        touch_heartbeat(&self.heartbeat_path)?;
+
+        if let Some(remote) = &self.remote {
+            remote
+                .s3
+                .refresh_lease(&remote.job_key, HEARTBEAT_GRACE_PERIOD_SECS)?;
+        }
+
+        Ok(())
     }
     
     /// Get the results path for this ingestion
@@ -603,11 +663,21 @@ impl TxtIngestion {
         let results_path = self.results_path();
         
         save_archive(archive_path.to_str().unwrap(), interner, results, &results_path, best_ortho, &lineage, ortho_count, &self.text_preview, self.word_count)?;
+
+        if let Some(remote) = &self.remote {
+            remote
+                .s3
+                .upload_archive(archive_path.as_path())?;
+            remote.s3.finalize_txt_job(&remote.job_key)?;
+        }
         Ok((archive_path.to_string_lossy().to_string(), lineage))
     }
     
     /// Cleanup work folder after processing
     pub fn cleanup(self) -> Result<(), FoldError> {
+        if let Some(remote) = &self.remote {
+            let _ = remote.s3.release_lease(&remote.job_key);
+        }
         cleanup_txt_processing(&self.work_folder)
     }
 }
@@ -623,12 +693,30 @@ pub struct ArchiveIngestion {
     pub word_count_a: usize,
     pub word_count_b: usize,
     config: StateConfig,
+    remote: Option<RemoteMergeHandle>,
+}
+
+struct RemoteMergeHandle {
+    s3: Arc<S3State>,
+    archive_a_key: String,
+    archive_b_key: String,
 }
 
 impl ArchiveIngestion {
     /// Touch the heartbeat file (zero-arity as requested)
     pub fn touch_heartbeat(&self) -> Result<(), FoldError> {
-        touch_heartbeat(&self.heartbeat_path)
+        touch_heartbeat(&self.heartbeat_path)?;
+
+        if let Some(remote) = &self.remote {
+            remote
+                .s3
+                .refresh_lease(&remote.archive_a_key, HEARTBEAT_GRACE_PERIOD_SECS)?;
+            remote
+                .s3
+                .refresh_lease(&remote.archive_b_key, HEARTBEAT_GRACE_PERIOD_SECS)?;
+        }
+
+        Ok(())
     }
     
     /// Load both interners
@@ -687,11 +775,23 @@ impl ArchiveIngestion {
         let merged_preview = format!("{} ... {}", self.text_preview_a, self.text_preview_b);
         
         save_archive(archive_path.to_str().unwrap(), interner, results, results_path, best_ortho, &merged_lineage, ortho_count, &merged_preview, merged_word_count)?;
+
+        if let Some(remote) = &self.remote {
+            remote.s3.upload_archive(archive_path.as_path())?;
+            remote.s3.delete_remote_archive(&remote.archive_a_key)?;
+            remote.s3.delete_remote_archive(&remote.archive_b_key)?;
+            remote.s3.release_lease(&remote.archive_a_key)?;
+            remote.s3.release_lease(&remote.archive_b_key)?;
+        }
         Ok((archive_path.to_string_lossy().to_string(), merged_lineage))
     }
     
     /// Cleanup original archives and merge work folder
     pub fn cleanup(self) -> Result<(), FoldError> {
+        if let Some(remote) = &self.remote {
+            let _ = remote.s3.release_lease(&remote.archive_a_key);
+            let _ = remote.s3.release_lease(&remote.archive_b_key);
+        }
         // Clean up merge work folder (contains queue/, seen_shards/, heartbeat)
         if Path::new(&self.merge_work_folder).exists() {
             fs::remove_dir_all(&self.merge_work_folder).map_err(FoldError::Io)?;
@@ -708,6 +808,9 @@ pub fn count_txt_files_remaining() -> Result<usize, FoldError> {
 
 /// Count remaining text files in input with custom config
 pub fn count_txt_files_remaining_with_config(config: &StateConfig) -> Result<usize, FoldError> {
+    if let Some(remote) = &config.remote {
+        return remote.count_available_txt(HEARTBEAT_GRACE_PERIOD_SECS);
+    }
     count_txt_files(config.input_dir().to_str().unwrap())
 }
 
@@ -716,6 +819,11 @@ pub fn count_running_jobs_with_config(config: &StateConfig) -> Result<usize, Fol
     let in_process_path = config.in_process_dir();
     
     if !in_process_path.exists() {
+        if let Some(remote) = &config.remote {
+            if let Ok(count) = remote.count_active_leases(HEARTBEAT_GRACE_PERIOD_SECS) {
+                return Ok(count);
+            }
+        }
         return Ok(0);
     }
     
@@ -741,7 +849,13 @@ pub fn count_running_jobs_with_config(config: &StateConfig) -> Result<usize, Fol
             }
         }
     }
-    
+
+    if let Some(remote) = &config.remote {
+        if let Ok(remote_count) = remote.count_active_leases(HEARTBEAT_GRACE_PERIOD_SECS) {
+            return Ok(remote_count.max(job_count));
+        }
+    }
+
     Ok(job_count)
 }
 
@@ -752,6 +866,12 @@ pub fn find_txt_file() -> Result<Option<String>, FoldError> {
 
 /// Find the next text file to process with custom config
 pub fn find_txt_file_with_config(config: &StateConfig) -> Result<Option<String>, FoldError> {
+    if let Some(remote) = &config.remote {
+        if let Some(job) = remote.checkout_next_txt(&config.input_dir(), HEARTBEAT_GRACE_PERIOD_SECS)? {
+            return Ok(Some(job.local_path.to_string_lossy().to_string()));
+        }
+        return Ok(None);
+    }
     find_next_txt_file(config.input_dir().to_str().unwrap())
 }
 
@@ -762,6 +882,15 @@ pub fn get_two_largest_archives() -> Result<Option<(String, String)>, FoldError>
 
 /// Get the two largest archives with custom config
 pub fn get_two_largest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
+    if let Some(remote) = &config.remote {
+        if let Some(pair) = remote.checkout_two_archives(&config.input_dir(), HEARTBEAT_GRACE_PERIOD_SECS)? {
+            return Ok(Some((
+                pair.local_b.to_string_lossy().to_string(),
+                pair.local_a.to_string_lossy().to_string(),
+            )));
+        }
+        return Ok(None);
+    }
     let archives = find_archives(config.input_dir().to_str().unwrap())?;
     
     if archives.len() < 2 {
@@ -864,6 +993,11 @@ pub fn ingest_txt_file_with_config(file_path: &str, config: &StateConfig) -> Res
     // Compute text metadata
     let word_count = count_words(&text);
     let text_preview = create_text_preview(&text, 4, 4); // First 4 and last 4 words for text blobs
+
+    let remote = config.remote.as_ref().map(|s3| RemoteTxtHandle {
+        s3: Arc::clone(s3),
+        job_key: format!("input/{}.txt", filename),
+    });
     
     Ok(TxtIngestion {
         work_folder,
@@ -873,6 +1007,7 @@ pub fn ingest_txt_file_with_config(file_path: &str, config: &StateConfig) -> Res
         text_preview,
         word_count,
         config: config.clone(),
+        remote,
     })
 }
 
@@ -912,6 +1047,24 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
     // Create heartbeat for merge operation
     let heartbeat_path = merge_work_folder.join("heartbeat");
     touch_heartbeat(heartbeat_path.to_str().unwrap())?;
+
+    let remote = config.remote.as_ref().map(|s3| RemoteMergeHandle {
+        s3: Arc::clone(s3),
+        archive_a_key: format!(
+            "input/{}",
+            Path::new(archive_a_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+        archive_b_key: format!(
+            "input/{}",
+            Path::new(archive_b_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+    });
     
     Ok(ArchiveIngestion {
         work_a_path,
@@ -923,6 +1076,7 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
         word_count_a: word_count_a_orig,
         word_count_b: word_count_b_orig,
         config: config.clone(),
+        remote,
     })
 }
 

@@ -10,6 +10,7 @@ pub mod seen_tracker;
 pub mod spatial;
 pub mod splitter;
 pub mod tui;
+pub mod s3_state;
 
 pub use error::*;
 pub use interner::*;

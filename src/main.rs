@@ -8,9 +8,9 @@ use std::thread;
 fn main() -> Result<(), FoldError> {
     // Check for test environment variable
     let config = if let Ok(test_dir) = std::env::var("FOLD_STATE_DIR") {
-        StateConfig::custom(PathBuf::from(test_dir))
+        StateConfig::with_remote(PathBuf::from(test_dir))?
     } else {
-        StateConfig::default()
+        StateConfig::with_remote(PathBuf::from("./fold_state"))?
     };
     
     // Initialize: setup directories and recover abandoned files

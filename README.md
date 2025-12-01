@@ -26,6 +26,16 @@ Example:
 
 This splits `book.txt` by "CHAPTER" delimiter, filtering out chunks smaller than 50000 characters, and places the results in `./fold_state/input/`.
 
+To stage directly for multi-machine/S3 runs, split locally and sync chunks to your bucket/Space:
+
+```bash
+export FOLD_S3_BUCKET=<bucket>
+export FOLD_S3_REGION=<region>
+export FOLD_S3_PREFIX=fold
+export FOLD_S3_ENDPOINT=https://nyc3.digitaloceanspaces.com # optional/custom
+./stage_s3.sh <input_file> [min_length] [state_dir]
+```
+
 ### Run Fold
 
 Process all files in the input directory:
