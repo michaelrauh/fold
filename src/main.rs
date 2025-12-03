@@ -1,5 +1,6 @@
 use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, StateConfig}, interner::Interner, memory_config::MemoryConfig, metrics::Metrics, ortho::Ortho, seen_tracker::SeenTracker, tui::Tui, FoldError};
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,15 +21,27 @@ fn main() -> Result<(), FoldError> {
     let metrics = Metrics::new();
     let should_quit = Arc::new(AtomicBool::new(false));
     
-    // Spawn TUI thread
-    let metrics_clone = metrics.clone_handle();
-    let should_quit_clone = Arc::clone(&should_quit);
-    let tui_handle = thread::spawn(move || {
-        let mut tui = Tui::new(metrics_clone, should_quit_clone);
-        if let Err(e) = tui.run() {
-            eprintln!("TUI error: {}", e);
-        }
-    });
+    let tui_enabled = std::env::var("FOLD_DISABLE_TUI").is_err() && std::io::stdout().is_terminal();
+    
+    // Spawn TUI thread with panic-forwarding so we don't leave the terminal in a broken state.
+    let tui_handle = if tui_enabled {
+        let metrics_clone = metrics.clone_handle();
+        let should_quit_clone = Arc::clone(&should_quit);
+        Some(thread::spawn(move || {
+            let result = std::panic::catch_unwind(move || {
+                let mut tui = Tui::new(metrics_clone, should_quit_clone);
+                tui.run()
+            });
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!("TUI error: {}", e),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }))
+    } else {
+        metrics.add_log("TUI disabled (no TTY or FOLD_DISABLE_TUI set)".to_string());
+        None
+    };
     
     // Count initial chunks
     let total_chunks = file_handler::count_txt_files_remaining_with_config(&config)?;
@@ -73,55 +86,89 @@ fn main() -> Result<(), FoldError> {
     // Main processing loop - two modes:
     // Mode 1: If there are 2+ result archives, merge the two largest
     // Mode 2: If there are not 2 results, process txt into result
-    loop {
-        // Check for stale heartbeats and recover abandoned work from crashed processes
-        file_handler::check_and_recover_stale_work(&config)?;
-        
-        // Update the count of distinct running jobs
-        let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
-        metrics.update_global(|g| g.distinct_jobs_count = jobs_count);
-        
-        // Check for existing archives
-        let archive_pair = file_handler::get_two_largest_archives_with_config(&config)?;
-        
-        if let Some((second_largest, largest)) = archive_pair {
-            // Mode 1: Merge archives
-            metrics.update_global(|g| g.mode = "Merging Archives".to_string());
-            metrics.clear_chart_history();
-            metrics.add_log("MODE 1: Merging archives".to_string());
-            metrics.add_log(format!("Merging: {} + {}", second_largest, largest));
+    let main_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), FoldError> {
+        loop {
+            // Check for stale heartbeats and recover abandoned work from crashed processes
+            file_handler::check_and_recover_stale_work(&config)?;
             
-            merge_archives(&second_largest, &largest, &config, &metrics)?;
+            // Update the count of distinct running jobs
+            let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
+            metrics.update_global(|g| g.distinct_jobs_count = jobs_count);
             
-        } else {
-            // Mode 2: Process txt file
-            let txt_file = file_handler::find_txt_file_with_config(&config)?;
+            // Check for existing archives
+            let archive_pair = file_handler::get_two_largest_archives_with_config(&config)?;
             
-            if txt_file.is_none() {
-                metrics.add_log("No more files to process".to_string());
-                metrics.add_log("Processing completed".to_string());
-                break;
+            if let Some((second_largest, largest)) = archive_pair {
+                // Mode 1: Merge archives
+                metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+                metrics.clear_chart_history();
+                metrics.add_log("MODE 1: Merging archives".to_string());
+                metrics.add_log(format!("Merging: {} + {}", second_largest, largest));
+                
+                match merge_archives(&second_largest, &largest, &config, &metrics) {
+                    Ok(()) => {}
+                    Err(e) if is_concurrent_claim_error(&e) => {
+                        metrics.add_log(format!(
+                            "Lost race to claim archives ({}); retrying selection",
+                            e
+                        ));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+                
+            } else {
+                // Mode 2: Process txt file
+                let txt_file = file_handler::find_txt_file_with_config(&config)?;
+                
+                if txt_file.is_none() {
+                    metrics.add_log("No more files to process".to_string());
+                    metrics.add_log("Processing completed".to_string());
+                    break;
+                }
+                
+                metrics.update_global(|g| g.mode = "Processing Text".to_string());
+                metrics.clear_chart_history();
+                metrics.add_log("MODE 2: Processing text file".to_string());
+                
+                let txt_file = txt_file.unwrap();
+                match process_txt_file(txt_file.clone(), &config, &metrics) {
+                    Ok(()) => {}
+                    Err(e) if is_concurrent_claim_error(&e) => {
+                        metrics.add_log(format!(
+                            "Lost race to claim {}; retrying selection",
+                            txt_file
+                        ));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            
-            metrics.update_global(|g| g.mode = "Processing Text".to_string());
-            metrics.clear_chart_history();
-            metrics.add_log("MODE 2: Processing text file".to_string());
-            
-            process_txt_file(txt_file.unwrap(), &config, &metrics)?;
         }
-    }
+        Ok(())
+    }));
     
     // Signal TUI to quit and wait for it
     should_quit.store(true, Ordering::Relaxed);
-    let _ = tui_handle.join();
+    let tui_result = if let Some(handle) = tui_handle {
+        Some(handle.join())
+    } else {
+        None
+    };
     
-    Ok(())
+    match (main_result, tui_result) {
+        (Ok(Ok(())), Some(Ok(()))) | (Ok(Ok(())), None) => Ok(()),
+        (Ok(Ok(())), Some(Err(panic))) => std::panic::resume_unwind(panic),
+        (Ok(Err(e)), _) => Err(e),
+        (Err(panic), _) => std::panic::resume_unwind(panic),
+    }
 }
 
 fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) -> Result<(), FoldError> {
     // Ingest the text file (now includes reading the text)
     let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)?;
     let remaining = file_handler::count_txt_files_remaining_with_config(config)?;
+    metrics.reset_new_orthos();
     
     metrics.update_operation(|op| {
         op.current_file = ingestion.filename.clone();
@@ -201,10 +248,18 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
             // Update RAM usage and jobs count
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
-            let used_mb = sys.used_memory() / 1_048_576;
+            // sysinfo returns bytes (0.32); use raw values without extra scaling
+            let used_bytes = sys.used_memory();
+            let total_bytes = sys.total_memory();
+            let percent = if total_bytes > 0 {
+                ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
+            } else {
+                0
+            };
             let jobs_count = file_handler::count_running_jobs_with_config(config).unwrap_or(0);
             metrics.update_global(|g| {
-                g.ram_mb = used_mb as usize;
+                g.ram_bytes = used_bytes as usize;
+                g.system_memory_percent = percent;
                 g.distinct_jobs_count = jobs_count;
             });
         }
@@ -265,6 +320,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
                     }
                     
                     results.push(child.clone())?;
+                    metrics.increment_new_orthos(1);
                     work_queue.push(child)?;
                 }
             }
@@ -343,6 +399,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         m.word_count_a = ingestion.word_count_a;
         m.word_count_b = ingestion.word_count_b;
     });
+    metrics.reset_new_orthos();
+    metrics.reset_seen_history(); // start fresh for rehydrate stage
     
     // Create merged interner: larger absorbs smaller, so larger's vocab is the base
     let merged_interner = larger_interner.merge(&smaller_interner);
@@ -387,6 +445,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let seed_ortho = Ortho::new();
     let seed_id = seed_ortho.id();
     tracker.insert(seed_id);
+    metrics.reset_seen_size(tracker.len());
     let mut best_ortho = seed_ortho.clone();
     let mut best_score = best_ortho.score();
     work_queue.push(seed_ortho)?;
@@ -500,6 +559,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     };
     
     metrics.add_log(format!("Remapping complete: A={}, B={}", total_from_a, total_from_b));
+
+    // Reset seen history for the search phase so the chart reflects the new stage only.
+    metrics.reset_seen_history();
+    metrics.reset_seen_size(tracker.len());
     
     metrics.set_operation_status("Processing merged space".to_string());
     metrics.update_operation(|op| {
@@ -525,10 +588,18 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             // Update RAM usage and jobs count
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
-            let used_mb = sys.used_memory() / 1_048_576;
+            // sysinfo returns bytes (0.32); use raw values without extra scaling
+            let used_bytes = sys.used_memory();
+            let total_bytes = sys.total_memory();
+            let percent = if total_bytes > 0 {
+                ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
+            } else {
+                0
+            };
             let jobs_count = file_handler::count_running_jobs_with_config(config).unwrap_or(0);
             metrics.update_global(|g| {
-                g.ram_mb = used_mb as usize;
+                g.ram_bytes = used_bytes as usize;
+                g.system_memory_percent = percent;
                 g.distinct_jobs_count = jobs_count;
             });
         }
@@ -584,6 +655,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                     }
                     
                     merged_results.push(child.clone())?;
+                    metrics.increment_new_orthos(1);
                     work_queue.push(child)?;
                 }
             }
@@ -652,9 +724,23 @@ fn print_optimal(_ortho: &Ortho, _interner: &Interner) {
     // Optimal ortho info is now displayed in TUI metrics
 }
 
+// Treat common IO races (files already moved by another process) as recoverable.
+fn is_concurrent_claim_error(err: &FoldError) -> bool {
+    match err {
+        FoldError::Io(io_err) => {
+            matches!(
+                io_err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+            ) || matches!(io_err.raw_os_error(), Some(39) | Some(66))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     
     #[test]
     fn test_score() {
@@ -664,5 +750,21 @@ mod tests {
         assert_eq!(volume, 1);
         // All 4 slots are None
         assert_eq!(fullness, 0);
+    }
+
+    #[test]
+    fn concurrent_claim_errors_are_retryable() {
+        let not_found = FoldError::Io(std::io::Error::new(ErrorKind::NotFound, "missing"));
+        assert!(is_concurrent_claim_error(&not_found));
+
+        let already_exists = FoldError::Io(std::io::Error::new(ErrorKind::AlreadyExists, "exists"));
+        assert!(is_concurrent_claim_error(&already_exists));
+
+        let dir_not_empty = FoldError::Io(std::io::Error::from_raw_os_error(39));
+        assert!(is_concurrent_claim_error(&dir_not_empty));
+
+        let permission_denied =
+            FoldError::Io(std::io::Error::new(ErrorKind::PermissionDenied, "denied"));
+        assert!(!is_concurrent_claim_error(&permission_denied));
     }
 }

@@ -36,7 +36,6 @@ pub struct GlobalMetrics {
     pub remaining_chunks: usize,
     pub system_memory_percent: usize,
     pub start_time: u64,
-    pub ram_mb: usize,
     pub current_lineage: String,
     pub queue_buffer_size: usize,
     pub bloom_capacity: usize,
@@ -45,6 +44,7 @@ pub struct GlobalMetrics {
     pub queue_depth_pk: usize,
     pub seen_size_pk: usize,
     pub distinct_jobs_count: usize,
+    pub ram_bytes: usize,
 }
 
 impl Default for GlobalMetrics {
@@ -62,7 +62,6 @@ impl Default for GlobalMetrics {
             remaining_chunks: 0,
             system_memory_percent: 0,
             start_time,
-            ram_mb: 0,
             current_lineage: String::new(),
             queue_buffer_size: 0,
             bloom_capacity: 0,
@@ -71,6 +70,7 @@ impl Default for GlobalMetrics {
             queue_depth_pk: 0,
             seen_size_pk: 0,
             distinct_jobs_count: 0,
+            ram_bytes: 0,
         }
     }
 }
@@ -84,6 +84,7 @@ pub struct OperationStatus {
     pub progress_total: usize,
     pub text_preview: String,
     pub word_count: usize,
+    pub new_orthos: usize,
 }
 
 impl Default for OperationStatus {
@@ -100,6 +101,7 @@ impl Default for OperationStatus {
             progress_total: 0,
             text_preview: String::new(),
             word_count: 0,
+            new_orthos: 0,
         }
     }
 }
@@ -327,6 +329,21 @@ impl Metrics {
         self.record_sample(size, |inner| &mut inner.seen_history_samples);
     }
 
+    pub fn reset_seen_history(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.seen_history_samples.clear();
+    }
+
+    pub fn reset_new_orthos(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.new_orthos = 0;
+    }
+
+    pub fn increment_new_orthos(&self, count: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.new_orthos = inner.operation.new_orthos.saturating_add(count);
+    }
+
     pub fn record_optimal_volume(&self, volume: usize) {
         self.record_sample(volume, |inner| &mut inner.optimal_volume_samples);
     }
@@ -427,7 +444,17 @@ impl Metrics {
         inner.queue_depth_samples.clear();
         inner.seen_size_samples.clear();
         inner.optimal_volume_samples.clear();
+        inner.global.queue_depth_pk = 0;
+        inner.global.seen_size_pk = 0;
         // Note: seen_history_samples is NOT cleared - it persists across all chunks
+    }
+
+    pub fn reset_seen_size(&self, baseline: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.seen_size_samples.clear();
+        inner.global.seen_size_pk = baseline;
+        let timestamp = Self::current_timestamp();
+        inner.seen_size_samples.push_back(MetricSample { timestamp, value: baseline });
     }
 
     pub fn add_log(&self, message: String) {

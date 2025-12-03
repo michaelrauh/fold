@@ -124,10 +124,12 @@ impl Tui {
             .as_secs();
         let elapsed = now - snapshot.global.start_time;
         let elapsed_str = format_elapsed(elapsed);
-        
-        let line1 = format!("FOLD Dashboard [Time: {} │ RAM: {} MB / {}%]", 
+
+        let ram_readable = format_bytes(snapshot.global.ram_bytes);
+        let line1 = format!(
+            "FOLD Dashboard [Time: {} │ RAM: {} ({}%)]",
             elapsed_str,
-            format_number(snapshot.global.ram_mb),
+            ram_readable,
             snapshot.global.system_memory_percent
         );
         let line2 = format!("Mode: {} │ Interner: v{} │ Vocab: {}",
@@ -135,11 +137,12 @@ impl Tui {
             snapshot.global.interner_version,
             format_number(snapshot.global.vocab_size)
         );
-        let line3 = format!("Chunks: {} │ Processed: {} │ Remaining: {} │ Jobs: {}",
+        let line3 = format!("Chunks: {} │ Processed: {} │ Remaining: {} │ Jobs: {} │ New orthos: {}",
             snapshot.global.total_chunks,
             snapshot.global.processed_chunks,
             snapshot.global.remaining_chunks,
-            snapshot.global.distinct_jobs_count
+            snapshot.global.distinct_jobs_count,
+            format_number(snapshot.operation.new_orthos)
         );
         let line4 = format!("QBuf: {} │ Bloom: {} │ Shards: {}/{} in mem",
             format_number(snapshot.global.queue_buffer_size),
@@ -254,6 +257,10 @@ impl Tui {
                 Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(truncate_string(&snapshot.operation.status, available.saturating_sub(8)), Style::default().fg(Color::Cyan)),
                 Span::styled(format!(" ({})", elapsed_str), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("New orthos: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_number(snapshot.operation.new_orthos)),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -546,28 +553,33 @@ impl Tui {
 
     fn render_seen_size_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let sampled_data = sample_data(&snapshot.seen_size_samples, area.width.saturating_sub(2) as usize);
-        let data: Vec<u64> = sampled_data.iter().map(|s| s.value as u64).collect();
+        let baseline = sampled_data.first().map(|s| s.value).unwrap_or(0);
+        let data: Vec<u64> = sampled_data
+            .iter()
+            .map(|s| s.value.saturating_sub(baseline) as u64)
+            .collect();
 
-        let (current, peak, rate) = if !snapshot.seen_size_samples.is_empty() {
-            let current = snapshot.seen_size_samples.last().map(|s| s.value).unwrap_or(0);
-            let peak = snapshot.global.seen_size_pk;
+        let (current, _peak, rate, baseline_raw) = if !snapshot.seen_size_samples.is_empty() {
+            let current_raw = snapshot.seen_size_samples.last().map(|s| s.value).unwrap_or(0);
+            let peak_raw = snapshot.global.seen_size_pk;
+            let baseline_raw = baseline;
             let rate = if snapshot.seen_size_samples.len() >= 10 {
                 let prev_idx = snapshot.seen_size_samples.len().saturating_sub(10);
                 let prev = snapshot.seen_size_samples[prev_idx].value;
-                (current as i64 - prev as i64) / 10
+                (current_raw as i64 - prev as i64) / 10
             } else {
                 0
             };
-            (current as u64, peak as u64, rate)
+            (current_raw as u64, peak_raw as u64, rate, baseline_raw as u64)
         } else {
-            (0, 0, 0)
+            (0, 0, 0, 0)
         };
 
         let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Seen │ Cur:{} Pk:{} Δ{}{}/s",
+            "Seen │ Cur:{} Base:{} Δ{}{}/s",
             format_number(current as usize),
-            format_number(peak as usize),
+            format_number(baseline_raw as usize),
             rate_sign,
             format_number(rate.abs() as usize)
         );
@@ -599,8 +611,10 @@ impl Tui {
         
         // Format title with statistics
         let title = format!(
-            "Status Duration │ Avg:{}s Min:{}s Max:{}s",
-            avg, min, max
+            "Status Duration │ Avg:{} Min:{} Max:{}",
+            format_elapsed(avg),
+            format_elapsed(min),
+            format_elapsed(max)
         );
         
         if snapshot.status_history.is_empty() {
@@ -889,6 +903,26 @@ fn format_number(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= TB {
+        format!("{:.2} TB", b / TB)
+    } else if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
     }
 }
 

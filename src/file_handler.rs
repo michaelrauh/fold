@@ -78,6 +78,7 @@ pub fn check_and_recover_stale_work(config: &StateConfig) -> Result<(), FoldErro
 
 fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
     let in_process_path = std::path::Path::new(in_process_dir);
+    let input_path = std::path::Path::new(input_dir);
     
     if !in_process_path.exists() {
         return Ok(());
@@ -97,15 +98,20 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
             if heartbeat_path.exists() && is_heartbeat_stale(&heartbeat_path)? {
                 // Check if this is a txt.work folder
                 let source_txt_path = entry_path.join("source.txt");
-                if source_txt_path.exists() {
-                    // Recover the txt.work folder back to input as a plain txt file
-                    if let Some(folder_name) = entry_path.file_name() {
-                        let folder_name_str = folder_name.to_str().unwrap_or("recovered");
-                        if folder_name_str.ends_with(".txt.work") {
-                            let base_name = &folder_name_str[..folder_name_str.len() - 9]; // Remove ".txt.work"
-                            let target_path = format!("{}/{}.txt", input_dir, base_name);
-                            fs::rename(&source_txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
-                            // println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
+                    if source_txt_path.exists() {
+                        // Recover the txt.work folder back to input as a plain txt file
+                        if let Some(folder_name) = entry_path.file_name() {
+                            let folder_name_str = folder_name.to_str().unwrap_or("recovered");
+                            if folder_name_str.ends_with(".txt.work") {
+                                let base_name = &folder_name_str[..folder_name_str.len() - 9]; // Remove ".txt.work"
+                                let target_path = format!("{}/{}.txt", input_dir, base_name);
+                                if Path::new(&target_path).exists() {
+                                    // Target already present; drop stale work folder instead of failing
+                                    let _ = fs::remove_dir_all(&entry_path);
+                                } else {
+                                    fs::rename(&source_txt_path, &target_path).map_err(|e| FoldError::Io(e))?;
+                                }
+                                // println!("[fold] Recovered abandoned txt file: {} -> {}", folder_name_str, target_path);
                             
                             // Delete the results_{filename} directory if it exists
                             let base_dir = Path::new(in_process_dir).parent().unwrap_or_else(|| Path::new("."));
@@ -141,11 +147,17 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                                                 let _ = fs::remove_file(&archive_heartbeat);
                                             }
                                             
-                                            // Move archive back to input
+                                            // Move archive back to input unless a backup exists (backups restored later)
                                             let archive_name = bin_path.file_name().unwrap();
                                             let input_path = Path::new(input_dir).join(archive_name);
-                                            // println!("[fold] Recovering merge archive: {:?} -> {:?}", bin_path, input_path);
-                                            let _ = fs::rename(&bin_path, &input_path);
+                                            let backup_path = format!("{}.backup", input_path.to_string_lossy());
+                                            if input_path.exists() || Path::new(&backup_path).exists() {
+                                                // Target already restored or backed up; drop stale work copy
+                                                let _ = fs::remove_dir_all(&bin_path);
+                                            } else {
+                                                // println!("[fold] Recovering merge archive: {:?} -> {:?}", bin_path, input_path);
+                                                let _ = fs::rename(&bin_path, &input_path);
+                                            }
                                         }
                                     }
                                 }
@@ -175,9 +187,48 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                         
                         let archive_name = entry_path.file_name().unwrap();
                         let input_path = Path::new(input_dir).join(archive_name);
-                        // println!("[fold] Recovering orphaned archive: {:?} -> {:?}", entry_path, input_path);
-                        fs::rename(&entry_path, &input_path).map_err(|e| FoldError::Io(e))?;
+                        let backup_path = format!("{}.backup", input_path.to_string_lossy());
+                        if input_path.exists() || Path::new(&backup_path).exists() {
+                            // Target already present (e.g., user staged input). Drop stale in_process copy.
+                            let _ = fs::remove_dir_all(&entry_path);
+                        } else {
+                            // println!("[fold] Recovering orphaned archive: {:?} -> {:?}", entry_path, input_path);
+                            fs::rename(&entry_path, &input_path).map_err(|e| FoldError::Io(e))?;
+                        }
                         recovered_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Restore any archive backups left in input (created at merge start).
+    if input_path.exists() {
+        for entry in fs::read_dir(input_path).map_err(|e| FoldError::Io(e))? {
+            let entry = entry.map_err(|e| FoldError::Io(e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(ext) = path.extension() {
+                    if ext == "backup" {
+                        let original_path = Path::new(path.to_str().unwrap().trim_end_matches(".backup"));
+
+                        // If there's an active work folder for this archive, skip restoring the backup.
+                        // This avoids racing with a currently running merge that already claimed it.
+                        if let Some(original_name) = original_path.file_name().and_then(|n| n.to_str()) {
+                            let work_folder = std::path::Path::new(in_process_dir).join(original_name);
+                            let heartbeat = work_folder.join("heartbeat");
+                            if heartbeat.exists() && !is_heartbeat_stale(&heartbeat).unwrap_or(true) {
+                                continue;
+                            }
+                        }
+
+                        if !original_path.exists() {
+                            // println!("[fold] Restoring archive backup: {:?} -> {:?}", path, original_path);
+                            fs::rename(&path, original_path).map_err(|e| FoldError::Io(e))?;
+                        } else {
+                            // Original is already present; drop stale backup
+                            let _ = fs::remove_dir_all(&path);
+                        }
                     }
                 }
             }
@@ -228,15 +279,37 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
 }
 
 fn is_heartbeat_stale(heartbeat_path: &Path) -> Result<bool, FoldError> {
+    let now = SystemTime::now();
     let metadata = fs::metadata(heartbeat_path).map_err(|e| FoldError::Io(e))?;
     let modified = metadata.modified().map_err(|e| FoldError::Io(e))?;
-    let now = SystemTime::now();
-    
+
+    // If the file's modification time is beyond the grace period, treat as stale.
     if let Ok(duration) = now.duration_since(modified) {
-        Ok(duration.as_secs() > HEARTBEAT_GRACE_PERIOD_SECS)
-    } else {
-        Ok(false)
+        if duration.as_secs() > HEARTBEAT_GRACE_PERIOD_SECS {
+            return Ok(true);
+        }
     }
+
+    // First, attempt to parse the heartbeat contents (timestamp and pid)
+    if let Ok(contents) = fs::read_to_string(heartbeat_path) {
+        let mut parts = contents
+            .split(|c| c == ':' || c == '\n' || c == ' ')
+            .filter(|s| !s.is_empty());
+
+        let timestamp_secs = parts.next().and_then(|s| s.parse::<u64>().ok());
+
+        // Fall back to timestamp-based staleness (new format uses timestamp too)
+        if let Some(ts) = timestamp_secs {
+            if let Ok(duration) = now.duration_since(UNIX_EPOCH + std::time::Duration::from_secs(ts)) {
+                if duration.as_secs() > HEARTBEAT_GRACE_PERIOD_SECS {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    // Compatibility fallback: use file modification time if contents are unreadable/legacy
+    Ok(false)
 }
 
 fn touch_heartbeat(heartbeat_path: &str) -> Result<(), FoldError> {
@@ -244,8 +317,10 @@ fn touch_heartbeat(heartbeat_path: &str) -> Result<(), FoldError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
         .as_secs();
+    let pid = std::process::id();
+    let content = format!("{}:{}", now, pid);
     
-    fs::write(heartbeat_path, now.to_string().as_bytes()).map_err(|e| FoldError::Io(e))?;
+    fs::write(heartbeat_path, content.as_bytes()).map_err(|e| FoldError::Io(e))?;
     Ok(())
 }
 
@@ -281,7 +356,7 @@ fn count_txt_files(input_dir: &str) -> Result<usize, FoldError> {
     Ok(count)
 }
 
-fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> {
+fn find_next_txt_file(input_dir: &str, in_process_dir: &str) -> Result<Option<String>, FoldError> {
     let path = std::path::Path::new(input_dir);
     
     if !path.exists() {
@@ -299,6 +374,18 @@ fn find_next_txt_file(input_dir: &str) -> Result<Option<String>, FoldError> {
         if entry_path.is_file() {
             if let Some(ext) = entry_path.extension() {
                 if ext == "txt" {
+                    // Skip if there's an active .txt.work folder with fresh heartbeat for this file
+                    if let Some(stem) = entry_path.file_stem().and_then(|s| s.to_str()) {
+                        let work_folder = Path::new(in_process_dir).join(format!("{}.txt.work", stem));
+                        let heartbeat = work_folder.join("heartbeat");
+                        if heartbeat.exists() {
+                            let stale = is_heartbeat_stale(&heartbeat).unwrap_or(false);
+                            if !stale {
+                                continue;
+                            }
+                        }
+                    }
+
                     if let Some(path_str) = entry_path.to_str() {
                         if let Ok(metadata) = entry_path.metadata() {
                             let size = metadata.len();
@@ -522,12 +609,20 @@ fn cleanup_txt_processing(work_folder: &str) -> Result<(), FoldError> {
 }
 
 /// Sets up archive merging by moving archives to in_process directory
-/// Returns (work_path_a, work_path_b)
-fn setup_archive_merge(archive_a_path: &str, archive_b_path: &str, in_process_dir: &str) -> Result<(String, String), FoldError> {
+/// Returns (work_path_a, work_path_b, backup_path_a, backup_path_b)
+fn setup_archive_merge(archive_a_path: &str, archive_b_path: &str, in_process_dir: &str) -> Result<(String, String, String, String), FoldError> {
     let archive_a_name = Path::new(archive_a_path).file_name().unwrap().to_str().unwrap();
     let archive_b_name = Path::new(archive_b_path).file_name().unwrap().to_str().unwrap();
     let work_a_path = format!("{}/{}", in_process_dir, archive_a_name);
     let work_b_path = format!("{}/{}", in_process_dir, archive_b_name);
+    
+    // Before moving the archives out of input, make backups so recovery can restore
+    let backup_a_path = format!("{}.backup", archive_a_path);
+    let backup_b_path = format!("{}.backup", archive_b_path);
+    if Path::new(&backup_a_path).exists() { fs::remove_dir_all(&backup_a_path).map_err(FoldError::Io)?; }
+    if Path::new(&backup_b_path).exists() { fs::remove_dir_all(&backup_b_path).map_err(FoldError::Io)?; }
+    copy_dir_all(archive_a_path, &backup_a_path)?;
+    copy_dir_all(archive_b_path, &backup_b_path)?;
     
     fs::rename(archive_a_path, &work_a_path).map_err(FoldError::Io)?;
     fs::rename(archive_b_path, &work_b_path).map_err(FoldError::Io)?;
@@ -536,7 +631,7 @@ fn setup_archive_merge(archive_a_path: &str, archive_b_path: &str, in_process_di
     touch_heartbeat(&format!("{}/heartbeat", work_a_path))?;
     touch_heartbeat(&format!("{}/heartbeat", work_b_path))?;
     
-    Ok((work_a_path, work_b_path))
+    Ok((work_a_path, work_b_path, backup_a_path, backup_b_path))
 }
 
 /// Cleans up archives by removing them if they exist
@@ -546,6 +641,25 @@ fn cleanup_archives(archive_paths: &[&str]) -> Result<(), FoldError> {
             fs::remove_dir_all(archive_path).map_err(|e| FoldError::Io(e))?;
         }
     }
+    Ok(())
+}
+
+// Simple recursive copy for directory trees (used for merge backups)
+fn copy_dir_all(src: &str, dst: &str) -> Result<(), FoldError> {
+    fs::create_dir_all(dst).map_err(|e| FoldError::Io(e))?;
+    
+    for entry in fs::read_dir(src).map_err(|e| FoldError::Io(e))? {
+        let entry = entry.map_err(|e| FoldError::Io(e))?;
+        let path = entry.path();
+        let dest_path = Path::new(dst).join(entry.file_name());
+        
+        if path.is_dir() {
+            copy_dir_all(path.to_str().unwrap(), dest_path.to_str().unwrap())?;
+        } else {
+            fs::copy(&path, &dest_path).map_err(|e| FoldError::Io(e))?;
+        }
+    }
+    
     Ok(())
 }
 
@@ -616,6 +730,8 @@ impl TxtIngestion {
 pub struct ArchiveIngestion {
     work_a_path: String,
     work_b_path: String,
+    backup_a_path: String,
+    backup_b_path: String,
     merge_work_folder: String,
     heartbeat_path: String,
     pub text_preview_a: String,
@@ -698,6 +814,7 @@ impl ArchiveIngestion {
         }
         // Clean up the work paths (archives in in_process), not the original paths
         cleanup_archives(&[&self.work_a_path, &self.work_b_path])
+            .and_then(|_| cleanup_archives(&[&self.backup_a_path, &self.backup_b_path]))
     }
 }
 
@@ -752,7 +869,10 @@ pub fn find_txt_file() -> Result<Option<String>, FoldError> {
 
 /// Find the next text file to process with custom config
 pub fn find_txt_file_with_config(config: &StateConfig) -> Result<Option<String>, FoldError> {
-    find_next_txt_file(config.input_dir().to_str().unwrap())
+    find_next_txt_file(
+        config.input_dir().to_str().unwrap(),
+        config.in_process_dir().to_str().unwrap(),
+    )
 }
 
 /// Get the two largest archives (uses default config)
@@ -903,7 +1023,7 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
         String::new()
     };
     
-    let (work_a_path, work_b_path) = setup_archive_merge(archive_a_path, archive_b_path, in_process.to_str().unwrap())?;
+    let (work_a_path, work_b_path, backup_a_path, backup_b_path) = setup_archive_merge(archive_a_path, archive_b_path, in_process.to_str().unwrap())?;
     
     // Create merge work folder for isolated queue and seen_shards
     let merge_work_folder = in_process.join(format!("merge_{}.work", std::process::id()));
@@ -916,6 +1036,8 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
     Ok(ArchiveIngestion {
         work_a_path,
         work_b_path,
+        backup_a_path,
+        backup_b_path,
         merge_work_folder: merge_work_folder.to_string_lossy().to_string(),
         heartbeat_path: heartbeat_path.to_string_lossy().to_string(),
         text_preview_a,
@@ -930,6 +1052,7 @@ pub fn ingest_archives_with_config(archive_a_path: &str, archive_b_path: &str, c
 mod tests {
     use super::*;
     use crate::ortho::Ortho;
+    use std::sync::{Arc, Barrier};
     
     #[test]
     fn test_save_and_load_archive() {
@@ -1141,5 +1264,104 @@ mod tests {
         // Should still count 2 jobs (no heartbeat means not active)
         let count = count_running_jobs_with_config(&config).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn concurrent_ingest_only_allows_one_claim() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        let input_dir = config.input_dir();
+        fs::create_dir_all(&input_dir).unwrap();
+
+        let txt_path = input_dir.join("race.txt");
+        fs::write(&txt_path, "concurrent ingestion test").unwrap();
+        let txt_path_str = txt_path.to_string_lossy().to_string();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let config_clone = config.clone();
+                let barrier = Arc::clone(&barrier);
+                let path = txt_path_str.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ingest_txt_file_with_config(&path, &config_clone)
+                })
+            })
+            .collect();
+
+        let mut successes = 0;
+        let mut concurrency_errors = 0;
+
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(ingestion) => {
+                    successes += 1;
+                    ingestion.cleanup().unwrap();
+                }
+                Err(FoldError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    concurrency_errors += 1;
+                }
+                Err(other) => panic!("unexpected error: {:?}", other),
+            }
+        }
+
+        assert_eq!(successes, 1, "exactly one worker should claim the file");
+        assert_eq!(
+            concurrency_errors, 1,
+            "the losing worker should see an atomic-move race error"
+        );
+    }
+
+    #[test]
+    fn find_txt_skips_active_work_folder() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        // Two input files
+        fs::create_dir_all(config.input_dir()).unwrap();
+        let first = config.input_dir().join("a.txt");
+        let second = config.input_dir().join("b.txt");
+        fs::write(&first, "one").unwrap();
+        fs::write(&second, "two").unwrap();
+
+        // Active work folder for a.txt with fresh heartbeat
+        let work_a = config.in_process_dir().join("a.txt.work");
+        fs::create_dir_all(&work_a).unwrap();
+        create_heartbeat(work_a.to_str().unwrap()).unwrap();
+
+        // Should return b.txt (skip a.txt because its work folder is active)
+        let next = find_txt_file_with_config(&config).unwrap();
+        assert_eq!(next.as_deref(), Some(second.to_str().unwrap()));
+    }
+
+    #[test]
+    fn backups_not_restored_when_active_work_exists() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        // Prepare an archive backup in input
+        let archive = config.input_dir().join("archive_test.bin");
+        let backup = config.input_dir().join("archive_test.bin.backup");
+        fs::create_dir_all(&backup).unwrap();
+
+        // Active work folder with fresh heartbeat
+        let work = config.in_process_dir().join("archive_test.bin");
+        fs::create_dir_all(&work).unwrap();
+        create_heartbeat(work.to_str().unwrap()).unwrap();
+
+        // Recovery should not restore the backup while work is active
+        recover_abandoned_files(config.input_dir().to_str().unwrap(), config.in_process_dir().to_str().unwrap()).unwrap();
+        assert!(backup.exists(), "backup should remain while work is active");
+        assert!(!archive.exists(), "archive should not be restored while work is active");
     }
 }
