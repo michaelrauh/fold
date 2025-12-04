@@ -1,9 +1,11 @@
 use crate::{disk_backed_queue::DiskBackedQueue, interner::Interner, ortho::Ortho, FoldError};
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_GRACE_PERIOD_SECS: u64 = 600; // 10 minutes
+const MEM_CLAIM_STALE_GRACE_SECS: u64 = HEARTBEAT_GRACE_PERIOD_SECS;
 
 /// Count words in text (whitespace-separated tokens)
 fn count_words(text: &str) -> usize {
@@ -54,6 +56,10 @@ impl StateConfig {
     pub fn results_dir(&self, name: &str) -> PathBuf {
         self.base_dir.join(format!("results_{}", name))
     }
+
+    pub fn mem_claims_dir(&self) -> PathBuf {
+        self.base_dir.join("mem_claims")
+    }
 }
 
 /// Initialize the file system: create directories and recover abandoned files
@@ -82,6 +88,10 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
     
     if !in_process_path.exists() {
         return Ok(());
+    }
+
+    if !input_path.exists() {
+        fs::create_dir_all(input_path).map_err(FoldError::Io)?;
     }
     
     let mut recovered_count = 0;
@@ -234,6 +244,34 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
             }
         }
     }
+
+    // Second pass: recover orphaned archives in in_process that have no heartbeat.
+    // These are most likely leftover from interrupted moves before heartbeat creation.
+    if in_process_path.exists() {
+        for entry in fs::read_dir(in_process_path).map_err(|e| FoldError::Io(e))? {
+            let entry = entry.map_err(|e| FoldError::Io(e))?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                if let Some(ext) = entry_path.extension() {
+                    if ext == "bin" {
+                        let heartbeat = entry_path.join("heartbeat");
+                        if !heartbeat.exists() {
+                            let archive_name = entry_path.file_name().unwrap();
+                            let input_target = Path::new(input_dir).join(archive_name);
+                            let backup_target = format!("{}.backup", input_target.to_string_lossy());
+
+                            if input_target.exists() || Path::new(&backup_target).exists() {
+                                // Input or backup already present; drop the orphaned copy.
+                                let _ = fs::remove_dir_all(&entry_path);
+                            } else {
+                                let _ = fs::rename(&entry_path, &input_target);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     
     // Clean up orphaned results_merged_* directories in the parent directory
     // Only delete if the corresponding merge_*.work folder doesn't exist or has stale heartbeat
@@ -324,11 +362,197 @@ fn touch_heartbeat(heartbeat_path: &str) -> Result<(), FoldError> {
     Ok(())
 }
 
+pub fn touch_heartbeat_file(heartbeat_path: &str) -> Result<(), FoldError> {
+    touch_heartbeat(heartbeat_path)
+}
+
+pub fn is_heartbeat_file_stale(heartbeat_path: &Path) -> Result<bool, FoldError> {
+    is_heartbeat_stale(heartbeat_path)
+}
+
 fn create_heartbeat(work_folder_path: &str) -> Result<String, FoldError> {
     // Heartbeat is now inside the work folder
     let heartbeat_path = format!("{}/heartbeat", work_folder_path);
     touch_heartbeat(&heartbeat_path)?;
     Ok(heartbeat_path)
+}
+
+#[derive(Debug, Clone)]
+pub struct MemClaimRecord {
+    pub pid: u32,
+    pub role: String,
+    pub requested_bytes: usize,
+    pub granted_bytes: usize,
+    pub timestamp_secs: u64,
+}
+
+pub struct MemClaimGuard {
+    record: MemClaimRecord,
+    path: String,
+}
+
+impl MemClaimGuard {
+    pub fn touch(&self) -> Result<(), FoldError> {
+        write_mem_claim_file(&self.path, &self.record, Some(current_timestamp_secs()?))
+    }
+
+    pub fn release(self) -> Result<(), FoldError> {
+        let _ = fs::remove_file(&self.path);
+        Ok(())
+    }
+
+    pub fn granted_bytes(&self) -> usize {
+        self.record.granted_bytes
+    }
+
+    pub fn requested_bytes(&self) -> usize {
+        self.record.requested_bytes
+    }
+}
+
+impl Drop for MemClaimGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn current_timestamp_secs() -> Result<u64, FoldError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .as_secs())
+}
+
+fn mem_claim_path(config: &StateConfig, pid: u32) -> PathBuf {
+    config.mem_claims_dir().join(format!("{}.claim", pid))
+}
+
+fn write_mem_claim_file(path: &str, record: &MemClaimRecord, ts_override: Option<u64>) -> Result<(), FoldError> {
+    let timestamp = ts_override.unwrap_or(record.timestamp_secs);
+    let content = format!(
+        "pid:{}\nrole:{}\nrequested:{}\ngranted:{}\ntimestamp:{}\n",
+        record.pid, record.role, record.requested_bytes, record.granted_bytes, timestamp
+    );
+    fs::write(path, content).map_err(FoldError::Io)
+}
+
+fn parse_mem_claim(path: &Path) -> Option<MemClaimRecord> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut pid = None;
+    let mut role = None;
+    let mut requested_bytes = None;
+    let mut granted_bytes = None;
+    let mut timestamp_secs = None;
+
+    for line in content.lines() {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next()?;
+        let value = parts.next().unwrap_or("");
+        match key {
+            "pid" => pid = value.parse().ok(),
+            "role" => role = Some(value.to_string()),
+            "requested" => requested_bytes = value.parse().ok(),
+            "granted" => granted_bytes = value.parse().ok(),
+            "timestamp" => timestamp_secs = value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    Some(MemClaimRecord {
+        pid: pid?,
+        role: role?,
+        requested_bytes: requested_bytes?,
+        granted_bytes: granted_bytes?,
+        timestamp_secs: timestamp_secs?,
+    })
+}
+
+fn is_claim_stale(path: &Path) -> bool {
+    if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = SystemTime::now().duration_since(modified) {
+                if duration.as_secs() > MEM_CLAIM_STALE_GRACE_SECS {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn load_active_mem_claims(config: &StateConfig) -> Result<Vec<MemClaimRecord>, FoldError> {
+    let mut claims = Vec::new();
+    let claims_dir = config.mem_claims_dir();
+    fs::create_dir_all(&claims_dir).map_err(FoldError::Io)?;
+
+    for entry in fs::read_dir(&claims_dir).map_err(FoldError::Io)? {
+        let entry = entry.map_err(FoldError::Io)?;
+        let path = entry.path();
+        if path.is_file() && path.extension().map(|ext| ext == "claim").unwrap_or(false) {
+            if is_claim_stale(&path) {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+
+            if let Some(record) = parse_mem_claim(&path) {
+                claims.push(record);
+            } else {
+                // Corrupt claim files should not block work
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    Ok(claims)
+}
+
+pub fn cleanup_stale_mem_claims(config: &StateConfig) -> Result<(), FoldError> {
+    let claims_dir = config.mem_claims_dir();
+    fs::create_dir_all(&claims_dir).map_err(FoldError::Io)?;
+
+    for entry in fs::read_dir(&claims_dir).map_err(FoldError::Io)? {
+        let entry = entry.map_err(FoldError::Io)?;
+        let path = entry.path();
+        if path.is_file() && path.extension().map(|ext| ext == "claim").unwrap_or(false) {
+            if is_claim_stale(&path) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn create_mem_claim(config: &StateConfig, role: &str, requested_bytes: usize, granted_bytes: usize) -> Result<MemClaimGuard, FoldError> {
+    let claims_dir = config.mem_claims_dir();
+    fs::create_dir_all(&claims_dir).map_err(FoldError::Io)?;
+    let pid = std::process::id();
+    let timestamp_secs = current_timestamp_secs()?;
+    let record = MemClaimRecord {
+        pid,
+        role: role.to_string(),
+        requested_bytes,
+        granted_bytes,
+        timestamp_secs,
+    };
+    let path = mem_claim_path(config, pid);
+    // Write via create_new to avoid clobbering if stale file remains; remove stale before overwriting
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path);
+    match result {
+        Ok(_) => write_mem_claim_file(path.to_str().unwrap(), &record, Some(timestamp_secs))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&path);
+            write_mem_claim_file(path.to_str().unwrap(), &record, Some(timestamp_secs))?;
+        }
+        Err(e) => return Err(FoldError::Io(e)),
+    };
+
+    Ok(MemClaimGuard {
+        record,
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 
@@ -880,6 +1104,11 @@ pub fn get_two_largest_archives() -> Result<Option<(String, String)>, FoldError>
     get_two_largest_archives_with_config(&StateConfig::default())
 }
 
+/// Get the two smallest archives (uses default config)
+pub fn get_two_smallest_archives() -> Result<Option<(String, String)>, FoldError> {
+    get_two_smallest_archives_with_config(&StateConfig::default())
+}
+
 /// Get the two largest archives with custom config
 pub fn get_two_largest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
     let archives = find_archives(config.input_dir().to_str().unwrap())?;
@@ -905,6 +1134,30 @@ pub fn get_two_largest_archives_with_config(config: &StateConfig) -> Result<Opti
     let second_largest = archives_with_counts[archives_with_counts.len() - 2].0.clone();
     
     Ok(Some((second_largest, largest)))
+}
+
+/// Get the two smallest archives with custom config
+pub fn get_two_smallest_archives_with_config(config: &StateConfig) -> Result<Option<(String, String)>, FoldError> {
+    let archives = find_archives(config.input_dir().to_str().unwrap())?;
+
+    if archives.len() < 2 {
+        return Ok(None);
+    }
+
+    let mut archives_with_counts: Vec<(String, usize)> = archives
+        .into_iter()
+        .filter_map(|(path, _size)| load_metadata(&path).ok().map(|count| (path, count)))
+        .collect();
+
+    if archives_with_counts.len() < 2 {
+        return Ok(None);
+    }
+
+    archives_with_counts.sort_by_key(|(_, count)| *count);
+    let smallest = archives_with_counts[0].0.clone();
+    let second_smallest = archives_with_counts[1].0.clone();
+
+    Ok(Some((smallest, second_smallest)))
 }
 
 /// Archive metadata for initialization
@@ -1264,6 +1517,64 @@ mod tests {
         // Should still count 2 jobs (no heartbeat means not active)
         let count = count_running_jobs_with_config(&config).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn orphaned_in_process_archives_without_heartbeat_are_recovered() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        // Create orphaned archive in in_process without heartbeat
+        let orphan = config.in_process_dir().join("archive_orphan.bin");
+        fs::create_dir_all(&orphan).unwrap();
+
+        // No copy exists in input; should be moved back to input
+        recover_abandoned_files(config.input_dir().to_str().unwrap(), config.in_process_dir().to_str().unwrap()).unwrap();
+        assert!(!orphan.exists(), "orphaned copy should be removed from in_process");
+        assert!(config.input_dir().join("archive_orphan.bin").exists(), "archive should be restored to input");
+
+        // Now create a second orphan when input already has a copy; it should be dropped
+        let orphan_dup = config.in_process_dir().join("archive_orphan.bin");
+        fs::create_dir_all(&orphan_dup).unwrap();
+        recover_abandoned_files(config.input_dir().to_str().unwrap(), config.in_process_dir().to_str().unwrap()).unwrap();
+        assert!(!orphan_dup.exists(), "duplicate orphan should be deleted");
+    }
+
+    #[test]
+    fn mem_claim_create_load_and_cleanup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+
+        let guard = create_mem_claim(&config, "leader", 10_000, 8_000).unwrap();
+        let claim_path = config
+            .mem_claims_dir()
+            .join(format!("{}.claim", std::process::id()));
+        assert!(claim_path.exists(), "claim file should be created");
+
+        let claims = load_active_mem_claims(&config).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].granted_bytes, guard.granted_bytes());
+        assert_eq!(claims[0].requested_bytes, guard.requested_bytes());
+        assert_eq!(claims[0].role, "leader");
+
+        // Touch claim to ensure non-stale
+        guard.touch().unwrap();
+
+        // Make the claim stale and ensure cleanup removes it
+        let stale_time = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(MEM_CLAIM_STALE_GRACE_SECS + 5))
+            .unwrap();
+        let stale_filetime = filetime::FileTime::from_system_time(stale_time);
+        filetime::set_file_mtime(&claim_path, stale_filetime).unwrap();
+
+        cleanup_stale_mem_claims(&config).unwrap();
+        assert!(
+            !claim_path.exists(),
+            "stale claim should be removed by cleanup"
+        );
+
+        drop(guard); // should be a no-op even if file already removed
     }
 
     #[test]

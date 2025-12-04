@@ -126,8 +126,15 @@ impl Tui {
         let elapsed_str = format_elapsed(elapsed);
 
         let ram_readable = format_bytes(snapshot.global.ram_bytes);
+        let role_label = if snapshot.global.role.is_empty() {
+            "unknown".to_string()
+        } else {
+            snapshot.global.role.clone()
+        };
+
         let line1 = format!(
-            "FOLD Dashboard [Time: {} │ RAM: {} ({}%)]",
+            "FOLD Dashboard [Role: {} │ Time: {} │ RAM: {} ({}%)]",
+            role_label,
             elapsed_str,
             ram_readable,
             snapshot.global.system_memory_percent

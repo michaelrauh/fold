@@ -1,5 +1,13 @@
 use sysinfo::System;
 
+const BYTES_PER_ORTHO: usize = 200;
+const BYTES_PER_BLOOM_ITEM: usize = 2;
+const BYTES_PER_SHARD_ITEM: usize = 12;
+const TARGET_ITEMS_PER_SHARD: usize = 10_000;
+const MIN_QUEUE_BUFFER: usize = 10_000;
+const MIN_BLOOM_CAPACITY: usize = 1_000_000;
+const MIN_SHARDS_IN_MEMORY: usize = 16;
+
 /// Configuration for memory-intensive components
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
@@ -117,6 +125,59 @@ impl MemoryConfig {
         
         config
     }
+
+    /// Estimate bytes used by the configuration, including a 20% runtime reserve.
+    pub fn estimate_bytes(&self, interner_bytes: usize) -> usize {
+        let queue_memory = 2usize
+            .saturating_mul(self.queue_buffer_size)
+            .saturating_mul(BYTES_PER_ORTHO);
+        let bloom_memory = self.bloom_capacity.saturating_mul(BYTES_PER_BLOOM_ITEM);
+        let shard_memory = self
+            .max_shards_in_memory
+            .saturating_mul(TARGET_ITEMS_PER_SHARD)
+            .saturating_mul(BYTES_PER_SHARD_ITEM);
+        let runtime_reserve = (queue_memory + bloom_memory + shard_memory + interner_bytes) / 5;
+
+        interner_bytes
+            .saturating_add(queue_memory)
+            .saturating_add(bloom_memory)
+            .saturating_add(shard_memory)
+            .saturating_add(runtime_reserve)
+    }
+
+    /// Attempt to scale the configuration down to fit within the available bytes.
+    /// Returns None if even the minimum viable configuration cannot fit.
+    pub fn scale_to_budget(&self, available_bytes: usize, interner_bytes: usize) -> Option<Self> {
+        if available_bytes == 0 {
+            return None;
+        }
+
+        let mut scaled = self.clone();
+        let current_estimate = scaled.estimate_bytes(interner_bytes);
+        if current_estimate <= available_bytes {
+            return Some(scaled);
+        }
+
+        let scale = available_bytes as f64 / current_estimate as f64;
+
+        scaled.queue_buffer_size = (((scaled.queue_buffer_size as f64) * scale)
+            .round() as usize)
+            .max(MIN_QUEUE_BUFFER);
+        scaled.bloom_capacity = (((scaled.bloom_capacity as f64) * scale)
+            .round() as usize)
+            .max(MIN_BLOOM_CAPACITY);
+        scaled.max_shards_in_memory = (((scaled.max_shards_in_memory as f64) * scale)
+            .round() as usize)
+            .max(MIN_SHARDS_IN_MEMORY)
+            .min(scaled.num_shards);
+
+        let scaled_estimate = scaled.estimate_bytes(interner_bytes);
+        if scaled_estimate <= available_bytes {
+            Some(scaled)
+        } else {
+            None
+        }
+    }
     
     fn print_summary(&self, interner_bytes: usize, runtime_reserve: usize) {
         let bytes_per_ortho = 200;
@@ -196,6 +257,30 @@ mod tests {
         assert_eq!(config.bloom_capacity, 10_000_000);
         assert_eq!(config.num_shards, 64);
         assert_eq!(config.max_shards_in_memory, 64);
+    }
+
+    #[test]
+    fn estimate_and_scale_down_to_budget() {
+        let config = MemoryConfig::default_config();
+        let interner_bytes = 1_000_000;
+        let estimate = config.estimate_bytes(interner_bytes);
+        assert!(estimate > 0);
+
+        // Budget equal to estimate should succeed (no scaling needed).
+        let budget_ok = estimate;
+        let scaled_same = config
+            .scale_to_budget(budget_ok, interner_bytes)
+            .expect("should accept budget equal to estimate");
+        assert_eq!(scaled_same.queue_buffer_size, config.queue_buffer_size);
+
+        // Budget far below minimum should fail to scale.
+        let budget_too_small = 1;
+        assert!(
+            config
+                .scale_to_budget(budget_too_small, interner_bytes)
+                .is_none(),
+            "scaling should fail when budget is below any viable configuration"
+        );
     }
     
     #[test]

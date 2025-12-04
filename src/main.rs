@@ -1,10 +1,28 @@
-use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, StateConfig}, interner::Interner, memory_config::MemoryConfig, metrics::Metrics, ortho::Ortho, seen_tracker::SeenTracker, tui::Tui, FoldError};
+use fold::{disk_backed_queue::DiskBackedQueue, file_handler::{self, MemClaimGuard, StateConfig}, interner::Interner, memory_config::MemoryConfig, metrics::Metrics, ortho::Ortho, seen_tracker::SeenTracker, tui::Tui, FoldError};
 use std::collections::HashSet;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerRole {
+    Leader,
+    Follower,
+}
+
+impl WorkerRole {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WorkerRole::Leader => "leader",
+            WorkerRole::Follower => "follower",
+        }
+    }
+}
 
 fn main() -> Result<(), FoldError> {
     // Check for test environment variable
@@ -84,64 +102,122 @@ fn main() -> Result<(), FoldError> {
     }
     
     // Main processing loop - two modes:
-    // Mode 1: If there are 2+ result archives, merge the two largest
-    // Mode 2: If there are not 2 results, process txt into result
+    // Mode 1: Merge archives (leaders pick the largest pair; followers merge the smallest pair only when no text is free)
+    // Mode 2: Process txt into result
     let main_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), FoldError> {
+        let mut last_role: Option<WorkerRole> = None;
         loop {
             // Check for stale heartbeats and recover abandoned work from crashed processes
             file_handler::check_and_recover_stale_work(&config)?;
+            file_handler::cleanup_stale_mem_claims(&config)?;
+
+            let role = determine_role(&config)?;
+            if last_role != Some(role) {
+                metrics.add_log(format!("Role change: {:?}", role));
+                metrics.update_global(|g| g.role = role.as_str().to_string());
+                last_role = Some(role);
+            } else {
+                metrics.update_global(|g| g.role = role.as_str().to_string());
+            }
             
             // Update the count of distinct running jobs
             let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
             metrics.update_global(|g| g.distinct_jobs_count = jobs_count);
             
-            // Check for existing archives
-            let archive_pair = file_handler::get_two_largest_archives_with_config(&config)?;
-            
-            if let Some((second_largest, largest)) = archive_pair {
-                // Mode 1: Merge archives
-                metrics.update_global(|g| g.mode = "Merging Archives".to_string());
-                metrics.clear_chart_history();
-                metrics.add_log("MODE 1: Merging archives".to_string());
-                metrics.add_log(format!("Merging: {} + {}", second_largest, largest));
-                
-                match merge_archives(&second_largest, &largest, &config, &metrics) {
-                    Ok(()) => {}
-                    Err(e) if is_concurrent_claim_error(&e) => {
-                        metrics.add_log(format!(
-                            "Lost race to claim archives ({}); retrying selection",
-                            e
-                        ));
-                        continue;
+            match role {
+                WorkerRole::Leader => {
+                    let archive_pair = file_handler::get_two_largest_archives_with_config(&config)?;
+                    
+                    if let Some((second_largest, largest)) = archive_pair {
+                        // Mode 1: Merge archives
+                        metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+                        metrics.clear_chart_history();
+                        metrics.add_log("MODE 1: Merging archives".to_string());
+                        metrics.add_log(format!("Merging: {} + {}", second_largest, largest));
+                        
+                        match merge_archives(&second_largest, &largest, &config, &metrics, role) {
+                            Ok(()) => {}
+                            Err(e) if is_concurrent_claim_error(&e) => {
+                                metrics.add_log(format!(
+                                    "Lost race to claim archives ({}); retrying selection",
+                                    e
+                                ));
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        
+                    } else {
+                        // Mode 2: Process txt file
+                        let txt_file = file_handler::find_txt_file_with_config(&config)?;
+                        
+                        if txt_file.is_none() {
+                            metrics.add_log("No more files to process".to_string());
+                            metrics.add_log("Processing completed".to_string());
+                            break;
+                        }
+                        
+                        metrics.update_global(|g| g.mode = "Processing Text".to_string());
+                        metrics.clear_chart_history();
+                        metrics.add_log("MODE 2: Processing text file".to_string());
+                        
+                        let txt_file = txt_file.unwrap();
+                        match process_txt_file(txt_file.clone(), &config, &metrics, role) {
+                            Ok(()) => {}
+                            Err(e) if is_concurrent_claim_error(&e) => {
+                                metrics.add_log(format!(
+                                    "Lost race to claim {}; retrying selection",
+                                    txt_file
+                                ));
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
-                
-            } else {
-                // Mode 2: Process txt file
-                let txt_file = file_handler::find_txt_file_with_config(&config)?;
-                
-                if txt_file.is_none() {
-                    metrics.add_log("No more files to process".to_string());
-                    metrics.add_log("Processing completed".to_string());
-                    break;
-                }
-                
-                metrics.update_global(|g| g.mode = "Processing Text".to_string());
-                metrics.clear_chart_history();
-                metrics.add_log("MODE 2: Processing text file".to_string());
-                
-                let txt_file = txt_file.unwrap();
-                match process_txt_file(txt_file.clone(), &config, &metrics) {
-                    Ok(()) => {}
-                    Err(e) if is_concurrent_claim_error(&e) => {
-                        metrics.add_log(format!(
-                            "Lost race to claim {}; retrying selection",
-                            txt_file
-                        ));
-                        continue;
+                WorkerRole::Follower => {
+                    // Followers prioritize ingesting new text; merge smallest archives only when none are available.
+                    if let Some(txt_file) = file_handler::find_txt_file_with_config(&config)? {
+                        metrics.update_global(|g| g.mode = "Processing Text".to_string());
+                        metrics.clear_chart_history();
+                        metrics.add_log("MODE 2: Processing text file".to_string());
+                        
+                        match process_txt_file(txt_file.clone(), &config, &metrics, role) {
+                            Ok(()) => {}
+                            Err(e) if is_concurrent_claim_error(&e) => {
+                                metrics.add_log(format!(
+                                    "Lost race to claim {}; retrying selection",
+                                    txt_file
+                                ));
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else if let Some((smallest, second_smallest)) =
+                        file_handler::get_two_smallest_archives_with_config(&config)?
+                    {
+                        // Mode 1 for followers: merge the two smallest archives when no text is free
+                        metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+                        metrics.clear_chart_history();
+                        metrics.add_log("MODE 1: Merging archives".to_string());
+                        metrics.add_log(format!("Merging: {} + {}", smallest, second_smallest));
+                        
+                        match merge_archives(&smallest, &second_smallest, &config, &metrics, role) {
+                            Ok(()) => {}
+                            Err(e) if is_concurrent_claim_error(&e) => {
+                                metrics.add_log(format!(
+                                    "Lost race to claim archives ({}); retrying selection",
+                                    e
+                                ));
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        metrics.add_log("No more files to process".to_string());
+                        metrics.add_log("Processing completed".to_string());
+                        break;
                     }
-                    Err(e) => return Err(e),
                 }
             }
         }
@@ -155,6 +231,8 @@ fn main() -> Result<(), FoldError> {
     } else {
         None
     };
+
+    cleanup_leader_lock(&config);
     
     match (main_result, tui_result) {
         (Ok(Ok(())), Some(Ok(()))) | (Ok(Ok(())), None) => Ok(()),
@@ -164,7 +242,7 @@ fn main() -> Result<(), FoldError> {
     }
 }
 
-fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) -> Result<(), FoldError> {
+fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics, role: WorkerRole) -> Result<(), FoldError> {
     // Ingest the text file (now includes reading the text)
     let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)?;
     let remaining = file_handler::count_txt_files_remaining_with_config(config)?;
@@ -193,7 +271,8 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     
     // Calculate memory config for this file
     let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
-    let memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    let mut memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    let mem_claim = acquire_memory_claim(role, config, metrics, &mut memory_config, interner_bytes)?;
     
     metrics.update_global(|g| {
         g.queue_buffer_size = memory_config.queue_buffer_size;
@@ -272,6 +351,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
             print_optimal(&best_ortho, &interner);
             // Update heartbeat every 100k orthos (zero-arity)
             ingestion.touch_heartbeat()?;
+            mem_claim.touch()?;
         }
         
         // Get requirements from ortho
@@ -354,7 +434,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics) 
     Ok(())
 }
 
-fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConfig, metrics: &Metrics) -> Result<(), FoldError> {
+fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConfig, metrics: &Metrics, role: WorkerRole) -> Result<(), FoldError> {
     // Get archive ortho counts for display BEFORE ingest moves them
     let orthos_a = file_handler::load_archive_metadata(archive_a_path).unwrap_or(0);
     let orthos_b = file_handler::load_archive_metadata(archive_b_path).unwrap_or(0);
@@ -417,7 +497,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     
     // Calculate memory config
     let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
-    let memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    let mut memory_config = MemoryConfig::calculate(interner_bytes, 0);
+    let mem_claim = acquire_memory_claim(role, config, metrics, &mut memory_config, interner_bytes)?;
     
     metrics.update_global(|g| {
         g.queue_buffer_size = memory_config.queue_buffer_size;
@@ -483,6 +564,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             
             if total_from_larger % 10000 == 0 {
                 ingestion.touch_heartbeat()?;
+                mem_claim.touch()?;
                 metrics.update_operation(|op| op.progress_current = total_from_larger);
                 metrics.record_seen_size(tracker.len());
             }
@@ -526,6 +608,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 
                 if total_from_smaller % 10000 == 0 {
                     ingestion.touch_heartbeat()?;
+                    mem_claim.touch()?;
                     metrics.update_operation(|op| op.progress_current = total_from_smaller);
                     metrics.record_seen_size(tracker.len());
                 }
@@ -612,6 +695,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             print_optimal(&best_ortho, &merged_interner);
             // Touch heartbeat (zero-arity)
             ingestion.touch_heartbeat()?;
+            mem_claim.touch()?;
         }
         
         let (forbidden, required) = ortho.get_requirements();
@@ -722,6 +806,135 @@ fn is_ortho_impacted_fast(ortho: &Ortho, impacted_set: &HashSet<&Vec<usize>>) ->
 
 fn print_optimal(_ortho: &Ortho, _interner: &Interner) {
     // Optimal ortho info is now displayed in TUI metrics
+}
+
+fn acquire_memory_claim(
+    role: WorkerRole,
+    config: &StateConfig,
+    metrics: &Metrics,
+    memory_config: &mut MemoryConfig,
+    interner_bytes: usize,
+) -> Result<MemClaimGuard, FoldError> {
+    let budget = memory_budget_bytes();
+    let active_claims = file_handler::load_active_mem_claims(config)?;
+    let used: usize = active_claims.iter().map(|c| c.granted_bytes).sum();
+    let available = budget.saturating_sub(used);
+    let requested_bytes = memory_config.estimate_bytes(interner_bytes);
+    let mut granted_bytes = requested_bytes;
+
+    if requested_bytes > available {
+        if let Some(scaled) = memory_config.scale_to_budget(available, interner_bytes) {
+            *memory_config = scaled;
+            granted_bytes = memory_config.estimate_bytes(interner_bytes);
+            metrics.add_log(format!(
+                "Scaled memory request for {}: requested={} granted={} available={}",
+                role.as_str(),
+                requested_bytes,
+                granted_bytes,
+                available
+            ));
+        } else {
+            metrics.add_log(format!(
+                "Exiting: insufficient memory budget (requested {} bytes, available {}).",
+                requested_bytes, available
+            ));
+            return Err(FoldError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Insufficient memory budget for job",
+            )));
+        }
+    }
+
+    file_handler::create_mem_claim(config, role.as_str(), requested_bytes, granted_bytes)
+}
+
+fn memory_budget_bytes() -> usize {
+    if let Ok(budget_env) = std::env::var("FOLD_RAM_BUDGET_BYTES") {
+        if let Ok(parsed) = budget_env.parse::<usize>() {
+            return parsed;
+        }
+    }
+
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_memory();
+    ((sys.total_memory() as usize) * 75) / 100
+}
+
+fn determine_role(config: &StateConfig) -> Result<WorkerRole, FoldError> {
+    if let Ok(force) = std::env::var("FOLD_FORCE_ROLE") {
+        let force_lower = force.to_lowercase();
+        if force_lower == "follower" {
+            return Ok(WorkerRole::Follower);
+        } else if force_lower == "leader" {
+            return ensure_leader_lock(config);
+        }
+    }
+    ensure_leader_lock(config)
+}
+
+fn ensure_leader_lock(config: &StateConfig) -> Result<WorkerRole, FoldError> {
+    let lock_path = config.in_process_dir().join("leader.lock");
+    fs::create_dir_all(config.in_process_dir()).map_err(FoldError::Io)?;
+
+    let claim_leader = || -> Result<bool, FoldError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .as_secs();
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let content = format!("{}:{}", timestamp, std::process::id());
+                file.write_all(content.as_bytes()).map_err(FoldError::Io)?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(FoldError::Io(e)),
+        }
+    };
+
+    if lock_path.exists() {
+        if file_handler::is_heartbeat_file_stale(&lock_path)? {
+            let _ = fs::remove_file(&lock_path);
+        } else {
+            let owner_pid = fs::read_to_string(&lock_path).ok().and_then(|contents| {
+                contents
+                    .split(':')
+                    .nth(1)
+                    .and_then(|p| p.split_whitespace().next())
+                    .and_then(|p| p.parse::<u32>().ok())
+            });
+            if owner_pid == Some(std::process::id()) {
+                file_handler::touch_heartbeat_file(lock_path.to_str().unwrap())?;
+                return Ok(WorkerRole::Leader);
+            } else {
+                return Ok(WorkerRole::Follower);
+            }
+        }
+    }
+
+    if claim_leader()? {
+        Ok(WorkerRole::Leader)
+    } else {
+        Ok(WorkerRole::Follower)
+    }
+}
+
+fn cleanup_leader_lock(config: &StateConfig) {
+    let lock_path = config.in_process_dir().join("leader.lock");
+    if let Ok(contents) = fs::read_to_string(&lock_path) {
+        let owner_pid = contents
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.split_whitespace().next())
+            .and_then(|p| p.parse::<u32>().ok());
+        if owner_pid == Some(std::process::id()) {
+            let _ = fs::remove_file(lock_path);
+        }
+    }
 }
 
 // Treat common IO races (files already moved by another process) as recoverable.

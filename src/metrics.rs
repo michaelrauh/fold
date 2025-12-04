@@ -29,6 +29,7 @@ pub struct StatusDurationStats {
 #[derive(Clone, Debug)]
 pub struct GlobalMetrics {
     pub mode: String,
+    pub role: String,
     pub interner_version: usize,
     pub vocab_size: usize,
     pub total_chunks: usize,
@@ -55,6 +56,7 @@ impl Default for GlobalMetrics {
             .as_secs();
         Self {
             mode: "Starting".to_string(),
+            role: String::new(),
             interner_version: 0,
             vocab_size: 0,
             total_chunks: 0,
