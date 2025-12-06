@@ -151,9 +151,11 @@ impl Tui {
             snapshot.global.distinct_jobs_count,
             format_number(snapshot.operation.new_orthos)
         );
-        let line4 = format!("QBuf: {} │ Bloom: {} │ Shards: {}/{} in mem",
+        let fp_rate_display = format_percent(snapshot.global.bloom_fp_rate);
+        let line4 = format!("QBuf: {} │ Bloom: {} (~{}) │ Shards: {}/{} in mem",
             format_number(snapshot.global.queue_buffer_size),
             format_number(snapshot.global.bloom_capacity),
+            fp_rate_display,
             format_number(snapshot.global.max_shards_in_memory),
             format_number(snapshot.global.num_shards)
         );
@@ -910,6 +912,14 @@ fn format_number(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn format_percent(p: f64) -> String {
+    if p.is_finite() {
+        format!("{:.2}%", p * 100.0)
+    } else {
+        "n/a".to_string()
     }
 }
 

@@ -1,5 +1,5 @@
 use bloomfilter::Bloom;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -66,6 +66,7 @@ impl Shard {
 /// and a sharded hashmap with LRU disk backing for memory efficiency
 pub struct SeenTracker {
     bloom: Bloom<usize>,
+    bloom_capacity: usize,
     
     // Sharding configuration
     num_shards: usize,
@@ -111,6 +112,7 @@ impl SeenTracker {
         
         Self {
             bloom,
+            bloom_capacity,
             num_shards,
             max_shards_in_memory,
             loaded_shards: Vec::new(),
@@ -196,7 +198,99 @@ impl SeenTracker {
     pub fn len(&self) -> usize {
         self.total_seen_count
     }
+
+    pub fn bloom_capacity(&self) -> usize {
+        self.bloom_capacity
+    }
+
+    pub fn estimated_false_positive_rate(&self) -> f64 {
+        estimate_fp_rate(self.bloom_capacity, self.total_seen_count, 0.01)
+    }
+
+    pub fn estimated_false_positive_rate_for_capacity(&self, capacity: usize) -> f64 {
+        estimate_fp_rate(capacity, self.total_seen_count, 0.01)
+    }
+
+    pub fn rebuild_bloom(&mut self, new_capacity: usize) -> Result<f64, FoldError> {
+        if new_capacity <= self.bloom_capacity {
+            return Ok(self.estimated_false_positive_rate());
+        }
+
+        // Flush loaded shards so disk contains current state
+        self.flush()?;
+
+        let false_positive_rate = 0.01;
+        let mut new_bloom = Bloom::new_for_fp_rate(new_capacity, false_positive_rate);
+
+        let mut loaded_ids = HashSet::new();
+        for shard in &self.loaded_shards {
+            loaded_ids.insert(shard.id);
+            for id in shard.seen.keys() {
+                new_bloom.set(id);
+            }
+        }
+
+        if self.shard_dir.exists() {
+            for entry in fs::read_dir(&self.shard_dir).map_err(FoldError::Io)? {
+                let entry = entry.map_err(FoldError::Io)?;
+                if entry.path().is_file() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.starts_with("shard_") && name.ends_with(".bin") {
+                            if let Some(id) = name
+                                .trim_start_matches("shard_")
+                                .trim_end_matches(".bin")
+                                .parse::<usize>()
+                                .ok()
+                            {
+                                if loaded_ids.contains(&id) {
+                                    continue;
+                                }
+                            }
+                            let shard = Shard::load_from_disk(&entry.path())?;
+                            for id in shard.seen.keys() {
+                                new_bloom.set(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.bloom = new_bloom;
+        self.bloom_capacity = new_capacity;
+
+        Ok(self.estimated_false_positive_rate())
+    }
     
+    /// Current cap on how many shards can be resident simultaneously.
+    pub fn max_shards_in_memory(&self) -> usize {
+        self.max_shards_in_memory
+    }
+
+    /// Reduce the shard residency limit and evict least-recently-used shards to match.
+    /// Returns the number of shards evicted.
+    pub fn shrink_shards_in_memory(&mut self, new_limit: usize) -> usize {
+        if new_limit == 0 {
+            return 0;
+        }
+
+        let target = new_limit.min(self.num_shards).max(1);
+        if target >= self.max_shards_in_memory {
+            self.max_shards_in_memory = target;
+            return 0;
+        }
+
+        self.max_shards_in_memory = target;
+        let mut evicted = 0;
+        while self.loaded_shards.len() > self.max_shards_in_memory {
+            let mut shard = self.loaded_shards.remove(0);
+            let _ = shard.save_to_disk(&self.shard_dir);
+            evicted += 1;
+        }
+
+        evicted
+    }
+
     /// Check if the tracker is empty
     pub fn is_empty(&self) -> bool {
         self.total_seen_count == 0
@@ -211,10 +305,28 @@ impl SeenTracker {
     }
 }
 
+fn estimate_fp_rate(capacity: usize, items: usize, target_fp: f64) -> f64 {
+    if capacity == 0 {
+        return 1.0;
+    }
+    if items == 0 {
+        return 0.0;
+    }
+
+    let bits_per_item = (-target_fp.ln()) / (std::f64::consts::LN_2.powi(2));
+    let m = bits_per_item * capacity as f64;
+    let k = (m / capacity as f64) * std::f64::consts::LN_2;
+
+    let exponent = (-k * items as f64 / m).exp();
+    let fp_rate = (1.0 - exponent).powf(k);
+    fp_rate.max(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn test_seen_tracker_basic() {
@@ -317,5 +429,40 @@ mod tests {
         for i in 0..100 {
             assert!(tracker.contains(&i), "False negative for {}", i);
         }
+    }
+
+    #[test]
+    fn test_bloom_rebuild_increases_capacity_and_reduces_fp() {
+        let base = std::env::temp_dir().join(format!("seen_tracker_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+
+        let mut tracker = SeenTracker::with_path(
+            base.to_str().unwrap(),
+            1_000,  // intentionally small to force higher FP
+            8,
+            4,
+        );
+
+        for i in 0..10_000 {
+            tracker.insert(i);
+        }
+
+        let fp_before = tracker.estimated_false_positive_rate();
+        let capacity_before = tracker.bloom_capacity();
+
+        let fp_after = tracker.rebuild_bloom(capacity_before * 4).expect("rebuild succeeds");
+
+        assert!(tracker.bloom_capacity() > capacity_before, "capacity should grow");
+        assert!(
+            fp_after <= fp_before,
+            "false positive rate should not increase after rebuild (before {:.4}, after {:.4})",
+            fp_before,
+            fp_after
+        );
+
+        // Spot-check membership survived rebuild
+        assert!(tracker.contains(&1234));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -273,6 +273,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics, 
     let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
     let mut memory_config = MemoryConfig::calculate(interner_bytes, 0);
     let mem_claim = acquire_memory_claim(role, config, metrics, &mut memory_config, interner_bytes)?;
+    let mem_budget_bytes = memory_budget_bytes();
     
     metrics.update_global(|g| {
         g.queue_buffer_size = memory_config.queue_buffer_size;
@@ -297,6 +298,9 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics, 
         memory_config.num_shards,
         memory_config.max_shards_in_memory,
     );
+    let mut sys = sysinfo::System::new();
+    metrics.update_global(|g| g.bloom_fp_rate = tracker.estimated_false_positive_rate());
+    metrics.update_global(|g| g.bloom_fp_rate = tracker.estimated_false_positive_rate());
     
     // Seed with empty ortho
     let seed_ortho = Ortho::new();
@@ -325,7 +329,6 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics, 
             });
             
             // Update RAM usage and jobs count
-            let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             // sysinfo returns bytes (0.32); use raw values without extra scaling
             let used_bytes = sys.used_memory();
@@ -341,6 +344,8 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics, 
                 g.system_memory_percent = percent;
                 g.distinct_jobs_count = jobs_count;
             });
+            apply_shard_pressure_valve(&mut tracker, metrics, mem_budget_bytes, used_bytes as usize);
+            maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys)?;
         }
         
         if processed_count % 50000 == 0 {
@@ -352,6 +357,7 @@ fn process_txt_file(file_path: String, config: &StateConfig, metrics: &Metrics, 
             // Update heartbeat every 100k orthos (zero-arity)
             ingestion.touch_heartbeat()?;
             mem_claim.touch()?;
+            touch_leader_lock_if_owner(config)?;
         }
         
         // Get requirements from ortho
@@ -499,6 +505,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
     let interner_bytes = bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
     let mut memory_config = MemoryConfig::calculate(interner_bytes, 0);
     let mem_claim = acquire_memory_claim(role, config, metrics, &mut memory_config, interner_bytes)?;
+    let mem_budget_bytes = memory_budget_bytes();
     
     metrics.update_global(|g| {
         g.queue_buffer_size = memory_config.queue_buffer_size;
@@ -521,6 +528,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
         memory_config.num_shards,
         memory_config.max_shards_in_memory,
     );
+    let mut sys = sysinfo::System::new();
     
     // Seed with empty ortho
     let seed_ortho = Ortho::new();
@@ -562,12 +570,14 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             merged_results.push(ortho.clone())?;
             total_from_larger += 1;
             
-            if total_from_larger % 10000 == 0 {
-                ingestion.touch_heartbeat()?;
-                mem_claim.touch()?;
-                metrics.update_operation(|op| op.progress_current = total_from_larger);
-                metrics.record_seen_size(tracker.len());
-            }
+                if total_from_larger % 10000 == 0 {
+                    ingestion.touch_heartbeat()?;
+                    mem_claim.touch()?;
+                    touch_leader_lock_if_owner(config)?;
+                    metrics.update_operation(|op| op.progress_current = total_from_larger);
+                    metrics.record_seen_size(tracker.len());
+                    maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys)?;
+                }
             
             // Check if this ortho is impacted - if so, add to work queue
             if is_ortho_impacted_fast(&ortho, &larger_impacted_set) {
@@ -609,8 +619,10 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 if total_from_smaller % 10000 == 0 {
                     ingestion.touch_heartbeat()?;
                     mem_claim.touch()?;
+                    touch_leader_lock_if_owner(config)?;
                     metrics.update_operation(|op| op.progress_current = total_from_smaller);
                     metrics.record_seen_size(tracker.len());
+                    maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys)?;
                 }
                 
                 // Check if this ortho is impacted - if so, add to work queue
@@ -669,7 +681,6 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             });
             
             // Update RAM usage and jobs count
-            let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             // sysinfo returns bytes (0.32); use raw values without extra scaling
             let used_bytes = sys.used_memory();
@@ -685,6 +696,8 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
                 g.system_memory_percent = percent;
                 g.distinct_jobs_count = jobs_count;
             });
+            apply_shard_pressure_valve(&mut tracker, metrics, mem_budget_bytes, used_bytes as usize);
+            maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys)?;
         }
         
         if processed_count % 50000 == 0 {
@@ -696,6 +709,7 @@ fn merge_archives(archive_a_path: &str, archive_b_path: &str, config: &StateConf
             // Touch heartbeat (zero-arity)
             ingestion.touch_heartbeat()?;
             mem_claim.touch()?;
+            touch_leader_lock_if_owner(config)?;
         }
         
         let (forbidden, required) = ortho.get_requirements();
@@ -834,14 +848,22 @@ fn acquire_memory_claim(
                 available
             ));
         } else {
-            metrics.add_log(format!(
-                "Exiting: insufficient memory budget (requested {} bytes, available {}).",
-                requested_bytes, available
-            ));
-            return Err(FoldError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Insufficient memory budget for job",
-            )));
+            if role == WorkerRole::Leader {
+                metrics.add_log(format!(
+                    "Leader proceeding without budget: requested {} bytes, available {} bytes. Claiming anyway.",
+                    requested_bytes, available
+                ));
+                granted_bytes = requested_bytes;
+            } else {
+                metrics.add_log(format!(
+                    "Exiting: insufficient memory budget (requested {} bytes, available {}).",
+                    requested_bytes, available
+                ));
+                return Err(FoldError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Insufficient memory budget for job",
+                )));
+            }
         }
     }
 
@@ -858,6 +880,96 @@ fn memory_budget_bytes() -> usize {
     let mut sys = sysinfo::System::new_all();
     sys.refresh_memory();
     ((sys.total_memory() as usize) * 75) / 100
+}
+
+fn apply_shard_pressure_valve(
+    tracker: &mut SeenTracker,
+    metrics: &Metrics,
+    mem_budget_bytes: usize,
+    used_memory_bytes: usize,
+) {
+    if mem_budget_bytes == 0 {
+        return;
+    }
+
+    let high_water = (mem_budget_bytes as f64 * 0.90).round() as usize;
+    if used_memory_bytes < high_water {
+        return;
+    }
+
+    let current_cap = tracker.max_shards_in_memory();
+    if current_cap <= 1 {
+        return;
+    }
+
+    let mut new_cap = ((current_cap as f64) * 0.75).round() as usize;
+    if new_cap >= current_cap {
+        new_cap = current_cap.saturating_sub(1);
+    }
+    if new_cap == 0 {
+        new_cap = 1;
+    }
+
+    let evicted = tracker.shrink_shards_in_memory(new_cap);
+    if current_cap != tracker.max_shards_in_memory() || evicted > 0 {
+        metrics.add_log(format!(
+            "Memory pressure: used {} MB (>=90% of budget {} MB); shard cap {} -> {} (evicted {} shards)",
+            used_memory_bytes / 1_048_576,
+            mem_budget_bytes / 1_048_576,
+            current_cap,
+            tracker.max_shards_in_memory(),
+            evicted
+        ));
+        metrics.update_global(|g| g.max_shards_in_memory = tracker.max_shards_in_memory());
+    }
+}
+
+fn maybe_expand_bloom(
+    tracker: &mut SeenTracker,
+    metrics: &Metrics,
+    mem_budget_bytes: usize,
+    sys: &mut sysinfo::System,
+) -> Result<(), FoldError> {
+    let current_fp = tracker.estimated_false_positive_rate();
+    metrics.update_global(|g| g.bloom_fp_rate = current_fp);
+
+    const FP_THRESHOLD: f64 = 0.02; // trigger expansion when above 2%
+    const FP_TARGET: f64 = 0.01; // aim back toward 1%
+
+    if current_fp <= FP_THRESHOLD {
+        return Ok(());
+    }
+
+    let mut target_capacity = tracker.bloom_capacity().saturating_mul(2);
+    let mut projected_fp = tracker.estimated_false_positive_rate_for_capacity(target_capacity);
+    while projected_fp > FP_TARGET {
+        target_capacity = target_capacity.saturating_mul(2);
+        projected_fp = tracker.estimated_false_positive_rate_for_capacity(target_capacity);
+        if target_capacity >= tracker.bloom_capacity().saturating_mul(64) {
+            break;
+        }
+    }
+
+    metrics.add_log(format!(
+        "Bloom FP degraded to {:.2}% (cap {}, seen {}); rebuilding bloom to {} (projected {:.2}%)",
+        current_fp * 100.0,
+        tracker.bloom_capacity(),
+        tracker.len(),
+        target_capacity,
+        projected_fp * 100.0
+    ));
+
+    let new_fp = tracker.rebuild_bloom(target_capacity)?;
+    metrics.update_global(|g| {
+        g.bloom_capacity = target_capacity;
+        g.bloom_fp_rate = new_fp;
+    });
+
+    sys.refresh_memory();
+    let used_bytes = sys.used_memory() as usize;
+    apply_shard_pressure_valve(tracker, metrics, mem_budget_bytes, used_bytes);
+
+    Ok(())
 }
 
 fn determine_role(config: &StateConfig) -> Result<WorkerRole, FoldError> {
@@ -921,6 +1033,24 @@ fn ensure_leader_lock(config: &StateConfig) -> Result<WorkerRole, FoldError> {
     } else {
         Ok(WorkerRole::Follower)
     }
+}
+
+fn touch_leader_lock_if_owner(config: &StateConfig) -> Result<(), FoldError> {
+    let lock_path = config.in_process_dir().join("leader.lock");
+
+    if let Ok(contents) = fs::read_to_string(&lock_path) {
+        let owner_pid = contents
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.split_whitespace().next())
+            .and_then(|p| p.parse::<u32>().ok());
+
+        if owner_pid == Some(std::process::id()) {
+            file_handler::touch_heartbeat_file(lock_path.to_str().unwrap())?;
+        }
+    }
+
+    Ok(())
 }
 
 fn cleanup_leader_lock(config: &StateConfig) {
