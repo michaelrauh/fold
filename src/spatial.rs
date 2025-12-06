@@ -342,20 +342,56 @@ fn get_impacted_phrase_locations_compute(
         .collect()
 }
 
+fn get_predecessor_prefilled_positions(dims: &[usize], _indices_in_order: &[Vec<usize>], location_to_index: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
+    // Base case: [2,2] has no predecessor
+    if dims.len() == 2 && dims.iter().all(|&x| x == 2) { return vec![]; }
+    
+    // Find unique predecessor and get reorg pattern
+    if let Some((i, _)) = dims.iter().enumerate().find(|&(_, v)| *v > 2) {
+        // Came from expand_over - decrement that dimension
+        let mut pred = dims.to_vec();
+        pred[i] -= 1;
+        // Compute remap inline to avoid calling get_meta recursively
+        let pred_indices = indices_in_order_compute(&pred);
+        apply_mapping(&pred_indices, location_to_index)
+    } else {
+        // Came from expand_up - all dims are 2, len > 2
+        let mut pred = dims.to_vec();
+        pred.pop();
+        // Compute remap_for_up inline
+        let padded_positions = pad_compute(&pred, 0);
+        apply_mapping(&padded_positions, location_to_index)
+    }
+}
+
+fn pad_compute(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
+    indices_in_order_compute(dims)
+        .into_iter()
+        .map(|mut indices| { indices.insert(dims.len() - position, 0); indices })
+        .collect()
+}
+
 fn get_diagonals_compute(
     dims: &[usize],
     index_to_location: &FxHashMap<usize, Vec<usize>>,
     location_to_index: &FxHashMap<Vec<usize>, usize>,
     indices: &[Vec<usize>],
 ) -> Vec<Vec<usize>> {
+    let prefilled: std::collections::HashSet<usize> = get_predecessor_prefilled_positions(dims, indices, location_to_index).into_iter().collect();
+    
     (0..dims.iter().product::<usize>())
         .map(|location| {
             let current_index = &index_to_location[&location];
             let current_distance: usize = current_index.iter().sum();
             indices
                 .iter()
-                .filter(|index| *index < current_index && index.iter().sum::<usize>() == current_distance)
-                .map(|x| location_to_index[x])
+                .enumerate()
+                .filter(|(idx, index)| {
+                    index.iter().sum::<usize>() == current_distance &&
+                    *index != current_index &&
+                    (*index < current_index || prefilled.contains(idx))
+                })
+                .map(|(_, x)| location_to_index[x])
                 .collect_vec()
         })
         .collect_vec()
