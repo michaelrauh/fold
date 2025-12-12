@@ -14,6 +14,7 @@ smallvec = "1.13"
 sysinfo = "0.32"
 ratatui = "0.29"
 crossterm = "0.28"
+ctrlc = "3.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

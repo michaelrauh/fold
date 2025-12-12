@@ -1,9 +1,9 @@
-use std::{cell::RefCell, cmp::Ordering};
 use itertools::Itertools;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::{cell::RefCell, cmp::Ordering};
 
 // Cache key: (dims, up_axis)
 type MetaCacheKey = (Vec<usize>, Option<usize>);
@@ -13,7 +13,7 @@ struct DimMeta {
     indices_in_order: Vec<Vec<usize>>,
     axis_positions: Vec<usize>,
     impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
-    diagonals: Vec<Vec<usize>>,  // Enriched diagonals (base + parent-filled forward positions)
+    diagonals: Vec<Vec<usize>>, // Enriched diagonals (base + parent-filled forward positions)
     location_to_index: FxHashMap<Vec<usize>, usize>,
 }
 
@@ -32,14 +32,30 @@ impl DimMeta {
             .enumerate()
             .map(|(i, loc)| (i, loc))
             .collect();
-        let impacted_phrase_locations = get_impacted_phrase_locations_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
-        
+        let impacted_phrase_locations = get_impacted_phrase_locations_compute(
+            dims,
+            &index_to_location,
+            &location_to_index,
+            &indices_in_order,
+        );
+
         // Compute base diagonals (positions < current in same shell)
-        let base_diagonals = get_diagonals_compute(dims, &index_to_location, &location_to_index, &indices_in_order);
-        
+        let base_diagonals = get_diagonals_compute(
+            dims,
+            &index_to_location,
+            &location_to_index,
+            &indices_in_order,
+        );
+
         // Enrich with parent-filled forward positions
-        let diagonals = enrich_diagonals(dims, up_axis, &base_diagonals, &indices_in_order, &location_to_index);
-        
+        let diagonals = enrich_diagonals(
+            dims,
+            up_axis,
+            &base_diagonals,
+            &indices_in_order,
+            &location_to_index,
+        );
+
         DimMeta {
             indices_in_order,
             axis_positions: (1..=dims.len()).collect(),
@@ -65,29 +81,33 @@ fn enrich_diagonals(
     if dims == [2, 2] {
         return base_diagonals.to_vec();
     }
-    
+
     // Get parent dims
     let parent_dims = match parent(dims) {
         Some(p) => p,
         None => return base_diagonals.to_vec(),
     };
-    
+
     // Get positions filled from parent based on up_axis
     let filled_from_parent: FxHashSet<usize> = match up_axis {
         None => {
             // Over expansion: parent has same dimensionality
-            remap_internal(&parent_dims, location_to_index).into_iter().collect()
+            remap_internal(&parent_dims, location_to_index)
+                .into_iter()
+                .collect()
         }
         Some(axis) => {
             // Up expansion: parent has one fewer dimension
-            remap_for_up_internal(&parent_dims, axis, location_to_index).into_iter().collect()
+            remap_for_up_internal(&parent_dims, axis, location_to_index)
+                .into_iter()
+                .collect()
         }
     };
-    
+
     if filled_from_parent.is_empty() {
         return base_diagonals.to_vec();
     }
-    
+
     // Enrich each position's diagonals
     let total = dims.iter().product::<usize>();
     (0..total)
@@ -95,17 +115,18 @@ fn enrich_diagonals(
             let mut diagonals = base_diagonals[loc].clone();
             let current_index = &indices_in_order[loc];
             let current_distance: usize = current_index.iter().sum();
-            
+
             // Add forward positions that are in same shell and filled from parent
             for (pos, index) in indices_in_order.iter().enumerate() {
                 if pos > loc  // forward position
                     && index.iter().sum::<usize>() == current_distance  // same shell
-                    && filled_from_parent.contains(&pos)  // filled from parent
+                    && filled_from_parent.contains(&pos)
+                // filled from parent
                 {
                     diagonals.push(pos);
                 }
             }
-            
+
             // Sort and deduplicate
             diagonals.sort();
             diagonals.dedup();
@@ -115,23 +136,40 @@ fn enrich_diagonals(
 }
 
 /// Internal remap that doesn't call get_meta to avoid nested borrow
-fn remap_internal(old_dims: &[usize], new_location_to_index: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
+fn remap_internal(
+    old_dims: &[usize],
+    new_location_to_index: &FxHashMap<Vec<usize>, usize>,
+) -> Vec<usize> {
     let old_positions = indices_in_order_compute(old_dims);
-    old_positions.iter().filter_map(|pos| new_location_to_index.get(pos).copied()).collect()
+    old_positions
+        .iter()
+        .filter_map(|pos| new_location_to_index.get(pos).copied())
+        .collect()
 }
 
 /// Internal remap_for_up that doesn't call get_meta to avoid nested borrow
-fn remap_for_up_internal(old_dims: &[usize], position: usize, new_location_to_index: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
+fn remap_for_up_internal(
+    old_dims: &[usize],
+    position: usize,
+    new_location_to_index: &FxHashMap<Vec<usize>, usize>,
+) -> Vec<usize> {
     let padded_positions = pad_internal(old_dims, position);
-    padded_positions.iter().filter_map(|pos| new_location_to_index.get(pos).copied()).collect()
+    padded_positions
+        .iter()
+        .filter_map(|pos| new_location_to_index.get(pos).copied())
+        .collect()
 }
 
 /// Internal pad that doesn't call get_meta to avoid nested borrow
 fn pad_internal(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
     let indices = indices_in_order_compute(dims);
     let insert_pos = dims.len().saturating_sub(position);
-    indices.into_iter()
-        .map(|mut loc| { loc.insert(insert_pos, 0); loc })
+    indices
+        .into_iter()
+        .map(|mut loc| {
+            loc.insert(insert_pos, 0);
+            loc
+        })
         .collect()
 }
 
@@ -148,9 +186,9 @@ fn get_meta_with_axis(dims: &[usize], up_axis: Option<usize>) -> Rc<DimMeta> {
     DIM_META_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let key = (dims.to_vec(), up_axis);
-        if let Some(m) = cache.get(&key) { 
-            META_HITS.fetch_add(1, AtomicOrdering::Relaxed); 
-            return m.clone(); 
+        if let Some(m) = cache.get(&key) {
+            META_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            return m.clone();
         }
         META_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         let meta = Rc::new(DimMeta::new(dims, up_axis));
@@ -164,10 +202,19 @@ fn get_meta(dims: &[usize]) -> Rc<DimMeta> {
     get_meta_with_axis(dims, None)
 }
 
-pub fn meta_stats() -> (usize, usize) { (META_HITS.load(AtomicOrdering::Relaxed), META_MISSES.load(AtomicOrdering::Relaxed)) }
+pub fn meta_stats() -> (usize, usize) {
+    (
+        META_HITS.load(AtomicOrdering::Relaxed),
+        META_MISSES.load(AtomicOrdering::Relaxed),
+    )
+}
 
 /// Get requirements for a position - fully cached lookup
-pub fn get_requirements(loc: usize, dims: &[usize], up_axis: Option<usize>) -> (Vec<Vec<usize>>, Vec<usize>) {
+pub fn get_requirements(
+    loc: usize,
+    dims: &[usize],
+    up_axis: Option<usize>,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
     let meta = get_meta_with_axis(dims, up_axis);
     (
         meta.impacted_phrase_locations[loc].clone(),
@@ -175,17 +222,25 @@ pub fn get_requirements(loc: usize, dims: &[usize], up_axis: Option<usize>) -> (
     )
 }
 
-pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> { get_meta(dims).axis_positions.clone() }
+pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> {
+    get_meta(dims).axis_positions.clone()
+}
 
-pub fn get_location_to_index(dims: &[usize]) -> FxHashMap<Vec<usize>, usize> { get_meta(dims).location_to_index.clone() }
+pub fn get_location_to_index(dims: &[usize]) -> FxHashMap<Vec<usize>, usize> {
+    get_meta(dims).location_to_index.clone()
+}
 
-pub fn is_base(dims: &[usize]) -> bool { dims.iter().all(|&x| x == 2) }
+pub fn is_base(dims: &[usize]) -> bool {
+    dims.iter().all(|&x| x == 2)
+}
 
 pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     let key = (old_dims.to_vec(), position);
     EXPAND_UP_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(result) = cache.get(&key) { result.clone() } else {
+        if let Some(result) = cache.get(&key) {
+            result.clone()
+        } else {
             let result = expand_for_up(old_dims, position);
             cache.insert(key, result.clone());
             result
@@ -197,7 +252,9 @@ pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     let key = old_dims.to_vec();
     EXPAND_OVER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(result) = cache.get(&key) { result.clone() } else {
+        if let Some(result) = cache.get(&key) {
+            result.clone()
+        } else {
             let result = expand_for_over(old_dims);
             cache.insert(key, result.clone());
             result
@@ -205,7 +262,9 @@ pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     })
 }
 
-pub fn capacity(dims: &[usize]) -> usize { dims.iter().product() }
+pub fn capacity(dims: &[usize]) -> usize {
+    dims.iter().product()
+}
 
 fn apply_mapping(positions: &[Vec<usize>], mapping: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
     positions.iter().map(|pos| mapping[pos]).collect()
@@ -230,7 +289,10 @@ fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
         .indices_in_order
         .iter()
         .cloned()
-        .map(|mut indices| { indices.insert(dims.len() - position, 0); indices })
+        .map(|mut indices| {
+            indices.insert(dims.len() - position, 0);
+            indices
+        })
         .collect()
 }
 
@@ -239,7 +301,7 @@ fn parent(dims: &[usize]) -> Option<Vec<usize>> {
     if dims == &[2, 2] {
         return None;
     }
-    
+
     // If all entries are 2 and dims.len() > 2: remove one 2, then sort
     if dims.iter().all(|&x| x == 2) && dims.len() > 2 {
         let mut p = dims.to_vec();
@@ -247,7 +309,7 @@ fn parent(dims: &[usize]) -> Option<Vec<usize>> {
         p.sort();
         return Some(p);
     }
-    
+
     // Otherwise (some entry > 2): replace one occurrence of max with max-1, sort
     let m = *dims.iter().max().unwrap();
     let mut p = dims.to_vec();
@@ -265,13 +327,13 @@ fn parent(dims: &[usize]) -> Option<Vec<usize>> {
 fn next_dims_over(old_dims: &[usize]) -> Vec<Vec<usize>> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    
+
     // Generate candidates by incrementing each index by 1, then sorting
     for i in 0..old_dims.len() {
         let mut new_dims = old_dims.to_vec();
         new_dims[i] += 1;
         new_dims.sort();
-        
+
         // Deduplicate
         if seen.insert(new_dims.clone()) {
             // Keep only if parent(new_dims) == old_dims
@@ -282,14 +344,15 @@ fn next_dims_over(old_dims: &[usize]) -> Vec<Vec<usize>> {
             }
         }
     }
-    
+
     candidates
 }
 
 fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     let over_dims = next_dims_over(old_dims);
     let mut results = Vec::with_capacity(over_dims.len());
-    for new_dims in over_dims { // preallocate reorg pattern
+    for new_dims in over_dims {
+        // preallocate reorg pattern
         let reorganization_pattern = remap(old_dims, &new_dims);
         let cap = capacity(&new_dims);
         results.push((new_dims, cap, reorganization_pattern));
@@ -354,7 +417,9 @@ fn get_diagonals_compute(
             let current_distance: usize = current_index.iter().sum();
             indices
                 .iter()
-                .filter(|index| *index < current_index && index.iter().sum::<usize>() == current_distance)
+                .filter(|index| {
+                    *index < current_index && index.iter().sum::<usize>() == current_distance
+                })
                 .map(|x| location_to_index[x])
                 .collect_vec()
         })
@@ -365,22 +430,26 @@ fn index_array(dims: &[usize]) -> Vec<Vec<usize>> {
     cartesian_product(dims.iter().map(|x| (0..*x).collect()).collect())
 }
 
-fn indices_in_order_compute(dims: &[usize]) -> Vec<Vec<usize>> { order_by_distance(index_array(dims)) }
+fn indices_in_order_compute(dims: &[usize]) -> Vec<Vec<usize>> {
+    order_by_distance(index_array(dims))
+}
 
 fn order_by_distance(indices: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
     let mut sorted = indices;
-    sorted.sort_by(|a, b| {
-        match a.iter().sum::<usize>().cmp(&b.iter().sum()) {
-            Ordering::Less => Ordering::Less,
-            Ordering::Equal => {
-                for (x, y) in a.iter().zip(b) {
-                    if x > y { return Ordering::Greater; }
-                    if x < y { return Ordering::Less; }
+    sorted.sort_by(|a, b| match a.iter().sum::<usize>().cmp(&b.iter().sum()) {
+        Ordering::Less => Ordering::Less,
+        Ordering::Equal => {
+            for (x, y) in a.iter().zip(b) {
+                if x > y {
+                    return Ordering::Greater;
                 }
-                unreachable!("Duplicate indices impossible")
+                if x < y {
+                    return Ordering::Less;
+                }
             }
-            Ordering::Greater => Ordering::Greater,
+            unreachable!("Duplicate indices impossible")
         }
+        Ordering::Greater => Ordering::Greater,
     });
     sorted
 }
@@ -390,7 +459,11 @@ fn partial_cartesian<T: Clone>(a: Vec<Vec<T>>, b: Vec<T>) -> Vec<Vec<T>> {
         .flat_map(|xs| {
             b.iter()
                 .cloned()
-                .map(|y| { let mut vec = xs.clone(); vec.push(y); vec })
+                .map(|y| {
+                    let mut vec = xs.clone();
+                    vec.push(y);
+                    vec
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -400,7 +473,9 @@ fn cartesian_product<T: Clone>(lists: Vec<Vec<T>>) -> Vec<Vec<T>> {
     match lists.split_first() {
         Some((first, rest)) => {
             let init: Vec<Vec<T>> = first.iter().cloned().map(|n| vec![n]).collect();
-            rest.iter().cloned().fold(init, |vec, list| partial_cartesian(vec, list))
+            rest.iter()
+                .cloned()
+                .fold(init, |vec, list| partial_cartesian(vec, list))
         }
         None => vec![],
     }
@@ -413,80 +488,108 @@ mod tests {
 
     #[test]
     fn it_produces_an_index_matrix_with_dims() {
-        assert_eq!(index_array(&vec![3, 3]), vec![
-            vec![0, 0], vec![0, 1], vec![0, 2],
-            vec![1, 0], vec![1, 1], vec![1, 2],
-            vec![2, 0], vec![2, 1], vec![2, 2]
-        ]);
+        assert_eq!(
+            index_array(&vec![3, 3]),
+            vec![
+                vec![0, 0],
+                vec![0, 1],
+                vec![0, 2],
+                vec![1, 0],
+                vec![1, 1],
+                vec![1, 2],
+                vec![2, 0],
+                vec![2, 1],
+                vec![2, 2]
+            ]
+        );
     }
 
     #[test]
     fn it_orders_indices() {
-        assert_eq!(order_by_distance(vec![
-            vec![0, 0], vec![0, 1], vec![0, 2],
-            vec![1, 0], vec![1, 1], vec![1, 2],
-            vec![2, 0], vec![2, 1], vec![2, 2]
-        ]), vec![
-            vec![0, 0], vec![0, 1], vec![1, 0],
-            vec![0, 2], vec![1, 1], vec![2, 0],
-            vec![1, 2], vec![2, 1], vec![2, 2]
-        ]);
+        assert_eq!(
+            order_by_distance(vec![
+                vec![0, 0],
+                vec![0, 1],
+                vec![0, 2],
+                vec![1, 0],
+                vec![1, 1],
+                vec![1, 2],
+                vec![2, 0],
+                vec![2, 1],
+                vec![2, 2]
+            ]),
+            vec![
+                vec![0, 0],
+                vec![0, 1],
+                vec![1, 0],
+                vec![0, 2],
+                vec![1, 1],
+                vec![2, 0],
+                vec![1, 2],
+                vec![2, 1],
+                vec![2, 2]
+            ]
+        );
     }
 
     #[test]
     fn it_gets_impacted_phrase_locations() {
-        let (phrases, _diag) = get_requirements(3, &[2,2], None);
+        let (phrases, _diag) = get_requirements(3, &[2, 2], None);
         assert_eq!(phrases, vec![vec![1], vec![2]]);
     }
 
     #[test]
     fn it_gets_impacted_diagonals() {
-        let (_, diag) = get_requirements(5, &[3,3], None);
-        assert_eq!(diag, vec![3,4]);
+        let (_, diag) = get_requirements(5, &[3, 3], None);
+        assert_eq!(diag, vec![3, 4]);
     }
 
     #[test]
     fn it_provides_capacity_information_by_dims() {
-        assert_eq!(capacity(&vec![2,2]), 4);
-        assert_eq!(capacity(&vec![2,2,2]), 8);
+        assert_eq!(capacity(&vec![2, 2]), 4);
+        assert_eq!(capacity(&vec![2, 2, 2]), 8);
     }
 
     #[test]
     fn it_determines_if_dims_are_base() {
-        assert!(is_base(&vec![2,2]));
-        assert!(!is_base(&vec![3,2]));
+        assert!(is_base(&vec![2, 2]));
+        assert!(!is_base(&vec![3, 2]));
     }
 
     #[test]
     fn it_determines_the_reorganization_pattern_for_over() {
-        assert_eq!(remap(&vec![2,2], &vec![3,2]), vec![0,1,2,3]);
+        assert_eq!(remap(&vec![2, 2], &vec![3, 2]), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn it_pads_at_a_position_for_up() {
-        assert_eq!(pad(&vec![2,2], 0), vec![
-            vec![0,0,0], vec![0,1,0], vec![1,0,0], vec![1,1,0]
-        ]);
+        assert_eq!(
+            pad(&vec![2, 2], 0),
+            vec![vec![0, 0, 0], vec![0, 1, 0], vec![1, 0, 0], vec![1, 1, 0]]
+        );
     }
 
     #[test]
     fn it_determines_the_reorganization_pattern_for_up() {
-        assert_eq!(remap_for_up(&vec![2,2], 0), vec![0,2,3,6]);
+        assert_eq!(remap_for_up(&vec![2, 2], 0), vec![0, 2, 3, 6]);
     }
 
     #[test]
     fn it_expands_for_over() {
-        assert_eq!(expand_over(&vec![2,2]), vec![(vec![2,3],6,vec![0,1,2,4])]);
+        assert_eq!(
+            expand_over(&vec![2, 2]),
+            vec![(vec![2, 3], 6, vec![0, 1, 2, 4])]
+        );
     }
 
     #[test]
     fn it_expands_for_up() {
-        assert_eq!(expand_up(&vec![2,2],0)[1].0, vec![2,2,2]);
+        assert_eq!(expand_up(&vec![2, 2], 0)[1].0, vec![2, 2, 2]);
     }
 
     #[test]
     fn it_gets_axis_positions() {
-        assert_eq!(get_axis_positions(&[2,2]), vec![1,2]);
+        assert_eq!(get_axis_positions(&[2, 2]), vec![1, 2]);
     }
 
     #[test]
@@ -525,7 +628,7 @@ mod tests {
         let result = expand_over(&vec![2, 2]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![2, 3]);
-        
+
         // From [2,3]: increment each dimension, sort, keep if parent matches [2,3]
         // Increment 0th: [3,3] → sorted [3,3], parent([3,3]) = [2,3] ✓
         // Increment 1st: [2,4] → sorted [2,4], parent([2,4]) = [2,3] ✓

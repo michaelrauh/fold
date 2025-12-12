@@ -167,9 +167,7 @@ mod tests {
         // This creates three sentences since sentences are split by . ? ; ! , \n\n
         // "hello", "world", and "it's working" become three separate sentences
         // "hello" and "world" are single words, so they don't create phrases
-        let expected = vec![
-            vec!["it's".to_string(), "working".to_string()],
-        ];
+        let expected = vec![vec!["it's".to_string(), "working".to_string()]];
         assert_eq!(phrases, expected);
     }
 

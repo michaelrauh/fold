@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use fold::spatial::{
-    expand_over, expand_up, get_requirements, is_base,
-    capacity, get_axis_positions, get_location_to_index
+    capacity, expand_over, expand_up, get_axis_positions, get_location_to_index, get_requirements,
+    is_base,
 };
 
 fn bench_get_requirements(c: &mut Criterion) {
@@ -27,10 +27,8 @@ fn bench_expand_over(c: &mut Criterion) {
 }
 
 fn bench_capacity(c: &mut Criterion) {
-    c.bench_function("capacity_2d", |b| {
-        b.iter(|| capacity(black_box(&[3, 3])))
-    });
-    
+    c.bench_function("capacity_2d", |b| b.iter(|| capacity(black_box(&[3, 3]))));
+
     c.bench_function("capacity_3d", |b| {
         b.iter(|| capacity(black_box(&[2, 3, 4])))
     });
@@ -40,7 +38,7 @@ fn bench_get_axis_positions(c: &mut Criterion) {
     c.bench_function("get_axis_positions_2d", |b| {
         b.iter(|| get_axis_positions(black_box(&[3, 3])))
     });
-    
+
     c.bench_function("get_axis_positions_3d", |b| {
         b.iter(|| get_axis_positions(black_box(&[2, 3, 4])))
     });
@@ -50,7 +48,7 @@ fn bench_get_location_to_index(c: &mut Criterion) {
     c.bench_function("get_location_to_index_2d", |b| {
         b.iter(|| get_location_to_index(black_box(&[3, 3])))
     });
-    
+
     c.bench_function("get_location_to_index_3d", |b| {
         b.iter(|| get_location_to_index(black_box(&[2, 3, 4])))
     });

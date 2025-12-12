@@ -1,9 +1,6 @@
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fold::{
-    disk_backed_queue::DiskBackedQueue,
-    interner::Interner,
-    ortho::Ortho,
-    seen_tracker::SeenTracker,
+    disk_backed_queue::DiskBackedQueue, interner::Interner, ortho::Ortho, seen_tracker::SeenTracker,
 };
 use tempfile::TempDir;
 

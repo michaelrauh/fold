@@ -24,14 +24,12 @@ const LONG_TEXT: &str = "The quick brown fox jumps over the lazy dog. \
     Don't count your chickens before they hatch.";
 
 fn bench_new(c: &mut Criterion) {
-    c.bench_function("splitter_new", |b| {
-        b.iter(|| Splitter::new())
-    });
+    c.bench_function("splitter_new", |b| b.iter(|| Splitter::new()));
 }
 
 fn bench_vocabulary_short(c: &mut Criterion) {
     let splitter = Splitter::new();
-    
+
     c.bench_function("splitter_vocabulary_short", |b| {
         b.iter(|| splitter.vocabulary(black_box(SHORT_TEXT)))
     });
@@ -39,7 +37,7 @@ fn bench_vocabulary_short(c: &mut Criterion) {
 
 fn bench_vocabulary_medium(c: &mut Criterion) {
     let splitter = Splitter::new();
-    
+
     c.bench_function("splitter_vocabulary_medium", |b| {
         b.iter(|| splitter.vocabulary(black_box(MEDIUM_TEXT)))
     });
@@ -47,7 +45,7 @@ fn bench_vocabulary_medium(c: &mut Criterion) {
 
 fn bench_vocabulary_long(c: &mut Criterion) {
     let splitter = Splitter::new();
-    
+
     c.bench_function("splitter_vocabulary_long", |b| {
         b.iter(|| splitter.vocabulary(black_box(LONG_TEXT)))
     });
@@ -55,7 +53,7 @@ fn bench_vocabulary_long(c: &mut Criterion) {
 
 fn bench_phrases_short(c: &mut Criterion) {
     let splitter = Splitter::new();
-    
+
     c.bench_function("splitter_phrases_short", |b| {
         b.iter(|| splitter.phrases(black_box(SHORT_TEXT)))
     });
@@ -63,7 +61,7 @@ fn bench_phrases_short(c: &mut Criterion) {
 
 fn bench_phrases_medium(c: &mut Criterion) {
     let splitter = Splitter::new();
-    
+
     c.bench_function("splitter_phrases_medium", |b| {
         b.iter(|| splitter.phrases(black_box(MEDIUM_TEXT)))
     });
@@ -71,7 +69,7 @@ fn bench_phrases_medium(c: &mut Criterion) {
 
 fn bench_phrases_long(c: &mut Criterion) {
     let splitter = Splitter::new();
-    
+
     c.bench_function("splitter_phrases_long", |b| {
         b.iter(|| splitter.phrases(black_box(LONG_TEXT)))
     });

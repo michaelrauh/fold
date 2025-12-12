@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_SAMPLES: usize = 2000;
@@ -209,15 +209,15 @@ struct MetricsInner {
     merge: MergeStatus,
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
-    
+
     queue_depth_samples: VecDeque<MetricSample>,
     seen_size_samples: VecDeque<MetricSample>,
     seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
-    
+
     status_history: VecDeque<StatusHistoryEntry>,
     status_duration_stats: StatusDurationStats,
-    
+
     logs: VecDeque<LogEntry>,
 }
 
@@ -269,7 +269,7 @@ impl Metrics {
         let now = Self::current_timestamp();
         let prev_start = inner.operation.status_start_time;
         let duration = now.saturating_sub(prev_start);
-        
+
         // Record previous status if it had non-zero duration
         if duration > 0 && !inner.operation.status.is_empty() {
             let entry = StatusHistoryEntry {
@@ -281,7 +281,7 @@ impl Metrics {
             if inner.status_history.len() > 100 {
                 inner.status_history.pop_front();
             }
-            
+
             // Update all-time statistics
             let stats = &mut inner.status_duration_stats;
             stats.total_count += 1;
@@ -294,7 +294,7 @@ impl Metrics {
                 stats.max_duration = stats.max_duration.max(duration);
             }
         }
-        
+
         inner.operation.status = status;
         inner.operation.status_start_time = now;
     }
@@ -312,6 +312,11 @@ impl Metrics {
     pub fn update_optimal_ortho(&self, update: impl FnOnce(&mut OptimalOrtho)) {
         let mut inner = self.inner.lock().unwrap();
         update(&mut inner.optimal_ortho);
+    }
+
+    pub fn optimal_score(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.optimal_ortho.volume, inner.optimal_ortho.fullness)
     }
 
     pub fn record_queue_depth(&self, depth: usize) {
@@ -358,14 +363,14 @@ impl Metrics {
     {
         let mut inner = self.inner.lock().unwrap();
         let samples = getter(&mut *inner);
-        
+
         let sample = MetricSample {
             timestamp: Self::current_timestamp(),
             value,
         };
-        
+
         samples.push_back(sample);
-        
+
         // When we exceed threshold, downsample by time-based bucketing
         // This preserves temporal distribution - always keeping oldest and newest data
         if samples.len() > DOWNSAMPLE_THRESHOLD {
@@ -374,19 +379,22 @@ impl Metrics {
             *samples = new_samples;
         }
     }
-    
-    fn downsample_by_time(samples: &VecDeque<MetricSample>, target_size: usize) -> VecDeque<MetricSample> {
+
+    fn downsample_by_time(
+        samples: &VecDeque<MetricSample>,
+        target_size: usize,
+    ) -> VecDeque<MetricSample> {
         if samples.len() <= target_size {
             return samples.clone();
         }
-        
+
         let mut result = VecDeque::with_capacity(target_size);
-        
+
         // Always keep first sample
         if let Some(first) = samples.front() {
             result.push_back(first.clone());
         }
-        
+
         if target_size <= 2 {
             // Just keep first and last
             if let Some(last) = samples.back() {
@@ -396,12 +404,12 @@ impl Metrics {
             }
             return result;
         }
-        
+
         // Divide the timeline into buckets and take one sample per bucket
         let first_ts = samples.front().map(|s| s.timestamp).unwrap_or(0);
         let last_ts = samples.back().map(|s| s.timestamp).unwrap_or(0);
         let time_span = last_ts.saturating_sub(first_ts);
-        
+
         if time_span == 0 {
             // All samples at same timestamp - just take evenly spaced by index
             let step = samples.len() / target_size;
@@ -413,33 +421,33 @@ impl Metrics {
         } else {
             // Time-based bucketing
             let bucket_duration = time_span as f64 / (target_size - 1) as f64;
-            
+
             for i in 1..target_size {
                 let target_ts = first_ts + (i as f64 * bucket_duration) as u64;
-                
+
                 // Find closest sample to this timestamp
                 let mut best_idx = 0;
                 let mut best_diff = u64::MAX;
-                
+
                 for (idx, sample) in samples.iter().enumerate() {
                     let diff = if sample.timestamp >= target_ts {
                         sample.timestamp - target_ts
                     } else {
                         target_ts - sample.timestamp
                     };
-                    
+
                     if diff < best_diff {
                         best_diff = diff;
                         best_idx = idx;
                     }
                 }
-                
+
                 if best_idx < samples.len() && result.len() < target_size {
                     result.push_back(samples[best_idx].clone());
                 }
             }
         }
-        
+
         result
     }
 
@@ -458,16 +466,20 @@ impl Metrics {
         inner.seen_size_samples.clear();
         inner.global.seen_size_pk = baseline;
         let timestamp = Self::current_timestamp();
-        inner.seen_size_samples.push_back(MetricSample { timestamp, value: baseline });
+        inner.seen_size_samples.push_back(MetricSample {
+            timestamp,
+            value: baseline,
+        });
     }
 
     pub fn add_log(&self, message: String) {
         let mut inner = self.inner.lock().unwrap();
+        let clean_message = strip_ansi_codes(&message);
         let entry = LogEntry {
             timestamp: Self::current_timestamp(),
-            message,
+            message: clean_message,
         };
-        
+
         inner.logs.push_back(entry);
         if inner.logs.len() > 100 {
             inner.logs.pop_front();
@@ -507,4 +519,50 @@ pub struct MetricsSnapshot {
     pub status_history: Vec<StatusHistoryEntry>,
     pub status_duration_stats: StatusDurationStats,
     pub logs: Vec<LogEntry>,
+}
+
+// Remove ANSI escape sequences so log lines don't leak color codes into the TUI.
+fn strip_ansi_codes(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut bytes = input.as_bytes().iter().copied().peekable();
+
+    while let Some(b) = bytes.next() {
+        if b == 0x1B {
+            // Skip CSI / OSC sequences and their payload.
+            if let Some(next) = bytes.peek().copied() {
+                match next {
+                    b'[' | b'(' | b')' | b'*' | b'+' | b',' | b'-' | b'.' | b'/' => {
+                        bytes.next();
+                        while let Some(c) = bytes.next() {
+                            if (0x40..=0x7E).contains(&c) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    b']' => {
+                        bytes.next();
+                        let mut prev_escape = false;
+                        while let Some(c) = bytes.next() {
+                            if c == 0x07 {
+                                break;
+                            }
+                            if prev_escape && c == b'\\' {
+                                break;
+                            }
+                            prev_escape = c == 0x1B;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // Bare ESC: drop it.
+            continue;
+        }
+
+        result.push(b as char);
+    }
+
+    result
 }

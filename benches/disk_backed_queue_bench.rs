@@ -5,9 +5,7 @@ use tempfile::TempDir;
 
 fn bench_new(c: &mut Criterion) {
     c.bench_function("queue_new", |b| {
-        b.iter(|| {
-            DiskBackedQueue::new(black_box(100)).unwrap()
-        })
+        b.iter(|| DiskBackedQueue::new(black_box(100)).unwrap())
     });
 }
 
@@ -15,11 +13,9 @@ fn bench_new_from_path(c: &mut Criterion) {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("queue_bench");
     let path_str = path.to_str().unwrap();
-    
+
     c.bench_function("queue_new_from_path", |b| {
-        b.iter(|| {
-            DiskBackedQueue::new_from_path(black_box(path_str), black_box(100)).unwrap()
-        })
+        b.iter(|| DiskBackedQueue::new_from_path(black_box(path_str), black_box(100)).unwrap())
     });
 }
 
@@ -27,7 +23,7 @@ fn bench_push_no_spill(c: &mut Criterion) {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("queue_push");
     let path_str = path.to_str().unwrap();
-    
+
     c.bench_function("queue_push_no_spill", |b| {
         b.iter_batched(
             || DiskBackedQueue::new_from_path(path_str, 1000).unwrap(),
@@ -35,7 +31,7 @@ fn bench_push_no_spill(c: &mut Criterion) {
                 let ortho = Ortho::new();
                 queue.push(black_box(ortho)).unwrap();
             },
-            criterion::BatchSize::SmallInput
+            criterion::BatchSize::SmallInput,
         )
     });
 }
@@ -44,7 +40,7 @@ fn bench_push_with_spill(c: &mut Criterion) {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("queue_spill");
     let path_str = path.to_str().unwrap();
-    
+
     c.bench_function("queue_push_with_spill", |b| {
         b.iter_batched(
             || {
@@ -59,7 +55,7 @@ fn bench_push_with_spill(c: &mut Criterion) {
                 let ortho = Ortho::new();
                 queue.push(black_box(ortho)).unwrap();
             },
-            criterion::BatchSize::SmallInput
+            criterion::BatchSize::SmallInput,
         )
     });
 }
@@ -68,7 +64,7 @@ fn bench_pop_from_memory(c: &mut Criterion) {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("queue_pop_mem");
     let path_str = path.to_str().unwrap();
-    
+
     c.bench_function("queue_pop_from_memory", |b| {
         b.iter_batched(
             || {
@@ -76,10 +72,8 @@ fn bench_pop_from_memory(c: &mut Criterion) {
                 queue.push(Ortho::new()).unwrap();
                 queue
             },
-            |mut queue| {
-                queue.pop().unwrap()
-            },
-            criterion::BatchSize::SmallInput
+            |mut queue| queue.pop().unwrap(),
+            criterion::BatchSize::SmallInput,
         )
     });
 }
@@ -88,7 +82,7 @@ fn bench_pop_from_disk(c: &mut Criterion) {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("queue_pop_disk");
     let path_str = path.to_str().unwrap();
-    
+
     c.bench_function("queue_pop_from_disk", |b| {
         b.iter_batched(
             || {
@@ -104,10 +98,8 @@ fn bench_pop_from_disk(c: &mut Criterion) {
                 }
                 queue
             },
-            |mut queue| {
-                queue.pop().unwrap()
-            },
-            criterion::BatchSize::SmallInput
+            |mut queue| queue.pop().unwrap(),
+            criterion::BatchSize::SmallInput,
         )
     });
 }
@@ -116,7 +108,7 @@ fn bench_flush(c: &mut Criterion) {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("queue_flush");
     let path_str = path.to_str().unwrap();
-    
+
     c.bench_function("queue_flush", |b| {
         b.iter_batched(
             || {
@@ -126,10 +118,8 @@ fn bench_flush(c: &mut Criterion) {
                 }
                 queue
             },
-            |mut queue| {
-                queue.flush().unwrap()
-            },
-            criterion::BatchSize::SmallInput
+            |mut queue| queue.flush().unwrap(),
+            criterion::BatchSize::SmallInput,
         )
     });
 }
@@ -139,14 +129,12 @@ fn bench_len(c: &mut Criterion) {
     let path = temp_dir.path().join("queue_len");
     let path_str = path.to_str().unwrap();
     let mut queue = DiskBackedQueue::new_from_path(path_str, 100).unwrap();
-    
+
     for _ in 0..50 {
         queue.push(Ortho::new()).unwrap();
     }
-    
-    c.bench_function("queue_len", |b| {
-        b.iter(|| queue.len())
-    });
+
+    c.bench_function("queue_len", |b| b.iter(|| queue.len()));
 }
 
 fn bench_base_path(c: &mut Criterion) {
@@ -154,10 +142,8 @@ fn bench_base_path(c: &mut Criterion) {
     let path = temp_dir.path().join("queue_path");
     let path_str = path.to_str().unwrap();
     let queue = DiskBackedQueue::new_from_path(path_str, 100).unwrap();
-    
-    c.bench_function("queue_base_path", |b| {
-        b.iter(|| queue.base_path())
-    });
+
+    c.bench_function("queue_base_path", |b| b.iter(|| queue.base_path()));
 }
 
 criterion_group!(
