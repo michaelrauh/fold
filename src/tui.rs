@@ -143,6 +143,7 @@ impl Tui {
         let elapsed_str = format_elapsed(elapsed);
 
         let ram_readable = format_bytes(snapshot.global.ram_bytes);
+        let proc_ram_readable = format_bytes(snapshot.global.process_rss_bytes);
         let role_label = if snapshot.global.role.is_empty() {
             "unknown".to_string()
         } else {
@@ -150,8 +151,12 @@ impl Tui {
         };
 
         let line1 = format!(
-            "FOLD Dashboard [Role: {} │ Time: {} │ RAM: {} ({}%)]",
-            role_label, elapsed_str, ram_readable, snapshot.global.system_memory_percent
+            "FOLD Dashboard [Role: {} │ Time: {} │ RAM Total: {} ({}%) │ RAM Proc: {}]",
+            role_label,
+            elapsed_str,
+            ram_readable,
+            snapshot.global.system_memory_percent,
+            proc_ram_readable
         );
         let line2 = format!(
             "Mode: {} │ Interner: v{} │ Vocab: {}",

@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use sysinfo::ProcessesToUpdate;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerRole {
@@ -416,9 +417,9 @@ fn process_txt_file(
 
                     // Update RAM usage and jobs count
                     sys.refresh_memory();
-                    // sysinfo returns bytes (0.32); use raw values without extra scaling
-                    let used_bytes = sys.used_memory();
-                    let total_bytes = sys.total_memory();
+                    let (used_bytes, total_bytes) =
+                        normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
+                    let proc_rss_bytes = current_process_rss_bytes(&mut sys);
                     let percent = if total_bytes > 0 {
                         ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
                     } else {
@@ -428,6 +429,7 @@ fn process_txt_file(
                         file_handler::count_running_jobs_with_config(config).unwrap_or(0);
                     metrics.update_global(|g| {
                         g.ram_bytes = used_bytes as usize;
+                        g.process_rss_bytes = proc_rss_bytes;
                         g.system_memory_percent = percent;
                         g.distinct_jobs_count = jobs_count;
                     });
@@ -437,7 +439,7 @@ fn process_txt_file(
                         mem_budget_bytes,
                         used_bytes as usize,
                         role,
-                    );
+                    )?;
                     maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
                 }
 
@@ -930,9 +932,9 @@ fn merge_archives(
 
                     // Update RAM usage and jobs count
                     sys.refresh_memory();
-                    // sysinfo returns bytes (0.32); use raw values without extra scaling
-                    let used_bytes = sys.used_memory();
-                    let total_bytes = sys.total_memory();
+                    let (used_bytes, total_bytes) =
+                        normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
+                    let proc_rss_bytes = current_process_rss_bytes(&mut sys);
                     let percent = if total_bytes > 0 {
                         ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
                     } else {
@@ -942,6 +944,7 @@ fn merge_archives(
                         file_handler::count_running_jobs_with_config(config).unwrap_or(0);
                     metrics.update_global(|g| {
                         g.ram_bytes = used_bytes as usize;
+                        g.process_rss_bytes = proc_rss_bytes;
                         g.system_memory_percent = percent;
                         g.distinct_jobs_count = jobs_count;
                     });
@@ -951,7 +954,7 @@ fn merge_archives(
                         mem_budget_bytes,
                         used_bytes as usize,
                         role,
-                    );
+                    )?;
                     maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
                 }
 
@@ -1190,7 +1193,61 @@ fn memory_budget_bytes() -> usize {
 
     let mut sys = sysinfo::System::new_all();
     sys.refresh_memory();
-    ((sys.total_memory() as usize) * 75) / 100
+    let (_, total_bytes) = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
+    (total_bytes * 75) / 100
+}
+
+fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            if let Some(mem_total_kib) = meminfo
+                .lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                let mem_total_kib_f = mem_total_kib as f64;
+                // If sysinfo matches /proc/meminfo in KiB, convert to bytes.
+                if within_10_pct(total_raw as f64, mem_total_kib_f) {
+                    let factor = 1024usize;
+                    return (
+                        (used_raw as usize).saturating_mul(factor),
+                        (total_raw as usize).saturating_mul(factor),
+                    );
+                }
+                // If sysinfo already reports bytes (matches /proc/meminfo bytes), keep as-is.
+                let mem_total_bytes_f = mem_total_kib_f * 1024.0;
+                if within_10_pct(total_raw as f64, mem_total_bytes_f) {
+                    return (used_raw as usize, total_raw as usize);
+                }
+            }
+        }
+    }
+    // Fallback: assume values are in KiB, convert to bytes.
+    let factor = 1024usize;
+    (
+        (used_raw as usize).saturating_mul(factor),
+        (total_raw as usize).saturating_mul(factor),
+    )
+}
+
+fn within_10_pct(v: f64, target: f64) -> bool {
+    if !v.is_finite() || !target.is_finite() || target == 0.0 {
+        return false;
+    }
+    let diff = (v - target).abs();
+    diff <= target * 0.10
+}
+
+fn current_process_rss_bytes(sys: &mut sysinfo::System) -> usize {
+    if let Ok(pid) = sysinfo::get_current_pid() {
+        let _ = sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+        if let Some(proc) = sys.process(pid) {
+            return proc.memory() as usize;
+        }
+    }
+    0
 }
 
 fn apply_shard_pressure_valve(
@@ -1199,21 +1256,38 @@ fn apply_shard_pressure_valve(
     mem_budget_bytes: usize,
     used_memory_bytes: usize,
     role: WorkerRole,
-) {
+) -> Result<(), FoldError> {
     if mem_budget_bytes == 0 {
-        return;
+        return Ok(());
     }
 
     let (high_water_pct, low_water_pct) = match role {
-        WorkerRole::Leader => (0.90, 0.70),
-        WorkerRole::Follower => (0.80, 0.60),
+        WorkerRole::Leader => (0.90, 0.80),
+        WorkerRole::Follower => (0.80, 0.70),
     };
     let high_water = (mem_budget_bytes as f64 * high_water_pct).round() as usize;
     let low_water = (mem_budget_bytes as f64 * low_water_pct).round() as usize;
 
     let current_cap = tracker.max_shards_in_memory();
 
-    if used_memory_bytes >= high_water && current_cap > 1 {
+    if used_memory_bytes >= high_water {
+        if current_cap <= 1 {
+            if role == WorkerRole::Follower && used_memory_bytes >= high_water {
+                metrics.add_log(format!(
+                    "Memory pressure ({}): used {} MB (>= {:.0}% of budget {} MB) at min shards; follower exiting",
+                    role.as_str(),
+                    used_memory_bytes / 1_048_576,
+                    high_water_pct * 100.0,
+                    mem_budget_bytes / 1_048_576,
+                ));
+                return Err(FoldError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Follower exiting: memory pressure",
+                )));
+            }
+            return Ok(());
+        }
+
         let new_cap = current_cap.saturating_sub(1).max(1);
 
         let evicted = tracker.shrink_shards_in_memory(new_cap);
@@ -1249,6 +1323,7 @@ fn apply_shard_pressure_valve(
             metrics.update_global(|g| g.max_shards_in_memory = tracker.max_shards_in_memory());
         }
     }
+    Ok(())
 }
 
 fn maybe_expand_bloom(
@@ -1258,6 +1333,10 @@ fn maybe_expand_bloom(
     sys: &mut sysinfo::System,
     role: WorkerRole,
 ) -> Result<(), FoldError> {
+    if mem_budget_bytes == 0 {
+        return Ok(());
+    }
+
     let current_fp = tracker.estimated_false_positive_rate();
     metrics.update_global(|g| g.bloom_fp_rate = current_fp);
 
@@ -1278,6 +1357,63 @@ fn maybe_expand_bloom(
         }
     }
 
+    // Estimate memory for the rebuild (conservative: old bloom + new bloom while rebuilding).
+    const BLOOM_BYTES_PER_ITEM_EST: usize = 2;
+    let new_bloom_bytes = target_capacity.saturating_mul(BLOOM_BYTES_PER_ITEM_EST);
+
+    sys.refresh_memory();
+    let (mut used_bytes, _) = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
+    let shrink_threshold_bytes = (mem_budget_bytes as f64 * 0.90).round() as usize;
+
+    // If we can't fit the rebuild, shrink shards by one until we can or we hit minimum.
+    while used_bytes.saturating_add(new_bloom_bytes) >= shrink_threshold_bytes
+        && tracker.max_shards_in_memory() > 1
+    {
+        let current_cap = tracker.max_shards_in_memory();
+        let new_cap = current_cap.saturating_sub(1).max(1);
+        let evicted = tracker.shrink_shards_in_memory(new_cap);
+        if evicted > 0 || current_cap != tracker.max_shards_in_memory() {
+            metrics.add_log(format!(
+                "Bloom headroom: shrinking shards {} -> {} (evicted {}) to make room",
+                current_cap,
+                tracker.max_shards_in_memory(),
+                evicted
+            ));
+            metrics.update_global(|g| g.max_shards_in_memory = tracker.max_shards_in_memory());
+        } else {
+            break;
+        }
+        sys.refresh_memory();
+        used_bytes = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory()).0;
+    }
+
+    // After shrinking, check if we have enough headroom.
+    if used_bytes.saturating_add(new_bloom_bytes) >= shrink_threshold_bytes {
+        match role {
+            WorkerRole::Follower => {
+                metrics.add_log(format!(
+                    "Bloom rebuild aborted: not enough headroom even after shard shrink (used {} MB, need {} MB, budget {:.0}%); follower exiting",
+                    used_bytes / 1_048_576,
+                    new_bloom_bytes / 1_048_576,
+                    (shrink_threshold_bytes as f64 / mem_budget_bytes as f64) * 100.0
+                ));
+                return Err(FoldError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Follower exiting: insufficient headroom for bloom rebuild",
+                )));
+            }
+            WorkerRole::Leader => {
+                metrics.add_log(format!(
+                    "Bloom rebuild deferred: not enough headroom even after shard shrink (used {} MB, need {} MB, budget {:.0}%)",
+                    used_bytes / 1_048_576,
+                    new_bloom_bytes / 1_048_576,
+                    (shrink_threshold_bytes as f64 / mem_budget_bytes as f64) * 100.0
+                ));
+                return Ok(());
+            }
+        }
+    }
+
     metrics.add_log(format!(
         "Bloom FP degraded to {:.2}% (cap {}, seen {}); rebuilding bloom to {} (projected {:.2}%)",
         current_fp * 100.0,
@@ -1294,8 +1430,8 @@ fn maybe_expand_bloom(
     });
 
     sys.refresh_memory();
-    let used_bytes = sys.used_memory() as usize;
-    apply_shard_pressure_valve(tracker, metrics, mem_budget_bytes, used_bytes, role);
+    let used_bytes = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory()).0;
+    apply_shard_pressure_valve(tracker, metrics, mem_budget_bytes, used_bytes, role)?;
 
     Ok(())
 }

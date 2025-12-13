@@ -47,6 +47,7 @@ pub struct GlobalMetrics {
     pub seen_size_pk: usize,
     pub distinct_jobs_count: usize,
     pub ram_bytes: usize,
+    pub process_rss_bytes: usize,
 }
 
 impl Default for GlobalMetrics {
@@ -75,6 +76,7 @@ impl Default for GlobalMetrics {
             seen_size_pk: 0,
             distinct_jobs_count: 0,
             ram_bytes: 0,
+            process_rss_bytes: 0,
         }
     }
 }
