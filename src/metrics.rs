@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -221,6 +224,7 @@ struct MetricsInner {
     status_duration_stats: StatusDurationStats,
 
     logs: VecDeque<LogEntry>,
+    log_file_path: Option<PathBuf>,
 }
 
 impl Metrics {
@@ -239,8 +243,14 @@ impl Metrics {
                 status_history: VecDeque::with_capacity(100),
                 status_duration_stats: StatusDurationStats::default(),
                 logs: VecDeque::with_capacity(100),
+                log_file_path: None,
             })),
         }
+    }
+
+    pub fn set_log_file_path(&self, path: PathBuf) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.log_file_path = Some(path);
     }
 
     pub fn clone_handle(&self) -> Self {
@@ -485,6 +495,17 @@ impl Metrics {
         inner.logs.push_back(entry);
         if inner.logs.len() > 100 {
             inner.logs.pop_front();
+        }
+
+        if let Some(path) = inner.log_file_path.clone() {
+            if let Some(last) = inner.logs.back() {
+                let line = format!("{} {}\n", last.timestamp, last.message);
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut f| f.write_all(line.as_bytes()));
+            }
         }
     }
 

@@ -72,6 +72,10 @@ impl StateConfig {
     pub fn mem_claims_dir(&self) -> PathBuf {
         self.base_dir.join("mem_claims")
     }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.base_dir.join("logs")
+    }
 }
 
 /// Initialize the file system: create directories and recover abandoned files

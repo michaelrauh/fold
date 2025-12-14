@@ -1,5 +1,7 @@
 use crate::FoldError;
 use bloomfilter::Bloom;
+use hashbrown::HashSet as HbHashSet;
+use nohash_hasher::BuildNoHashHasher;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -8,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_PER_SHARD_BUFFER: usize = 1024;
 const DEFAULT_GLOBAL_BUFFER: usize = 16_384;
+
+type FastSet<T> = HbHashSet<T, BuildNoHashHasher<T>>;
 
 #[derive(Clone, Default, Debug)]
 pub struct TrackerStats {
@@ -37,7 +41,7 @@ enum FlushReason {
 /// A single shard containing a portion of the seen IDs
 struct Shard {
     id: usize,
-    seen: HashMap<usize, ()>,
+    seen: FastSet<usize>,
     dirty: bool, // true if modified since last disk write
 }
 
@@ -45,17 +49,17 @@ impl Shard {
     fn new(id: usize) -> Self {
         Self {
             id,
-            seen: HashMap::new(),
+            seen: FastSet::default(),
             dirty: false,
         }
     }
 
     fn load_from_disk(path: &Path) -> Result<Self, FoldError> {
         let data = fs::read(path).map_err(|e| FoldError::Io(e))?;
-        let seen: HashMap<usize, ()> =
-            bincode::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| FoldError::Deserialization(Box::new(e)))?
-                .0;
+        let seen_vec: Vec<usize> = bincode::decode_from_slice(&data, bincode::config::standard())
+            .map_err(|e| FoldError::Deserialization(Box::new(e)))?
+            .0;
+        let seen: FastSet<usize> = seen_vec.into_iter().collect();
 
         let file_name = path
             .file_name()
@@ -83,8 +87,12 @@ impl Shard {
         fs::create_dir_all(dir).map_err(|e| FoldError::Io(e))?;
 
         let path = dir.join(format!("shard_{:08}.bin", self.id));
-        let data = bincode::encode_to_vec(&self.seen, bincode::config::standard())
-            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
+        // Persist as a Vec to avoid relying on HashSet serde support for the no-hash hasher.
+        let data = bincode::encode_to_vec(
+            &self.seen.iter().copied().collect::<Vec<_>>(),
+            bincode::config::standard(),
+        )
+        .map_err(|e| FoldError::Serialization(Box::new(e)))?;
 
         fs::write(path, data).map_err(|e| FoldError::Io(e))?;
         self.dirty = false;
@@ -117,7 +125,7 @@ pub struct SeenTracker {
     buffered_total: usize,
     per_shard_flush_threshold: usize,
     global_buffer_limit: usize,
-    already_emitted: HashSet<usize>,
+    already_emitted: FastSet<usize>,
 
     // Instrumentation
     stats: TrackerStats,
@@ -178,7 +186,7 @@ impl SeenTracker {
             buffered_total: 0,
             per_shard_flush_threshold: DEFAULT_PER_SHARD_BUFFER,
             global_buffer_limit: DEFAULT_GLOBAL_BUFFER,
-            already_emitted: HashSet::new(),
+            already_emitted: FastSet::default(),
             stats: TrackerStats::default(),
         }
     }
@@ -235,17 +243,14 @@ impl SeenTracker {
             let shard = self.get_shard_mut(shard_id)?;
             shard.seen.reserve(items.len());
             for (id, already_emitted) in items {
-                if shard.seen.contains_key(&id) {
-                    if !already_emitted {
-                        result.seen.push(id);
-                    }
-                } else {
-                    shard.seen.insert(id, ());
+                if shard.seen.insert(id) {
                     shard.dirty = true;
                     new_ids.push(id);
                     if !already_emitted {
                         result.new.push(id);
                     }
+                } else if !already_emitted {
+                    result.seen.push(id);
                 }
                 processed += 1;
             }
@@ -326,7 +331,7 @@ impl SeenTracker {
         // Try to get the shard (will load from disk if needed, or create new if doesn't exist)
         // If the shard doesn't exist on disk, it will be created empty, so contains_key will return false
         if let Ok(shard) = self.get_shard_mut(shard_id) {
-            return shard.seen.contains_key(id);
+            return shard.seen.contains(id);
         }
 
         // If we can't load the shard for some reason, assume not seen
@@ -343,8 +348,7 @@ impl SeenTracker {
 
         // Get or load shard and insert
         if let Ok(shard) = self.get_shard_mut(shard_id) {
-            if !shard.seen.contains_key(&id) {
-                shard.seen.insert(id, ());
+            if shard.seen.insert(id) {
                 shard.dirty = true;
                 self.total_seen_count += 1;
             }
@@ -432,7 +436,7 @@ impl SeenTracker {
         let mut loaded_ids = HashSet::new();
         for shard in &self.loaded_shards {
             loaded_ids.insert(shard.id);
-            for id in shard.seen.keys() {
+            for id in shard.seen.iter() {
                 new_bloom.set(id);
             }
         }
@@ -454,7 +458,7 @@ impl SeenTracker {
                                 }
                             }
                             let shard = Shard::load_from_disk(&entry.path())?;
-                            for id in shard.seen.keys() {
+                            for id in shard.seen.iter() {
                                 new_bloom.set(id);
                             }
                         }

@@ -61,6 +61,11 @@ fn main() -> Result<(), FoldError> {
 
     // Initialize metrics and TUI
     let metrics = Metrics::new();
+    let log_dir = config.logs_dir();
+    fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("fold_{}.log", std::process::id()));
+    metrics.set_log_file_path(log_path);
+    metrics.add_log("Log file initialized".to_string());
     let should_quit = Arc::new(AtomicBool::new(false));
 
     let tui_enabled = std::env::var("FOLD_DISABLE_TUI").is_err() && std::io::stdout().is_terminal();
@@ -1232,6 +1237,7 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
     )
 }
 
+#[allow(dead_code)]
 fn within_10_pct(v: f64, target: f64) -> bool {
     if !v.is_finite() || !target.is_finite() || target == 0.0 {
         return false;
