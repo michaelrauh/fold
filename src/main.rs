@@ -6,14 +6,12 @@ use fold::{
     memory_config::MemoryConfig,
     metrics::Metrics,
     ortho::Ortho,
-    seen_tracker::{BatchResult, SeenTracker},
+    seen_tracker::{self, BatchResult, SeenTracker},
     tui::Tui,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::IsTerminal;
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +23,10 @@ enum WorkerRole {
     Leader,
     Follower,
 }
+
+const COMPLETION_CHUNK_SIZE: usize = 1_000;
+const FANOUT_LOG_THRESHOLD: usize = COMPLETION_CHUNK_SIZE;
+const WRITE_SAMPLE_MOD: usize = 10_000;
 
 impl WorkerRole {
     fn as_str(&self) -> &'static str {
@@ -66,6 +68,7 @@ fn main() -> Result<(), FoldError> {
     let log_path = log_dir.join(format!("fold_{}.log", std::process::id()));
     metrics.set_log_file_path(log_path);
     metrics.add_log("Log file initialized".to_string());
+    metrics.set_trace_file_path(log_dir.join("loop_trace.log"));
     let should_quit = Arc::new(AtomicBool::new(false));
 
     let tui_enabled = std::env::var("FOLD_DISABLE_TUI").is_err() && std::io::stdout().is_terminal();
@@ -438,6 +441,37 @@ fn process_txt_file(
                         g.system_memory_percent = percent;
                         g.distinct_jobs_count = jobs_count;
                     });
+                    let tracker_stats = tracker.stats_snapshot();
+                    if tracker_stats.buffered_total >= seen_tracker::DEFAULT_GLOBAL_BUFFER {
+                        let over = tracker_stats
+                            .buffered_total
+                            .saturating_sub(seen_tracker::DEFAULT_GLOBAL_BUFFER);
+                        metrics.add_log(format!(
+                            "Seen tracker buffers high: total={} ({} over) max_per_shard={}",
+                            tracker_stats.buffered_total,
+                            over,
+                            tracker_stats.max_buffered_per_shard
+                        ));
+                    }
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let trace_line = format!(
+                        "{} role={} mode=process processed={} queue_len={} results_len={} tracker_len={} shard_cap={} buffered_total={} max_buf={} used_mb={} rss_mb={}",
+                        ts,
+                        role.as_str(),
+                        processed_count,
+                        work_queue.len(),
+                        results.len(),
+                        tracker.len(),
+                        tracker.max_shards_in_memory(),
+                        tracker_stats.buffered_total,
+                        tracker_stats.max_buffered_per_shard,
+                        used_bytes / 1_048_576,
+                        proc_rss_bytes / 1_048_576
+                    );
+                    metrics.add_trace_line(trace_line);
                     apply_shard_pressure_valve(
                         &mut tracker,
                         metrics,
@@ -465,41 +499,52 @@ fn process_txt_file(
 
                 // Get completions from interner
                 let completions = interner.intersect(&required, &forbidden);
-
-                // Generate child orthos
-                let mut batch_ids = Vec::new();
-                for completion in completions {
-                    let children = ortho.add(completion);
-
-                    for child in children {
-                        let child_id = child.id();
-                        pending_children.entry(child_id).or_insert(PendingEntry {
-                            ortho: child,
-                            source: PendingSource::Search,
-                        });
-                        batch_ids.push(child_id);
-                    }
+                let total_completions = completions.len();
+                if total_completions > FANOUT_LOG_THRESHOLD {
+                    let chunks =
+                        (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
+                    metrics.add_log(format!(
+                        "Fanout: {} completions; processing in {} chunks of {}",
+                        total_completions, chunks, COMPLETION_CHUNK_SIZE
+                    ));
                 }
 
-                if !batch_ids.is_empty() {
-                    let batch_result = tracker.check_batch(&batch_ids, false)?;
-                    let mut on_new = |entry: PendingEntry| -> Result<(), FoldError> {
-                        let child = entry.ortho;
-                        let candidate_score = child.score();
-                        if candidate_score > best_score {
-                            best_ortho = child.clone();
-                            best_score = candidate_score;
+                // Generate child orthos in chunks to bound peak allocations
+                for chunk in completions.chunks(COMPLETION_CHUNK_SIZE) {
+                    let mut batch_ids = Vec::new();
+                    for completion in chunk {
+                        let children = ortho.add(*completion);
+
+                        for child in children {
+                            let child_id = child.id();
+                            pending_children.entry(child_id).or_insert(PendingEntry {
+                                ortho: child,
+                                source: PendingSource::Search,
+                            });
+                            batch_ids.push(child_id);
                         }
-                        if candidate_score > global_score {
-                            global_score = candidate_score;
-                            optimal_dirty = true;
-                        }
-                        results.push(child.clone())?;
-                        pending_new_orthos = pending_new_orthos.saturating_add(1);
-                        work_queue.push(child)?;
-                        Ok(())
-                    };
-                    handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
+                    }
+
+                    if !batch_ids.is_empty() {
+                        let batch_result = tracker.check_batch(&batch_ids, false)?;
+                        let mut on_new = |entry: PendingEntry| -> Result<(), FoldError> {
+                            let child = entry.ortho;
+                            let candidate_score = child.score();
+                            if candidate_score > best_score {
+                                best_ortho = child.clone();
+                                best_score = candidate_score;
+                            }
+                            if candidate_score > global_score {
+                                global_score = candidate_score;
+                                optimal_dirty = true;
+                            }
+                            results.push(child.clone())?;
+                            pending_new_orthos = pending_new_orthos.saturating_add(1);
+                            work_queue.push(child)?;
+                            Ok(())
+                        };
+                        handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
+                    }
                 }
             }
             None => {
@@ -953,6 +998,37 @@ fn merge_archives(
                         g.system_memory_percent = percent;
                         g.distinct_jobs_count = jobs_count;
                     });
+                    let tracker_stats = tracker.stats_snapshot();
+                    if tracker_stats.buffered_total >= seen_tracker::DEFAULT_GLOBAL_BUFFER {
+                        let over = tracker_stats
+                            .buffered_total
+                            .saturating_sub(seen_tracker::DEFAULT_GLOBAL_BUFFER);
+                        metrics.add_log(format!(
+                            "Seen tracker buffers high: total={} ({} over) max_per_shard={}",
+                            tracker_stats.buffered_total,
+                            over,
+                            tracker_stats.max_buffered_per_shard
+                        ));
+                    }
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let trace_line = format!(
+                        "{} role={} mode=merge processed={} queue_len={} results_len={} tracker_len={} shard_cap={} buffered_total={} max_buf={} used_mb={} rss_mb={}",
+                        ts,
+                        role.as_str(),
+                        processed_count,
+                        work_queue.len(),
+                        merged_results.len(),
+                        tracker.len(),
+                        tracker.max_shards_in_memory(),
+                        tracker_stats.buffered_total,
+                        tracker_stats.max_buffered_per_shard,
+                        used_bytes / 1_048_576,
+                        proc_rss_bytes / 1_048_576
+                    );
+                    metrics.add_trace_line(trace_line);
                     apply_shard_pressure_valve(
                         &mut tracker,
                         metrics,
@@ -977,43 +1053,54 @@ fn merge_archives(
 
                 let (forbidden, required) = ortho.get_requirements();
                 let completions = merged_interner.intersect(&required, &forbidden);
-
-                let mut batch_ids = Vec::new();
-                for completion in completions {
-                    let children = ortho.add(completion);
-
-                    for child in children {
-                        let child_id = child.id();
-                        pending_children.entry(child_id).or_insert(PendingEntry {
-                            ortho: child,
-                            source: PendingSource::Search,
-                        });
-                        batch_ids.push(child_id);
-                    }
+                let total_completions = completions.len();
+                if total_completions > FANOUT_LOG_THRESHOLD {
+                    let chunks =
+                        (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
+                    metrics.add_log(format!(
+                        "Fanout during merge search: {} completions; processing in {} chunks of {}",
+                        total_completions, chunks, COMPLETION_CHUNK_SIZE
+                    ));
                 }
 
-                if !batch_ids.is_empty() {
-                    let batch_result = tracker.check_batch(&batch_ids, false)?;
-                    let mut on_new = |entry: PendingEntry| -> Result<(), FoldError> {
-                        let child = entry.ortho;
-                        let candidate_score = child.score();
+                for chunk in completions.chunks(COMPLETION_CHUNK_SIZE) {
+                    let mut batch_ids = Vec::new();
+                    for completion in chunk {
+                        let children = ortho.add(*completion);
 
-                        // Update local best for this operation
-                        if candidate_score > best_score {
-                            best_ortho = child.clone();
-                            best_score = candidate_score;
+                        for child in children {
+                            let child_id = child.id();
+                            pending_children.entry(child_id).or_insert(PendingEntry {
+                                ortho: child,
+                                source: PendingSource::Search,
+                            });
+                            batch_ids.push(child_id);
                         }
-                        if candidate_score > global_score {
-                            global_score = candidate_score;
-                            optimal_dirty = true;
-                        }
+                    }
 
-                        merged_results.push(child.clone())?;
-                        pending_new_orthos = pending_new_orthos.saturating_add(1);
-                        work_queue.push(child)?;
-                        Ok(())
-                    };
-                    handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
+                    if !batch_ids.is_empty() {
+                        let batch_result = tracker.check_batch(&batch_ids, false)?;
+                        let mut on_new = |entry: PendingEntry| -> Result<(), FoldError> {
+                            let child = entry.ortho;
+                            let candidate_score = child.score();
+
+                            // Update local best for this operation
+                            if candidate_score > best_score {
+                                best_ortho = child.clone();
+                                best_score = candidate_score;
+                            }
+                            if candidate_score > global_score {
+                                global_score = candidate_score;
+                                optimal_dirty = true;
+                            }
+
+                            merged_results.push(child.clone())?;
+                            pending_new_orthos = pending_new_orthos.saturating_add(1);
+                            work_queue.push(child)?;
+                            Ok(())
+                        };
+                        handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
+                    }
                 }
             }
             None => {

@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_SAMPLES: usize = 2000;
 const DOWNSAMPLE_THRESHOLD: usize = 1500;
+pub const TRACE_RING_LINES: usize = 500;
 
 #[derive(Clone, Debug)]
 pub struct MetricSample {
@@ -225,6 +226,8 @@ struct MetricsInner {
 
     logs: VecDeque<LogEntry>,
     log_file_path: Option<PathBuf>,
+    trace_lines: VecDeque<String>,
+    trace_file_path: Option<PathBuf>,
 }
 
 impl Metrics {
@@ -244,6 +247,8 @@ impl Metrics {
                 status_duration_stats: StatusDurationStats::default(),
                 logs: VecDeque::with_capacity(100),
                 log_file_path: None,
+                trace_lines: VecDeque::with_capacity(TRACE_RING_LINES),
+                trace_file_path: None,
             })),
         }
     }
@@ -251,6 +256,11 @@ impl Metrics {
     pub fn set_log_file_path(&self, path: PathBuf) {
         let mut inner = self.inner.lock().unwrap();
         inner.log_file_path = Some(path);
+    }
+
+    pub fn set_trace_file_path(&self, path: PathBuf) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.trace_file_path = Some(path);
     }
 
     pub fn clone_handle(&self) -> Self {
@@ -505,6 +515,27 @@ impl Metrics {
                     .append(true)
                     .open(path)
                     .and_then(|mut f| f.write_all(line.as_bytes()));
+            }
+        }
+    }
+
+    pub fn add_trace_line(&self, line: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.trace_lines.push_back(line);
+        if inner.trace_lines.len() > TRACE_RING_LINES {
+            inner.trace_lines.pop_front();
+        }
+
+        if let Some(path) = inner.trace_file_path.clone() {
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+            {
+                for l in inner.trace_lines.iter() {
+                    let _ = writeln!(file, "{l}");
+                }
             }
         }
     }

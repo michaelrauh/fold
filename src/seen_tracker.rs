@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_PER_SHARD_BUFFER: usize = 1024;
-const DEFAULT_GLOBAL_BUFFER: usize = 16_384;
+pub const DEFAULT_GLOBAL_BUFFER: usize = 16_384;
 
 type FastSet<T> = HbHashSet<T, BuildNoHashHasher<T>>;
 
