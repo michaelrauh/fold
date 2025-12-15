@@ -369,6 +369,27 @@ fn process_txt_file(
     let mut sys = sysinfo::System::new();
     metrics.update_global(|g| g.bloom_fp_rate = tracker.estimated_false_positive_rate());
     metrics.update_global(|g| g.bloom_fp_rate = tracker.estimated_false_positive_rate());
+    let work_queue_stats = work_queue.stats();
+    let results_stats = results.stats();
+    metrics.add_log(format!(
+        "[{} init] work_queue path={} buf_size={} buffered={} disk={} files={} results path={} buf_size={} buffered={} disk={} files={} tracker_len={} bloom_cap={} shards={} max_in_mem={} mem_budget_mb={}",
+        role.as_str(),
+        work_queue_stats.base_path,
+        work_queue_stats.buffer_size,
+        work_queue_stats.buffer_len,
+        work_queue_stats.disk_count,
+        work_queue_stats.disk_file_count,
+        results_stats.base_path,
+        results_stats.buffer_size,
+        results_stats.buffer_len,
+        results_stats.disk_count,
+        results_stats.disk_file_count,
+        tracker.len(),
+        memory_config.bloom_capacity,
+        memory_config.num_shards,
+        memory_config.max_shards_in_memory,
+        mem_budget_bytes / 1_048_576
+    ));
 
     // Seed with empty ortho
     let seed_ortho = Ortho::new();
@@ -388,12 +409,13 @@ fn process_txt_file(
 
     // Process work queue until empty
     let mut processed_count = 0;
+    let mut write_sample_counter = 0usize;
     loop {
         match work_queue.pop()? {
             Some(ortho) => {
                 processed_count += 1;
 
-                if processed_count % 1000 == 0 {
+                if processed_count % 1000 == 0 || write_sample_counter >= WRITE_SAMPLE_MOD {
                     // Update metrics
                     metrics.record_queue_depth(work_queue.len());
                     metrics.record_seen_size(tracker.len());
@@ -442,6 +464,32 @@ fn process_txt_file(
                         g.distinct_jobs_count = jobs_count;
                     });
                     let tracker_stats = tracker.stats_snapshot();
+                    let work_stats = work_queue.stats();
+                    let results_stats = results.stats();
+                    metrics.add_log(format!(
+                        "[process tick] role={} processed={} work_total={} (buf {} / {} disk {} files {}) results_total={} (buf {} / {} disk {} files {}) pending_children={} pending_new={} tracker_seen={} tracker_buffered={} max_buf_per_shard={} rss_mb={} used_mb={} budget_mb={} write_sample_counter={}",
+                        role.as_str(),
+                        processed_count,
+                        work_stats.total_len,
+                        work_stats.buffer_len,
+                        work_stats.buffer_size,
+                        work_stats.disk_count,
+                        work_stats.disk_file_count,
+                        results_stats.total_len,
+                        results_stats.buffer_len,
+                        results_stats.buffer_size,
+                        results_stats.disk_count,
+                        results_stats.disk_file_count,
+                        pending_children.len(),
+                        pending_new_orthos,
+                        tracker.len(),
+                        tracker_stats.buffered_total,
+                        tracker_stats.max_buffered_per_shard,
+                        proc_rss_bytes / 1_048_576,
+                        used_bytes / 1_048_576,
+                        mem_budget_bytes / 1_048_576,
+                        write_sample_counter
+                    ));
                     if tracker_stats.buffered_total >= seen_tracker::DEFAULT_GLOBAL_BUFFER {
                         let over = tracker_stats
                             .buffered_total
@@ -480,6 +528,7 @@ fn process_txt_file(
                         role,
                     )?;
                     maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
+                    write_sample_counter = 0;
                 }
 
                 if processed_count % 50000 == 0 {
@@ -545,12 +594,23 @@ fn process_txt_file(
                         };
                         handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
                     }
+                    write_sample_counter = write_sample_counter.saturating_add(batch_ids.len());
                 }
             }
             None => {
+                let buffered_before = tracker.buffered_total();
                 if tracker.buffered_total() == 0 {
                     break;
                 }
+                metrics.add_log(format!(
+                    "[process flush] role={} buffered_total={} pending_children={} pending_new={} work_total={} results_total={}",
+                    role.as_str(),
+                    buffered_before,
+                    pending_children.len(),
+                    pending_new_orthos,
+                    work_queue.len(),
+                    results.len()
+                ));
                 let batch_result = tracker.flush_pending()?;
                 if batch_result.new.is_empty() && batch_result.seen.is_empty() {
                     if tracker.buffered_total() == 0 {
@@ -574,6 +634,20 @@ fn process_txt_file(
                     Ok(())
                 };
                 handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
+                let tracker_stats = tracker.stats_snapshot();
+                let work_stats = work_queue.stats();
+                let results_stats = results.stats();
+                metrics.add_log(format!(
+                    "[process flush done] role={} buffered_total={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={} max_buf_per_shard={}",
+                    role.as_str(),
+                    tracker_stats.buffered_total,
+                    work_stats.total_len,
+                    results_stats.total_len,
+                    pending_children.len(),
+                    pending_new_orthos,
+                    tracker.len(),
+                    tracker_stats.max_buffered_per_shard
+                ));
             }
         }
     }
@@ -741,6 +815,27 @@ fn merge_archives(
         memory_config.max_shards_in_memory,
     );
     let mut sys = sysinfo::System::new();
+    let work_queue_stats = work_queue.stats();
+    let merged_results_stats = merged_results.stats();
+    metrics.add_log(format!(
+        "[{} merge init] work_queue path={} buf_size={} buffered={} disk={} files={} merged_results path={} buf_size={} buffered={} disk={} files={} tracker_len={} bloom_cap={} shards={} max_in_mem={} mem_budget_mb={}",
+        role.as_str(),
+        work_queue_stats.base_path,
+        work_queue_stats.buffer_size,
+        work_queue_stats.buffer_len,
+        work_queue_stats.disk_count,
+        work_queue_stats.disk_file_count,
+        merged_results_stats.base_path,
+        merged_results_stats.buffer_size,
+        merged_results_stats.buffer_len,
+        merged_results_stats.disk_count,
+        merged_results_stats.disk_file_count,
+        tracker.len(),
+        memory_config.bloom_capacity,
+        memory_config.num_shards,
+        memory_config.max_shards_in_memory,
+        mem_budget_bytes / 1_048_576
+    ));
 
     // Seed with empty ortho
     let seed_ortho = Ortho::new();
@@ -751,6 +846,7 @@ fn merge_archives(
     let mut best_score = best_ortho.score();
     work_queue.push(seed_ortho)?;
     let mut pending_ingest: HashMap<usize, PendingEntry> = HashMap::new();
+    let mut write_sample_counter = 0usize;
 
     // Get results paths using method
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
@@ -812,6 +908,26 @@ fn merge_archives(
             Ok(())
         };
         handle_batch_result(batch_result, &mut pending_ingest, &mut on_new)?;
+        if total_from_larger > 0 && total_from_larger % 10000 == 0 {
+            let tracker_stats = tracker.stats_snapshot();
+            let merged_stats = merged_results.stats();
+            metrics.add_log(format!(
+                "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={} tracker_buffered={} max_buf_per_shard={}",
+                larger_name,
+                role.as_str(),
+                larger_name,
+                total_from_larger,
+                merged_stats.total_len,
+                merged_stats.buffer_len,
+                merged_stats.buffer_size,
+                merged_stats.disk_count,
+                merged_stats.disk_file_count,
+                pending_ingest.len(),
+                tracker.len(),
+                tracker_stats.buffered_total,
+                tracker_stats.max_buffered_per_shard
+            ));
+        }
     }
 
     // Process smaller archive (needs remapping)
@@ -872,6 +988,26 @@ fn merge_archives(
                 Ok(())
             };
             handle_batch_result(batch_result, &mut pending_ingest, &mut on_new)?;
+            if total_from_smaller > 0 && total_from_smaller % 10000 == 0 {
+                let tracker_stats = tracker.stats_snapshot();
+                let merged_stats = merged_results.stats();
+                metrics.add_log(format!(
+                "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={} tracker_buffered={} max_buf_per_shard={}",
+                smaller_name,
+                role.as_str(),
+                smaller_name,
+                total_from_smaller,
+                merged_stats.total_len,
+                merged_stats.buffer_len,
+                merged_stats.buffer_size,
+                merged_stats.disk_count,
+                merged_stats.disk_file_count,
+                pending_ingest.len(),
+                tracker.len(),
+                tracker_stats.buffered_total,
+                tracker_stats.max_buffered_per_shard
+            ));
+            }
         }
     }
 
@@ -949,7 +1085,7 @@ fn merge_archives(
             Some(ortho) => {
                 processed_count += 1;
 
-                if processed_count % 1000 == 0 {
+                if processed_count % 1000 == 0 || write_sample_counter >= WRITE_SAMPLE_MOD {
                     let queue_depth = work_queue.len();
                     metrics.record_queue_depth(queue_depth);
                     metrics.record_seen_size(tracker.len());
@@ -999,6 +1135,32 @@ fn merge_archives(
                         g.distinct_jobs_count = jobs_count;
                     });
                     let tracker_stats = tracker.stats_snapshot();
+                    let work_stats = work_queue.stats();
+                    let merged_stats = merged_results.stats();
+                    metrics.add_log(format!(
+                        "[merge tick] role={} processed={} work_total={} (buf {} / {} disk {} files {}) merged_results_total={} (buf {} / {} disk {} files {}) pending_children={} pending_new={} tracker_seen={} tracker_buffered={} max_buf_per_shard={} rss_mb={} used_mb={} budget_mb={} write_sample_counter={}",
+                        role.as_str(),
+                        processed_count,
+                        work_stats.total_len,
+                        work_stats.buffer_len,
+                        work_stats.buffer_size,
+                        work_stats.disk_count,
+                        work_stats.disk_file_count,
+                        merged_stats.total_len,
+                        merged_stats.buffer_len,
+                        merged_stats.buffer_size,
+                        merged_stats.disk_count,
+                        merged_stats.disk_file_count,
+                        pending_children.len(),
+                        pending_new_orthos,
+                        tracker.len(),
+                        tracker_stats.buffered_total,
+                        tracker_stats.max_buffered_per_shard,
+                        proc_rss_bytes / 1_048_576,
+                        used_bytes / 1_048_576,
+                        mem_budget_bytes / 1_048_576,
+                        write_sample_counter
+                    ));
                     if tracker_stats.buffered_total >= seen_tracker::DEFAULT_GLOBAL_BUFFER {
                         let over = tracker_stats
                             .buffered_total
@@ -1037,6 +1199,7 @@ fn merge_archives(
                         role,
                     )?;
                     maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
+                    write_sample_counter = 0;
                 }
 
                 if processed_count % 50000 == 0 {
@@ -1101,12 +1264,23 @@ fn merge_archives(
                         };
                         handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
                     }
+                    write_sample_counter = write_sample_counter.saturating_add(batch_ids.len());
                 }
             }
             None => {
+                let buffered_before = tracker.buffered_total();
                 if tracker.buffered_total() == 0 {
                     break;
                 }
+                metrics.add_log(format!(
+                    "[merge flush] role={} buffered_total={} pending_children={} pending_new={} work_total={} results_total={}",
+                    role.as_str(),
+                    buffered_before,
+                    pending_children.len(),
+                    pending_new_orthos,
+                    work_queue.len(),
+                    merged_results.len()
+                ));
                 let batch_result = tracker.flush_pending()?;
                 if batch_result.new.is_empty() && batch_result.seen.is_empty() {
                     if tracker.buffered_total() == 0 {
@@ -1132,6 +1306,20 @@ fn merge_archives(
                     Ok(())
                 };
                 handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
+                let tracker_stats = tracker.stats_snapshot();
+                let work_stats = work_queue.stats();
+                let merged_stats = merged_results.stats();
+                metrics.add_log(format!(
+                    "[merge flush done] role={} buffered_total={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={} max_buf_per_shard={}",
+                    role.as_str(),
+                    tracker_stats.buffered_total,
+                    work_stats.total_len,
+                    merged_stats.total_len,
+                    pending_children.len(),
+                    pending_new_orthos,
+                    tracker.len(),
+                    tracker_stats.max_buffered_per_shard
+                ));
             }
         }
     }

@@ -1,14 +1,9 @@
 use crate::spatial;
 use bincode::Decode;
 use bincode::Encode;
-use std::cell::RefCell;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-
-thread_local! {
-    static ORTHO_SCORE_CACHE: RefCell<HashMap<usize, (usize, usize)>> = RefCell::new(HashMap::new());
-}
 
 #[derive(PartialEq, Debug, Clone, Encode, Decode)]
 pub struct Ortho {
@@ -27,12 +22,6 @@ impl Ortho {
         dims.hash(&mut hasher);
         payload.hash(&mut hasher);
         up_axis.hash(&mut hasher);
-        (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
-    }
-    fn compute_score_key(dims: &Vec<usize>, payload: &Vec<Option<usize>>) -> usize {
-        let mut hasher = DefaultHasher::new();
-        dims.hash(&mut hasher);
-        payload.hash(&mut hasher);
         (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
     }
     pub fn new() -> Self {
@@ -268,15 +257,7 @@ impl Ortho {
         (volume, fullness)
     }
     pub fn score(&self) -> (usize, usize) {
-        let key = Self::compute_score_key(&self.dims, &self.payload);
-        ORTHO_SCORE_CACHE.with(|cache| {
-            if let Some(score) = cache.borrow().get(&key) {
-                return *score;
-            }
-            let score = self.compute_score_components();
-            cache.borrow_mut().insert(key, score);
-            score
-        })
+        self.compute_score_components()
     }
     pub fn volume(&self) -> usize {
         self.score().0

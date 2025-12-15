@@ -604,7 +604,7 @@ impl Tui {
 
         let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Queue │ Cur:{} Pk:{} Δ{}{}/s",
+            "Queue │ Cur:{} Pk:{} Δ{}{}",
             format_number(current as usize),
             format_number(peak as usize),
             rate_sign,
@@ -662,7 +662,7 @@ impl Tui {
 
         let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Seen │ Cur:{} Base:{} Δ{}{}/s",
+            "Seen │ Cur:{} Base:{} Δ{}{}",
             format_number(current as usize),
             format_number(baseline_raw as usize),
             rate_sign,

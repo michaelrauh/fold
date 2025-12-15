@@ -14,6 +14,16 @@ pub struct DiskBackedQueue {
     disk_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueStats {
+    pub buffer_len: usize,
+    pub buffer_size: usize,
+    pub disk_count: usize,
+    pub disk_file_count: usize,
+    pub total_len: usize,
+    pub base_path: String,
+}
+
 impl DiskBackedQueue {
     pub fn new(buffer_size: usize) -> Result<Self, FoldError> {
         let disk_path = PathBuf::from("./fold_state/queue");
@@ -106,6 +116,22 @@ impl DiskBackedQueue {
 
     pub fn base_path(&self) -> String {
         self.disk_path.to_string_lossy().to_string()
+    }
+
+    pub fn stats(&self) -> QueueStats {
+        let buffer_len = self.buffer.len();
+        let disk_count = self.disk_count;
+        let disk_file_count = self.disk_files.len();
+        let buffer_size = self.buffer_size;
+        let base_path = self.base_path();
+        QueueStats {
+            buffer_len,
+            buffer_size,
+            disk_count,
+            disk_file_count,
+            total_len: buffer_len.saturating_add(disk_count),
+            base_path,
+        }
     }
 
     pub fn flush(&mut self) -> Result<(), FoldError> {
@@ -338,6 +364,31 @@ mod tests {
         let queue = DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 10).unwrap();
 
         assert!(queue.base_path().contains("queue"));
+    }
+
+    #[test]
+    fn test_stats_report_buffer_and_disk_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let queue_path = temp_dir.path().join("queue");
+        let mut queue = DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 4).unwrap();
+
+        queue.push(Ortho::new()).unwrap();
+        queue.push(Ortho::new()).unwrap();
+        queue.push(Ortho::new()).unwrap();
+
+        let stats_before = queue.stats();
+        assert_eq!(stats_before.buffer_len, 3);
+        assert_eq!(stats_before.disk_count, 0);
+        assert_eq!(stats_before.total_len, 3);
+
+        queue.flush().unwrap();
+
+        let stats_after = queue.stats();
+        assert_eq!(stats_after.buffer_len, 0);
+        assert_eq!(stats_after.disk_count, 3);
+        assert_eq!(stats_after.total_len, 3);
+        assert_eq!(stats_after.disk_file_count, 1);
+        assert_eq!(stats_after.buffer_size, 4);
     }
 
     #[test]
