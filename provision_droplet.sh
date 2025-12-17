@@ -11,8 +11,14 @@ REGION="${REGION:-nyc3}"
 SIZE="${SIZE:-s-4vcpu-16gb}"
 IMAGE="${IMAGE:-ubuntu-22-04-x64}"
 SSH_KEY="${SSH_KEY:-<ssh-key-id-or-fingerprint>}" # must exist in DO + locally loaded
-REMOTE_APP_DIR="${REMOTE_APP_DIR:-/root/fold}"
 TMUX_SESSION="${TMUX_SESSION:-fold}"
+MOUNT_POINT="${MOUNT_POINT:-/mnt/fold}"
+VOLUME_NAME="${VOLUME_NAME:-fold-data}"
+VOLUME_SIZE_GB="${VOLUME_SIZE_GB:-100}"
+SANITIZED_VOLUME_NAME="${VOLUME_NAME// /_}"
+VOLUME_DEVICE="${VOLUME_DEVICE:-/dev/disk/by-id/scsi-0DO_Volume_${SANITIZED_VOLUME_NAME}}"
+VOLUME_FS_TYPE="${VOLUME_FS_TYPE:-ext4}"
+REMOTE_APP_DIR="${REMOTE_APP_DIR:-$MOUNT_POINT/fold}"
 
 # Code sync: set SYNC_MODE=local to rsync the working tree; SYNC_MODE=github to clone/pull.
 SYNC_MODE="${SYNC_MODE:-local}"                # local|github
@@ -45,6 +51,11 @@ create_or_get_droplet() {
 
 fetch_ip() {
   doctl compute droplet get "$DROPLET_NAME" --format PublicIPv4 --no-header |
+    tr -d '[:space:]'
+}
+
+fetch_droplet_id() {
+  doctl compute droplet get "$DROPLET_NAME" --format ID --no-header |
     tr -d '[:space:]'
 }
 
@@ -90,7 +101,8 @@ apt_with_retry() {
 }
 wait_for_dpkg
 apt_with_retry apt-get update -y
-apt_with_retry apt-get install -y git tmux build-essential pkg-config libssl-dev curl ca-certificates
+apt_with_retry apt-get install -y git tmux build-essential pkg-config libssl-dev curl ca-certificates e2fsprogs \
+  linux-tools-common "linux-tools-$(uname -r)" "linux-cloud-tools-$(uname -r)"
 if [ ! -d "$HOME/.cargo" ]; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
@@ -147,21 +159,96 @@ EOF
   esac
 }
 
+create_or_get_volume() {
+  local id
+  if id="$(doctl compute volume get "$VOLUME_NAME" --format ID --no-header 2>/dev/null | tr -d '[:space:]')"; then
+    echo "Volume $VOLUME_NAME already exists ($id)."
+  else
+    echo "Creating volume $VOLUME_NAME (${VOLUME_SIZE_GB}GiB in $REGION)..."
+    id="$(doctl compute volume create "$VOLUME_NAME" \
+      --region "$REGION" \
+      --size "${VOLUME_SIZE_GB}GiB" \
+      --format ID \
+      --no-header | tr -d '[:space:]')"
+  fi
+  VOLUME_ID="$id"
+}
+
+attach_volume_to_droplet() {
+  local droplet_id="$1"
+  local attached_ids
+  attached_ids="$(doctl compute volume get "$VOLUME_NAME" --format DropletIDs --no-header 2>/dev/null || true)"
+  if echo "$attached_ids" | tr -d '[],' | tr ' ' '\n' | grep -qw "$droplet_id"; then
+    echo "Volume $VOLUME_NAME already attached to droplet $droplet_id."
+    return
+  fi
+
+  echo "Attaching volume $VOLUME_NAME ($VOLUME_ID) to droplet $droplet_id..."
+  doctl compute volume-action attach "$VOLUME_ID" "$droplet_id" --wait
+}
+
+prepare_volume_mount() {
+  local ip="$1"
+  ssh "root@$ip" <<EOF
+set -euo pipefail
+DEVICE="$VOLUME_DEVICE"
+MOUNT_POINT="$MOUNT_POINT"
+REMOTE_APP_DIR="$REMOTE_APP_DIR"
+FS_TYPE="$VOLUME_FS_TYPE"
+TRIES=12
+
+for i in \$(seq 1 "\$TRIES"); do
+  if [ -e "\$DEVICE" ]; then
+    break
+  fi
+  echo "Waiting for \$DEVICE to attach (\$i/\$TRIES)..."
+  sleep 5
+done
+
+if [ ! -e "\$DEVICE" ]; then
+  echo "Block device \$DEVICE not found. Ensure the volume is attached." >&2
+  exit 1
+fi
+
+mkdir -p "\$MOUNT_POINT"
+if ! blkid "\$DEVICE" >/dev/null 2>&1; then
+  echo "Formatting \$DEVICE as \$FS_TYPE..."
+  mkfs -t "\$FS_TYPE" -F "\$DEVICE"
+fi
+
+if ! mountpoint -q "\$MOUNT_POINT"; then
+  mount "\$DEVICE" "\$MOUNT_POINT"
+fi
+
+if ! grep -q "\$DEVICE" /etc/fstab; then
+  echo "\$DEVICE \$MOUNT_POINT \$FS_TYPE defaults,nofail 0 2" >> /etc/fstab
+fi
+
+mkdir -p "\$REMOTE_APP_DIR"
+EOF
+}
+
 main() {
   create_or_get_droplet
+  droplet_id="$(fetch_droplet_id)"
   ip="$(fetch_ip)"
   [ -n "$ip" ] || abort "Could not get droplet IP"
   wait_for_ssh "$ip"
+  create_or_get_volume
+  attach_volume_to_droplet "$droplet_id"
   bootstrap_remote "$ip"
+  prepare_volume_mount "$ip"
   ensure_remote_dir "$ip"
   sync_code "$ip"
   sync_text "$ip"
 
   echo
   echo "Droplet ready at: $ip"
-  echo "SSH in: ssh root@$ip"
-  echo "Start tmux: ssh root@$ip \"tmux new -s $TMUX_SESSION\""
-  echo "Run app inside tmux: source ~/.cargo/env && cd $REMOTE_APP_DIR && cargo run --release"
+  echo "SSH command: ssh root@$ip"
+  echo "App directory on volume: $REMOTE_APP_DIR (mounted from $VOLUME_NAME at $MOUNT_POINT)"
+  echo "After SSH: cd $REMOTE_APP_DIR"
+  echo "Start app (tmux w/2 panes): ./start_fold.sh"
+  echo "One-liner: ssh root@$ip \"cd $REMOTE_APP_DIR && ./start_fold.sh\""
 }
 
 main "$@"

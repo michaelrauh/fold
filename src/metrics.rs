@@ -1,13 +1,10 @@
+use crate::seen_tracker::TrackerStats;
 use std::collections::VecDeque;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_SAMPLES: usize = 2000;
 const DOWNSAMPLE_THRESHOLD: usize = 1500;
-pub const TRACE_RING_LINES: usize = 500;
 
 #[derive(Clone, Debug)]
 pub struct MetricSample {
@@ -43,8 +40,6 @@ pub struct GlobalMetrics {
     pub start_time: u64,
     pub current_lineage: String,
     pub queue_buffer_size: usize,
-    pub bloom_capacity: usize,
-    pub bloom_fp_rate: f64,
     pub num_shards: usize,
     pub max_shards_in_memory: usize,
     pub queue_depth_pk: usize,
@@ -72,8 +67,6 @@ impl Default for GlobalMetrics {
             start_time,
             current_lineage: String::new(),
             queue_buffer_size: 0,
-            bloom_capacity: 0,
-            bloom_fp_rate: 0.0,
             num_shards: 0,
             max_shards_in_memory: 0,
             queue_depth_pk: 0,
@@ -81,6 +74,29 @@ impl Default for GlobalMetrics {
             distinct_jobs_count: 0,
             ram_bytes: 0,
             process_rss_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TrackerMetrics {
+    pub tier_count: usize,
+    pub top_tiers: Vec<usize>,
+    pub merge_count: u64,
+    pub merge_keys_total: u64,
+    pub avg_probe_depth: f64,
+    pub bytes_est: usize,
+}
+
+impl From<TrackerStats> for TrackerMetrics {
+    fn from(stats: TrackerStats) -> Self {
+        Self {
+            tier_count: stats.tier_count,
+            top_tiers: stats.top_tiers,
+            merge_count: stats.merge_count,
+            merge_keys_total: stats.merge_keys_total,
+            avg_probe_depth: stats.avg_probe_depth,
+            bytes_est: stats.bytes_est,
         }
     }
 }
@@ -215,6 +231,7 @@ struct MetricsInner {
     merge: MergeStatus,
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
+    tracker: TrackerMetrics,
 
     queue_depth_samples: VecDeque<MetricSample>,
     seen_size_samples: VecDeque<MetricSample>,
@@ -225,9 +242,6 @@ struct MetricsInner {
     status_duration_stats: StatusDurationStats,
 
     logs: VecDeque<LogEntry>,
-    log_file_path: Option<PathBuf>,
-    trace_lines: VecDeque<String>,
-    trace_file_path: Option<PathBuf>,
 }
 
 impl Metrics {
@@ -239,6 +253,7 @@ impl Metrics {
                 merge: MergeStatus::default(),
                 largest_archive: LargestArchive::default(),
                 optimal_ortho: OptimalOrtho::default(),
+                tracker: TrackerMetrics::default(),
                 queue_depth_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -246,21 +261,8 @@ impl Metrics {
                 status_history: VecDeque::with_capacity(100),
                 status_duration_stats: StatusDurationStats::default(),
                 logs: VecDeque::with_capacity(100),
-                log_file_path: None,
-                trace_lines: VecDeque::with_capacity(TRACE_RING_LINES),
-                trace_file_path: None,
             })),
         }
-    }
-
-    pub fn set_log_file_path(&self, path: PathBuf) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.log_file_path = Some(path);
-    }
-
-    pub fn set_trace_file_path(&self, path: PathBuf) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.trace_file_path = Some(path);
     }
 
     pub fn clone_handle(&self) -> Self {
@@ -368,6 +370,11 @@ impl Metrics {
     pub fn reset_new_orthos(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.operation.new_orthos = 0;
+    }
+
+    pub fn set_tracker_metrics(&self, stats: TrackerStats) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.tracker = TrackerMetrics::from(stats);
     }
 
     pub fn increment_new_orthos(&self, count: usize) {
@@ -506,38 +513,6 @@ impl Metrics {
         if inner.logs.len() > 100 {
             inner.logs.pop_front();
         }
-
-        if let Some(path) = inner.log_file_path.clone() {
-            if let Some(last) = inner.logs.back() {
-                let line = format!("{} {}\n", last.timestamp, last.message);
-                let _ = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .and_then(|mut f| f.write_all(line.as_bytes()));
-            }
-        }
-    }
-
-    pub fn add_trace_line(&self, line: String) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.trace_lines.push_back(line);
-        if inner.trace_lines.len() > TRACE_RING_LINES {
-            inner.trace_lines.pop_front();
-        }
-
-        if let Some(path) = inner.trace_file_path.clone() {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-            {
-                for l in inner.trace_lines.iter() {
-                    let _ = writeln!(file, "{l}");
-                }
-            }
-        }
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -548,6 +523,7 @@ impl Metrics {
             merge: inner.merge.clone(),
             largest_archive: inner.largest_archive.clone(),
             optimal_ortho: inner.optimal_ortho.clone(),
+            tracker: inner.tracker.clone(),
             queue_depth_samples: inner.queue_depth_samples.iter().cloned().collect(),
             seen_size_samples: inner.seen_size_samples.iter().cloned().collect(),
             seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
@@ -566,6 +542,7 @@ pub struct MetricsSnapshot {
     pub merge: MergeStatus,
     pub largest_archive: LargestArchive,
     pub optimal_ortho: OptimalOrtho,
+    pub tracker: TrackerMetrics,
     pub queue_depth_samples: Vec<MetricSample>,
     pub seen_size_samples: Vec<MetricSample>,
     pub seen_history_samples: Vec<MetricSample>,

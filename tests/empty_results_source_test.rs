@@ -46,8 +46,6 @@ fn test_empty_text_produces_archive_with_no_results() -> Result<(), FoldError> {
     let mut tracker = SeenTracker::with_path(
         seen_shards_path.to_str().unwrap(),
         memory_config.bloom_capacity,
-        memory_config.num_shards,
-        memory_config.max_shards_in_memory,
     );
 
     // Seed with empty ortho
@@ -200,8 +198,6 @@ fn test_single_word_produces_minimal_results() -> Result<(), FoldError> {
     let mut tracker = SeenTracker::with_path(
         seen_shards_path.to_str().unwrap(),
         memory_config.bloom_capacity,
-        memory_config.num_shards,
-        memory_config.max_shards_in_memory,
     );
 
     let seed_ortho = Ortho::new();

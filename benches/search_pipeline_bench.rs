@@ -30,8 +30,7 @@ fn bench_search_pipeline(c: &mut Criterion) {
                 // Large buffer to avoid spills; keep all shards in memory to avoid disk flushes.
                 let mut queue =
                     DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 100_000).unwrap();
-                let mut tracker =
-                    SeenTracker::with_path(tracker_path.to_str().unwrap(), 1_000_000, 64, 64);
+                let mut tracker = SeenTracker::with_path(tracker_path.to_str().unwrap(), 1_000_000);
 
                 let seed = Ortho::new();
                 tracker.insert(seed.id());
@@ -84,8 +83,7 @@ fn bench_search_pipeline_book(c: &mut Criterion) {
                 // Large buffer to reduce spills but still realistic for book-scale vocab.
                 let mut queue =
                     DiskBackedQueue::new_from_path(queue_path.to_str().unwrap(), 200_000).unwrap();
-                let mut tracker =
-                    SeenTracker::with_path(tracker_path.to_str().unwrap(), 2_000_000, 128, 128);
+                let mut tracker = SeenTracker::with_path(tracker_path.to_str().unwrap(), 2_000_000);
 
                 let seed = Ortho::new();
                 tracker.insert(seed.id());

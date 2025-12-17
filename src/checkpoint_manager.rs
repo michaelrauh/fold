@@ -128,15 +128,13 @@ impl CheckpointManager {
 
         // Use memory configuration
         let bloom_capacity = memory_config.bloom_capacity;
-        let num_shards = memory_config.num_shards;
-        let max_shards_in_memory = memory_config.max_shards_in_memory;
-
-        // println!("[fold] Tracker config: bloom_capacity={}, num_shards={}, max_in_memory={}",
-        //          bloom_capacity, num_shards, max_shards_in_memory);
 
         // Create tracker with calculated configuration
-        let mut tracker =
-            SeenTracker::with_config(bloom_capacity, num_shards, max_shards_in_memory);
+        let tracker_path = Path::new(&self.results_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("seen_shards");
+        let mut tracker = SeenTracker::with_path(tracker_path.to_str().unwrap(), bloom_capacity);
 
         // Delete current results if exists
         if Path::new(&self.results_path).exists() {
@@ -159,6 +157,9 @@ impl CheckpointManager {
                 // println!("[fold] Consumed {}/{} results...", consumed, total_items);
             }
         }
+
+        // Ensure buffered inserts are persisted so the tracker reflects correct counts.
+        let _ = tracker.flush_pending();
 
         // Cleanup temp directory
         if Path::new(&self.results_temp).exists() {
@@ -234,7 +235,7 @@ mod tests {
         let result = manager.load(&memory_config).unwrap();
         assert!(result.is_some());
 
-        let (loaded_interner, mut loaded_results, mut loaded_tracker) = result.unwrap();
+        let (loaded_interner, mut loaded_results, loaded_tracker) = result.unwrap();
 
         assert_eq!(loaded_interner.version(), interner.version());
         // Verify results by popping (len() is not reliable for reloaded queues)
@@ -297,7 +298,7 @@ mod tests {
         let loaded = result.unwrap();
         assert!(loaded.is_some(), "Checkpoint should exist");
 
-        let (_int, _res, mut loaded_tracker) = loaded.unwrap();
+        let (_int, _res, loaded_tracker) = loaded.unwrap();
 
         // All three should be in the tracker (reconstructed from all results)
         assert_eq!(

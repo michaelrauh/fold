@@ -6,7 +6,7 @@ use fold::{
     memory_config::MemoryConfig,
     metrics::Metrics,
     ortho::Ortho,
-    seen_tracker::{self, BatchResult, SeenTracker},
+    seen_tracker::{BatchResult, SeenTracker},
     tui::Tui,
 };
 use std::collections::{HashMap, HashSet};
@@ -65,10 +65,7 @@ fn main() -> Result<(), FoldError> {
     let metrics = Metrics::new();
     let log_dir = config.logs_dir();
     fs::create_dir_all(&log_dir)?;
-    let log_path = log_dir.join(format!("fold_{}.log", std::process::id()));
-    metrics.set_log_file_path(log_path);
-    metrics.add_log("Log file initialized".to_string());
-    metrics.set_trace_file_path(log_dir.join("loop_trace.log"));
+    metrics.add_log("Log initialized".to_string());
     let should_quit = Arc::new(AtomicBool::new(false));
 
     let tui_enabled = std::env::var("FOLD_DISABLE_TUI").is_err() && std::io::stdout().is_terminal();
@@ -343,7 +340,6 @@ fn process_txt_file(
 
     metrics.update_global(|g| {
         g.queue_buffer_size = memory_config.queue_buffer_size;
-        g.bloom_capacity = memory_config.bloom_capacity;
         g.num_shards = memory_config.num_shards;
         g.max_shards_in_memory = memory_config.max_shards_in_memory;
     });
@@ -360,19 +356,12 @@ fn process_txt_file(
 
     // Initialize tracker for this file (isolated to work folder)
     let seen_shards_path = ingestion.seen_shards_path();
-    let mut tracker = SeenTracker::with_path(
-        &seen_shards_path,
-        memory_config.bloom_capacity,
-        memory_config.num_shards,
-        memory_config.max_shards_in_memory,
-    );
+    let mut tracker = SeenTracker::with_path(&seen_shards_path, memory_config.bloom_capacity);
     let mut sys = sysinfo::System::new();
-    metrics.update_global(|g| g.bloom_fp_rate = tracker.estimated_false_positive_rate());
-    metrics.update_global(|g| g.bloom_fp_rate = tracker.estimated_false_positive_rate());
     let work_queue_stats = work_queue.stats();
     let results_stats = results.stats();
     metrics.add_log(format!(
-        "[{} init] work_queue path={} buf_size={} buffered={} disk={} files={} results path={} buf_size={} buffered={} disk={} files={} tracker_len={} bloom_cap={} shards={} max_in_mem={} mem_budget_mb={}",
+        "[{} init] work_queue path={} buf_size={} buffered={} disk={} files={} results path={} buf_size={} buffered={} disk={} files={} tracker_len={} mem_budget_mb={}",
         role.as_str(),
         work_queue_stats.base_path,
         work_queue_stats.buffer_size,
@@ -385,9 +374,6 @@ fn process_txt_file(
         results_stats.disk_count,
         results_stats.disk_file_count,
         tracker.len(),
-        memory_config.bloom_capacity,
-        memory_config.num_shards,
-        memory_config.max_shards_in_memory,
         mem_budget_bytes / 1_048_576
     ));
 
@@ -406,6 +392,7 @@ fn process_txt_file(
     work_queue.push(seed_ortho)?;
 
     metrics.set_operation_status("Processing orthos".to_string());
+    let _tracker_buffer_warned = false;
 
     // Process work queue until empty
     let mut processed_count = 0;
@@ -419,6 +406,7 @@ fn process_txt_file(
                     // Update metrics
                     metrics.record_queue_depth(work_queue.len());
                     metrics.record_seen_size(tracker.len());
+                    metrics.set_tracker_metrics(tracker.stats_snapshot());
                     metrics.record_optimal_volume(best_ortho.volume());
                     metrics.update_operation(|op| {
                         op.progress_current = processed_count;
@@ -463,71 +451,48 @@ fn process_txt_file(
                         g.system_memory_percent = percent;
                         g.distinct_jobs_count = jobs_count;
                     });
-                    let tracker_stats = tracker.stats_snapshot();
-                    let work_stats = work_queue.stats();
-                    let results_stats = results.stats();
-                    metrics.add_log(format!(
-                        "[process tick] role={} processed={} work_total={} (buf {} / {} disk {} files {}) results_total={} (buf {} / {} disk {} files {}) pending_children={} pending_new={} tracker_seen={} tracker_buffered={} max_buf_per_shard={} rss_mb={} used_mb={} budget_mb={} write_sample_counter={}",
-                        role.as_str(),
-                        processed_count,
-                        work_stats.total_len,
-                        work_stats.buffer_len,
-                        work_stats.buffer_size,
-                        work_stats.disk_count,
-                        work_stats.disk_file_count,
-                        results_stats.total_len,
-                        results_stats.buffer_len,
-                        results_stats.buffer_size,
-                        results_stats.disk_count,
-                        results_stats.disk_file_count,
-                        pending_children.len(),
-                        pending_new_orthos,
-                        tracker.len(),
-                        tracker_stats.buffered_total,
-                        tracker_stats.max_buffered_per_shard,
-                        proc_rss_bytes / 1_048_576,
-                        used_bytes / 1_048_576,
-                        mem_budget_bytes / 1_048_576,
-                        write_sample_counter
-                    ));
-                    if tracker_stats.buffered_total >= seen_tracker::DEFAULT_GLOBAL_BUFFER {
-                        let over = tracker_stats
-                            .buffered_total
-                            .saturating_sub(seen_tracker::DEFAULT_GLOBAL_BUFFER);
+                    if role == WorkerRole::Follower
+                        && total_bytes > 0
+                        && used_bytes >= (total_bytes as f64 * 0.85) as usize
+                    {
                         metrics.add_log(format!(
-                            "Seen tracker buffers high: total={} ({} over) max_per_shard={}",
-                            tracker_stats.buffered_total,
-                            over,
-                            tracker_stats.max_buffered_per_shard
+                            "Follower exiting: memory pressure (used {} MB / total {} MB)",
+                            used_bytes / 1_048_576,
+                            total_bytes as usize / 1_048_576
                         ));
+                        return Err(FoldError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Follower exiting: memory pressure",
+                        )));
                     }
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let trace_line = format!(
-                        "{} role={} mode=process processed={} queue_len={} results_len={} tracker_len={} shard_cap={} buffered_total={} max_buf={} used_mb={} rss_mb={}",
-                        ts,
-                        role.as_str(),
-                        processed_count,
-                        work_queue.len(),
-                        results.len(),
-                        tracker.len(),
-                        tracker.max_shards_in_memory(),
-                        tracker_stats.buffered_total,
-                        tracker_stats.max_buffered_per_shard,
-                        used_bytes / 1_048_576,
-                        proc_rss_bytes / 1_048_576
-                    );
-                    metrics.add_trace_line(trace_line);
-                    apply_shard_pressure_valve(
-                        &mut tracker,
-                        metrics,
-                        mem_budget_bytes,
-                        used_bytes as usize,
-                        role,
-                    )?;
-                    maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
+                    if role == WorkerRole::Follower
+                        && total_bytes > 0
+                        && used_bytes >= (total_bytes as f64 * 0.85) as usize
+                    {
+                        metrics.add_log(format!(
+                            "Follower exiting: memory pressure (used {} MB / total {} MB)",
+                            used_bytes / 1_048_576,
+                            total_bytes as usize / 1_048_576
+                        ));
+                        return Err(FoldError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Follower exiting: memory pressure",
+                        )));
+                    }
+                    if role == WorkerRole::Follower
+                        && mem_budget_bytes > 0
+                        && used_bytes >= (mem_budget_bytes as f64 * 0.85) as usize
+                    {
+                        metrics.add_log(format!(
+                            "Follower exiting: memory pressure (used {} MB / budget {} MB)",
+                            used_bytes / 1_048_576,
+                            mem_budget_bytes / 1_048_576
+                        ));
+                        return Err(FoldError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Follower exiting: memory pressure",
+                        )));
+                    }
                     write_sample_counter = 0;
                 }
 
@@ -598,14 +563,12 @@ fn process_txt_file(
                 }
             }
             None => {
-                let buffered_before = tracker.buffered_total();
                 if tracker.buffered_total() == 0 {
                     break;
                 }
                 metrics.add_log(format!(
-                    "[process flush] role={} buffered_total={} pending_children={} pending_new={} work_total={} results_total={}",
+                    "[process flush] role={} pending_children={} pending_new={} work_total={} results_total={}",
                     role.as_str(),
-                    buffered_before,
                     pending_children.len(),
                     pending_new_orthos,
                     work_queue.len(),
@@ -615,7 +578,7 @@ fn process_txt_file(
                 if batch_result.new.is_empty() && batch_result.seen.is_empty() {
                     if tracker.buffered_total() == 0 {
                         break;
-                    }
+                }
                 }
                 let mut on_new = |entry: PendingEntry| -> Result<(), FoldError> {
                     let child = entry.ortho;
@@ -634,26 +597,23 @@ fn process_txt_file(
                     Ok(())
                 };
                 handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
-                let tracker_stats = tracker.stats_snapshot();
-                let work_stats = work_queue.stats();
-                let results_stats = results.stats();
-                metrics.add_log(format!(
-                    "[process flush done] role={} buffered_total={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={} max_buf_per_shard={}",
-                    role.as_str(),
-                    tracker_stats.buffered_total,
-                    work_stats.total_len,
-                    results_stats.total_len,
-                    pending_children.len(),
-                    pending_new_orthos,
-                    tracker.len(),
-                    tracker_stats.max_buffered_per_shard
-                ));
+                    let work_stats = work_queue.stats();
+                    let results_stats = results.stats();
+                    metrics.add_log(format!(
+                        "[process flush done] role={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={}",
+                        role.as_str(),
+                        work_stats.total_len,
+                        results_stats.total_len,
+                        pending_children.len(),
+                        pending_new_orthos,
+                        tracker.len()
+                    ));
+                }
             }
         }
-    }
 
-    if pending_new_orthos > 0 {
-        metrics.increment_new_orthos(pending_new_orthos);
+        if pending_new_orthos > 0 {
+            metrics.increment_new_orthos(pending_new_orthos);
     }
     if optimal_dirty {
         let (volume, fullness) = best_score;
@@ -791,7 +751,6 @@ fn merge_archives(
 
     metrics.update_global(|g| {
         g.queue_buffer_size = memory_config.queue_buffer_size;
-        g.bloom_capacity = memory_config.bloom_capacity;
         g.num_shards = memory_config.num_shards;
         g.max_shards_in_memory = memory_config.max_shards_in_memory;
     });
@@ -808,17 +767,12 @@ fn merge_archives(
 
     // Initialize tracker (isolated to merge work folder)
     let seen_shards_path = ingestion.seen_shards_path();
-    let mut tracker = SeenTracker::with_path(
-        &seen_shards_path,
-        memory_config.bloom_capacity,
-        memory_config.num_shards,
-        memory_config.max_shards_in_memory,
-    );
+    let mut tracker = SeenTracker::with_path(&seen_shards_path, memory_config.bloom_capacity);
     let mut sys = sysinfo::System::new();
     let work_queue_stats = work_queue.stats();
     let merged_results_stats = merged_results.stats();
     metrics.add_log(format!(
-        "[{} merge init] work_queue path={} buf_size={} buffered={} disk={} files={} merged_results path={} buf_size={} buffered={} disk={} files={} tracker_len={} bloom_cap={} shards={} max_in_mem={} mem_budget_mb={}",
+        "[{} merge init] work_queue path={} buf_size={} buffered={} disk={} files={} merged_results path={} buf_size={} buffered={} disk={} files={} tracker_len={} mem_budget_mb={}",
         role.as_str(),
         work_queue_stats.base_path,
         work_queue_stats.buffer_size,
@@ -831,9 +785,6 @@ fn merge_archives(
         merged_results_stats.disk_count,
         merged_results_stats.disk_file_count,
         tracker.len(),
-        memory_config.bloom_capacity,
-        memory_config.num_shards,
-        memory_config.max_shards_in_memory,
         mem_budget_bytes / 1_048_576
     ));
 
@@ -896,7 +847,7 @@ fn merge_archives(
                 touch_leader_lock_if_owner(config)?;
                 metrics.update_operation(|op| op.progress_current = total_from_larger);
                 metrics.record_seen_size(tracker.len());
-                maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
+                metrics.set_tracker_metrics(tracker.stats_snapshot());
             }
 
             if is_ortho_impacted_fast(&child, &larger_impacted_set) {
@@ -909,10 +860,9 @@ fn merge_archives(
         };
         handle_batch_result(batch_result, &mut pending_ingest, &mut on_new)?;
         if total_from_larger > 0 && total_from_larger % 10000 == 0 {
-            let tracker_stats = tracker.stats_snapshot();
             let merged_stats = merged_results.stats();
             metrics.add_log(format!(
-                "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={} tracker_buffered={} max_buf_per_shard={}",
+                "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={}",
                 larger_name,
                 role.as_str(),
                 larger_name,
@@ -923,9 +873,7 @@ fn merge_archives(
                 merged_stats.disk_count,
                 merged_stats.disk_file_count,
                 pending_ingest.len(),
-                tracker.len(),
-                tracker_stats.buffered_total,
-                tracker_stats.max_buffered_per_shard
+                tracker.len()
             ));
         }
     }
@@ -970,14 +918,14 @@ fn merge_archives(
                     total_from_smaller += 1;
                 }
 
-                if total_from_smaller % 10000 == 0 {
-                    ingestion.touch_heartbeat()?;
-                    mem_claim.touch()?;
-                    touch_leader_lock_if_owner(config)?;
-                    metrics.update_operation(|op| op.progress_current = total_from_smaller);
-                    metrics.record_seen_size(tracker.len());
-                    maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
-                }
+            if total_from_smaller % 10000 == 0 {
+                ingestion.touch_heartbeat()?;
+                mem_claim.touch()?;
+                touch_leader_lock_if_owner(config)?;
+                metrics.update_operation(|op| op.progress_current = total_from_smaller);
+                metrics.record_seen_size(tracker.len());
+                metrics.set_tracker_metrics(tracker.stats_snapshot());
+            }
 
                 if is_ortho_impacted_fast(&ortho, &smaller_impacted_set) {
                     work_queue.push(child)?;
@@ -988,11 +936,10 @@ fn merge_archives(
                 Ok(())
             };
             handle_batch_result(batch_result, &mut pending_ingest, &mut on_new)?;
-            if total_from_smaller > 0 && total_from_smaller % 10000 == 0 {
-                let tracker_stats = tracker.stats_snapshot();
-                let merged_stats = merged_results.stats();
-                metrics.add_log(format!(
-                "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={} tracker_buffered={} max_buf_per_shard={}",
+        if total_from_smaller > 0 && total_from_smaller % 10000 == 0 {
+            let merged_stats = merged_results.stats();
+            metrics.add_log(format!(
+                "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={}",
                 smaller_name,
                 role.as_str(),
                 smaller_name,
@@ -1003,12 +950,10 @@ fn merge_archives(
                 merged_stats.disk_count,
                 merged_stats.disk_file_count,
                 pending_ingest.len(),
-                tracker.len(),
-                tracker_stats.buffered_total,
-                tracker_stats.max_buffered_per_shard
+                tracker.len()
             ));
-            }
         }
+    }
     }
 
     while tracker.buffered_total() > 0 {
@@ -1089,6 +1034,7 @@ fn merge_archives(
                     let queue_depth = work_queue.len();
                     metrics.record_queue_depth(queue_depth);
                     metrics.record_seen_size(tracker.len());
+                    metrics.set_tracker_metrics(tracker.stats_snapshot());
                     metrics.record_optimal_volume(best_ortho.volume());
                     metrics.update_operation(|op| {
                         op.progress_current = processed_count;
@@ -1134,71 +1080,20 @@ fn merge_archives(
                         g.system_memory_percent = percent;
                         g.distinct_jobs_count = jobs_count;
                     });
-                    let tracker_stats = tracker.stats_snapshot();
-                    let work_stats = work_queue.stats();
-                    let merged_stats = merged_results.stats();
-                    metrics.add_log(format!(
-                        "[merge tick] role={} processed={} work_total={} (buf {} / {} disk {} files {}) merged_results_total={} (buf {} / {} disk {} files {}) pending_children={} pending_new={} tracker_seen={} tracker_buffered={} max_buf_per_shard={} rss_mb={} used_mb={} budget_mb={} write_sample_counter={}",
-                        role.as_str(),
-                        processed_count,
-                        work_stats.total_len,
-                        work_stats.buffer_len,
-                        work_stats.buffer_size,
-                        work_stats.disk_count,
-                        work_stats.disk_file_count,
-                        merged_stats.total_len,
-                        merged_stats.buffer_len,
-                        merged_stats.buffer_size,
-                        merged_stats.disk_count,
-                        merged_stats.disk_file_count,
-                        pending_children.len(),
-                        pending_new_orthos,
-                        tracker.len(),
-                        tracker_stats.buffered_total,
-                        tracker_stats.max_buffered_per_shard,
-                        proc_rss_bytes / 1_048_576,
-                        used_bytes / 1_048_576,
-                        mem_budget_bytes / 1_048_576,
-                        write_sample_counter
-                    ));
-                    if tracker_stats.buffered_total >= seen_tracker::DEFAULT_GLOBAL_BUFFER {
-                        let over = tracker_stats
-                            .buffered_total
-                            .saturating_sub(seen_tracker::DEFAULT_GLOBAL_BUFFER);
+                    if role == WorkerRole::Follower
+                        && mem_budget_bytes > 0
+                        && used_bytes >= (mem_budget_bytes as f64 * 0.85) as usize
+                    {
                         metrics.add_log(format!(
-                            "Seen tracker buffers high: total={} ({} over) max_per_shard={}",
-                            tracker_stats.buffered_total,
-                            over,
-                            tracker_stats.max_buffered_per_shard
+                            "Follower exiting: memory pressure (used {} MB / budget {} MB)",
+                            used_bytes / 1_048_576,
+                            mem_budget_bytes / 1_048_576
                         ));
+                        return Err(FoldError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Follower exiting: memory pressure",
+                        )));
                     }
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let trace_line = format!(
-                        "{} role={} mode=merge processed={} queue_len={} results_len={} tracker_len={} shard_cap={} buffered_total={} max_buf={} used_mb={} rss_mb={}",
-                        ts,
-                        role.as_str(),
-                        processed_count,
-                        work_queue.len(),
-                        merged_results.len(),
-                        tracker.len(),
-                        tracker.max_shards_in_memory(),
-                        tracker_stats.buffered_total,
-                        tracker_stats.max_buffered_per_shard,
-                        used_bytes / 1_048_576,
-                        proc_rss_bytes / 1_048_576
-                    );
-                    metrics.add_trace_line(trace_line);
-                    apply_shard_pressure_valve(
-                        &mut tracker,
-                        metrics,
-                        mem_budget_bytes,
-                        used_bytes as usize,
-                        role,
-                    )?;
-                    maybe_expand_bloom(&mut tracker, metrics, mem_budget_bytes, &mut sys, role)?;
                     write_sample_counter = 0;
                 }
 
@@ -1268,14 +1163,12 @@ fn merge_archives(
                 }
             }
             None => {
-                let buffered_before = tracker.buffered_total();
                 if tracker.buffered_total() == 0 {
                     break;
                 }
                 metrics.add_log(format!(
-                    "[merge flush] role={} buffered_total={} pending_children={} pending_new={} work_total={} results_total={}",
+                    "[merge flush] role={} pending_children={} pending_new={} work_total={} results_total={}",
                     role.as_str(),
-                    buffered_before,
                     pending_children.len(),
                     pending_new_orthos,
                     work_queue.len(),
@@ -1306,19 +1199,16 @@ fn merge_archives(
                     Ok(())
                 };
                 handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
-                let tracker_stats = tracker.stats_snapshot();
                 let work_stats = work_queue.stats();
                 let merged_stats = merged_results.stats();
                 metrics.add_log(format!(
-                    "[merge flush done] role={} buffered_total={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={} max_buf_per_shard={}",
+                    "[merge flush done] role={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={}",
                     role.as_str(),
-                    tracker_stats.buffered_total,
                     work_stats.total_len,
                     merged_stats.total_len,
                     pending_children.len(),
                     pending_new_orthos,
-                    tracker.len(),
-                    tracker_stats.max_buffered_per_shard
+                    tracker.len()
                 ));
             }
         }
@@ -1529,192 +1419,6 @@ fn current_process_rss_bytes(sys: &mut sysinfo::System) -> usize {
         }
     }
     0
-}
-
-fn apply_shard_pressure_valve(
-    tracker: &mut SeenTracker,
-    metrics: &Metrics,
-    mem_budget_bytes: usize,
-    used_memory_bytes: usize,
-    role: WorkerRole,
-) -> Result<(), FoldError> {
-    if mem_budget_bytes == 0 {
-        return Ok(());
-    }
-
-    let (high_water_pct, low_water_pct) = match role {
-        WorkerRole::Leader => (0.90, 0.80),
-        WorkerRole::Follower => (0.80, 0.70),
-    };
-    let high_water = (mem_budget_bytes as f64 * high_water_pct).round() as usize;
-    let low_water = (mem_budget_bytes as f64 * low_water_pct).round() as usize;
-
-    let current_cap = tracker.max_shards_in_memory();
-
-    if used_memory_bytes >= high_water {
-        if current_cap <= 1 {
-            if role == WorkerRole::Follower && used_memory_bytes >= high_water {
-                metrics.add_log(format!(
-                    "Memory pressure ({}): used {} MB (>= {:.0}% of budget {} MB) at min shards; follower exiting",
-                    role.as_str(),
-                    used_memory_bytes / 1_048_576,
-                    high_water_pct * 100.0,
-                    mem_budget_bytes / 1_048_576,
-                ));
-                return Err(FoldError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Follower exiting: memory pressure",
-                )));
-            }
-            return Ok(());
-        }
-
-        let new_cap = current_cap.saturating_sub(1).max(1);
-
-        let evicted = tracker.shrink_shards_in_memory(new_cap);
-        if current_cap != tracker.max_shards_in_memory() || evicted > 0 {
-            metrics.add_log(format!(
-                "Memory pressure ({}): used {} MB (>= {:.0}% of budget {} MB); shard cap {} -> {} (evicted {} shards)",
-                role.as_str(),
-                used_memory_bytes / 1_048_576,
-                high_water_pct * 100.0,
-                mem_budget_bytes / 1_048_576,
-                current_cap,
-                tracker.max_shards_in_memory(),
-                evicted
-            ));
-            metrics.update_global(|g| g.max_shards_in_memory = tracker.max_shards_in_memory());
-        }
-    } else if used_memory_bytes <= low_water {
-        let grow_target = current_cap
-            .saturating_add(1)
-            .min(tracker.max_shards_ceiling());
-        let grown = tracker.grow_shards_in_memory(grow_target);
-        if grown > 0 {
-            metrics.add_log(format!(
-                "Memory recovered ({}): used {} MB (<= {:.0}% of budget {} MB); shard cap {} -> {} (grew {})",
-                role.as_str(),
-                used_memory_bytes / 1_048_576,
-                low_water_pct * 100.0,
-                mem_budget_bytes / 1_048_576,
-                current_cap,
-                tracker.max_shards_in_memory(),
-                grown
-            ));
-            metrics.update_global(|g| g.max_shards_in_memory = tracker.max_shards_in_memory());
-        }
-    }
-    Ok(())
-}
-
-fn maybe_expand_bloom(
-    tracker: &mut SeenTracker,
-    metrics: &Metrics,
-    mem_budget_bytes: usize,
-    sys: &mut sysinfo::System,
-    role: WorkerRole,
-) -> Result<(), FoldError> {
-    if mem_budget_bytes == 0 {
-        return Ok(());
-    }
-
-    let current_fp = tracker.estimated_false_positive_rate();
-    metrics.update_global(|g| g.bloom_fp_rate = current_fp);
-
-    const FP_THRESHOLD: f64 = 0.02; // trigger expansion when above 2%
-    const FP_TARGET: f64 = 0.01; // aim back toward 1%
-
-    if current_fp <= FP_THRESHOLD {
-        return Ok(());
-    }
-
-    let mut target_capacity = tracker.bloom_capacity().saturating_mul(2);
-    let mut projected_fp = tracker.estimated_false_positive_rate_for_capacity(target_capacity);
-    while projected_fp > FP_TARGET {
-        target_capacity = target_capacity.saturating_mul(2);
-        projected_fp = tracker.estimated_false_positive_rate_for_capacity(target_capacity);
-        if target_capacity >= tracker.bloom_capacity().saturating_mul(64) {
-            break;
-        }
-    }
-
-    // Estimate memory for the rebuild (conservative: old bloom + new bloom while rebuilding).
-    const BLOOM_BYTES_PER_ITEM_EST: usize = 2;
-    let new_bloom_bytes = target_capacity.saturating_mul(BLOOM_BYTES_PER_ITEM_EST);
-
-    sys.refresh_memory();
-    let (mut used_bytes, _) = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-    let shrink_threshold_bytes = (mem_budget_bytes as f64 * 0.90).round() as usize;
-
-    // If we can't fit the rebuild, shrink shards by one until we can or we hit minimum.
-    while used_bytes.saturating_add(new_bloom_bytes) >= shrink_threshold_bytes
-        && tracker.max_shards_in_memory() > 1
-    {
-        let current_cap = tracker.max_shards_in_memory();
-        let new_cap = current_cap.saturating_sub(1).max(1);
-        let evicted = tracker.shrink_shards_in_memory(new_cap);
-        if evicted > 0 || current_cap != tracker.max_shards_in_memory() {
-            metrics.add_log(format!(
-                "Bloom headroom: shrinking shards {} -> {} (evicted {}) to make room",
-                current_cap,
-                tracker.max_shards_in_memory(),
-                evicted
-            ));
-            metrics.update_global(|g| g.max_shards_in_memory = tracker.max_shards_in_memory());
-        } else {
-            break;
-        }
-        sys.refresh_memory();
-        used_bytes = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory()).0;
-    }
-
-    // After shrinking, check if we have enough headroom.
-    if used_bytes.saturating_add(new_bloom_bytes) >= shrink_threshold_bytes {
-        match role {
-            WorkerRole::Follower => {
-                metrics.add_log(format!(
-                    "Bloom rebuild aborted: not enough headroom even after shard shrink (used {} MB, need {} MB, budget {:.0}%); follower exiting",
-                    used_bytes / 1_048_576,
-                    new_bloom_bytes / 1_048_576,
-                    (shrink_threshold_bytes as f64 / mem_budget_bytes as f64) * 100.0
-                ));
-                return Err(FoldError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Follower exiting: insufficient headroom for bloom rebuild",
-                )));
-            }
-            WorkerRole::Leader => {
-                metrics.add_log(format!(
-                    "Bloom rebuild deferred: not enough headroom even after shard shrink (used {} MB, need {} MB, budget {:.0}%)",
-                    used_bytes / 1_048_576,
-                    new_bloom_bytes / 1_048_576,
-                    (shrink_threshold_bytes as f64 / mem_budget_bytes as f64) * 100.0
-                ));
-                return Ok(());
-            }
-        }
-    }
-
-    metrics.add_log(format!(
-        "Bloom FP degraded to {:.2}% (cap {}, seen {}); rebuilding bloom to {} (projected {:.2}%)",
-        current_fp * 100.0,
-        tracker.bloom_capacity(),
-        tracker.len(),
-        target_capacity,
-        projected_fp * 100.0
-    ));
-
-    let new_fp = tracker.rebuild_bloom(target_capacity)?;
-    metrics.update_global(|g| {
-        g.bloom_capacity = target_capacity;
-        g.bloom_fp_rate = new_fp;
-    });
-
-    sys.refresh_memory();
-    let used_bytes = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory()).0;
-    apply_shard_pressure_valve(tracker, metrics, mem_budget_bytes, used_bytes, role)?;
-
-    Ok(())
 }
 
 fn determine_role(config: &StateConfig) -> Result<WorkerRole, FoldError> {

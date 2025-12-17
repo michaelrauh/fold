@@ -172,16 +172,25 @@ impl Tui {
             snapshot.global.distinct_jobs_count,
             format_number(snapshot.operation.new_orthos)
         );
-        let fp_rate_display = format_percent(snapshot.global.bloom_fp_rate);
+        let top_tiers = if snapshot.tracker.top_tiers.is_empty() {
+            "n/a".to_string()
+        } else {
+            snapshot
+                .tracker
+                .top_tiers
+                .iter()
+                .map(|t| format_number(*t))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
         let line4 = format!(
-            "QBuf: {} │ Bloom: {} (~{}) │ Shards: {}/{} in mem",
-            format_number(snapshot.global.queue_buffer_size),
-            format_number(snapshot.global.bloom_capacity),
-            fp_rate_display,
-            format_number(snapshot.global.max_shards_in_memory),
-            format_number(snapshot.global.num_shards)
+            "Seen tiers: {} (top {}) │ Merges: {} │ Avg probe: {:.2} │ Est size: {}",
+            snapshot.tracker.tier_count,
+            top_tiers,
+            snapshot.tracker.merge_count,
+            snapshot.tracker.avg_probe_depth,
+            format_bytes(snapshot.tracker.bytes_est)
         );
-
         let header_lines = vec![
             Line::from(truncate_string(&line1, max_width)),
             Line::from(truncate_string(&line2, max_width)),
@@ -1021,6 +1030,7 @@ fn format_number(n: usize) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn format_percent(p: f64) -> String {
     if p.is_finite() {
         format!("{:.2}%", p * 100.0)
