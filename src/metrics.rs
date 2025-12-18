@@ -246,8 +246,7 @@ struct MetricsInner {
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
     tracker: TrackerMetrics,
-    tracker_last_len: usize,
-    tracker_last_timestamp: u64,
+    tracker_len_samples: VecDeque<MetricSample>,
 
     queue_depth_samples: VecDeque<MetricSample>,
     seen_size_samples: VecDeque<MetricSample>,
@@ -270,8 +269,7 @@ impl Metrics {
                 largest_archive: LargestArchive::default(),
                 optimal_ortho: OptimalOrtho::default(),
                 tracker: TrackerMetrics::default(),
-                tracker_last_len: 0,
-                tracker_last_timestamp: Self::current_timestamp(),
+                tracker_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 queue_depth_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -393,17 +391,30 @@ impl Metrics {
     pub fn set_tracker_metrics(&self, stats: TrackerStats) {
         let mut inner = self.inner.lock().unwrap();
         let now = Self::current_timestamp();
-        let prev_len = inner.tracker_last_len;
-        let prev_ts = inner.tracker_last_timestamp;
-        inner.tracker_last_len = stats.total_len;
-        inner.tracker_last_timestamp = now;
+        inner.tracker_len_samples.push_back(MetricSample {
+            timestamp: now,
+            value: stats.total_len,
+        });
+        while let Some(front) = inner.tracker_len_samples.front() {
+            if now.saturating_sub(front.timestamp) > 60 {
+                inner.tracker_len_samples.pop_front();
+            } else {
+                break;
+            }
+        }
 
         let mut tracker_metrics = TrackerMetrics::from(stats);
-        if now > prev_ts {
-            let delta_len = tracker_metrics.total_len.saturating_sub(prev_len);
-            let delta_time = now.saturating_sub(prev_ts).max(1);
-            tracker_metrics.add_rate_per_sec = delta_len as f64 / delta_time as f64;
+        if let (Some(first), Some(last)) = (
+            inner.tracker_len_samples.front(),
+            inner.tracker_len_samples.back(),
+        ) {
+            let dt = last.timestamp.saturating_sub(first.timestamp);
+            if dt > 0 && last.value >= first.value {
+                tracker_metrics.add_rate_per_sec =
+                    (last.value - first.value) as f64 / dt as f64;
+            }
         }
+
         inner.tracker = tracker_metrics;
     }
 

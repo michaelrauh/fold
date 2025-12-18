@@ -700,40 +700,59 @@ impl Tui {
             0.0
         };
 
-        let tiers_label = if tracker.tiers.is_empty() {
-            "none".to_string()
-        } else {
-            let formatted: Vec<String> = tracker
-                .tiers
-                .iter()
-                .map(|t| format_number(*t))
-                .collect();
-            formatted.join(", ")
-        };
-
-        let lines = vec![
-            Line::from(format!(
-                "Hit: {:.1}% │ Avg probe: {:.2} │ Add rate: {}/s",
-                hit_percent, tracker.avg_probe_depth, add_rate
-            )),
-            Line::from(format!(
-                "Merges: {} │ Est size: {} │ Front: {}",
-                format_number(tracker.merge_count as usize),
-                format_bytes(tracker.bytes_est),
-                format_number(tracker.front_len)
-            )),
-            Line::from(format!(
-                "Tiers: {} │ Levels: {}",
-                tracker.tier_count,
-                truncate_string(&tiers_label, area.width.saturating_sub(6) as usize)
-            )),
-        ];
-
         let block = Block::default().borders(Borders::ALL).title("Seen Tracker");
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let paragraph = Paragraph::new(lines);
-        f.render_widget(paragraph, inner);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(1)])
+            .split(inner);
+
+        let lines_top = vec![Line::from(format!(
+            "Hit: {:.1}% │ Avg probe: {:.2} │ Add rate (1m): {}/s",
+            hit_percent, tracker.avg_probe_depth, add_rate
+        ))];
+        let lines_mid = vec![Line::from(format!(
+            "Merges: {} │ Est size: {} │ Front: {} │ Tiers: {}",
+            format_number(tracker.merge_count as usize),
+            format_bytes(tracker.bytes_est),
+            format_number(tracker.front_len),
+            tracker.tier_count
+        ))];
+
+        f.render_widget(Paragraph::new(lines_top), chunks[0]);
+        f.render_widget(Paragraph::new(lines_mid), chunks[1]);
+
+        let data: Vec<u64> = if tracker.tiers.is_empty() {
+            vec![0]
+        } else {
+            let max_width = chunks[2].width.saturating_sub(2) as usize;
+            let start = tracker
+                .tiers
+                .len()
+                .saturating_sub(max_width.max(1));
+            tracker.tiers[start..]
+                .iter()
+                .map(|v| *v as u64)
+                .collect()
+        };
+        let title = format!(
+            "Tier sizes (old→new) max:{}",
+            format_number(tracker.tiers.iter().cloned().max().unwrap_or(0))
+        );
+        let sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(truncate_string(
+                        &title,
+                        chunks[2].width.saturating_sub(2) as usize,
+                    )),
+            )
+            .data(&data)
+            .style(Style::default().fg(Color::LightGreen));
+        f.render_widget(sparkline, chunks[2]);
     }
 
     #[allow(dead_code)]
