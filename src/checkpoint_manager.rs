@@ -235,7 +235,7 @@ mod tests {
         let result = manager.load(&memory_config).unwrap();
         assert!(result.is_some());
 
-        let (loaded_interner, mut loaded_results, loaded_tracker) = result.unwrap();
+        let (loaded_interner, mut loaded_results, mut loaded_tracker) = result.unwrap();
 
         assert_eq!(loaded_interner.version(), interner.version());
         // Verify results by popping (len() is not reliable for reloaded queues)
@@ -298,7 +298,7 @@ mod tests {
         let loaded = result.unwrap();
         assert!(loaded.is_some(), "Checkpoint should exist");
 
-        let (_int, _res, loaded_tracker) = loaded.unwrap();
+        let (_int, _res, mut loaded_tracker) = loaded.unwrap();
 
         // All three should be in the tracker (reconstructed from all results)
         assert_eq!(

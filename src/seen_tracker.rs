@@ -7,10 +7,15 @@ pub const DEFAULT_GLOBAL_BUFFER: usize = 16_384;
 pub struct TrackerStats {
     pub tier_count: usize,
     pub top_tiers: Vec<usize>,
+    pub tiers: Vec<usize>,
+    pub front_len: usize,
+    pub total_len: usize,
     pub merge_count: u64,
     pub merge_keys_total: u64,
     pub avg_probe_depth: f64,
     pub bytes_est: usize,
+    pub hit_count: u64,
+    pub lookup_count: u64,
 }
 
 #[derive(Default, Debug)]
@@ -39,7 +44,7 @@ impl SeenTracker {
         }
     }
 
-    pub fn contains(&self, id: &usize) -> bool {
+    pub fn contains(&mut self, id: &usize) -> bool {
         self.inner.contains(id)
     }
 

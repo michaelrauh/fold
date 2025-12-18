@@ -15,6 +15,8 @@ pub struct HashSetDoublingTracker {
     probe_steps_sum: u64,
     probe_samples: u64,
     op_counter: u64,
+    hit_count: u64,
+    lookup_count: u64,
 }
 
 impl HashSetDoublingTracker {
@@ -29,22 +31,17 @@ impl HashSetDoublingTracker {
             probe_steps_sum: 0,
             probe_samples: 0,
             op_counter: 0,
+            hit_count: 0,
+            lookup_count: 0,
         }
     }
 
-    pub fn contains(&self, id: &usize) -> bool {
-        self.contains_with_steps(id, false).0
+    pub fn contains(&mut self, id: &usize) -> bool {
+        self.contains_internal(id, false).0
     }
 
     pub fn contains_sampled(&mut self, id: &usize) -> bool {
-        self.op_counter = self.op_counter.wrapping_add(1);
-        let sample = self.op_counter & 0x3FF == 0; // sample roughly every 1024 lookups
-        let (present, steps) = self.contains_with_steps(id, sample);
-        if sample {
-            self.probe_samples = self.probe_samples.saturating_add(1);
-            self.probe_steps_sum = self.probe_steps_sum.saturating_add(steps);
-        }
-        present
+        self.contains_internal(id, true).0
     }
 
     pub fn insert(&mut self, id: usize) {
@@ -112,6 +109,7 @@ impl HashSetDoublingTracker {
         for len in self.levels.iter().rev().take(3) {
             top_tiers.push(len.len());
         }
+        let tiers = self.levels.iter().map(|l| l.len()).collect::<Vec<_>>();
         let avg_probe_depth = if self.probe_samples > 0 {
             self.probe_steps_sum as f64 / self.probe_samples as f64
         } else {
@@ -121,10 +119,15 @@ impl HashSetDoublingTracker {
         TrackerStats {
             tier_count,
             top_tiers,
+            tiers,
+            front_len: self.front.len(),
+            total_len: self.len(),
             merge_count: self.merge_count,
             merge_keys_total: self.merge_keys_total,
             avg_probe_depth,
             bytes_est,
+            hit_count: self.hit_count,
+            lookup_count: self.lookup_count,
         }
     }
 
@@ -138,6 +141,21 @@ impl HashSetDoublingTracker {
 
     fn capacity_for_level(&self, level: usize) -> usize {
         self.base_capacity << level
+    }
+
+    fn contains_internal(&mut self, id: &usize, allow_sample: bool) -> (bool, u64) {
+        self.lookup_count = self.lookup_count.saturating_add(1);
+        self.op_counter = self.op_counter.wrapping_add(1);
+        let sample = allow_sample && (self.op_counter & 0x3FF == 0); // ~every 1024 lookups
+        let (present, steps) = self.contains_with_steps(id, sample);
+        if present {
+            self.hit_count = self.hit_count.saturating_add(1);
+        }
+        if sample {
+            self.probe_samples = self.probe_samples.saturating_add(1);
+            self.probe_steps_sum = self.probe_steps_sum.saturating_add(steps);
+        }
+        (present, steps)
     }
 
     fn contains_with_steps(&self, id: &usize, sample: bool) -> (bool, u64) {

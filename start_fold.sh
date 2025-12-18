@@ -12,6 +12,10 @@ STATE_DIR="$SCRIPT_DIR/fold_state"
 APP_BIN="$SCRIPT_DIR/target/release/fold"
 CARGO_ENV="$HOME/.cargo/env"
 
+# Default to debuginfo + frame pointers for better perf attribution; allow override via env.
+RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2}"
+export RUSTFLAGS
+
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required to run this script" >&2
   exit 1
@@ -33,7 +37,7 @@ if [ ! -f "$SCRIPT_DIR/e.txt" ]; then
 fi
 
 echo "Building release binary with DWARF + frame pointers for perf..."
-RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=2" cargo build --release
+cargo build --release
 if [ ! -x "$APP_BIN" ]; then
   echo "Binary $APP_BIN not found after build" >&2
   exit 1

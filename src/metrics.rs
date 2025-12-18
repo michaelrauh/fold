@@ -82,10 +82,15 @@ impl Default for GlobalMetrics {
 pub struct TrackerMetrics {
     pub tier_count: usize,
     pub top_tiers: Vec<usize>,
+    pub tiers: Vec<usize>,
+    pub front_len: usize,
+    pub total_len: usize,
     pub merge_count: u64,
     pub merge_keys_total: u64,
     pub avg_probe_depth: f64,
     pub bytes_est: usize,
+    pub hit_rate: f64,
+    pub add_rate_per_sec: f64,
 }
 
 impl From<TrackerStats> for TrackerMetrics {
@@ -93,10 +98,19 @@ impl From<TrackerStats> for TrackerMetrics {
         Self {
             tier_count: stats.tier_count,
             top_tiers: stats.top_tiers,
+            tiers: stats.tiers,
+            front_len: stats.front_len,
+            total_len: stats.total_len,
             merge_count: stats.merge_count,
             merge_keys_total: stats.merge_keys_total,
             avg_probe_depth: stats.avg_probe_depth,
             bytes_est: stats.bytes_est,
+            hit_rate: if stats.lookup_count > 0 {
+                stats.hit_count as f64 / stats.lookup_count as f64
+            } else {
+                0.0
+            },
+            add_rate_per_sec: 0.0,
         }
     }
 }
@@ -232,6 +246,8 @@ struct MetricsInner {
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
     tracker: TrackerMetrics,
+    tracker_last_len: usize,
+    tracker_last_timestamp: u64,
 
     queue_depth_samples: VecDeque<MetricSample>,
     seen_size_samples: VecDeque<MetricSample>,
@@ -254,6 +270,8 @@ impl Metrics {
                 largest_archive: LargestArchive::default(),
                 optimal_ortho: OptimalOrtho::default(),
                 tracker: TrackerMetrics::default(),
+                tracker_last_len: 0,
+                tracker_last_timestamp: Self::current_timestamp(),
                 queue_depth_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -374,7 +392,19 @@ impl Metrics {
 
     pub fn set_tracker_metrics(&self, stats: TrackerStats) {
         let mut inner = self.inner.lock().unwrap();
-        inner.tracker = TrackerMetrics::from(stats);
+        let now = Self::current_timestamp();
+        let prev_len = inner.tracker_last_len;
+        let prev_ts = inner.tracker_last_timestamp;
+        inner.tracker_last_len = stats.total_len;
+        inner.tracker_last_timestamp = now;
+
+        let mut tracker_metrics = TrackerMetrics::from(stats);
+        if now > prev_ts {
+            let delta_len = tracker_metrics.total_len.saturating_sub(prev_len);
+            let delta_time = now.saturating_sub(prev_ts).max(1);
+            tracker_metrics.add_rate_per_sec = delta_len as f64 / delta_time as f64;
+        }
+        inner.tracker = tracker_metrics;
     }
 
     pub fn increment_new_orthos(&self, count: usize) {

@@ -574,14 +574,14 @@ impl Tui {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Length(6),
-                Constraint::Length(8),
+                Constraint::Length(10),
                 Constraint::Min(10),
             ])
             .split(area);
 
         self.render_queue_depth_chart(f, right_chunks[0], snapshot);
         self.render_seen_size_chart(f, right_chunks[1], snapshot);
-        self.render_status_duration_chart(f, right_chunks[2], snapshot);
+        self.render_tracker_panel(f, right_chunks[2], snapshot);
         self.render_optimal_ortho_display(f, right_chunks[3], snapshot);
     }
 
@@ -691,6 +691,52 @@ impl Tui {
         f.render_widget(sparkline, area);
     }
 
+    fn render_tracker_panel(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let tracker = &snapshot.tracker;
+        let add_rate = format_rate(tracker.add_rate_per_sec);
+        let hit_percent = if tracker.hit_rate.is_finite() {
+            tracker.hit_rate * 100.0
+        } else {
+            0.0
+        };
+
+        let tiers_label = if tracker.tiers.is_empty() {
+            "none".to_string()
+        } else {
+            let formatted: Vec<String> = tracker
+                .tiers
+                .iter()
+                .map(|t| format_number(*t))
+                .collect();
+            formatted.join(", ")
+        };
+
+        let lines = vec![
+            Line::from(format!(
+                "Hit: {:.1}% │ Avg probe: {:.2} │ Add rate: {}/s",
+                hit_percent, tracker.avg_probe_depth, add_rate
+            )),
+            Line::from(format!(
+                "Merges: {} │ Est size: {} │ Front: {}",
+                format_number(tracker.merge_count as usize),
+                format_bytes(tracker.bytes_est),
+                format_number(tracker.front_len)
+            )),
+            Line::from(format!(
+                "Tiers: {} │ Levels: {}",
+                tracker.tier_count,
+                truncate_string(&tiers_label, area.width.saturating_sub(6) as usize)
+            )),
+        ];
+
+        let block = Block::default().borders(Borders::ALL).title("Seen Tracker");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
+
+    #[allow(dead_code)]
     fn render_status_duration_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let stats = &snapshot.status_duration_stats;
 
@@ -1056,6 +1102,16 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.2} KB", b / KB)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_rate(per_sec: f64) -> String {
+    if per_sec >= 1_000_000.0 {
+        format!("{:.2}M", per_sec / 1_000_000.0)
+    } else if per_sec >= 1_000.0 {
+        format!("{:.2}k", per_sec / 1_000.0)
+    } else {
+        format!("{:.2}", per_sec)
     }
 }
 
