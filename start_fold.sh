@@ -59,5 +59,7 @@ APP_CMD="$ENV_INIT; \"$APP_BIN\""
 echo "Starting tmux session $TMUX_SESSION with two fold instances..."
 TMUX= tmux -S "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -n "fold-1" "$APP_CMD"
 TMUX= tmux -S "$TMUX_SOCKET" new-window -d -t "$TMUX_SESSION:1" -n "fold-2" "$APP_CMD"
+# Keep panes visible after the app exits so you can inspect the final TUI/error.
+TMUX= tmux -S "$TMUX_SOCKET" set-window-option -g remain-on-exit on
 
 echo "Attach with: tmux -S $TMUX_SOCKET attach -t $TMUX_SESSION"
