@@ -1,17 +1,17 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use fold::seen_tracker::SeenTracker;
 use fold::seen_tracker_cached_runs::CachedRunSeenTracker;
 use fold::seen_tracker_doubling_vec::DoublingVecTracker;
 use fold::seen_tracker_doubling_vec_bloom::DoublingVecBloomTracker;
-use fold::seen_tracker_hashset_doubling::HashSetDoublingTracker;
 use fold::seen_tracker_dual_vec::DualVecSeenTracker;
 use fold::seen_tracker_eytzinger_bloom::{
     EytzingerBloomTracker, EytzingerNoBloomTracker, SortedVecBloomTracker,
 };
+use fold::seen_tracker_hashset_doubling::HashSetDoublingTracker;
 use fold::seen_tracker_hashset_vec::HashSetVecTracker;
 use fold::seen_tracker_hashset_vec_bloom::HashSetVecBloomTracker;
-use fold::seen_tracker_merge_dedup::MergeDedupTracker;
 use fold::seen_tracker_linear_probe::LinearProbeDiskResizeTracker;
+use fold::seen_tracker_merge_dedup::MergeDedupTracker;
 use fold::seen_tracker_segments::SegmentedRamSeenTracker;
 use fold::seen_tracker_sharded::ShardedSeenTracker;
 use std::time::{Duration, Instant};
@@ -380,8 +380,7 @@ fn bench_cached_runs_amortized_insert_flush_high(c: &mut Criterion) {
                 let temp_dir = TempDir::new().unwrap();
                 let path = temp_dir.path().join("cached_runs_high");
                 let path_str = path.to_str().unwrap();
-                let mut tracker =
-                    CachedRunSeenTracker::with_path(path_str, 2_000_000, 100_000, 60);
+                let mut tracker = CachedRunSeenTracker::with_path(path_str, 2_000_000, 100_000, 60);
 
                 let mut next_id = 0usize;
                 let mut buf = Vec::with_capacity(CHUNK);
@@ -424,8 +423,12 @@ fn bench_cached_runs_amortized_insert_flush_med(c: &mut Criterion) {
                 let temp_dir = TempDir::new().unwrap();
                 let path = temp_dir.path().join("cached_runs_med");
                 let path_str = path.to_str().unwrap();
-                let mut tracker =
-                    CachedRunSeenTracker::with_path(path_str, 2_000_000, BUFFER_LIMIT, MAX_CACHED_RUNS);
+                let mut tracker = CachedRunSeenTracker::with_path(
+                    path_str,
+                    2_000_000,
+                    BUFFER_LIMIT,
+                    MAX_CACHED_RUNS,
+                );
 
                 let mut next_id = 0usize;
                 let mut buf = Vec::with_capacity(CHUNK);
@@ -795,11 +798,7 @@ fn bench_hashset_doubling_head_to_head_10m_base_8k(c: &mut Criterion) {
 }
 
 fn bench_hashset_doubling_head_to_head_10m_base_16k(c: &mut Criterion) {
-    run_hashset_doubling_head_to_head(
-        c,
-        16_384,
-        "hashset_doubling_head_to_head_10m_base16k",
-    );
+    run_hashset_doubling_head_to_head(c, 16_384, "hashset_doubling_head_to_head_10m_base16k");
 }
 
 fn run_hashset_doubling_head_to_head(c: &mut Criterion, base: usize, name: &'static str) {

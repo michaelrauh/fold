@@ -578,7 +578,7 @@ fn process_txt_file(
                 if batch_result.new.is_empty() && batch_result.seen.is_empty() {
                     if tracker.buffered_total() == 0 {
                         break;
-                }
+                    }
                 }
                 let mut on_new = |entry: PendingEntry| -> Result<(), FoldError> {
                     let child = entry.ortho;
@@ -597,9 +597,9 @@ fn process_txt_file(
                     Ok(())
                 };
                 handle_batch_result(batch_result, &mut pending_children, &mut on_new)?;
-                    let work_stats = work_queue.stats();
-                    let results_stats = results.stats();
-                    metrics.add_log(format!(
+                let work_stats = work_queue.stats();
+                let results_stats = results.stats();
+                metrics.add_log(format!(
                         "[process flush done] role={} work_total={} results_total={} pending_children={} pending_new={} tracker_seen={}",
                         role.as_str(),
                         work_stats.total_len,
@@ -608,12 +608,12 @@ fn process_txt_file(
                         pending_new_orthos,
                         tracker.len()
                     ));
-                }
             }
         }
+    }
 
-        if pending_new_orthos > 0 {
-            metrics.increment_new_orthos(pending_new_orthos);
+    if pending_new_orthos > 0 {
+        metrics.increment_new_orthos(pending_new_orthos);
     }
     if optimal_dirty {
         let (volume, fullness) = best_score;
@@ -918,14 +918,14 @@ fn merge_archives(
                     total_from_smaller += 1;
                 }
 
-            if total_from_smaller % 10000 == 0 {
-                ingestion.touch_heartbeat()?;
-                mem_claim.touch()?;
-                touch_leader_lock_if_owner(config)?;
-                metrics.update_operation(|op| op.progress_current = total_from_smaller);
-                metrics.record_seen_size(tracker.len());
-                metrics.set_tracker_metrics(tracker.stats_snapshot());
-            }
+                if total_from_smaller % 10000 == 0 {
+                    ingestion.touch_heartbeat()?;
+                    mem_claim.touch()?;
+                    touch_leader_lock_if_owner(config)?;
+                    metrics.update_operation(|op| op.progress_current = total_from_smaller);
+                    metrics.record_seen_size(tracker.len());
+                    metrics.set_tracker_metrics(tracker.stats_snapshot());
+                }
 
                 if is_ortho_impacted_fast(&ortho, &smaller_impacted_set) {
                     work_queue.push(child)?;
@@ -936,9 +936,9 @@ fn merge_archives(
                 Ok(())
             };
             handle_batch_result(batch_result, &mut pending_ingest, &mut on_new)?;
-        if total_from_smaller > 0 && total_from_smaller % 10000 == 0 {
-            let merged_stats = merged_results.stats();
-            metrics.add_log(format!(
+            if total_from_smaller > 0 && total_from_smaller % 10000 == 0 {
+                let merged_stats = merged_results.stats();
+                metrics.add_log(format!(
                 "[merge ingest {}] role={} total_from_{}={} merged_results_total={} (buf {} / {} disk {} files {}) pending_ingest={} tracker_seen={}",
                 smaller_name,
                 role.as_str(),
@@ -952,8 +952,8 @@ fn merge_archives(
                 pending_ingest.len(),
                 tracker.len()
             ));
+            }
         }
-    }
     }
 
     while tracker.buffered_total() > 0 {

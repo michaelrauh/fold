@@ -1,5 +1,6 @@
 use crate::FoldError;
 use crate::seen_tracker_hashset_doubling::HashSetDoublingTracker;
+use std::path::Path;
 
 pub const DEFAULT_GLOBAL_BUFFER: usize = 16_384;
 
@@ -38,9 +39,10 @@ impl SeenTracker {
         Self::with_path("./fold_state/seen_shards", DEFAULT_GLOBAL_BUFFER)
     }
 
-    pub fn with_path(_path: &str, _bloom_capacity: usize) -> Self {
+    pub fn with_path(path: &str, _bloom_capacity: usize) -> Self {
+        let merge_dir = Path::new(path).join("merge_runs");
         Self {
-            inner: HashSetDoublingTracker::new(DEFAULT_GLOBAL_BUFFER),
+            inner: HashSetDoublingTracker::with_merge_dir_default(DEFAULT_GLOBAL_BUFFER, merge_dir),
         }
     }
 

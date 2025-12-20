@@ -1,4 +1,4 @@
-use crate::{seen_tracker::BatchResult, FoldError};
+use crate::{FoldError, seen_tracker::BatchResult};
 use bloomfilter::Bloom;
 
 /// Deferred-dedup tracker: accumulates buffers and deduplicates only on merge/flush.
@@ -38,8 +38,10 @@ impl MergeDedupTracker {
         }
         self.buffer.sort_unstable();
         self.buffer.dedup();
-        self.committed =
-            merge_sorted(std::mem::take(&mut self.buffer), std::mem::take(&mut self.committed));
+        self.committed = merge_sorted(
+            std::mem::take(&mut self.buffer),
+            std::mem::take(&mut self.committed),
+        );
         for id in &self.committed {
             self.bloom.set(id);
         }

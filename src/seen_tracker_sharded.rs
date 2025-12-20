@@ -1,7 +1,7 @@
 use crate::FoldError;
 use bloomfilter::Bloom;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -24,9 +24,10 @@ impl Shard {
 
     fn load_from_disk(path: &Path) -> Result<Self, FoldError> {
         let data = fs::read(path).map_err(FoldError::Io)?;
-        let seen: HashMap<usize, ()> = bincode::decode_from_slice(&data, bincode::config::standard())
-            .map_err(|e| FoldError::Deserialization(Box::new(e)))?
-            .0;
+        let seen: HashMap<usize, ()> =
+            bincode::decode_from_slice(&data, bincode::config::standard())
+                .map_err(|e| FoldError::Deserialization(Box::new(e)))?
+                .0;
 
         let file_name = path
             .file_name()
@@ -54,10 +55,8 @@ impl Shard {
         fs::create_dir_all(dir).map_err(FoldError::Io)?;
 
         let path = dir.join(format!("shard_{:08}.bin", self.id));
-        let data =
-            bincode::encode_to_vec(&self.seen, bincode::config::standard()).map_err(|e| {
-                FoldError::Serialization(Box::new(e))
-            })?;
+        let data = bincode::encode_to_vec(&self.seen, bincode::config::standard())
+            .map_err(|e| FoldError::Serialization(Box::new(e)))?;
 
         fs::write(path, data).map_err(FoldError::Io)?;
         self.dirty = false;
@@ -95,7 +94,12 @@ impl ShardedSeenTracker {
         num_shards: usize,
         max_shards_in_memory: usize,
     ) -> Self {
-        Self::with_path("./fold_state/seen_shards", bloom_capacity, num_shards, max_shards_in_memory)
+        Self::with_path(
+            "./fold_state/seen_shards",
+            bloom_capacity,
+            num_shards,
+            max_shards_in_memory,
+        )
     }
 
     /// Create with explicit path (used by benches/tests to isolate state).

@@ -18,7 +18,11 @@ pub struct DualVecSeenTracker {
 
 impl DualVecSeenTracker {
     pub fn new(expected_items: usize, flush_limit: usize) -> Self {
-        Self::with_path("./fold_state/seen_dual_vec.bin", expected_items, flush_limit)
+        Self::with_path(
+            "./fold_state/seen_dual_vec.bin",
+            expected_items,
+            flush_limit,
+        )
     }
 
     pub fn with_path(path: &str, bloom_capacity: usize, flush_limit: usize) -> Self {

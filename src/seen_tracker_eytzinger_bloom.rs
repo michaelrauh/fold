@@ -328,13 +328,20 @@ fn build_tier(mut sorted: Vec<usize>, fp_rate: f64) -> EytzingerTier {
     }
     let eytz = to_eytzinger(&sorted);
     sorted.shrink_to_fit();
-    EytzingerTier { bloom, sorted, eytzinger: eytz }
+    EytzingerTier {
+        bloom,
+        sorted,
+        eytzinger: eytz,
+    }
 }
 
 fn build_tier_no_bloom(mut sorted: Vec<usize>) -> EytzingerTierNoBloom {
     let eytz = to_eytzinger(&sorted);
     sorted.shrink_to_fit();
-    EytzingerTierNoBloom { sorted, eytzinger: eytz }
+    EytzingerTierNoBloom {
+        sorted,
+        eytzinger: eytz,
+    }
 }
 
 fn build_tier_sorted_bloom(mut sorted: Vec<usize>, fp_rate: f64) -> SortedVecBloomTier {

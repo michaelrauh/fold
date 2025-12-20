@@ -706,7 +706,11 @@ impl Tui {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Min(1),
+            ])
             .split(inner);
 
         let lines_top = vec![Line::from(format!(
@@ -728,14 +732,8 @@ impl Tui {
             vec![0]
         } else {
             let max_width = chunks[2].width.saturating_sub(2) as usize;
-            let start = tracker
-                .tiers
-                .len()
-                .saturating_sub(max_width.max(1));
-            tracker.tiers[start..]
-                .iter()
-                .map(|v| *v as u64)
-                .collect()
+            let start = tracker.tiers.len().saturating_sub(max_width.max(1));
+            tracker.tiers[start..].iter().map(|v| *v as u64).collect()
         };
         let title = format!(
             "Tier sizes (old→new) max:{}",

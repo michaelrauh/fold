@@ -282,8 +282,7 @@ mod tests {
 
     #[test]
     fn cached_runs_basic() {
-        let mut tracker =
-            CachedRunSeenTracker::with_path("./fold_state/cached_runs", 1000, 16, 2);
+        let mut tracker = CachedRunSeenTracker::with_path("./fold_state/cached_runs", 1000, 16, 2);
         tracker.insert(1);
         tracker.insert(2);
         assert!(tracker.contains(&1));

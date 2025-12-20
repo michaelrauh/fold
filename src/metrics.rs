@@ -410,8 +410,7 @@ impl Metrics {
         ) {
             let dt = last.timestamp.saturating_sub(first.timestamp);
             if dt > 0 && last.value >= first.value {
-                tracker_metrics.add_rate_per_sec =
-                    (last.value - first.value) as f64 / dt as f64;
+                tracker_metrics.add_rate_per_sec = (last.value - first.value) as f64 / dt as f64;
             }
         }
 
