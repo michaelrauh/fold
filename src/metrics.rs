@@ -217,6 +217,7 @@ struct MetricsInner {
     // Generational store metrics
     work_len_samples: VecDeque<MetricSample>,
     seen_len_accepted_samples: VecDeque<MetricSample>,
+    bucket_metrics: Vec<BucketMetrics>,
 
     status_history: VecDeque<StatusHistoryEntry>,
     status_duration_stats: StatusDurationStats,
@@ -237,6 +238,7 @@ impl Metrics {
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 work_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_len_accepted_samples: VecDeque::with_capacity(MAX_SAMPLES),
+                bucket_metrics: Vec::new(),
                 status_history: VecDeque::with_capacity(100),
                 status_duration_stats: StatusDurationStats::default(),
                 logs: VecDeque::with_capacity(100),
@@ -463,6 +465,11 @@ impl Metrics {
         });
     }
 
+    pub fn update_bucket_metrics(&self, bucket_stats: Vec<BucketMetrics>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.bucket_metrics = bucket_stats;
+    }
+
     pub fn add_log(&self, message: String) {
         let mut inner = self.inner.lock().unwrap();
         let clean_message = strip_ansi_codes(&message);
@@ -492,8 +499,17 @@ impl Metrics {
             status_history: inner.status_history.iter().cloned().collect(),
             status_duration_stats: inner.status_duration_stats.clone(),
             logs: inner.logs.iter().cloned().collect(),
+            bucket_metrics: inner.bucket_metrics.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct BucketMetrics {
+    pub bucket_id: usize,
+    pub run_count: usize,
+    pub landing_size: usize,
+    pub history_size_estimate: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -510,6 +526,7 @@ pub struct MetricsSnapshot {
     pub status_history: Vec<StatusHistoryEntry>,
     pub status_duration_stats: StatusDurationStats,
     pub logs: Vec<LogEntry>,
+    pub bucket_metrics: Vec<BucketMetrics>,
 }
 
 // Remove ANSI escape sequences so log lines don't leak color codes into the TUI.

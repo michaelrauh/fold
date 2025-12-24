@@ -351,6 +351,18 @@ fn process_txt_file(
     // Push seed to work queue
     store.push_segments(vec![seed_ortho])?;
 
+    // Initialize metrics with initial state
+    metrics.update_global(|g| {
+        g.generation = 0;
+        g.phase = "Idle".to_string();
+        g.work_len = store.work_len();
+        g.seen_len_accepted = store.seen_len_accepted();
+        g.run_budget_bytes = cfg.run_budget_bytes;
+        g.fan_in = cfg.fan_in;
+    });
+    metrics.record_work_len(store.work_len() as usize);
+    metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+
     metrics.set_operation_status("Processing orthos".to_string());
 
     let mut sys = sysinfo::System::new();
@@ -362,6 +374,31 @@ fn process_txt_file(
         if work_len == 0 {
             break;
         }
+
+        // Update global metrics at start of generation
+        metrics.update_global(|g| {
+            g.generation = generation;
+            g.phase = "Processing".to_string();
+            g.work_len = work_len;
+            g.seen_len_accepted = store.seen_len_accepted();
+            g.run_budget_bytes = cfg.run_budget_bytes;
+            g.fan_in = cfg.fan_in;
+        });
+        // Record samples for charts
+        metrics.record_work_len(work_len as usize);
+        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+        
+        // Update bucket metrics
+        let bucket_stats = store.bucket_stats();
+        let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
+            fold::metrics::BucketMetrics {
+                bucket_id: bs.bucket_id,
+                run_count: bs.run_count,
+                landing_size: bs.landing_size,
+                history_size_estimate: bs.history_size_estimate,
+            }
+        }).collect();
+        metrics.update_bucket_metrics(bucket_metrics);
 
         metrics.add_log(format!(
             "Generation {}: processing {} work items",
@@ -381,6 +418,26 @@ fn process_txt_file(
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;
                 });
+
+                // Update work queue metrics
+                metrics.update_global(|g| {
+                    g.work_len = store.work_len();
+                    g.seen_len_accepted = store.seen_len_accepted();
+                });
+                metrics.record_work_len(store.work_len() as usize);
+                metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+                
+                // Update bucket metrics for TUI visualization
+                let bucket_stats = store.bucket_stats();
+                let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
+                    fold::metrics::BucketMetrics {
+                        bucket_id: bs.bucket_id,
+                        run_count: bs.run_count,
+                        landing_size: bs.landing_size,
+                        history_size_estimate: bs.history_size_estimate,
+                    }
+                }).collect();
+                metrics.update_bucket_metrics(bucket_metrics);
 
                 if optimal_dirty {
                     let (volume, fullness) = best_score;
@@ -485,8 +542,19 @@ fn process_txt_file(
         ));
 
         // End of generation: drain, compact, anti-join, push new work
+        metrics.update_global(|g| {
+            g.phase = "Transition".to_string();
+        });
         metrics.set_operation_status(format!("Gen {} transition", generation));
         let new_work = store.on_generation_end(&cfg)?;
+        
+        // Update metrics after generation transition
+        metrics.update_global(|g| {
+            g.work_len = store.work_len();
+            g.seen_len_accepted = store.seen_len_accepted();
+        });
+        metrics.record_work_len(store.work_len() as usize);
+        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
         
         metrics.add_log(format!(
             "Generation {} complete: {} new work items, {} total seen",
@@ -681,6 +749,18 @@ fn merge_archives(
 
     store.push_segments(vec![seed_ortho])?;
 
+    // Initialize metrics with initial merge state
+    metrics.update_global(|g| {
+        g.generation = 0;
+        g.phase = "Idle".to_string();
+        g.work_len = store.work_len();
+        g.seen_len_accepted = store.seen_len_accepted();
+        g.run_budget_bytes = cfg.run_budget_bytes;
+        g.fan_in = cfg.fan_in;
+    });
+    metrics.record_work_len(store.work_len() as usize);
+    metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
 
@@ -787,11 +867,48 @@ fn merge_archives(
 
     metrics.set_operation_status("Processing merge generations".to_string());
 
+    // Initialize metrics with initial merge state
+    metrics.update_global(|g| {
+        g.generation = 0;
+        g.phase = "Idle".to_string();
+        g.work_len = store.work_len();
+        g.seen_len_accepted = store.seen_len_accepted();
+        g.run_budget_bytes = cfg.run_budget_bytes;
+        g.fan_in = cfg.fan_in;
+    });
+    metrics.record_work_len(store.work_len() as usize);
+    metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+
     loop {
         let work_len = store.work_len();
         if work_len == 0 {
             break;
         }
+
+        // Update global metrics at start of merge generation
+        metrics.update_global(|g| {
+            g.generation = generation;
+            g.phase = "Processing".to_string();
+            g.work_len = work_len;
+            g.seen_len_accepted = store.seen_len_accepted();
+            g.run_budget_bytes = cfg.run_budget_bytes;
+            g.fan_in = cfg.fan_in;
+        });
+        // Record samples for charts
+        metrics.record_work_len(work_len as usize);
+        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+        
+        // Update bucket metrics
+        let bucket_stats = store.bucket_stats();
+        let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
+            fold::metrics::BucketMetrics {
+                bucket_id: bs.bucket_id,
+                run_count: bs.run_count,
+                landing_size: bs.landing_size,
+                history_size_estimate: bs.history_size_estimate,
+            }
+        }).collect();
+        metrics.update_bucket_metrics(bucket_metrics);
 
         metrics.add_log(format!(
             "Merge Generation {}: processing {} work items",
@@ -811,6 +928,26 @@ fn merge_archives(
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;
                 });
+
+                // Update work queue metrics during merge
+                metrics.update_global(|g| {
+                    g.work_len = store.work_len();
+                    g.seen_len_accepted = store.seen_len_accepted();
+                });
+                metrics.record_work_len(store.work_len() as usize);
+                metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+                
+                // Update bucket metrics for TUI visualization
+                let bucket_stats = store.bucket_stats();
+                let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
+                    fold::metrics::BucketMetrics {
+                        bucket_id: bs.bucket_id,
+                        run_count: bs.run_count,
+                        landing_size: bs.landing_size,
+                        history_size_estimate: bs.history_size_estimate,
+                    }
+                }).collect();
+                metrics.update_bucket_metrics(bucket_metrics);
 
                 if optimal_dirty {
                     let (volume, fullness) = best_score;
@@ -911,8 +1048,19 @@ fn merge_archives(
         ));
 
         // End of generation
+        metrics.update_global(|g| {
+            g.phase = "Transition".to_string();
+        });
         metrics.set_operation_status(format!("Merge Gen {} transition", generation));
         let new_work = store.on_generation_end(&cfg)?;
+        
+        // Update metrics after merge generation transition
+        metrics.update_global(|g| {
+            g.work_len = store.work_len();
+            g.seen_len_accepted = store.seen_len_accepted();
+        });
+        metrics.record_work_len(store.work_len() as usize);
+        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
         
         metrics.add_log(format!(
             "Merge Generation {} complete: {} new work, {} total seen",

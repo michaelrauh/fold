@@ -150,6 +150,15 @@ fn compute_fan_in(budget: usize, read_buf_bytes: usize) -> usize {
 }
 
 
+/// Statistics for a single bucket
+#[derive(Clone, Debug)]
+pub struct BucketStats {
+    pub bucket_id: usize,
+    pub run_count: usize,
+    pub landing_size: usize,
+    pub history_size_estimate: usize,
+}
+
 /// Statistics for a single generation
 #[derive(Clone, Debug)]
 pub struct GenerationStats {
@@ -603,6 +612,35 @@ impl GenerationStore {
     /// Get the monotonic count of accepted items across all generations
     pub fn seen_len_accepted(&self) -> u64 {
         self.seen_len_accepted
+    }
+
+    /// Get per-bucket statistics for TUI visualization
+    pub fn bucket_stats(&self) -> Vec<BucketStats> {
+        (0..self.bucket_count)
+            .map(|bucket| {
+                let run_count = self.history_runs[bucket].len();
+                
+                // Estimate landing size by checking if active log exists
+                let landing_path = self.active_log_path(bucket);
+                let landing_size = std::fs::metadata(&landing_path)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
+                
+                // Estimate history size from run files
+                let history_size_estimate = self.history_runs[bucket]
+                    .iter()
+                    .filter_map(|path| std::fs::metadata(path).ok())
+                    .map(|m| m.len() as usize)
+                    .sum();
+                
+                BucketStats {
+                    bucket_id: bucket,
+                    run_count,
+                    landing_size,
+                    history_size_estimate,
+                }
+            })
+            .collect()
     }
 
     /// Flush all bucket writers

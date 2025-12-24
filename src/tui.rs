@@ -684,7 +684,7 @@ impl Tui {
     }
 
     fn render_history_panel(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        // Display generational store metadata
+        // Display generational store with per-bucket visualization
         let phase_str = &snapshot.global.phase;
         let generation = snapshot.global.generation;
         let work_len = snapshot.global.work_len;
@@ -696,24 +696,59 @@ impl Tui {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Min(3),
+            ])
             .split(inner);
 
+        // Top: Generation stats
         let lines_top = vec![Line::from(format!(
             "Gen: {} │ Phase: {} │ Work: {}",
             generation,
             phase_str,
             format_number(work_len as usize)
         ))];
+        f.render_widget(Paragraph::new(lines_top), chunks[0]);
+
+        // Middle: Global stats
         let lines_mid = vec![Line::from(format!(
             "Accepted: {} │ Budget: {} │ Fan-in: {}",
             format_number(seen as usize),
             format_bytes(snapshot.global.run_budget_bytes),
             snapshot.global.fan_in
         ))];
-
-        f.render_widget(Paragraph::new(lines_top), chunks[0]);
         f.render_widget(Paragraph::new(lines_mid), chunks[1]);
+
+        // Bottom: Per-bucket sparklines showing run counts
+        if !snapshot.bucket_metrics.is_empty() {
+            let bucket_count = snapshot.bucket_metrics.len();
+            let run_counts: Vec<u64> = snapshot.bucket_metrics
+                .iter()
+                .map(|b| b.run_count as u64)
+                .collect();
+            
+            let max_runs = run_counts.iter().max().copied().unwrap_or(1);
+            let total_runs: usize = snapshot.bucket_metrics.iter().map(|b| b.run_count).sum();
+            
+            let title = format!(
+                "Buckets: {} │ Total Runs: {} │ Max: {}",
+                bucket_count,
+                total_runs,
+                max_runs
+            );
+            
+            let sparkline = Sparkline::default()
+                .block(Block::default().title(title))
+                .data(&run_counts)
+                .style(Style::default().fg(Color::Cyan));
+            
+            f.render_widget(sparkline, chunks[2]);
+        } else {
+            let placeholder = Paragraph::new(vec![Line::from("Bucket stats loading...")]);
+            f.render_widget(placeholder, chunks[2]);
+        }
     }
 
     #[allow(dead_code)]
