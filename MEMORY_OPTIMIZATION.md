@@ -1,149 +1,273 @@
-# Dynamic Memory Configuration
+# Dynamic RAM Policy
 
 ## Overview
 
-The fold application now dynamically calculates optimal cache sizes to utilize up to 75% of available system RAM. This ensures efficient memory usage across different hardware configurations.
+Fold uses **continuous, dynamic RAM allocation** with leader/follower roles. RAM budgets adjust based on global system memory pressure, ensuring efficient resource usage without manual tuning.
 
-## Implementation
+## Leader/Follower Roles
 
-### New Module: `memory_config.rs`
+### Leader
+- **Primary processing node** or single-instance deployment
+- **Aggressive memory usage**: targets 65-85% of available RAM
+- **Large run budget**: 2-6 GB for external sort arenas
+- Suitable for dedicated processing machines
 
-The `MemoryConfig` struct calculates optimal values for:
+### Follower
+- **Resource-constrained node** or multi-instance deployment
+- **Conservative memory usage**: targets 50-70% of available RAM
+- **Smaller run budget**: 256 MB - 1 GB for external sort arenas
+- Minimum viable: 128 MB
+- Bail if budget < 128 MB and memory pressure persists
 
-1. **Queue Buffer Sizes** - In-memory buffers for work and results queues
-2. **Bloom Filter Capacity** - Fast negative lookup for seen orthos
-3. **Shard Count** - Number of hash shards for seen tracking
-4. **Shards in Memory** - How many shards to keep hot in RAM
+## Continuous RAM Dials
 
-### Memory Budget Breakdown
+RAM configuration is **not static**—it adjusts continuously based on system state:
 
-The 75% target RAM allocation is divided as follows:
+### Inputs
+- **Global RSS %**: Current memory usage as percentage of total system RAM
+- **Headroom bytes**: Available free memory
 
-1. **Interner** - Vocabulary and prefix-to-completions mappings (measured from serialized size)
-2. **Runtime Reserve** - 20% of target for working memory (ortho processing, vectors, etc.)
-3. **Bloom Filter** - ~2 bytes per item (1% false positive rate)
-4. **Queue Buffers** - 30% of remaining memory (2 queues × buffer_size × ~200 bytes per ortho)
-5. **Shards in Memory** - 70% of remaining memory (~12 bytes per hash entry)
+### Targets
 
-### Calculation Strategy
+| Role     | Aggressive Below | Conservative Above |
+|----------|------------------|--------------------|
+| Leader   | 65%              | 85%                |
+| Follower | 50%              | 70%                |
 
-```
-Total System RAM = 100%
-Target Usage = 75%
-Runtime Reserve = 20% of target
-Available for Caches = Target - Interner - Runtime Reserve
-Queue Memory = 30% of Available
-Shard Memory = 70% of Available
-```
-
-### Conservative Estimates
-
-- **Ortho size**: 200 bytes (accounts for small ~80 byte and large ~900 byte orthos)
-- **Bloom filter**: 2 bytes per item (optimal 1.44 bytes, rounded up for safety)
-- **Hash entry**: 12 bytes (usize key + () value + HashMap overhead)
-- **Shard size**: ~10,000 items (good disk I/O granularity)
-
-## Usage
-
-### Fresh Start
-
-When starting fresh (no checkpoint):
-```rust
-let config = MemoryConfig::calculate(0, 0);
-let tracker = SeenTracker::with_config(
-    config.bloom_capacity,
-    config.num_shards,
-    config.max_shards_in_memory
-);
-let queue = DiskBackedQueue::new(config.queue_buffer_size)?;
-```
-
-### Resume from Checkpoint
-
-When loading from checkpoint, the system automatically measures the interner size and result count, then recalculates optimal memory configuration:
+### Adjustment Strategy
 
 ```rust
-// Measure interner size and result count from checkpoint
-let interner_bytes = /* size of serialized interner */;
-let result_count = /* number of orthos in results queue */;
-
-let config = MemoryConfig::calculate(interner_bytes, result_count);
-// Config is then used when loading checkpoint
+fn compute_config(role: Role, global_rss_pct: f64, headroom: usize) -> Config {
+    let target_pct = match role {
+        Role::Leader => {
+            if global_rss_pct < 0.65 { 0.85 }
+            else { 0.65 }
+        }
+        Role::Follower => {
+            if global_rss_pct < 0.50 { 0.70 }
+            else { 0.50 }
+        }
+    };
+    
+    let budget = (total_ram * target_pct) - current_usage;
+    let run_budget = 0.7 * budget;
+    let fan_in = clamp(budget / read_buf_bytes, 8, 128);
+    
+    Config { run_budget_bytes: run_budget, fan_in, ... }
+}
 ```
 
-**Key behavior**: The bloom filter and shard configuration automatically scale based on the actual result count, ensuring efficient memory usage as the dataset grows.
+**Key behavior**:
+- Below target: Increase allocation (aggressive)
+- Above target: Decrease allocation (conservative)
+- Smooth transitions, not abrupt changes
 
-## Dynamic Rebalancing
+## RAM Budget Breakdown
 
-The system rebalances bloom filter capacity and shard count based on the number of results:
+### External Sort Components
 
-- **Bloom capacity**: `max(expected_results * 3, 1_000_000)`
-  - Maintains 3× headroom for growth
-  - Minimum 1M items to avoid degraded false positive rates
-  
-- **Shard count**: `clamp(expected_results / 10_000, 64, 1_024)`
-  - Target ~10K items per shard for optimal disk I/O
-  - Minimum 64 shards, maximum 1024 shards
+```
+run_budget = 0.7 * budget    # Arena for sort
+read_buf = budget / fan_in   # Per-run buffer for merge
+fan_in = clamp(budget / read_buf_bytes, 8, 128)
+```
 
-**Examples**:
-- 10K results → 1M bloom (minimum), 64 shards (minimum)
-- 100K results → 1M bloom (minimum), 64 shards (minimum)
-- 1M results → 3M bloom (3×), 100 shards (1M/10K)
-- 10M results → 30M bloom (3×), 1000 shards (10M/10K, at max)
+**Example** (Leader, 8 GB available):
+```
+budget = 8 GB
+run_budget = 5.6 GB          # Arena capacity
+read_buf = 64 MB             # Per-file read buffer
+fan_in = 128                 # Max concurrent runs
+```
+
+**Example** (Follower, 1 GB available):
+```
+budget = 1 GB
+run_budget = 700 MB          # Arena capacity
+read_buf = 8 MB              # Per-file read buffer
+fan_in = 128                 # Max concurrent runs
+```
+
+### Minimum Viable Configuration
+
+```
+run_budget >= 128 MB
+fan_in >= 8
+read_buf >= 8 MB
+```
+
+**Follower bail condition**:
+```rust
+if run_budget < 128 MB && global_rss_pct > 0.70 {
+    // Insufficient RAM, cannot proceed safely
+    bail!("Insufficient memory for follower role");
+}
+```
+
+## Integration with Compaction
+
+### Arena-Based Run Generation
+
+```rust
+let config = compute_config(role);
+let mut arena = Vec::with_capacity(config.run_budget_bytes / item_size);
+
+while let Some(item) = input.next() {
+    if arena.len() * item_size > config.run_budget_bytes {
+        // Arena full: sort and flush
+        arena.sort();
+        write_run(&arena)?;
+        arena.clear();
+        
+        // Re-check config for next run (RAM may have changed)
+        config = compute_config(role);
+        arena.reserve(config.run_budget_bytes / item_size);
+    }
+    arena.push(item);
+}
+```
+
+### K-Way Merge
+
+```rust
+let config = compute_config(role);
+let fan_in = config.fan_in;
+let read_buf_bytes = config.read_buf_bytes;
+
+let mut heap = BinaryHeap::new();
+for run in runs.chunks(fan_in) {
+    // Open up to fan_in runs, each with read_buf_bytes buffer
+    let merged = merge_runs(run, read_buf_bytes)?;
+    heap.push(merged);
+}
+```
+
+## Memory Pressure Handling
+
+### Leader Response
+1. **RSS < 65%**: Increase `run_budget` toward 85% target
+2. **RSS 65-85%**: Maintain current allocation
+3. **RSS > 85%**: Decrease `run_budget` toward 65% target
+4. Never drop below 128 MB minimum
+
+### Follower Response
+1. **RSS < 50%**: Increase `run_budget` toward 70% target
+2. **RSS 50-70%**: Maintain current allocation
+3. **RSS > 70%**: Decrease `run_budget` toward 50% target
+4. If < 128 MB and RSS > 70%: bail (insufficient resources)
+
+## Superseded Features
+
+This RAM policy **replaces** the following old mechanisms:
+
+### Old: Static Memory Config
+- `MemoryConfig::calculate(interner_bytes, result_count)`
+- Fixed bloom filter capacity
+- Fixed shard counts
+- Static queue buffer sizes
+
+### Old: Spill-Half Disk Queue
+- Hybrid memory/disk queue with 10K item threshold
+- Manual capacity tuning
+- Fixed spill trigger
+
+### Old: Bloom Filter + Sharded Seen Tracker
+- Bloom filter for fast negative lookup
+- Disk-backed hash shards with LRU cache
+- Complex memory management
+
+**All replaced by**: History store with sorted runs + dynamic RAM dials.
+
+## Configuration API
+
+```rust
+pub enum Role { Leader, Follower }
+
+pub struct Config {
+    pub run_budget_bytes: usize,  // Arena capacity
+    pub fan_in: usize,             // Max concurrent runs
+    pub read_buf_bytes: usize,     // Per-run read buffer
+    pub allow_compaction: bool,    // Enable optional history compaction
+}
+
+impl Config {
+    pub fn compute(role: Role) -> Self {
+        // Queries system memory, computes dynamic config
+    }
+}
+```
 
 ## Examples
 
-### Small Machine (8 GB RAM)
+### Leader on 16 GB Machine
 
 ```
-Total System RAM: 8192 MB
-Target memory usage: 6144 MB (75%)
-Interner size: 50 MB
-Runtime reserve: 1229 MB
-Available for caches: 4865 MB
+Total RAM: 16 GB
+Current usage: 8 GB (50%)
+Target: 85% (below aggressive threshold)
 
-Queue buffer size: 7,297 orthos (~1,459 MB per queue)
-Bloom capacity: 3,000,000 items (~6 MB)
-Shards: 300 total, 272 in memory (~3,398 MB)
-Estimated total: 6144 MB
+Budget: (16 GB × 0.85) - 8 GB = 5.6 GB
+run_budget: 5.6 GB × 0.7 = 3.92 GB
+fan_in: clamp(5.6 GB / 8 MB, 8, 128) = 128
+read_buf: 8 MB
 ```
 
-### Large Machine (64 GB RAM)
+### Follower on 4 GB Machine
 
 ```
-Total System RAM: 65536 MB
-Target memory usage: 49152 MB (75%)
-Interner size: 500 MB
-Runtime reserve: 9830 MB
-Available for caches: 38822 MB
+Total RAM: 4 GB
+Current usage: 2.5 GB (62.5%)
+Target: 50% (above conservative threshold)
 
-Queue buffer size: 58,233 orthos (~11,646 MB per queue)
-Bloom capacity: 30,000,000 items (~60 MB)
-Shards: 1000 total, 1000 in memory (~27,115 MB)
-Estimated total: 49152 MB
+Budget: (4 GB × 0.50) - 2.5 GB = -0.5 GB (negative!)
+Adjust: Use minimum viable config
+run_budget: 128 MB (minimum)
+fan_in: 8 (minimum)
+read_buf: 8 MB
+
+If RSS stays > 70%: bail (insufficient resources)
 ```
 
-## Benefits
+## Design Rationale
 
-1. **Automatic Scaling** - Works efficiently on any machine from laptops to servers
-2. **Maximized Performance** - Uses available RAM rather than leaving it unused
-3. **Conservative Overhead** - 20% runtime reserve ensures stability during peak processing
-4. **Balanced Allocation** - Prioritizes shards (70%) over queues (30%) based on typical access patterns
-5. **Graceful Degradation** - Shards spill to disk when needed, maintaining correctness
+### Why Continuous Adjustment?
 
-## Configuration Bounds
+- Memory pressure changes during execution
+- Other processes may start/stop
+- Adaptive policy prevents OOM
+- No manual tuning required
 
-The implementation includes sensible bounds:
+### Why Leader/Follower Split?
 
-- **Queue buffer**: 1,000 - 100,000 orthos
-- **Bloom capacity**: minimum 1,000,000 items (3x expected for growth)
-- **Shard count**: 64 - 1,024 shards
-- **Shards in memory**: 16 - total shard count
+- Single deployment: use Leader for maximum throughput
+- Multi-instance: use Follower to coexist safely
+- Cloud/container: Follower respects resource limits
+- Dedicated server: Leader maximizes hardware utilization
 
-## Testing
+### Why These Thresholds?
 
-All existing tests pass with the new memory configuration system. The `MemoryConfig::default_config()` provides test-friendly defaults (10K queue buffers, 10M bloom capacity, 64 shards).
+- **Leader 65-85%**: Aggressive but safe on dedicated machines
+- **Follower 50-70%**: Conservative for shared environments
+- **128 MB minimum**: Smallest viable arena for external sort
+- **8 fan_in minimum**: Reasonable merge performance
 
-## Dependencies
+### Why 70/30 Split?
 
-Added `sysinfo = "0.32"` to query system memory information.
+- **70% to arena**: Sort is the primary memory consumer
+- **30% to read buffers**: Fan-in of 8-128 provides good merge performance
+- Balance between arena size and merge parallelism
+
+## Migration Notes
+
+**This policy replaces**:
+- `MemoryConfig::calculate()` from old code
+- Bloom filter sizing logic
+- Shard count calculations
+- Queue buffer size tuning
+
+**Remove these when implementing**:
+- `memory_config.rs` (old static config)
+- Bloom filter allocation code
+- Seen tracker shard management
+- Fixed spill thresholds
+

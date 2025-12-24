@@ -116,12 +116,6 @@ fn main() -> Result<(), FoldError> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), FoldError> {
             let mut last_role: Option<Role> = None;
             loop {
-                // Check if user requested quit
-                if should_quit.load(Ordering::Relaxed) {
-                    metrics.add_log("User requested quit".to_string());
-                    break;
-                }
-
                 // Check for stale heartbeats and recover abandoned work from crashed processes
                 file_handler::check_and_recover_stale_work(&config)?;
                 file_handler::cleanup_stale_mem_claims(&config)?;
@@ -178,6 +172,7 @@ fn main() -> Result<(), FoldError> {
                             if txt_file.is_none() {
                                 metrics.add_log("No more files to process".to_string());
                                 metrics.add_log("Processing completed".to_string());
+                                eprintln!("[fold] No txt files found, exiting");
                                 break;
                             }
 
@@ -486,7 +481,7 @@ fn process_txt_file(
 
         // End of generation: drain, compact, anti-join, push new work
         metrics.set_operation_status(format!("Gen {} transition", generation));
-        let new_work = store.on_generation_end(&cfg)?;
+        let new_work = store.on_generation_end_ortho(&cfg)?;
         
         metrics.add_log(format!(
             "Generation {} complete: {} new work items, {} total seen",
@@ -511,7 +506,7 @@ fn process_txt_file(
     // For now, we'll collect from all buckets
     let mut all_results = Vec::new();
     for bucket in 0..8 {
-        for item in store.history_iter(bucket)? {
+        for item in store.history_iter_orthos(bucket)? {
             all_results.push(item?);
         }
     }
@@ -539,6 +534,7 @@ fn process_txt_file(
 
     print_optimal(&best_ortho, &interner);
 
+    eprintln!("[fold] Saving archive with {} orthos", total_orthos);
     // Save results as archive - write orthos directly to archive format
     let (archive_path, lineage) = save_archive_from_vec(
         &ingestion,
@@ -547,6 +543,7 @@ fn process_txt_file(
         Some(&best_ortho),
         total_orthos,
     )?;
+    eprintln!("[fold] Archive saved to: {}", archive_path);
 
     metrics.add_log(format!("Archive saved: {}", archive_path));
 
@@ -605,27 +602,37 @@ fn merge_archives(
     let merged_interner = larger_interner.merge(&smaller_interner);
 
     // Now calculate impacted keys by comparing merged against originals
-    // Both impacted_larger and impacted_smaller are returned in MERGED vocabulary space
+    // This gives us keys in MERGED vocabulary space that changed from each archive's perspective
     let impacted_larger = merged_interner.impacted_keys(&larger_interner);
     let impacted_smaller = merged_interner.impacted_keys(&smaller_interner);
 
-    // Build vocab mapping for remapping orthos (not keys) from smaller to merged
+    // Remap smaller's impacted keys to merged vocabulary space
+    // (larger's keys are already in merged space since merge is additive)
     let vocab_map_smaller =
         build_vocab_mapping(smaller_interner.vocabulary(), merged_interner.vocabulary());
+    let impacted_smaller_remapped: Vec<Vec<usize>> = impacted_smaller
+        .iter()
+        .map(|prefix| {
+            prefix
+                .iter()
+                .map(|&idx| vocab_map_smaller[idx])
+                .collect()
+        })
+        .collect();
 
     metrics.update_merge(|m| {
         m.current_merge = format!("merge_{}", std::process::id());
         m.archive_a_orthos = orthos_a;
         m.archive_b_orthos = orthos_b;
         m.impacted_a = if a_is_smaller {
-            impacted_smaller.len()
+            impacted_smaller_remapped.len()
         } else {
             impacted_larger.len()
         };
         m.impacted_b = if a_is_smaller {
             impacted_larger.len()
         } else {
-            impacted_smaller.len()
+            impacted_smaller_remapped.len()
         };
         m.seed_orthos_a = orthos_a;
         m.seed_orthos_b = orthos_b;
@@ -641,7 +648,7 @@ fn merge_archives(
         g.vocab_size = merged_interner.vocabulary().len();
     });
     metrics.add_log(format!(
-        "Merged interner: v{}, vocab={} (Archive {} is smaller)",
+        "Merged interner: v{}, vocab={} (Archive {} is smaller, remapping that side)",
         merged_interner.version(),
         merged_interner.vocabulary().len(),
         if a_is_smaller { "A" } else { "B" }
@@ -694,9 +701,9 @@ fn merge_archives(
     };
 
     let (smaller_path, smaller_impacted_ref, smaller_name) = if a_is_smaller {
-        (&results_a_path, &impacted_smaller, "A")
+        (&results_a_path, &impacted_smaller_remapped, "A")
     } else {
-        (&results_b_path, &impacted_smaller, "B")
+        (&results_b_path, &impacted_smaller_remapped, "B")
     };
 
     // Process larger archive (no remapping needed) - stream directly into GenerationStore
@@ -710,7 +717,7 @@ fn merge_archives(
     
     // Stream all orthos from larger archive's history into our merge store
     for bucket in 0..8 {
-        for result in larger_store.history_iter(bucket)? {
+        for result in larger_store.history_iter_orthos(bucket)? {
             let ortho = result?;
             total_from_larger += 1;
             
@@ -746,7 +753,7 @@ fn merge_archives(
     
     // Stream all orthos from smaller archive's history, remap, and store
     for bucket in 0..8 {
-        for result in smaller_store.history_iter(bucket)? {
+        for result in smaller_store.history_iter_orthos(bucket)? {
             let ortho = result?;
             total_from_smaller += 1;
             
@@ -912,7 +919,7 @@ fn merge_archives(
 
         // End of generation
         metrics.set_operation_status(format!("Merge Gen {} transition", generation));
-        let new_work = store.on_generation_end(&cfg)?;
+        let new_work = store.on_generation_end_ortho(&cfg)?;
         
         metrics.add_log(format!(
             "Merge Generation {} complete: {} new work, {} total seen",
@@ -935,7 +942,7 @@ fn merge_archives(
     // Collect all results from history
     let mut all_results = Vec::new();
     for bucket in 0..8 {
-        for item in store.history_iter(bucket)? {
+        for item in store.history_iter_orthos(bucket)? {
             all_results.push(item?);
         }
     }

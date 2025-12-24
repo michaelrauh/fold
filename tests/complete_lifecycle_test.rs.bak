@@ -50,8 +50,8 @@ fn test_complete_txt_lifecycle() {
     let store_path = PathBuf::from(&work_queue_path).parent().unwrap().to_path_buf();
     
     let mut store = GenerationStore::new_with_config(store_path.clone(), 8).unwrap();
-    store.push_segments(vec![Ortho::new()]).unwrap();
-    store.record_result(&Ortho::new()).unwrap();
+    store.push_segments_ortho(vec![Ortho::new()]).unwrap();
+    store.record_result_ortho(&Ortho::new()).unwrap();
 
     println!("✓ Step 3: Work directory created with GenerationStore");
     assert!(
@@ -208,8 +208,8 @@ fn test_complete_merge_lifecycle() {
     let merge_store_path = PathBuf::from(&work_queue_path).parent().unwrap().to_path_buf();
 
     let mut merge_store = GenerationStore::new_with_config(merge_store_path.clone(), 8).unwrap();
-    merge_store.push_segments(vec![Ortho::new()]).unwrap();
-    merge_store.record_result(&Ortho::new()).unwrap();
+    merge_store.push_segments_ortho(vec![Ortho::new()]).unwrap();
+    merge_store.record_result_ortho(&Ortho::new()).unwrap();
 
     println!("✓ Step 3: Merge work directories created");
     assert!(

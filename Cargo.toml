@@ -40,31 +40,11 @@ harness = false
 path = "benches/interner_bench.rs"
 
 [[bench]]
-name = "disk_backed_queue_bench"
-harness = false
-path = "benches/disk_backed_queue_bench.rs"
-
-[[bench]]
-name = "seen_tracker_bench"
-harness = false
-path = "benches/seen_tracker_bench.rs"
-
-[[bench]]
 name = "splitter_bench"
 harness = false
 path = "benches/splitter_bench.rs"
 
 [[bench]]
-name = "checkpoint_manager_bench"
+name = "generation_store_bench"
 harness = false
-path = "benches/checkpoint_manager_bench.rs"
-
-[[bench]]
-name = "memory_config_bench"
-harness = false
-path = "benches/memory_config_bench.rs"
-
-[[bench]]
-name = "search_pipeline_bench"
-harness = false
-path = "benches/search_pipeline_bench.rs"
+path = "benches/generation_store_bench.rs"

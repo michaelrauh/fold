@@ -1,133 +1,220 @@
-# Checkpoint System Design
+# Generational Frontier System Design
 
 ## Overview
 
-The fold application implements a fully atomic checkpoint system that allows resumption after crashes or interruptions. The checkpoint preserves both the interner state and all generated results, with proper deduplication via a seen tracker that is reconstructed on resume.
+Fold uses a **generational frontier model** where each generation processes a work queue to produce results, which are then deduplicated against history to form the next generation's work queue. This architecture uses disk to bound RAM usage, **not for durability**—there is no crash recovery of intermediate state. Resume is only at the **file/heartbeat level**: if processing crashes, heartbeat goes stale, and a later worker moves the input file back and deletes all intermediate state to restart from scratch.
 
-## Three-Queue Strategy
+## Core Architecture
 
-At certain points in time, there are **three result queues** in different states:
-
-1. **Checkpoint Backup** (`./fold_state/checkpoint/results_backup`)
-   - Read-only preserved copy
-   - Only updated when a new checkpoint succeeds
-   - Immutable during processing
-
-2. **Temporary Copy** (`./fold_state/results_temp`)
-   - Created only during checkpoint load
-   - Consumed to rebuild the seen set and new active queue
-   - Deleted after consumption completes
-
-3. **Active Queue** (`./fold_state/results`)
-   - Current working queue receiving new orthos
-   - Flushed to disk when saving checkpoint
-   - Copied to become next checkpoint backup
-
-## Save Checkpoint (Atomic)
+### Generational Cycle
 
 ```
-save_checkpoint(interner, results_queue):
-  1. Create temp directory: ./fold_state/checkpoint_temp
-  2. Flush results_queue (write all buffer to disk)
-  3. Serialize interner to temp/interner.bin
-  4. Copy results queue directory to temp/results_backup
-  5. ATOMIC: Remove old checkpoint, rename temp → checkpoint
+work(g) → process → results(g)
+
+when work(g) empty:
+  1. dedupe results(g) vs results(g) and history
+  2. → work(g+1)
 ```
 
-**Atomicity**: If crash occurs during save, either old checkpoint survives intact or new checkpoint is complete. No partial state.
+Each generation:
+- Processes work queue items to produce results
+- Results land in bucketed append-only logs
+- When work empties, results are compacted via external sort
+- Anti-join with history produces novel orthos
+- Novel orthos become next generation's work queue
 
-## Load Checkpoint (Three-Queue Consumption)
-
-```
-load_checkpoint() -> (Interner, DiskBackedQueue, SeenTracker):
-  1. Load interner from ./fold_state/checkpoint/interner.bin
-  2. Copy checkpoint/results_backup → results_temp (consumable copy)
-  3. Create temporary queue from results_temp
-  4. Count total items to calculate optimal configuration:
-     - bloom_capacity = result_count * 3 (min 1,000,000)
-     - num_shards = (result_count / 10,000).max(64).min(1024)
-     - max_shards_in_memory = 32
-  5. Clear old shard directory (./fold_state/seen_shards/)
-  6. Create new SeenTracker with calculated configuration
-  7. Create new active queue at results/
-  8. Pop ALL items from temp queue:
-     - Insert ortho.id() into seen tracker
-     - Push ortho to new active queue
-  9. Delete results_temp directory
-  10. Return (interner, new_active_queue, seen_tracker)
-```
-
-**Key Behavior**: The checkpoint backup is never modified. A copy is consumed to rebuild state, preserving the backup for potential re-use. The seen tracker is fully reconstructed with optimal sizing based on the actual result count.
-
-## Global Seen Tracker
-
-The `SeenTracker` is **global across all files**:
-
-- Initialized empty on fresh start (default config: 1M bloom, 64 shards, 32 in-memory)
-- Reconstructed from checkpoint results on resume (with optimal config based on result count)
-- Persists across file processing iterations
-- Prevents duplicate orthos even after resume
-- Uses disk-backed sharding for memory efficiency (see SEEN_TRACKER_DESIGN.md)
-
-## File Processing Flow
+### Landing → Compact → Anti-Join Pipeline
 
 ```
-main():
-  1. Load checkpoint → (interner?, results_queue, global_seen_tracker)
-  2. For each input file:
-     - Extend interner with new text
-     - Process work queue (use global_seen_tracker for deduplication)
-     - Push new orthos to results_queue
-     - Save checkpoint (atomic)
-     - Delete processed file
+┌──────────────────────────────────────────────────┐
+│ PROCESSING PHASE (work(g) → results(g))         │
+│ - Pop work item                                  │
+│ - Generate child orthos                          │
+│ - Append to landing zone (bucketed)             │
+└──────────────────────────────────────────────────┘
+                     ↓
+┌──────────────────────────────────────────────────┐
+│ DRAINING PHASE                                   │
+│ - Flush active landing logs                      │
+│ - Prepare for compaction                         │
+└──────────────────────────────────────────────────┘
+                     ↓
+┌──────────────────────────────────────────────────┐
+│ COMPACTING PHASE (per bucket)                   │
+│ - External sort: arena-based runs               │
+│ - K-way merge: runs → unique sorted run         │
+│ - Dedupe within generation                      │
+└──────────────────────────────────────────────────┘
+                     ↓
+┌──────────────────────────────────────────────────┐
+│ ANTI-JOIN PHASE (per bucket)                    │
+│ - Stream merge: gen(unique) vs history(sorted)  │
+│ - Emit novel orthos → work(g+1)                 │
+│ - Add unique run to history                     │
+└──────────────────────────────────────────────────┘
 ```
+
+## Landing Zone (Append-Only, RAM-Bounded)
+
+### Purpose
+
+Landing zones are **append-only logs** used purely to bound RAM during result generation. They accumulate results in memory and spill to disk when buffers fill.
+
+### Structure
+
+```
+fold_state/
+├── landing/
+│   ├── b=00/
+│   │   ├── active.log      # Current append target
+│   │   ├── drain-001.log   # Drained (immutable)
+│   │   └── drain-002.log
+│   ├── b=01/
+│   │   └── active.log
+│   └── ...
+```
+
+- **Bucketing**: `bucket = ortho.id() & (B - 1)` where B is power-of-two bucket count
+- **Active log**: Receives new orthos via append
+- **Drain**: Rename `active.log → drain-N.log` creates immutable snapshot
+- **Not durable**: Crash loses all landing/work/history state; heartbeat staleness triggers file-level restart
+
+### Ortho Serialization
+
+- Format: `bincode` encoding of `ortho::Ortho` from `src/ortho.rs`
+- Little-endian, no compression
+- Dedupe key: `ortho.id()` (hash of payload)
+- Collision handling: Equal IDs require struct equality
+
+## Heartbeat-Based File Recovery
+
+**No intermediate state recovery**:
+- Disk state (landing/work/history) is **not durable**
+- Crash during processing loses all intermediate artifacts
+- Heartbeat mechanism (updated periodically during processing) detects stale jobs
+- On heartbeat staleness: later worker moves input file back to `input/` and deletes all intermediate state
+- Processing restarts from scratch with fresh interner and empty state
+- Only completed archives (with successful heartbeat deletion) are preserved
+
+### Heartbeat Mechanism
+
+```
+fold_state/
+├── input/              # Pending text files
+├── in_process/         # Files being processed
+│   ├── file1.txt       # Input file (moved from input/)
+│   └── file1.heartbeat # Updated periodically (e.g., every 100K orthos)
+└── archives/           # Completed archives (heartbeat deleted)
+```
+
+**Normal flow**:
+1. Move `input/file.txt` → `in_process/file.txt`
+2. Create `in_process/file.heartbeat`
+3. Process: update heartbeat periodically
+4. On completion: save archive, delete `.txt` and `.heartbeat`
+
+**Crash recovery**:
+1. On startup, scan `in_process/` for `.heartbeat` files
+2. Check last modification time
+3. If stale (e.g., >10 minutes since last update):
+   - Move `file.txt` back to `input/`
+   - Delete `file.heartbeat`
+   - Delete all intermediate state (landing/, work/, history/ directories)
+4. File will be reprocessed from scratch by this or another worker
+
+**Key invariant**: Intermediate state is ephemeral and tied to heartbeat liveness.
+
+## Work Queue (Unordered Segments)
+
+Work items are stored as **unordered segments**—order is irrelevant:
+
+```
+fold_state/
+├── work/
+│   ├── seg-001.bin    # [count][ortho…]
+│   ├── seg-002.bin
+│   └── ...
+```
+
+- Drain segments sequentially
+- Segment format: `[u64 count][ortho bincode…]`
+- No ordering guarantee needed
+
+## History Store (Sorted Runs, No Compaction Required)
+
+### Purpose
+
+History maintains all previously seen orthos across generations as **sorted runs**:
+
+```
+fold_state/
+├── history/
+│   ├── b=00/
+│   │   ├── run-001.bin
+│   │   ├── run-002.bin
+│   │   └── ...
+│   └── ...
+```
+
+### Anti-Join Correctness
+
+- Anti-join streams merge: `gen(unique) ∩ ¬history(sorted)`
+- Novel orthos = in gen but not in history
+- Accepted count tracks `seen_len_accepted` (monotonic)
+- History may optionally compact runs when count > 64 (correctness doesn't depend on this)
 
 ## Directory Structure
 
 ```
 fold_state/
-├── checkpoint/              # Atomic checkpoint (updated atomically)
-│   ├── interner.bin
-│   └── results_backup/      # Preserved copy of results queue
-│       ├── queue_00000001.bin
-│       ├── queue_00000002.bin
-│       └── ...
-├── checkpoint_temp/         # Staging area during save (deleted after)
-├── results_temp/            # Consumable copy during load (deleted after)
-├── results/                 # Active working queue
-│   ├── queue_00000001.bin
-│   └── ...
-├── seen_shards/             # Disk-backed tracker shards (LRU cache)
-│   ├── shard_00000000.bin
-│   ├── shard_00000001.bin
-│   └── ...
-└── input/                   # Files to process (deleted after)
+├── input/                # Pending text files
+├── in_process/           # Files being processed (with heartbeats)
+│   ├── file1.txt
+│   └── file1.heartbeat
+├── landing/              # Ephemeral result logs (deleted on stale heartbeat)
+│   └── b=XX/
+│       ├── active.log
+│       └── drain-NNN.log
+├── work/                 # Ephemeral work segments (deleted on stale heartbeat)
+│   └── seg-NNN.bin
+├── history/              # Ephemeral dedupe runs (deleted on stale heartbeat)
+│   └── b=XX/
+│       └── run-NNN.bin
+└── archives/             # Completed, durable archives
+    └── file1.bin/
+        ├── interner.bin
+        ├── optimal.txt
+        └── lineage.txt
 ```
 
-## Recovery Guarantees
+**Ephemeral directories**: `landing/`, `work/`, `history/` are tied to active processing and deleted on heartbeat staleness or successful completion.
 
-1. **Crash during save**: Old checkpoint remains valid, temp directory is cleaned up on next save
-2. **Crash during load**: Checkpoint backup preserved, temp directory cleaned up on next load
-3. **Crash during processing**: Checkpoint remains at last successful file boundary
-4. **File deletion marker**: File is only deleted after successful checkpoint save
+**Durable directories**: Only `archives/` persists across crashes; everything else restarts from scratch.
 
-## Memory Considerations
+## Leader/Follower Roles
 
-- Seen tracker uses disk-backed sharding for memory efficiency
-  - Bloom filter: ~12MB for 10M items (always in memory)
-  - Hot shards: 32 shards × ~10K items × 24 bytes ≈ 7.7MB
-  - Cold shards: automatically evicted to disk
-  - Total hot memory: ~20MB (vs 252MB for all-in-memory approach)
-- Results queue uses disk backing with 10,000 item buffer
-- Checkpoint consumption reads from disk incrementally (doesn't load all results into memory)
-- See SEEN_TRACKER_DESIGN.md for detailed memory analysis
+The system supports two operational roles with different RAM allocation strategies:
 
-## Test Coverage
+### Leader
+- Larger RAM budget (2-6 GB for run generation)
+- Aggressive memory usage (targets 65-85% of available RAM)
+- Suitable for primary processing nodes
 
-- `test_save_and_load_checkpoint`: Basic checkpoint round-trip with SeenTracker
-- `test_checkpoint_rehydrates_bloom_from_all_results`: Verifies three-queue strategy and tracker reconstruction
-- `test_load_nonexistent_checkpoint`: Handles missing checkpoint gracefully
-- `test_results_queue_persistence`: Queue survives process restarts
-- `test_checkpoint_manager_integration`: Full integration test with tracker
+### Follower
+- Smaller RAM budget (256 MB - 1 GB for run generation)
+- Conservative memory usage (targets 50-70% of available RAM)
+- Suitable for resource-constrained nodes or when running multiple instances
 
-All tests use `tempfile` for isolation and automatic cleanup.
+RAM allocation is **continuous and dynamic**, adjusting based on global system memory pressure. See MEMORY_OPTIMIZATION.md for detailed RAM policy.
+
+## Ortho Interchange Format
+
+After integer bootstrap proving correctness, all boundaries use orthos:
+
+- **Landing logs**: orthos serialized via `bincode`
+- **Sorted runs**: orthos sorted by `ortho.id()`
+- **History runs**: orthos with dedupe key = `ortho.id()`
+- **Work segments**: orthos in unordered segment files
+
+Dedupe rules: Equal IDs require struct equality; collisions log and keep first.
+

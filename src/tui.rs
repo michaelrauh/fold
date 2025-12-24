@@ -172,30 +172,24 @@ impl Tui {
             snapshot.global.distinct_jobs_count,
             format_number(snapshot.operation.new_orthos)
         );
-        let top_tiers = if snapshot.tracker.top_tiers.is_empty() {
-            "n/a".to_string()
-        } else {
-            snapshot
-                .tracker
-                .top_tiers
-                .iter()
-                .map(|t| format_number(*t))
-                .collect::<Vec<_>>()
-                .join("/")
-        };
         let line4 = format!(
-            "Seen tiers: {} (top {}) │ Merges: {} │ Avg probe: {:.2} │ Est size: {}",
-            snapshot.tracker.tier_count,
-            top_tiers,
-            snapshot.tracker.merge_count,
-            snapshot.tracker.avg_probe_depth,
-            format_bytes(snapshot.tracker.bytes_est)
+            "Generation: {} │ Phase: {} │ Work: {} │ Accepted: {}",
+            snapshot.global.generation,
+            snapshot.global.phase,
+            format_number(snapshot.global.work_len as usize),
+            format_number(snapshot.global.seen_len_accepted as usize)
+        );
+        let line5 = format!(
+            "Run budget: {} │ Fan-in: {}",
+            format_bytes(snapshot.global.run_budget_bytes),
+            snapshot.global.fan_in
         );
         let header_lines = vec![
             Line::from(truncate_string(&line1, max_width)),
             Line::from(truncate_string(&line2, max_width)),
             Line::from(truncate_string(&line3, max_width)),
             Line::from(truncate_string(&line4, max_width)),
+            Line::from(truncate_string(&line5, max_width)),
         ];
 
         let header = Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL));
@@ -257,11 +251,11 @@ impl Tui {
             .starts_with("Processing Larger Archive")
         {
             let seen_current = snapshot
-                .seen_size_samples
+                .seen_len_accepted_samples
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
-            let seen_peak = snapshot.global.seen_size_pk;
+            let seen_peak = snapshot.seen_len_accepted_samples.iter().map(|s| s.value).max().unwrap_or(0);
 
             if seen_peak > 0 {
                 progress_ratio = seen_current as f64 / seen_peak as f64;
@@ -579,29 +573,29 @@ impl Tui {
             ])
             .split(area);
 
-        self.render_queue_depth_chart(f, right_chunks[0], snapshot);
-        self.render_seen_size_chart(f, right_chunks[1], snapshot);
-        self.render_tracker_panel(f, right_chunks[2], snapshot);
+        self.render_work_depth_chart(f, right_chunks[0], snapshot);
+        self.render_seen_growth_chart(f, right_chunks[1], snapshot);
+        self.render_history_panel(f, right_chunks[2], snapshot);
         self.render_optimal_ortho_display(f, right_chunks[3], snapshot);
     }
 
-    fn render_queue_depth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_work_depth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let sampled_data = sample_data(
-            &snapshot.queue_depth_samples,
+            &snapshot.work_len_samples,
             area.width.saturating_sub(2) as usize,
         );
         let data: Vec<u64> = sampled_data.iter().map(|s| s.value as u64).collect();
 
-        let (current, peak, rate) = if !snapshot.queue_depth_samples.is_empty() {
+        let (current, peak, rate) = if !snapshot.work_len_samples.is_empty() {
             let current = snapshot
-                .queue_depth_samples
+                .work_len_samples
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
-            let peak = snapshot.global.queue_depth_pk;
-            let rate = if snapshot.queue_depth_samples.len() >= 10 {
-                let prev_idx = snapshot.queue_depth_samples.len().saturating_sub(10);
-                let prev = snapshot.queue_depth_samples[prev_idx].value;
+            let peak = snapshot.work_len_samples.iter().map(|s| s.value).max().unwrap_or(0);
+            let rate = if snapshot.work_len_samples.len() >= 10 {
+                let prev_idx = snapshot.work_len_samples.len().saturating_sub(10);
+                let prev = snapshot.work_len_samples[prev_idx].value;
                 (current as i64 - prev as i64) / 10
             } else {
                 0
@@ -613,7 +607,7 @@ impl Tui {
 
         let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Queue │ Cur:{} Pk:{} Δ{}{}",
+            "Work │ Cur:{} Pk:{} Δ{}{}",
             format_number(current as usize),
             format_number(peak as usize),
             rate_sign,
@@ -633,9 +627,9 @@ impl Tui {
         f.render_widget(sparkline, area);
     }
 
-    fn render_seen_size_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_seen_growth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let sampled_data = sample_data(
-            &snapshot.seen_size_samples,
+            &snapshot.seen_len_accepted_samples,
             area.width.saturating_sub(2) as usize,
         );
         let baseline = sampled_data.first().map(|s| s.value).unwrap_or(0);
@@ -644,34 +638,32 @@ impl Tui {
             .map(|s| s.value.saturating_sub(baseline) as u64)
             .collect();
 
-        let (current, _peak, rate, baseline_raw) = if !snapshot.seen_size_samples.is_empty() {
+        let (current, rate, baseline_raw) = if !snapshot.seen_len_accepted_samples.is_empty() {
             let current_raw = snapshot
-                .seen_size_samples
+                .seen_len_accepted_samples
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
-            let peak_raw = snapshot.global.seen_size_pk;
             let baseline_raw = baseline;
-            let rate = if snapshot.seen_size_samples.len() >= 10 {
-                let prev_idx = snapshot.seen_size_samples.len().saturating_sub(10);
-                let prev = snapshot.seen_size_samples[prev_idx].value;
+            let rate = if snapshot.seen_len_accepted_samples.len() >= 10 {
+                let prev_idx = snapshot.seen_len_accepted_samples.len().saturating_sub(10);
+                let prev = snapshot.seen_len_accepted_samples[prev_idx].value;
                 (current_raw as i64 - prev as i64) / 10
             } else {
                 0
             };
             (
                 current_raw as u64,
-                peak_raw as u64,
                 rate,
                 baseline_raw as u64,
             )
         } else {
-            (0, 0, 0, 0)
+            (0, 0, 0)
         };
 
         let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Seen │ Cur:{} Base:{} Δ{}{}",
+            "Accepted │ Cur:{} Base:{} Δ{}{}",
             format_number(current as usize),
             format_number(baseline_raw as usize),
             rate_sign,
@@ -691,68 +683,37 @@ impl Tui {
         f.render_widget(sparkline, area);
     }
 
-    fn render_tracker_panel(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let tracker = &snapshot.tracker;
-        let add_rate = format_rate(tracker.add_rate_per_sec);
-        let hit_percent = if tracker.hit_rate.is_finite() {
-            tracker.hit_rate * 100.0
-        } else {
-            0.0
-        };
+    fn render_history_panel(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        // Display generational store metadata
+        let phase_str = &snapshot.global.phase;
+        let generation = snapshot.global.generation;
+        let work_len = snapshot.global.work_len;
+        let seen = snapshot.global.seen_len_accepted;
 
-        let block = Block::default().borders(Borders::ALL).title("Seen Tracker");
+        let block = Block::default().borders(Borders::ALL).title("Generational Store");
         let inner = block.inner(area);
         f.render_widget(block, area);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(1)])
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
             .split(inner);
 
         let lines_top = vec![Line::from(format!(
-            "Hit: {:.1}% │ Avg probe: {:.2} │ Add rate (1m): {}/s",
-            hit_percent, tracker.avg_probe_depth, add_rate
+            "Gen: {} │ Phase: {} │ Work: {}",
+            generation,
+            phase_str,
+            format_number(work_len as usize)
         ))];
         let lines_mid = vec![Line::from(format!(
-            "Merges: {} │ Est size: {} │ Front: {} │ Tiers: {}",
-            format_number(tracker.merge_count as usize),
-            format_bytes(tracker.bytes_est),
-            format_number(tracker.front_len),
-            tracker.tier_count
+            "Accepted: {} │ Budget: {} │ Fan-in: {}",
+            format_number(seen as usize),
+            format_bytes(snapshot.global.run_budget_bytes),
+            snapshot.global.fan_in
         ))];
 
         f.render_widget(Paragraph::new(lines_top), chunks[0]);
         f.render_widget(Paragraph::new(lines_mid), chunks[1]);
-
-        let data: Vec<u64> = if tracker.tiers.is_empty() {
-            vec![0]
-        } else {
-            let max_width = chunks[2].width.saturating_sub(2) as usize;
-            let start = tracker
-                .tiers
-                .len()
-                .saturating_sub(max_width.max(1));
-            tracker.tiers[start..]
-                .iter()
-                .map(|v| *v as u64)
-                .collect()
-        };
-        let title = format!(
-            "Tier sizes (old→new) max:{}",
-            format_number(tracker.tiers.iter().cloned().max().unwrap_or(0))
-        );
-        let sparkline = Sparkline::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(truncate_string(
-                        &title,
-                        chunks[2].width.saturating_sub(2) as usize,
-                    )),
-            )
-            .data(&data)
-            .style(Style::default().fg(Color::LightGreen));
-        f.render_widget(sparkline, chunks[2]);
     }
 
     #[allow(dead_code)]
@@ -1121,16 +1082,6 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.2} KB", b / KB)
     } else {
         format!("{} B", bytes)
-    }
-}
-
-fn format_rate(per_sec: f64) -> String {
-    if per_sec >= 1_000_000.0 {
-        format!("{:.2}M", per_sec / 1_000_000.0)
-    } else if per_sec >= 1_000.0 {
-        format!("{:.2}k", per_sec / 1_000.0)
-    } else {
-        format!("{:.2}", per_sec)
     }
 }
 

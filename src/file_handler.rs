@@ -1,4 +1,4 @@
-use crate::{FoldError, disk_backed_queue::DiskBackedQueue, interner::Interner, ortho::Ortho};
+use crate::{FoldError, interner::Interner, ortho::Ortho};
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -727,85 +727,6 @@ fn find_archives(input_dir: &str) -> Result<Vec<(String, u64)>, FoldError> {
     Ok(archives)
 }
 
-fn save_archive(
-    archive_path: &str,
-    interner: &Interner,
-    mut results: DiskBackedQueue,
-    results_path: &str,
-    best_ortho: Option<&Ortho>,
-    lineage: &str,
-    ortho_count: usize,
-    text_preview: &str,
-    word_count: usize,
-) -> Result<(), FoldError> {
-    // Flush and drop results to close file handles before rename
-    results.flush()?;
-    drop(results);
-
-    // Create archive directory
-    fs::create_dir_all(archive_path).map_err(|e| FoldError::Io(e))?;
-
-    // Move the DiskBackedQueue directory to the archive
-    let archive_results_path = format!("{}/results", archive_path);
-    let results_path_obj = Path::new(results_path);
-    if results_path_obj.exists() {
-        fs::rename(results_path, &archive_results_path).map_err(|e| FoldError::Io(e))?;
-    }
-
-    // Write the interner to the archive folder
-    let interner_path = format!("{}/interner.bin", archive_path);
-    let interner_bytes = bincode::encode_to_vec(interner, bincode::config::standard())?;
-    fs::write(interner_path, interner_bytes).map_err(|e| FoldError::Io(e))?;
-
-    // Write the optimal ortho as text if provided
-    if let Some(ortho) = best_ortho {
-        let optimal_path = format!("{}/optimal.txt", archive_path);
-        let optimal_text = format_optimal_ortho(ortho, interner);
-        fs::write(optimal_path, optimal_text).map_err(|e| FoldError::Io(e))?;
-
-        // Also save the optimal ortho in binary format for recovery
-        let optimal_bin_path = format!("{}/optimal.bin", archive_path);
-        let optimal_bytes = bincode::encode_to_vec(ortho, bincode::config::standard())?;
-        fs::write(optimal_bin_path, optimal_bytes).map_err(|e| FoldError::Io(e))?;
-    }
-
-    // Write the lineage tracking as S-expression
-    let lineage_path = format!("{}/lineage.txt", archive_path);
-    fs::write(lineage_path, lineage).map_err(|e| FoldError::Io(e))?;
-
-    // Write metadata (ortho count)
-    let metadata_path = format!("{}/metadata.txt", archive_path);
-    fs::write(metadata_path, ortho_count.to_string()).map_err(|e| FoldError::Io(e))?;
-
-    // Write text metadata (preview and word count)
-    let text_meta_path = format!("{}/text_meta.txt", archive_path);
-    let text_meta_content = format!("{}\n{}", word_count, text_preview);
-    fs::write(text_meta_path, text_meta_content).map_err(|e| FoldError::Io(e))?;
-
-    Ok(())
-}
-
-fn format_optimal_ortho(ortho: &Ortho, interner: &Interner) -> String {
-    let volume = ortho.dims().iter().map(|&d| d - 1).product::<usize>();
-    let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
-
-    let mut output = String::new();
-    output.push_str("===== OPTIMAL ORTHO =====\n");
-    output.push_str(&format!("Ortho ID: {}\n", ortho.id()));
-    output.push_str(&format!("Dimensions: {:?}\n", ortho.dims()));
-    output.push_str(&format!(
-        "Score: (volume={}, fullness={})\n",
-        volume, fullness
-    ));
-    output.push_str("\nGeometry:\n");
-
-    for line in format!("{}", ortho.display(interner)).lines() {
-        output.push_str(&format!("  {}\n", line));
-    }
-
-    output
-}
-
 /// Load interner from an archive
 pub fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
     let interner_path = format!("{}/interner.bin", archive_path);
@@ -1014,39 +935,9 @@ impl TxtIngestion {
         format!("{}/seen_shards", self.work_folder)
     }
 
-    /// Save the processing result as an archive
-    pub fn save_result(
-        &self,
-        interner: &Interner,
-        results: DiskBackedQueue,
-        best_ortho: Option<&Ortho>,
-        ortho_count: usize,
-    ) -> Result<(String, String), FoldError> {
-        let lineage = format!("\"{}\"", self.filename);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        // Use timestamp + nanos + filename for guaranteed uniqueness
-        let archive_path = self.config.input_dir().join(format!(
-            "archive_{}_{}_{}=.bin",
-            self.filename,
-            now.as_secs(),
-            now.subsec_nanos()
-        ));
-        let results_path = self.results_path();
-
-        save_archive(
-            archive_path.to_str().unwrap(),
-            interner,
-            results,
-            &results_path,
-            best_ortho,
-            &lineage,
-            ortho_count,
-            &self.text_preview,
-            self.word_count,
-        )?;
-        Ok((archive_path.to_string_lossy().to_string(), lineage))
+    /// Get the config for this ingestion
+    pub fn config(&self) -> &StateConfig {
+        &self.config
     }
 
     /// Cleanup work folder after processing
@@ -1108,45 +999,9 @@ impl ArchiveIngestion {
         format!("{}/seen_shards", self.merge_work_folder)
     }
 
-    /// Save merged result
-    pub fn save_result(
-        &self,
-        interner: &Interner,
-        results: DiskBackedQueue,
-        results_path: &str,
-        best_ortho: Option<&Ortho>,
-        lineage_a: &str,
-        lineage_b: &str,
-        ortho_count: usize,
-    ) -> Result<(String, String), FoldError> {
-        let merged_lineage = format!("({} {})", lineage_a, lineage_b);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        // Use timestamp + nanos + process ID for guaranteed uniqueness across merges
-        let archive_path = self.config.input_dir().join(format!(
-            "archive_merged_{}_{}_{}.bin",
-            now.as_secs(),
-            now.subsec_nanos(),
-            std::process::id()
-        ));
-
-        // Compute merged text metadata (sum of word counts, combined previews)
-        let merged_word_count = self.word_count_a + self.word_count_b;
-        let merged_preview = format!("{} ... {}", self.text_preview_a, self.text_preview_b);
-
-        save_archive(
-            archive_path.to_str().unwrap(),
-            interner,
-            results,
-            results_path,
-            best_ortho,
-            &merged_lineage,
-            ortho_count,
-            &merged_preview,
-            merged_word_count,
-        )?;
-        Ok((archive_path.to_string_lossy().to_string(), merged_lineage))
+    /// Get the config for this ingestion
+    pub fn config(&self) -> &StateConfig {
+        &self.config
     }
 
     /// Cleanup original archives and merge work folder
@@ -1485,78 +1340,7 @@ pub fn ingest_archives_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ortho::Ortho;
     use std::sync::{Arc, Barrier};
-
-    #[test]
-    fn test_save_and_load_archive() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let archive_path = temp_dir.path().join("test.bin");
-        let results_path = temp_dir.path().join("test_results");
-
-        let interner = Interner::from_text("hello world test");
-        let ortho1 = Ortho::new();
-        let ortho2 = Ortho::new();
-
-        // Create a DiskBackedQueue and add orthos
-        let mut results =
-            DiskBackedQueue::new_from_path(results_path.to_str().unwrap(), 10).unwrap();
-        results.push(ortho1.clone()).unwrap();
-        results.push(ortho2).unwrap();
-
-        // Save archive
-        save_archive(
-            archive_path.to_str().unwrap(),
-            &interner,
-            results,
-            results_path.to_str().unwrap(),
-            Some(&ortho1),
-            "\"test\"",
-            2,
-            "hello world ... test",
-            3,
-        )
-        .unwrap();
-
-        // Verify archive directory exists
-        assert!(archive_path.exists());
-        assert!(archive_path.is_dir());
-
-        // Verify interner.bin exists
-        let interner_path = archive_path.join("interner.bin");
-        assert!(interner_path.exists());
-
-        // Load and verify interner
-        let interner_bytes = fs::read(&interner_path).unwrap();
-        let (loaded_interner, _): (Interner, usize) =
-            bincode::decode_from_slice(&interner_bytes, bincode::config::standard()).unwrap();
-
-        assert_eq!(loaded_interner.version(), interner.version());
-        assert_eq!(
-            loaded_interner.vocabulary().len(),
-            interner.vocabulary().len()
-        );
-
-        // Verify results directory was moved
-        let archive_results_path = archive_path.join("results");
-        assert!(archive_results_path.exists());
-        assert!(archive_results_path.is_dir());
-
-        // Load results from the archive and verify by popping (len() is not reliable for reloaded queues)
-        let mut loaded_results =
-            DiskBackedQueue::new_from_path(archive_results_path.to_str().unwrap(), 10).unwrap();
-        let mut count = 0;
-        while loaded_results.pop().unwrap().is_some() {
-            count += 1;
-        }
-        assert_eq!(count, 2);
-
-        // Verify lineage.txt exists and contains expected value
-        let lineage_path = archive_path.join("lineage.txt");
-        assert!(lineage_path.exists());
-        let lineage = fs::read_to_string(&lineage_path).unwrap();
-        assert_eq!(lineage, "\"test\"");
-    }
 
     #[test]
     fn test_heartbeat_creation() {

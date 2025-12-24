@@ -1,261 +1,250 @@
-# DiskBackedQueue Design
+# External Sort Design
+
+## Overview
+
+Fold uses **bucketed external sort** to deduplicate results within each generation. External sort enables processing datasets larger than RAM by using arena-based run generation and k-way merge, with disk used to bound RAM usage rather than for durability.
 
 ## Purpose
 
-`DiskBackedQueue` provides a hybrid memory/disk queue for orthos that prevents out-of-memory errors during large-scale fold processing. It maintains working set in memory while spilling overflow to disk.
+Transform unsorted landing logs into sorted, deduplicated runs:
 
-## Problem Statement
+```
+landing/b=XX/drain-*.log  →  [external sort]  →  history/b=XX/run-NNN.bin
+```
 
-### The Memory Challenge
-
-- Orthos: 80-900+ bytes each
-- BFS frontier can grow to millions of items
-- Peak memory usage unpredictable (depends on text structure)
-- Cannot hold entire work queue in memory
-
-### The Solution
-
-Hybrid queue with automatic memory management:
-- Keep hot working set in RAM (default: 10,000 items)
-- Spill overflow to disk automatically
-- Load from disk as memory becomes available
-- Persistent across process restarts
+Each bucket is processed independently, enabling parallelization and bounded memory usage per bucket.
 
 ## Architecture
 
-### Three-Component Design
+### Arena-Based Run Generation
+
+**Goal**: Sort landing data in RAM-bounded chunks.
+
+**Process**:
+1. Allocate arena (e.g., `Vec<i64>` for bootstrap, `Vec<Ortho>` for production)
+2. Fill arena until capacity reached:
+   - Integers: `arena.len() * 8 <= run_budget_bytes`
+   - Orthos: `sum(bincode::serialized_size(&ortho)) <= run_budget_bytes`
+3. Sort arena in-place
+4. Write arena to run file
+5. Clear arena (reuse capacity) and repeat
+
+**Run file format**:
+- Sorted sequence of records
+- Integers: raw `i64` (8 bytes LE) during bootstrap
+- Orthos: `bincode` encoding in production
+- File naming: `run-001.bin`, `run-002.bin`, etc.
+
+### K-Way Merge
+
+**Goal**: Merge multiple sorted runs into a single sorted, deduplicated run.
+
+**Process**:
+1. Open up to `fan_in` runs simultaneously
+2. Maintain min-heap of (value, run_id) based on sort key
+3. Stream merge with duplicate elimination:
+   - Integers: dedupe by value
+   - Orthos: dedupe by `ortho.id()` (with struct equality check for collisions)
+4. Write merged output to new run file
+5. If more than `fan_in` runs, repeat merge (multi-pass)
+
+**Memory usage**:
+- `fan_in` read buffers × `read_buf_bytes`
+- One write buffer
+- Min-heap overhead: O(fan_in)
+
+### Multi-Pass Strategy
+
+If run count exceeds `fan_in`, perform multiple merge passes:
 
 ```
-┌─────────────────────────────────────────┐
-│  In-Memory VecDeque (hot working set)   │
-│  Capacity: 10,000 items (configurable)  │
-└─────────────┬───────────────────────────┘
-              │
-              ↓ spill when full
-┌─────────────────────────────────────────┐
-│  Disk Files (cold storage)              │
-│  Format: queue_NNNNNNNN.bin (bincode)   │
-│  Location: configurable base path       │
-└─────────────────────────────────────────┘
-              │
-              ↓ load on demand
-┌─────────────────────────────────────────┐
-│  File Index Tracker                     │
-│  next_write_file: which file to write   │
-│  next_read_file: which file to read     │
-└─────────────────────────────────────────┘
+Pass 1: 128 runs → 16 runs (fan_in=8)
+Pass 2: 16 runs → 2 runs
+Pass 3: 2 runs → 1 run (final unique run)
 ```
 
-### Memory Threshold Strategy
+Each pass reduces run count by factor of `fan_in`.
 
-- **Push behavior**: Add to in-memory queue
-  - If queue reaches capacity → flush to disk
-  - Memory queue cleared after flush
-  
-- **Pop behavior**: Remove from in-memory queue
-  - If queue empty → load next disk file
-  - Entire file loaded at once into memory
+## RAM Budget Configuration
 
-## File Format
+### Leader Role
+- `run_budget_bytes`: 2-6 GB (aggressive)
+- Target RAM usage: 65-85% of available
+- Suitable for primary processing nodes
 
-### Naming Convention
+### Follower Role
+- `run_budget_bytes`: 256 MB - 1 GB (conservative)
+- Target RAM usage: 50-70% of available
+- Minimum viable: 128 MB
+- Bail if insufficient RAM and memory pressure persists
 
+### Dynamic Adjustment
+
+RAM budget adjusts continuously based on:
+- Global RSS percentage
+- Available headroom
+- Role-specific targets
+
+Formula:
+```rust
+run_budget = 0.7 * budget  // 70% for arena
+fan_in = clamp(budget / read_buf_bytes, 8, 128)
 ```
-queue_00000001.bin  ← first spill
-queue_00000002.bin  ← second spill
-queue_00000003.bin  ← third spill
-...
-```
 
-### Serialization
+See MEMORY_OPTIMIZATION.md for detailed RAM policy.
 
-- Format: bincode (binary, compact)
-- Contents: `Vec<Ortho>` serialized as single blob
-- Each file contains one "chunk" of items (up to capacity)
+## Bucketing Strategy
 
-## Operations
-
-### Push
+### Power-of-Two Buckets
 
 ```rust
-queue.push(ortho)?;
+bucket = ortho.id() as u64 & (B - 1)
 ```
 
-1. Add ortho to in-memory `VecDeque`
-2. If `VecDeque.len() >= memory_capacity`:
-   - Serialize all items to `queue_NNNNNNNN.bin`
-   - Increment `next_write_file`
-   - Clear in-memory queue
-   - Increment disk item counter
+where `B` is power-of-two bucket count (e.g., 16, 32, 64).
 
-### Pop
+**Benefits**:
+- Fast bucket calculation (bitwise AND)
+- Uniform distribution (assuming good hash)
+- Independent processing per bucket
+- Parallelization opportunity
 
-```rust
-if let Some(ortho) = queue.pop()? {
-    // process ortho
-}
-```
+### Bucket Independence
 
-1. If in-memory queue not empty:
-   - Return front item from `VecDeque`
-2. If in-memory queue empty AND disk files exist:
-   - Load `queue_NNNNNNNN.bin` into memory
-   - Delete loaded file
-   - Increment `next_read_file`
-   - Return front item from newly loaded queue
+Each bucket processes independently:
+- Separate landing zones
+- Separate sort phases
+- Separate history stores
+- No cross-bucket dependencies
 
-### Len
+## Disk Usage Model
 
-```rust
-let total = queue.len();  // in-memory + on-disk
-```
+**Disk bounds RAM, not durability**:
+- Spill to disk when arena fills
+- Runs are intermediate artifacts (NOT durable)
+- Crash loses all intermediate state
+- Heartbeat staleness triggers file-level restart from scratch
 
-Returns: `in_memory_queue.len() + items_on_disk_count`
-
-### Flush
-
-```rust
-queue.flush()?;
-```
-
-Forces immediate spill of in-memory items to disk. Used before:
-- Checkpointing
-- Process shutdown
-- Manual persistence points
-
-## Persistence Strategy
-
-### State Preservation
-
-The queue can be reconstructed across process restarts:
-
-```rust
-// Initial creation
-let queue = DiskBackedQueue::new_from_path("./work_queue", 10000)?;
-
-// ... process items, some spill to disk ...
-
-// Process restarts
-let queue = DiskBackedQueue::new_from_path("./work_queue", 10000)?;
-// Automatically discovers existing files and continues
-```
-
-### File Discovery
-
-On `new_from_path()`:
-1. List all `queue_*.bin` files in directory
-2. Parse file numbers to find gaps
-3. Set `next_write_file` to first gap or max+1
-4. Set `next_read_file` to lowest numbered file
-5. Count items across all files for initial `len()`
-
-## Memory Characteristics
-
-### Bounded Memory Usage
-
-- **Maximum in-memory**: `memory_capacity × sizeof(Ortho)`
-- **Typical**: 10,000 items × ~400 bytes = ~4MB
-- **Configurable**: Adjust capacity based on available RAM
-
-### Disk Usage
-
-- **Unbounded**: Limited only by disk space
-- **Typical file size**: ~4MB per file (10,000 × 400 bytes)
-- **Cleanup**: Files deleted as they're consumed
-
-## Checkpoint Integration
-
-### Three-Queue Strategy
-
-During checkpoint save/load, the results queue uses a three-instance pattern:
-
-1. **Checkpoint backup** (preserved, read-only)
-   - Located at: `checkpoint/results_backup/`
-   - Never modified after checkpoint creation
-   - Source of truth for recovery
-
-2. **Temporary copy** (consumed during load)
-   - Located at: `results_temp/`
-   - Copy of checkpoint backup
-   - Consumed to rebuild bloom filter and seen set
-   - Deleted after rehydration complete
-
-3. **Active queue** (being built)
-   - Located at: `results/`
-   - Receives all items from temporary queue
-   - Becomes the new active results
-
-This ensures checkpoint data is never corrupted during load operations.
+**No intermediate recovery**:
+- Landing logs, runs, history are ephemeral during processing
+- Only completed archives (after successful processing) are preserved
+- Crash detection via heartbeat mechanism, not state inspection
 
 ## Performance Characteristics
 
-### Push Performance
+### Arena Sort
+- **Time**: O(n log n) per run
+- **Space**: O(run_budget_bytes)
+- **IO**: One sequential write per run
 
-- **Memory-only**: O(1) amortized (VecDeque push_back)
-- **With spill**: O(n) every n items (where n = memory_capacity)
-  - Serialize n items: O(n)
-  - Write to disk: O(n)
-  - Clear memory: O(1)
+### K-Way Merge
+- **Time**: O(n log k) where k = fan_in
+- **Space**: O(fan_in × read_buf_bytes)
+- **IO**: Sequential reads + one sequential write
 
-### Pop Performance
+### Multi-Pass
+- **Passes**: ⌈log_fan_in(run_count)⌉
+- **Total IO**: O(n × passes)
 
-- **Memory-only**: O(1) (VecDeque pop_front)
-- **With load**: O(n) every n items
-  - Read from disk: O(n)
-  - Deserialize: O(n)
-  - Delete file: O(1)
+## Example: 10 GB Data, 2 GB RAM Budget
 
-### Space Complexity
+```
+Arena capacity: ~200M integers (or ~2.5M orthos)
+Run size: ~2 GB
+Initial runs: 5 runs
 
-- **Memory**: O(memory_capacity)
-- **Disk**: O(total_items)
+K-way merge (fan_in=8):
+  Pass 1: 5 runs → 1 run (single pass sufficient)
 
-## Error Handling
+Total IO: ~20 GB (10 GB read, 10 GB write)
+Peak RAM: 2 GB
+```
 
-### Transient Failures
+## Record Formats
 
-- IO errors during spill → propagated as `FoldError::Io`
-- Disk full → propagated as `FoldError::Io`
-- Serialization errors → propagated as `FoldError::Bincode`
+### Bootstrap (Integers)
+- Raw `i64`: 8 bytes little-endian
+- Sort key: value itself
+- Dedupe key: value itself
 
-### Recovery
+### Production (Orthos)
+- `bincode` encoding of `ortho::Ortho`
+- Sort key: `ortho.id()`
+- Dedupe key: `ortho.id()` + struct equality check
+- Collision handling: Log and keep first
 
-- Partially written files: overwritten on next spill (atomic file creation)
-- Missing sequence numbers: automatically detected and filled
-- Corrupt files: fail fast with descriptive error
+See `src/ortho.rs` for canonical type definition.
+
+## Integration with Generational Pipeline
+
+```
+┌────────────────────────────────────────┐
+│ DRAINING PHASE                         │
+│ - Flush active landing logs            │
+│ - Create immutable drain-N.log files   │
+└────────────────────────────────────────┘
+              ↓
+┌────────────────────────────────────────┐
+│ COMPACTING PHASE (per bucket)         │
+│ 1. Arena-based run generation          │
+│    - Read drain logs                   │
+│    - Fill arena (RAM-bounded)          │
+│    - Sort + write run                  │
+│ 2. K-way merge                         │
+│    - Merge runs → unique sorted run    │
+│    - Dedupe within generation          │
+└────────────────────────────────────────┘
+              ↓
+┌────────────────────────────────────────┐
+│ ANTI-JOIN PHASE                        │
+│ - Stream merge: gen vs history         │
+│ - Emit novel orthos                    │
+│ - Add run to history                   │
+└────────────────────────────────────────┘
+```
+
+## Directory Structure
+
+```
+fold_state/
+├── landing/
+│   └── b=XX/
+│       ├── active.log     # Receiving new orthos
+│       └── drain-*.log    # Immutable, ready for sort
+├── compact_temp/
+│   └── b=XX/
+│       └── run-*.bin      # Intermediate sorted runs
+└── history/
+    └── b=XX/
+        └── run-*.bin      # Final deduplicated runs
+```
 
 ## Design Rationale
 
-### Why VecDeque for Memory?
+### Why Arena-Based?
 
-- Efficient FIFO operations (O(1) push_back, pop_front)
-- Contiguous memory for cache locality
-- No reallocation in steady state (pre-sized to capacity)
+- Predictable memory usage
+- Good cache locality (contiguous array)
+- Fast in-place sort
+- No allocation churn
 
-### Why File-Per-Chunk?
 
-- Atomic writes (single file write operation)
-- Simple cleanup (delete consumed files)
-- No file growth/truncation complexity
-- Easy to reason about and debug
+### Why Bucketed?
 
-### Why Bincode?
+- Parallel processing potential
+- Bounded memory per bucket
+- Uniform distribution via hash
 
-- Fast serialization/deserialization
-- Compact binary format
-- Native Rust type support
-- Zero-copy where possible
+### Why K-Way Merge?
 
-### Why Not Database?
+- Flexible fan-in tuning
+- Bounded file handles
+- Predictable IO pattern
+- Standard external sort approach
 
-- Adds complexity (SQL/NoSQL engine)
-- Overkill for simple FIFO queue
-- No query requirements
-- File-based is simpler and faster
+### Why Not In-Memory Sort?
 
-### Why Not Memory-Mapped Files?
-
-- Complex lifetime management
-- OS-dependent behavior
-- Overkill for append-only queue
-- Explicit I/O is more portable
+- Dataset exceeds RAM
+- Peak memory unpredictable
+- Must bound memory usage
+- External sort is proven approach

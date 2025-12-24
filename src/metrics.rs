@@ -1,4 +1,3 @@
-use crate::seen_tracker::TrackerStats;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,14 +38,16 @@ pub struct GlobalMetrics {
     pub system_memory_percent: usize,
     pub start_time: u64,
     pub current_lineage: String,
-    pub queue_buffer_size: usize,
-    pub num_shards: usize,
-    pub max_shards_in_memory: usize,
-    pub queue_depth_pk: usize,
-    pub seen_size_pk: usize,
     pub distinct_jobs_count: usize,
     pub ram_bytes: usize,
     pub process_rss_bytes: usize,
+    // Generational store fields
+    pub generation: u64,
+    pub phase: String,
+    pub work_len: u64,
+    pub seen_len_accepted: u64,
+    pub run_budget_bytes: usize,
+    pub fan_in: usize,
 }
 
 impl Default for GlobalMetrics {
@@ -66,51 +67,15 @@ impl Default for GlobalMetrics {
             system_memory_percent: 0,
             start_time,
             current_lineage: String::new(),
-            queue_buffer_size: 0,
-            num_shards: 0,
-            max_shards_in_memory: 0,
-            queue_depth_pk: 0,
-            seen_size_pk: 0,
             distinct_jobs_count: 0,
             ram_bytes: 0,
             process_rss_bytes: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TrackerMetrics {
-    pub tier_count: usize,
-    pub top_tiers: Vec<usize>,
-    pub tiers: Vec<usize>,
-    pub front_len: usize,
-    pub total_len: usize,
-    pub merge_count: u64,
-    pub merge_keys_total: u64,
-    pub avg_probe_depth: f64,
-    pub bytes_est: usize,
-    pub hit_rate: f64,
-    pub add_rate_per_sec: f64,
-}
-
-impl From<TrackerStats> for TrackerMetrics {
-    fn from(stats: TrackerStats) -> Self {
-        Self {
-            tier_count: stats.tier_count,
-            top_tiers: stats.top_tiers,
-            tiers: stats.tiers,
-            front_len: stats.front_len,
-            total_len: stats.total_len,
-            merge_count: stats.merge_count,
-            merge_keys_total: stats.merge_keys_total,
-            avg_probe_depth: stats.avg_probe_depth,
-            bytes_est: stats.bytes_est,
-            hit_rate: if stats.lookup_count > 0 {
-                stats.hit_count as f64 / stats.lookup_count as f64
-            } else {
-                0.0
-            },
-            add_rate_per_sec: 0.0,
+            generation: 0,
+            phase: "Idle".to_string(),
+            work_len: 0,
+            seen_len_accepted: 0,
+            run_budget_bytes: 0,
+            fan_in: 0,
         }
     }
 }
@@ -245,13 +210,13 @@ struct MetricsInner {
     merge: MergeStatus,
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
-    tracker: TrackerMetrics,
-    tracker_len_samples: VecDeque<MetricSample>,
 
-    queue_depth_samples: VecDeque<MetricSample>,
-    seen_size_samples: VecDeque<MetricSample>,
     seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
+    
+    // Generational store metrics
+    work_len_samples: VecDeque<MetricSample>,
+    seen_len_accepted_samples: VecDeque<MetricSample>,
 
     status_history: VecDeque<StatusHistoryEntry>,
     status_duration_stats: StatusDurationStats,
@@ -268,12 +233,10 @@ impl Metrics {
                 merge: MergeStatus::default(),
                 largest_archive: LargestArchive::default(),
                 optimal_ortho: OptimalOrtho::default(),
-                tracker: TrackerMetrics::default(),
-                tracker_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                queue_depth_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                seen_size_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
+                work_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
+                seen_len_accepted_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 status_history: VecDeque::with_capacity(100),
                 status_duration_stats: StatusDurationStats::default(),
                 logs: VecDeque::with_capacity(100),
@@ -359,63 +322,24 @@ impl Metrics {
         (inner.optimal_ortho.volume, inner.optimal_ortho.fullness)
     }
 
-    pub fn record_queue_depth(&self, depth: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        if depth > inner.global.queue_depth_pk {
-            inner.global.queue_depth_pk = depth;
-        }
-        drop(inner);
-        self.record_sample(depth, |inner| &mut inner.queue_depth_samples);
-    }
-
-    pub fn record_seen_size(&self, size: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        if size > inner.global.seen_size_pk {
-            inner.global.seen_size_pk = size;
-        }
-        drop(inner);
-        self.record_sample(size, |inner| &mut inner.seen_size_samples);
-        self.record_sample(size, |inner| &mut inner.seen_history_samples);
-    }
-
     pub fn reset_seen_history(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.seen_history_samples.clear();
     }
 
+    pub fn record_work_len(&self, len: usize) {
+        self.record_sample(len, |inner| &mut inner.work_len_samples);
+    }
+
+    pub fn record_seen_len_accepted(&self, len: usize) {
+        self.record_sample(len, |inner| &mut inner.seen_len_accepted_samples);
+        // Also record to persistent history that survives chunk resets
+        self.record_sample(len, |inner| &mut inner.seen_history_samples);
+    }
+
     pub fn reset_new_orthos(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.operation.new_orthos = 0;
-    }
-
-    pub fn set_tracker_metrics(&self, stats: TrackerStats) {
-        let mut inner = self.inner.lock().unwrap();
-        let now = Self::current_timestamp();
-        inner.tracker_len_samples.push_back(MetricSample {
-            timestamp: now,
-            value: stats.total_len,
-        });
-        while let Some(front) = inner.tracker_len_samples.front() {
-            if now.saturating_sub(front.timestamp) > 60 {
-                inner.tracker_len_samples.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        let mut tracker_metrics = TrackerMetrics::from(stats);
-        if let (Some(first), Some(last)) = (
-            inner.tracker_len_samples.front(),
-            inner.tracker_len_samples.back(),
-        ) {
-            let dt = last.timestamp.saturating_sub(first.timestamp);
-            if dt > 0 && last.value >= first.value {
-                tracker_metrics.add_rate_per_sec =
-                    (last.value - first.value) as f64 / dt as f64;
-            }
-        }
-
-        inner.tracker = tracker_metrics;
     }
 
     pub fn increment_new_orthos(&self, count: usize) {
@@ -523,20 +447,17 @@ impl Metrics {
 
     pub fn clear_chart_history(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.queue_depth_samples.clear();
-        inner.seen_size_samples.clear();
+        inner.work_len_samples.clear();
+        inner.seen_len_accepted_samples.clear();
         inner.optimal_volume_samples.clear();
-        inner.global.queue_depth_pk = 0;
-        inner.global.seen_size_pk = 0;
         // Note: seen_history_samples is NOT cleared - it persists across all chunks
     }
 
     pub fn reset_seen_size(&self, baseline: usize) {
         let mut inner = self.inner.lock().unwrap();
-        inner.seen_size_samples.clear();
-        inner.global.seen_size_pk = baseline;
+        inner.seen_len_accepted_samples.clear();
         let timestamp = Self::current_timestamp();
-        inner.seen_size_samples.push_back(MetricSample {
+        inner.seen_len_accepted_samples.push_back(MetricSample {
             timestamp,
             value: baseline,
         });
@@ -564,11 +485,10 @@ impl Metrics {
             merge: inner.merge.clone(),
             largest_archive: inner.largest_archive.clone(),
             optimal_ortho: inner.optimal_ortho.clone(),
-            tracker: inner.tracker.clone(),
-            queue_depth_samples: inner.queue_depth_samples.iter().cloned().collect(),
-            seen_size_samples: inner.seen_size_samples.iter().cloned().collect(),
             seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
             optimal_volume_samples: inner.optimal_volume_samples.iter().cloned().collect(),
+            work_len_samples: inner.work_len_samples.iter().cloned().collect(),
+            seen_len_accepted_samples: inner.seen_len_accepted_samples.iter().cloned().collect(),
             status_history: inner.status_history.iter().cloned().collect(),
             status_duration_stats: inner.status_duration_stats.clone(),
             logs: inner.logs.iter().cloned().collect(),
@@ -583,11 +503,10 @@ pub struct MetricsSnapshot {
     pub merge: MergeStatus,
     pub largest_archive: LargestArchive,
     pub optimal_ortho: OptimalOrtho,
-    pub tracker: TrackerMetrics,
-    pub queue_depth_samples: Vec<MetricSample>,
-    pub seen_size_samples: Vec<MetricSample>,
     pub seen_history_samples: Vec<MetricSample>,
     pub optimal_volume_samples: Vec<MetricSample>,
+    pub work_len_samples: Vec<MetricSample>,
+    pub seen_len_accepted_samples: Vec<MetricSample>,
     pub status_history: Vec<StatusHistoryEntry>,
     pub status_duration_stats: StatusDurationStats,
     pub logs: Vec<LogEntry>,
