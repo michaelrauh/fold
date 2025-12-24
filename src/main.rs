@@ -1186,6 +1186,9 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
             {
                 let mem_total_kib_f = mem_total_kib as f64;
                 // If sysinfo matches /proc/meminfo in KiB, convert to bytes.
+                fn within_10_pct(a: f64, b: f64) -> bool {
+                    (a - b).abs() / a.max(b) <= 0.1
+                }
                 if within_10_pct(total_raw as f64, mem_total_kib_f) {
                     let factor = 1024usize;
                     return (
