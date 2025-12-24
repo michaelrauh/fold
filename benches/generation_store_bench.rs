@@ -113,6 +113,11 @@ fn bench_sort_throughput_128mb(c: &mut Criterion) {
         fan_in: 32,
         read_buf_bytes: 64 * 1024,
         allow_compaction: true,
+        work_queue_cache_size: 10_000,
+        bufwriter_capacity: 64 * 1024,
+        work_segment_size: 1000,
+        history_cache_bytes: 1024 * 1024,
+        landing_flush_threshold: 64 * 1024,
     };
     
     // Create orthos for benchmarking (scaled down for reasonable test time)
@@ -137,6 +142,11 @@ fn bench_sort_throughput_512mb(c: &mut Criterion) {
         fan_in: 64,
         read_buf_bytes: 64 * 1024,
         allow_compaction: true,
+        work_queue_cache_size: 10_000,
+        bufwriter_capacity: 64 * 1024,
+        work_segment_size: 1000,
+        history_cache_bytes: 1024 * 1024,
+        landing_flush_threshold: 64 * 1024,
     };
     
     // Create orthos for benchmarking
@@ -161,6 +171,11 @@ fn bench_sort_throughput_2gb(c: &mut Criterion) {
         fan_in: 128,
         read_buf_bytes: 64 * 1024,
         allow_compaction: true,
+        work_queue_cache_size: 10_000,
+        bufwriter_capacity: 64 * 1024,
+        work_segment_size: 1000,
+        history_cache_bytes: 1024 * 1024,
+        landing_flush_threshold: 64 * 1024,
     };
     
     // Create orthos for benchmarking
@@ -260,10 +275,15 @@ fn bench_anti_join_history_100k(c: &mut Criterion) {
 
 fn bench_full_generation_with_duplicates(c: &mut Criterion) {
     let cfg = Config {
-        run_budget_bytes: 256 * 1024 * 1024, // 256MB
+        run_budget_bytes: 256 * 1024 * 1024,
         fan_in: 32,
         read_buf_bytes: 64 * 1024,
         allow_compaction: true,
+        work_queue_cache_size: 10_000,
+        bufwriter_capacity: 64 * 1024,
+        work_segment_size: 1000,
+        history_cache_bytes: 1024 * 1024,
+        landing_flush_threshold: 64 * 1024,
     };
     
     c.bench_function("full_generation_1m_ints_50pct_dupes", |b| {
@@ -323,6 +343,11 @@ fn bench_merge_unique_varying_runs(c: &mut Criterion) {
         fan_in: 32,
         read_buf_bytes: 64 * 1024,
         allow_compaction: true,
+        work_queue_cache_size: 10_000,
+        bufwriter_capacity: 64 * 1024,
+        work_segment_size: 1000,
+        history_cache_bytes: 1024 * 1024,
+        landing_flush_threshold: 64 * 1024,
     };
     
     for num_runs in [4, 8, 16, 32, 64].iter() {

@@ -332,12 +332,15 @@ fn process_txt_file(
     // Initialize GenerationStore for this file (work folder becomes gen store base)
     let store_path = PathBuf::from(ingestion.work_queue_path()).parent().unwrap().to_path_buf();
     let mut store = GenerationStore::new_with_config(store_path, 8)?;
+    store.configure(&cfg);
 
     metrics.add_log(format!(
-        "[{} init] generation_store initialized run_budget={} MB fan_in={}",
+        "[{} init] generation_store configured: run_budget={} MB, work_cache={} orthos, bufwriter={} KB, segment_size={} orthos",
         role_as_str(role),
         cfg.run_budget_bytes / 1_048_576,
-        cfg.fan_in
+        cfg.work_queue_cache_size,
+        cfg.bufwriter_capacity / 1024,
+        cfg.work_segment_size
     ));
 
     // Seed with empty ortho
@@ -361,7 +364,12 @@ fn process_txt_file(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+    metrics.record_landing_buffer_size(store.total_landing_size());
+    
+    // Check cache for initial optimal ortho
+    if let Some(cache_volume) = store.peek_best_volume_in_cache() {
+        metrics.record_optimal_volume(cache_volume);
+    }
 
     metrics.set_operation_status("Processing orthos".to_string());
 
@@ -388,6 +396,12 @@ fn process_txt_file(
             g.run_budget_bytes = cfg.run_budget_bytes;
             g.fan_in = cfg.fan_in;
         });
+        // Set progress tracking for this generation
+        metrics.update_operation(|op| {
+            op.progress_total = work_len as usize;
+            op.progress_current = 0;
+        });
+        metrics.set_operation_status(format!("Processing Gen {}", generation));
         // Record samples for charts
         metrics.record_work_len(work_len as usize);
         metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
@@ -420,6 +434,11 @@ fn process_txt_file(
 
             // Periodic updates - more frequent for better visibility
             if total_processed % 100 == 0 {
+                // Update progress for current generation
+                metrics.update_operation(|op| {
+                    op.progress_current = gen_processed;
+                });
+                
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(last_report_time).as_secs_f64();
                 
@@ -441,9 +460,17 @@ fn process_txt_file(
                 }
                 
                 metrics.record_optimal_volume(best_ortho.volume());
-                metrics.update_operation(|op| {
-                    op.progress_current = total_processed;
-                });
+                
+                // Also check cache for optimal ortho
+                if let Some(cache_volume) = store.peek_best_volume_in_cache() {
+                    if cache_volume > best_ortho.volume() {
+                        metrics.record_optimal_volume(cache_volume);
+                        if cache_volume > best_score.0 {
+                            best_score = (cache_volume, 0); // Don't know fullness for cached ortho
+                            optimal_dirty = true;
+                        }
+                    }
+                }
 
                 // Update work queue metrics
                 metrics.update_global(|g| {
@@ -451,7 +478,7 @@ fn process_txt_file(
                     g.seen_len_accepted = store.seen_len_accepted();
                 });
                 metrics.record_work_len(store.work_len() as usize);
-                metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+                metrics.record_landing_buffer_size(store.total_landing_size());
                 
                 // Update bucket metrics for TUI visualization
                 let bucket_stats = store.bucket_stats();
@@ -559,7 +586,10 @@ fn process_txt_file(
                     }
                     
                     // Record result to landing zone
-                    store.record_result(&child)?;
+                    store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                    
+                    // Increment new orthos counter for each generated ortho
+                    metrics.increment_new_orthos(1);
                 }
             }
         }
@@ -660,7 +690,7 @@ fn process_txt_file(
             g.phase = format!("Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
-        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+        metrics.record_landing_buffer_size(store.total_landing_size());
         
         metrics.add_log(format!(
             "Generation {} complete: {} new work items, {} total seen",
@@ -838,12 +868,14 @@ fn merge_archives(
     // Initialize GenerationStore for merge
     let store_path = PathBuf::from(ingestion.work_queue_path()).parent().unwrap().to_path_buf();
     let mut store = GenerationStore::new_with_config(store_path, 8)?;
+    store.configure(&cfg);
 
     metrics.add_log(format!(
-        "[{} merge init] generation_store initialized run_budget={} MB fan_in={}",
+        "[{} merge init] generation_store configured: run_budget={} MB, work_cache={} orthos, bufwriter={} KB",
         role_as_str(role),
         cfg.run_budget_bytes / 1_048_576,
-        cfg.fan_in
+        cfg.work_queue_cache_size,
+        cfg.bufwriter_capacity / 1024
     ));
 
     // Seed with empty ortho
@@ -865,7 +897,7 @@ fn merge_archives(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+    metrics.record_landing_buffer_size(store.total_landing_size());
 
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
@@ -961,9 +993,24 @@ fn merge_archives(
         total_from_smaller, smaller_name, impacted_from_smaller
     ));
 
+    // Update metrics with impacted counts from both archives
+    if a_is_smaller {
+        metrics.update_merge(|m| {
+            m.impacted_queued_a = impacted_from_smaller;
+            m.impacted_queued_b = impacted_from_larger;
+        });
+    } else {
+        metrics.update_merge(|m| {
+            m.impacted_queued_a = impacted_from_larger;
+            m.impacted_queued_b = impacted_from_smaller;
+        });
+    }
+
     metrics.add_log(format!(
-        "Rehydration complete: {} work items ready",
-        store.work_len()
+        "Rehydration complete: {} work items ready (A:{} B:{})",
+        store.work_len(),
+        if a_is_smaller { impacted_from_smaller } else { impacted_from_larger },
+        if a_is_smaller { impacted_from_larger } else { impacted_from_smaller }
     ));
 
     // Now process generations just like in process_txt_file
@@ -983,7 +1030,12 @@ fn merge_archives(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+    metrics.record_landing_buffer_size(store.total_landing_size());
+    
+    // Check cache for initial optimal ortho in merge
+    if let Some(cache_volume) = store.peek_best_volume_in_cache() {
+        metrics.record_optimal_volume(cache_volume);
+    }
 
     // Tracking for throughput calculation
     let mut last_report_time = std::time::Instant::now();
@@ -1004,9 +1056,15 @@ fn merge_archives(
             g.run_budget_bytes = cfg.run_budget_bytes;
             g.fan_in = cfg.fan_in;
         });
+        metrics.set_operation_status(format!("Processing Merge Gen {}", generation));
+        // Set progress tracking for this generation
+        metrics.update_operation(|op| {
+            op.progress_total = work_len as usize;
+            op.progress_current = 0;
+        });
         // Record samples for charts
         metrics.record_work_len(work_len as usize);
-        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+        metrics.record_landing_buffer_size(store.total_landing_size());
         
         // Update bucket metrics
         let bucket_stats = store.bucket_stats();
@@ -1036,6 +1094,11 @@ fn merge_archives(
 
             // Periodic updates - more frequent for better visibility
             if total_processed % 100 == 0 {
+                // Update progress for current generation
+                metrics.update_operation(|op| {
+                    op.progress_current = gen_processed;
+                });
+                
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(last_report_time).as_secs_f64();
                 
@@ -1057,6 +1120,18 @@ fn merge_archives(
                 }
                 
                 metrics.record_optimal_volume(best_ortho.volume());
+                
+                // Also check cache for optimal ortho during merge
+                if let Some(cache_volume) = store.peek_best_volume_in_cache() {
+                    if cache_volume > best_ortho.volume() {
+                        metrics.record_optimal_volume(cache_volume);
+                        if cache_volume > best_score.0 {
+                            best_score = (cache_volume, 0);
+                            optimal_dirty = true;
+                        }
+                    }
+                }
+                
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;
                 });
@@ -1067,7 +1142,7 @@ fn merge_archives(
                     g.seen_len_accepted = store.seen_len_accepted();
                 });
                 metrics.record_work_len(store.work_len() as usize);
-                metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+                metrics.record_landing_buffer_size(store.total_landing_size());
                 
                 // Update bucket metrics for TUI visualization
                 let bucket_stats = store.bucket_stats();
@@ -1171,7 +1246,10 @@ fn merge_archives(
                         optimal_dirty = true;
                     }
                     
-                    store.record_result(&child)?;
+                    store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                    
+                    // Increment new orthos counter for each generated ortho
+                    metrics.increment_new_orthos(1);
                 }
             }
         }
@@ -1272,7 +1350,7 @@ fn merge_archives(
             g.phase = format!("Merge Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
-        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
+        metrics.record_landing_buffer_size(store.total_landing_size());
         
         metrics.add_log(format!(
             "Merge Generation {} complete: {} new work, {} total seen",
@@ -1344,6 +1422,12 @@ fn merge_archives(
     });
 
     metrics.update_global(|g| g.processed_chunks += 1);
+
+    // Update merge metrics on completion
+    metrics.update_merge(|m| {
+        m.completed_merges += 1;
+        m.new_orthos_from_merge = total_orthos;
+    });
 
     // Cleanup
     ingestion.cleanup()?;
@@ -1507,10 +1591,10 @@ fn save_archive_vec_internal(
     let metadata_path = archive_path.join("metadata.txt");
     fs::write(metadata_path, ortho_count.to_string()).map_err(FoldError::Io)?;
     
-    // Write text metadata
-    let text_metadata_path = archive_path.join("text_metadata.txt");
-    let text_metadata = format!("preview: {}\nword_count: {}", text_preview, word_count);
-    fs::write(text_metadata_path, text_metadata).map_err(FoldError::Io)?;
+    // Write text metadata (format: word_count on line 1, preview on line 2)
+    let text_meta_path = archive_path.join("text_meta.txt");
+    let text_metadata = format!("{}\n{}", word_count, text_preview);
+    fs::write(text_meta_path, text_metadata).map_err(FoldError::Io)?;
     
     Ok((archive_path.to_string_lossy().to_string(), lineage.to_string()))
 }

@@ -251,11 +251,11 @@ impl Tui {
             .starts_with("Processing Larger Archive")
         {
             let seen_current = snapshot
-                .seen_len_accepted_samples
+                .landing_buffer_samples
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
-            let seen_peak = snapshot.seen_len_accepted_samples.iter().map(|s| s.value).max().unwrap_or(0);
+            let seen_peak = snapshot.landing_buffer_samples.iter().map(|s| s.value).max().unwrap_or(0);
 
             if seen_peak > 0 {
                 progress_ratio = seen_current as f64 / seen_peak as f64;
@@ -568,8 +568,8 @@ impl Tui {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Length(6),
-                Constraint::Length(10),
-                Constraint::Min(10),
+                Constraint::Length(11),
+                Constraint::Min(8),
             ])
             .split(area);
 
@@ -629,7 +629,7 @@ impl Tui {
 
     fn render_seen_growth_chart(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let sampled_data = sample_data(
-            &snapshot.seen_len_accepted_samples,
+            &snapshot.landing_buffer_samples,
             area.width.saturating_sub(2) as usize,
         );
         let baseline = sampled_data.first().map(|s| s.value).unwrap_or(0);
@@ -638,16 +638,16 @@ impl Tui {
             .map(|s| s.value.saturating_sub(baseline) as u64)
             .collect();
 
-        let (current, rate, baseline_raw) = if !snapshot.seen_len_accepted_samples.is_empty() {
+        let (current, rate, baseline_raw) = if !snapshot.landing_buffer_samples.is_empty() {
             let current_raw = snapshot
-                .seen_len_accepted_samples
+                .landing_buffer_samples
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
             let baseline_raw = baseline;
-            let rate = if snapshot.seen_len_accepted_samples.len() >= 10 {
-                let prev_idx = snapshot.seen_len_accepted_samples.len().saturating_sub(10);
-                let prev = snapshot.seen_len_accepted_samples[prev_idx].value;
+            let rate = if snapshot.landing_buffer_samples.len() >= 10 {
+                let prev_idx = snapshot.landing_buffer_samples.len().saturating_sub(10);
+                let prev = snapshot.landing_buffer_samples[prev_idx].value;
                 (current_raw as i64 - prev as i64) / 10
             } else {
                 0
@@ -663,7 +663,7 @@ impl Tui {
 
         let rate_sign = if rate >= 0 { "+" } else { "-" };
         let title = format!(
-            "Accepted │ Cur:{} Base:{} Δ{}{}",
+            "Produced │ Cur:{} Base:{} Δ{}{}",
             format_number(current as usize),
             format_number(baseline_raw as usize),
             rate_sign,
@@ -700,25 +700,24 @@ impl Tui {
         });
 
         if in_transition && !snapshot.bucket_metrics.is_empty() {
-            // Show detailed per-bucket progress during transitions
+            // TRANSITION MODE: Show detailed per-bucket progress
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(2),
+                    Constraint::Length(1),
                     Constraint::Min(3),
                 ])
                 .split(inner);
 
-            // Top: Generation stats
-            let lines_top = vec![Line::from(format!(
-                "Gen: {} │ {} │ Work: {}",
+            // Top: Generation transition header
+            let header_line = Line::from(format!(
+                "Gen: {} → {} transition │ Processing buckets...",
                 generation,
-                phase_str,
-                format_number(work_len as usize)
-            ))];
-            f.render_widget(Paragraph::new(lines_top), chunks[0]);
+                generation + 1
+            ));
+            f.render_widget(Paragraph::new(vec![header_line]), chunks[0]);
 
-            // Bottom: Per-bucket progress panel
+            // Bottom: Per-bucket progress panel (up to 8 buckets)
             let available_height = chunks[1].height as usize;
             let bucket_lines: Vec<Line> = snapshot.bucket_metrics
                 .iter()
@@ -737,6 +736,8 @@ impl Tui {
                     
                     let work_info = if b.new_work > 0 {
                         format!(" (+{} work)", format_number(b.new_work))
+                    } else if matches!(b.state, crate::metrics::BucketState::Complete) {
+                        String::from(" ")
                     } else {
                         String::new()
                     };
@@ -753,61 +754,115 @@ impl Tui {
             let progress_panel = Paragraph::new(bucket_lines);
             f.render_widget(progress_panel, chunks[1]);
         } else {
-            // Normal view with sparklines when not in transition
+            // NORMAL MODE: Activity dashboard with landing bars and health
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(2),
-                    Constraint::Length(2),
-                    Constraint::Min(3),
+                    Constraint::Length(2),  // Context lines
+                    Constraint::Length(3),  // Landing section
+                    Constraint::Length(2),  // Health section
                 ])
                 .split(inner);
 
-            // Top: Generation stats
-            let lines_top = vec![Line::from(format!(
-                "Gen: {} │ Phase: {} │ Work: {}",
-                generation,
-                phase_str,
-                format_number(work_len as usize)
-            ))];
-            f.render_widget(Paragraph::new(lines_top), chunks[0]);
+            // Section 1: Context
+            let context_lines = vec![
+                Line::from(format!(
+                    "Gen: {} │ Phase: {} │ Work: {}",
+                    generation,
+                    truncate_string(phase_str, 20),
+                    format_number(work_len as usize)
+                )),
+                Line::from(format!(
+                    "Accepted: {} │ Budget: {} │ Fan-in: {}",
+                    format_number(seen as usize),
+                    format_bytes(snapshot.global.run_budget_bytes),
+                    snapshot.global.fan_in
+                ))
+            ];
+            f.render_widget(Paragraph::new(context_lines), chunks[0]);
 
-            // Middle: Global stats
-            let lines_mid = vec![Line::from(format!(
-                "Accepted: {} │ Budget: {} │ Fan-in: {}",
-                format_number(seen as usize),
-                format_bytes(snapshot.global.run_budget_bytes),
-                snapshot.global.fan_in
-            ))];
-            f.render_widget(Paragraph::new(lines_mid), chunks[1]);
-
-            // Bottom: Per-bucket sparklines showing run counts
+            // Section 2: Landing Activity (most dynamic - changes every 100 orthos)
             if !snapshot.bucket_metrics.is_empty() {
-                let bucket_count = snapshot.bucket_metrics.len();
-                let run_counts: Vec<u64> = snapshot.bucket_metrics
-                    .iter()
-                    .map(|b| b.run_count as u64)
-                    .collect();
+                let max_landing = snapshot.bucket_metrics.iter()
+                    .map(|b| b.landing_size)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
                 
-                let max_runs = run_counts.iter().max().copied().unwrap_or(1);
-                let total_runs: usize = snapshot.bucket_metrics.iter().map(|b| b.run_count).sum();
+                // Build landing bars for buckets 0-3
+                let mut line1_spans = vec![Span::raw("Landing: ")];
+                for b in snapshot.bucket_metrics.iter().take(4) {
+                    let bar_len = if max_landing > 0 {
+                        ((b.landing_size as f64 / max_landing as f64) * 4.0).ceil() as usize
+                    } else {
+                        0
+                    };
+                    let bar = "█".repeat(bar_len);
+                    let color = if b.landing_size > 20_000 {
+                        Color::Yellow
+                    } else if b.landing_size > 0 {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    };
+                    line1_spans.push(Span::styled(
+                        format!("B{}:{:<4} ", b.bucket_id, bar),
+                        Style::default().fg(color)
+                    ));
+                    line1_spans.push(Span::raw(format!("{} ", format_bytes(b.landing_size))));
+                }
                 
-                let title = format!(
-                    "Buckets: {} │ Total Runs: {} │ Max: {}",
-                    bucket_count,
-                    total_runs,
-                    max_runs
-                );
+                // Build landing bars for buckets 4-7
+                let mut line2_spans = vec![Span::raw("         ")];
+                for b in snapshot.bucket_metrics.iter().skip(4).take(4) {
+                    let bar_len = if max_landing > 0 {
+                        ((b.landing_size as f64 / max_landing as f64) * 4.0).ceil() as usize
+                    } else {
+                        0
+                    };
+                    let bar = "█".repeat(bar_len);
+                    let color = if b.landing_size > 20_000 {
+                        Color::Yellow
+                    } else if b.landing_size > 0 {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    };
+                    line2_spans.push(Span::styled(
+                        format!("B{}:{:<4} ", b.bucket_id, bar),
+                        Style::default().fg(color)
+                    ));
+                    line2_spans.push(Span::raw(format!("{} ", format_bytes(b.landing_size))));
+                }
                 
-                let sparkline = Sparkline::default()
-                    .block(Block::default().title(title))
-                    .data(&run_counts)
-                    .style(Style::default().fg(Color::Cyan));
+                let landing_lines = vec![
+                    Line::from(line1_spans),
+                    Line::from(line2_spans),
+                ];
+                f.render_widget(Paragraph::new(landing_lines), chunks[1]);
                 
-                f.render_widget(sparkline, chunks[2]);
+                // Section 3: Compaction Health (updated at generation boundaries)
+                let mut health_spans = vec![Span::raw("Health:  ")];
+                for b in snapshot.bucket_metrics.iter() {
+                    let (indicator, color) = if b.run_count > 64 {
+                        ("⚡", Color::Red)     // Will compact next transition
+                    } else if b.run_count > 10 {
+                        ("‼", Color::Red)      // Heavily fragmented
+                    } else if b.run_count > 5 {
+                        ("!", Color::Yellow)   // Getting fragmented
+                    } else {
+                        ("✓", Color::Green)    // Healthy
+                    };
+                    health_spans.push(Span::raw(format!("B{}[{}]", b.bucket_id, b.run_count)));
+                    health_spans.push(Span::styled(indicator, Style::default().fg(color)));
+                    health_spans.push(Span::raw(" "));
+                }
+                
+                let health_line = Line::from(health_spans);
+                f.render_widget(Paragraph::new(vec![health_line]), chunks[2]);
             } else {
                 let placeholder = Paragraph::new(vec![Line::from("Bucket stats loading...")]);
-                f.render_widget(placeholder, chunks[2]);
+                f.render_widget(placeholder, chunks[1]);
             }
         }
     }

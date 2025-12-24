@@ -216,7 +216,7 @@ struct MetricsInner {
     
     // Generational store metrics
     work_len_samples: VecDeque<MetricSample>,
-    seen_len_accepted_samples: VecDeque<MetricSample>,
+    landing_buffer_samples: VecDeque<MetricSample>,
     bucket_metrics: Vec<BucketMetrics>,
 
     status_history: VecDeque<StatusHistoryEntry>,
@@ -237,7 +237,7 @@ impl Metrics {
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 work_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                seen_len_accepted_samples: VecDeque::with_capacity(MAX_SAMPLES),
+                landing_buffer_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 bucket_metrics: Vec::new(),
                 status_history: VecDeque::with_capacity(100),
                 status_duration_stats: StatusDurationStats::default(),
@@ -333,9 +333,12 @@ impl Metrics {
         self.record_sample(len, |inner| &mut inner.work_len_samples);
     }
 
+    pub fn record_landing_buffer_size(&self, size: usize) {
+        self.record_sample(size, |inner| &mut inner.landing_buffer_samples);
+    }
+
     pub fn record_seen_len_accepted(&self, len: usize) {
-        self.record_sample(len, |inner| &mut inner.seen_len_accepted_samples);
-        // Also record to persistent history that survives chunk resets
+        // Only record to persistent history that survives chunk resets
         self.record_sample(len, |inner| &mut inner.seen_history_samples);
     }
 
@@ -450,16 +453,16 @@ impl Metrics {
     pub fn clear_chart_history(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.work_len_samples.clear();
-        inner.seen_len_accepted_samples.clear();
+        inner.landing_buffer_samples.clear();
         inner.optimal_volume_samples.clear();
         // Note: seen_history_samples is NOT cleared - it persists across all chunks
     }
 
     pub fn reset_seen_size(&self, baseline: usize) {
         let mut inner = self.inner.lock().unwrap();
-        inner.seen_len_accepted_samples.clear();
+        inner.landing_buffer_samples.clear();
         let timestamp = Self::current_timestamp();
-        inner.seen_len_accepted_samples.push_back(MetricSample {
+        inner.landing_buffer_samples.push_back(MetricSample {
             timestamp,
             value: baseline,
         });
@@ -495,7 +498,7 @@ impl Metrics {
             seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
             optimal_volume_samples: inner.optimal_volume_samples.iter().cloned().collect(),
             work_len_samples: inner.work_len_samples.iter().cloned().collect(),
-            seen_len_accepted_samples: inner.seen_len_accepted_samples.iter().cloned().collect(),
+            landing_buffer_samples: inner.landing_buffer_samples.iter().cloned().collect(),
             status_history: inner.status_history.iter().cloned().collect(),
             status_duration_stats: inner.status_duration_stats.clone(),
             logs: inner.logs.iter().cloned().collect(),
@@ -536,7 +539,7 @@ pub struct MetricsSnapshot {
     pub seen_history_samples: Vec<MetricSample>,
     pub optimal_volume_samples: Vec<MetricSample>,
     pub work_len_samples: Vec<MetricSample>,
-    pub seen_len_accepted_samples: Vec<MetricSample>,
+    pub landing_buffer_samples: Vec<MetricSample>,
     pub status_history: Vec<StatusHistoryEntry>,
     pub status_duration_stats: StatusDurationStats,
     pub logs: Vec<LogEntry>,

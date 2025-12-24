@@ -28,66 +28,109 @@ pub struct Config {
     pub fan_in: usize,
     pub read_buf_bytes: usize,
     pub allow_compaction: bool,
+    pub work_queue_cache_size: usize,  // Max orthos to keep in memory
+    pub bufwriter_capacity: usize,      // Buffer size for each bucket writer
+    pub work_segment_size: usize,       // Orthos per segment file
+    pub history_cache_bytes: usize,     // RAM budget for caching history runs
+    pub landing_flush_threshold: usize, // Bytes before forcing flush
 }
 
 impl Config {
+    /// Create test config with minimal settings
+    #[cfg(test)]
+    pub fn test_config(run_budget_bytes: usize, fan_in: usize) -> Self {
+        Self {
+            run_budget_bytes,
+            fan_in,
+            read_buf_bytes: 64 * 1024,
+            allow_compaction: false,
+            work_queue_cache_size: 10_000,
+            bufwriter_capacity: 64 * 1024,
+            work_segment_size: 1000,
+            history_cache_bytes: 1024 * 1024,
+            landing_flush_threshold: 64 * 1024,
+        }
+    }
+
     /// Compute config based on role and current system memory state
     /// 
     /// RAM Policy:
-    /// - Leader targets: aggressive below 65%, conservative above 85%
-    /// - Follower targets: aggressive below 50%, conservative above 70%
-    /// - run_budget = 0.7 * budget
-    /// - fan_in = clamp(budget / read_buf, 8, 128)
+    /// - Target 85% total RAM usage aggressively
+    /// - Leader: Scale down only above 85% usage
+    /// - Follower: Scale down starting at 70% usage
+    /// - Allocate budget across: run_budget (30%), work cache (25%), buffers (20%), history cache (25%)
     /// - Follower bails if run_budget < 128MB when already at lowest budget and RSS stays above minimum target
     pub fn compute_config(role: Role) -> Option<Self> {
         let (used_bytes, total_bytes, _headroom_bytes) = get_memory_state();
         let used_pct = (used_bytes as f64 / total_bytes as f64) * 100.0;
         
-        // Define targets based on role
-        let (aggressive_threshold, conservative_threshold) = match role {
-            Role::Leader => (65.0, 85.0),
-            Role::Follower => (50.0, 70.0),
+        // Target 85% of total RAM
+        let target_usage_bytes = (total_bytes as f64 * 0.85) as usize;
+        let available_bytes = target_usage_bytes.saturating_sub(used_bytes);
+        
+        // Define scale-down thresholds based on role
+        let scale_threshold = match role {
+            Role::Leader => 85.0,  // Start scaling down at 85%
+            Role::Follower => 70.0, // Start scaling down at 70%
         };
         
-        // Default budgets
-        let (default_min, default_max) = match role {
-            Role::Leader => (2_000_000_000, 6_000_000_000), // 2-6 GB
-            Role::Follower => (256_000_000, 1_000_000_000),  // 256MB - 1GB
+        // Base budgets (at low usage)
+        let (base_budget, min_budget) = match role {
+            Role::Leader => (available_bytes, 2_000_000_000), // Use all available, min 2GB
+            Role::Follower => (available_bytes.min(4_000_000_000), 256_000_000), // Cap at 4GB, min 256MB
         };
         
-        // Calculate budget based on memory pressure
-        let budget = if used_pct < aggressive_threshold {
-            // Below aggressive threshold: use maximum budget
-            default_max
-        } else if used_pct > conservative_threshold {
-            // Above conservative threshold: use minimum budget
-            default_min
+        // Scale down budget if above threshold
+        let budget = if used_pct > scale_threshold {
+            // Linear scale-down from 100% at threshold to min at 95%
+            let scale_range = 95.0 - scale_threshold;
+            let position = ((used_pct - scale_threshold) / scale_range).min(1.0);
+            let budget_range = (base_budget - min_budget) as f64;
+            base_budget - (budget_range * position) as usize
         } else {
-            // In between: linear interpolation
-            let range = conservative_threshold - aggressive_threshold;
-            let position = (used_pct - aggressive_threshold) / range;
-            let budget_range = (default_max - default_min) as f64;
-            default_max - (budget_range * position) as usize
+            base_budget
         };
         
         // Check follower bail-out condition
         if role == Role::Follower {
-            let run_budget = (budget as f64 * 0.7) as usize;
-            if run_budget < 128_000_000 && used_pct >= aggressive_threshold {
-                // Follower should bail: run_budget < 128MB and RSS above minimum target
+            let run_budget = (budget as f64 * 0.3) as usize;
+            if run_budget < 128_000_000 && used_pct >= scale_threshold {
                 return None;
             }
         }
         
-        let run_budget_bytes = (budget as f64 * 0.7) as usize;
+        // Allocate budget across subsystems
+        let run_budget_bytes = (budget as f64 * 0.30) as usize;      // 30% for LSM runs
+        let work_cache_budget = (budget as f64 * 0.25) as usize;     // 25% for work queue cache
+        let buffer_budget = (budget as f64 * 0.20) as usize;         // 20% for write buffers
+        let history_cache_bytes = (budget as f64 * 0.25) as usize;   // 25% for history caching
+        
+        // Work queue cache: assume ~200 bytes per ortho
+        let work_queue_cache_size = work_cache_budget / 200;
+        
+        // BufWriter capacity: divide among 8 buckets, min 64KB, max 16MB per bucket
+        let bufwriter_capacity = (buffer_budget / 8).clamp(64 * 1024, 16 * 1024 * 1024);
+        
+        // Work segment size: larger segments = fewer files, assume ~200 bytes per ortho
+        // Target segments of ~10MB each = 50k orthos
+        let work_segment_size = 50_000;
+        
+        // Landing flush threshold: 1-10MB depending on buffer capacity
+        let landing_flush_threshold = bufwriter_capacity.clamp(1024 * 1024, 10 * 1024 * 1024);
+        
         let read_buf_bytes = 64 * 1024; // 64KB read buffer
-        let fan_in = compute_fan_in(budget, read_buf_bytes);
+        let fan_in = compute_fan_in(run_budget_bytes, read_buf_bytes);
         
         Some(Self {
             run_budget_bytes,
             fan_in,
             read_buf_bytes,
             allow_compaction: true,
+            work_queue_cache_size,
+            bufwriter_capacity,
+            work_segment_size,
+            history_cache_bytes,
+            landing_flush_threshold,
         })
     }
 }
@@ -179,13 +222,22 @@ pub struct GenerationStore {
     bucket_count: usize,
     bucket_writers: Vec<Option<BufWriter<File>>>,
     drain_counter: Vec<usize>,
+    landing_buffer_sizes: Vec<usize>, // Track bytes written to each bucket writer
     // Work queue state
     work_segments: Vec<PathBuf>,
     work_segment_counter: usize,
     total_work_len: u64,
+    work_queue_cache: Vec<Ortho>, // In-memory cache of work items
+    work_queue_cache_max: usize,   // Max cache size
+    work_segment_batch: Vec<Ortho>, // Batch for writing segments
+    work_segment_batch_max: usize,  // Max batch size before flush
+    bufwriter_capacity: usize,      // Buffer capacity for bucket writers
+    landing_flush_threshold: usize, // Threshold for flushing landing writes
     // History state
     history_runs: Vec<Vec<PathBuf>>, // Per-bucket list of history run files
     seen_len_accepted: u64, // Monotonic count of accepted items across all generations
+    #[allow(dead_code)]
+    history_cache: std::collections::HashMap<PathBuf, Vec<u8>>, // Cached history run contents (future optimization)
 }
 
 /// Placeholder for unsorted drained data
@@ -371,11 +423,19 @@ impl GenerationStore {
             bucket_count,
             bucket_writers: (0..bucket_count).map(|_| None).collect(),
             drain_counter: vec![0; bucket_count],
+            landing_buffer_sizes: vec![0; bucket_count],
             work_segments: Vec::new(),
             work_segment_counter: 0,
             total_work_len: 0,
+            work_queue_cache: Vec::new(),
+            work_queue_cache_max: 100_000, // Default, will be updated with config
+            work_segment_batch: Vec::new(),
+            work_segment_batch_max: 50_000, // Default, will be updated with config
+            bufwriter_capacity: 16 * 1024 * 1024, // Default 16MB
+            landing_flush_threshold: 10 * 1024 * 1024, // Default 10MB
             history_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
+            history_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -386,11 +446,19 @@ impl GenerationStore {
             bucket_count: 8,
             bucket_writers: (0..8).map(|_| None).collect(),
             drain_counter: vec![0; 8],
+            landing_buffer_sizes: vec![0; 8],
             work_segments: Vec::new(),
             work_segment_counter: 0,
             total_work_len: 0,
+            work_queue_cache: Vec::new(),
+            work_queue_cache_max: 100_000,
+            work_segment_batch: Vec::new(),
+            work_segment_batch_max: 50_000,
+            bufwriter_capacity: 16 * 1024 * 1024,
+            landing_flush_threshold: 10 * 1024 * 1024,
             history_runs: (0..8).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
+            history_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -412,23 +480,36 @@ impl GenerationStore {
 
     /// Record a result to the landing zone
     pub fn record_result(&mut self, ortho: &Ortho) -> io::Result<()> {
+        self.record_result_with_threshold(ortho, 10 * 1024 * 1024) // Default 10MB threshold
+    }
+
+    /// Record a result with configurable flush threshold
+    pub fn record_result_with_threshold(&mut self, ortho: &Ortho, flush_threshold: usize) -> io::Result<()> {
         let bucket = (ortho.id() as u64 & (self.bucket_count - 1) as u64) as usize;
         
-        // Get or create writer for this bucket
+        // Get or create writer for this bucket with configured buffer capacity
         if self.bucket_writers[bucket].is_none() {
             let path = self.active_log_path(bucket);
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)?;
-            self.bucket_writers[bucket] = Some(BufWriter::new(file));
+            self.bucket_writers[bucket] = Some(BufWriter::with_capacity(self.bufwriter_capacity, file));
         }
 
         // Write ortho as bincode
         let writer = self.bucket_writers[bucket].as_mut().unwrap();
         let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let encoded_len = encoded.len();
         writer.write_all(&encoded)?;
+        
+        // Track buffer size and flush if over threshold
+        self.landing_buffer_sizes[bucket] += encoded_len;
+        if self.landing_buffer_sizes[bucket] >= flush_threshold {
+            writer.flush()?;
+            self.landing_buffer_sizes[bucket] = 0;
+        }
         
         Ok(())
     }
@@ -458,75 +539,95 @@ impl GenerationStore {
     }
 
     /// Push a segment of work items to the work queue
-    /// Segment file format: [count as u64][ortho bincode...count items]
+    /// Uses batching to create larger segment files
     pub fn push_segments(&mut self, items: Vec<Ortho>) -> io::Result<()> {
         if items.is_empty() {
             return Ok(());
         }
 
-        let count = items.len() as u64;
+        // Add items to batch
+        self.work_segment_batch.extend(items);
+        
+        // Flush batch if it exceeds max size
+        if self.work_segment_batch.len() >= self.work_segment_batch_max {
+            self.flush_work_segment_batch()?;
+        }
+
+        Ok(())
+    }
+    
+    /// Flush the work segment batch to disk
+    fn flush_work_segment_batch(&mut self) -> io::Result<()> {
+        if self.work_segment_batch.is_empty() {
+            return Ok(());
+        }
+
+        let count = self.work_segment_batch.len() as u64;
         let segment_path = self.base_path
             .join("work")
             .join(format!("segment-{}.dat", self.work_segment_counter));
         self.work_segment_counter += 1;
 
-        // Write segment file: [count][ortho bincode...]
-        let mut file = BufWriter::new(File::create(&segment_path)?);
+        // Write segment file with large buffer
+        let mut file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&segment_path)?);
         file.write_all(&count.to_le_bytes())?;
-        for ortho in &items {
+        for ortho in &self.work_segment_batch {
             let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            // Write length prefix for ortho
             file.write_all(&(encoded.len() as u64).to_le_bytes())?;
             file.write_all(&encoded)?;
         }
         file.flush()?;
 
-        // Add to work segments list and update total length
+        // Add to work segments and update totals
         self.work_segments.push(segment_path);
         self.total_work_len += count;
+        self.work_segment_batch.clear();
 
         Ok(())
     }
 
     /// Pop a single work item from the work queue
-    /// Reads orthos from segments with length-prefix encoding
+    /// Uses in-memory cache for speed, only hits disk when cache empties
     pub fn pop_work(&mut self) -> io::Result<Option<Ortho>> {
-        if self.work_segments.is_empty() {
-            return Ok(None);
+        // Try to pop from cache first
+        if !self.work_queue_cache.is_empty() {
+            self.total_work_len -= 1;
+            return Ok(Some(self.work_queue_cache.remove(0)));
         }
-
-        // Take the first segment from the list
-        let segment_path = self.work_segments.remove(0);
-        let mut file = File::open(&segment_path)?;
-
-        // Read count
-        let mut count_bytes = [0u8; 8];
-        file.read_exact(&mut count_bytes)?;
-        let count = u64::from_le_bytes(count_bytes) as usize;
-
-        if count == 0 {
-            drop(file);
-            fs::remove_file(&segment_path)?;
-            return self.pop_work(); // Try next segment
+        
+        // Cache is empty, refill from disk segments
+        self.refill_work_cache()?;
+        
+        // Pop from cache after refill
+        if !self.work_queue_cache.is_empty() {
+            self.total_work_len -= 1;
+            return Ok(Some(self.work_queue_cache.remove(0)));
         }
+        
+        Ok(None)
+    }
+    
+    /// Refill work queue cache from disk segments
+    fn refill_work_cache(&mut self) -> io::Result<()> {
+        while self.work_queue_cache.len() < self.work_queue_cache_max && !self.work_segments.is_empty() {
+            // Take next segment
+            let segment_path = self.work_segments.remove(0);
+            let mut file = File::open(&segment_path)?;
 
-        // Read first ortho
-        let mut len_bytes = [0u8; 8];
-        file.read_exact(&mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
+            // Read count
+            let mut count_bytes = [0u8; 8];
+            file.read_exact(&mut count_bytes)?;
+            let count = u64::from_le_bytes(count_bytes) as usize;
 
-        let mut ortho_bytes = vec![0u8; len];
-        file.read_exact(&mut ortho_bytes)?;
-        let ortho: Ortho = bincode::decode_from_slice(&ortho_bytes, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-            .0;
+            if count == 0 {
+                drop(file);
+                fs::remove_file(&segment_path)?;
+                continue;
+            }
 
-        // If there are more items, rewrite the segment with remaining items
-        if count > 1 {
-            // Read all remaining orthos
-            let mut remaining = Vec::new();
-            for _ in 1..count {
+            // Read all orthos from segment into cache
+            for _ in 0..count {
                 let mut len_bytes = [0u8; 8];
                 file.read_exact(&mut len_bytes)?;
                 let len = u64::from_le_bytes(len_bytes) as usize;
@@ -536,39 +637,55 @@ impl GenerationStore {
                 let ortho: Ortho = bincode::decode_from_slice(&ortho_bytes, bincode::config::standard())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                     .0;
-                remaining.push(ortho);
+                
+                self.work_queue_cache.push(ortho);
+                
+                // Stop if cache is full
+                if self.work_queue_cache.len() >= self.work_queue_cache_max {
+                    break;
+                }
             }
 
+            // Delete consumed segment
             drop(file);
             fs::remove_file(&segment_path)?;
-
-            // Rewrite segment with remaining items
-            let new_count = remaining.len() as u64;
-            let mut new_file = BufWriter::new(File::create(&segment_path)?);
-            new_file.write_all(&new_count.to_le_bytes())?;
-            for ortho in &remaining {
-                let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                new_file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-                new_file.write_all(&encoded)?;
+            
+            // Stop if cache is full
+            if self.work_queue_cache.len() >= self.work_queue_cache_max {
+                break;
             }
-            new_file.flush()?;
-
-            // Put segment back at the front
-            self.work_segments.insert(0, segment_path);
-        } else {
-            // Last item, just delete the segment
-            drop(file);
-            fs::remove_file(&segment_path)?;
         }
-
-        self.total_work_len -= 1;
-        Ok(Some(ortho))
+        
+        Ok(())
     }
 
-    /// Get the current work queue length
+    /// Configure the store with Config settings
+    pub fn configure(&mut self, cfg: &Config) {
+        self.work_queue_cache_max = cfg.work_queue_cache_size;
+        self.work_segment_batch_max = cfg.work_segment_size;
+        self.bufwriter_capacity = cfg.bufwriter_capacity;
+        self.landing_flush_threshold = cfg.landing_flush_threshold;
+    }
+    
+    /// Flush all pending buffers (landing + work segments)
+    pub fn flush_all(&mut self) -> io::Result<()> {
+        // Flush all bucket writers
+        self.flush()?;
+        
+        // Flush work segment batch
+        self.flush_work_segment_batch()?;
+        
+        Ok(())
+    }
+
+    /// Get the current work queue length (includes in-memory cache)
     pub fn work_len(&self) -> u64 {
-        self.total_work_len
+        self.total_work_len + self.work_queue_cache.len() as u64 + self.work_segment_batch.len() as u64
+    }
+
+    /// Get just the in-memory work cache size (for debugging)
+    pub fn work_queue_cache_len(&self) -> usize {
+        self.work_queue_cache.len() + self.work_segment_batch.len()
     }
 
     /// Get current statistics
@@ -617,17 +734,41 @@ impl GenerationStore {
         self.seen_len_accepted
     }
 
+    /// Get total landing buffer size across all buckets (orthos pending acceptance)
+    pub fn total_landing_size(&self) -> usize {
+        self.landing_buffer_sizes.iter().sum()
+    }
+
+    /// Peek at the best ortho volume currently in work cache (without removing)
+    pub fn peek_best_volume_in_cache(&self) -> Option<usize> {
+        let cache_max = self.work_queue_cache.iter().map(|o| o.volume()).max();
+        let batch_max = self.work_segment_batch.iter().map(|o| o.volume()).max();
+        
+        match (cache_max, batch_max) {
+            (Some(c), Some(b)) => Some(c.max(b)),
+            (Some(c), None) => Some(c),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     /// Get per-bucket statistics for TUI visualization
     pub fn bucket_stats(&self) -> Vec<BucketStats> {
         (0..self.bucket_count)
             .map(|bucket| {
                 let run_count = self.history_runs[bucket].len();
                 
-                // Estimate landing size by checking if active log exists
+                // Get in-memory buffer size (actively accumulating)
+                let buffer_size = self.landing_buffer_sizes[bucket];
+                
+                // Get on-disk file size (what's been flushed)
                 let landing_path = self.active_log_path(bucket);
-                let landing_size = std::fs::metadata(&landing_path)
+                let file_size = std::fs::metadata(&landing_path)
                     .map(|m| m.len() as usize)
                     .unwrap_or(0);
+                
+                // Total landing size = in-memory + on-disk
+                let landing_size = buffer_size + file_size;
                 
                 // Estimate history size from run files
                 let history_size_estimate = self.history_runs[bucket]
@@ -672,6 +813,9 @@ impl GenerationStore {
         let mut buckets_processed = 0;
         let mut total_drained = 0usize;
         let mut total_accepted = 0u64;
+        
+        // Flush all pending writes before transition
+        self.flush_all()?;
         
         if let Some(cb) = &progress {
             cb(&format!("TRANSITION_START:{}", self.bucket_count));
@@ -784,6 +928,9 @@ impl GenerationStore {
             
             buckets_processed += 1;
         }
+        
+        // Flush all pending work to disk
+        self.flush_work_segment_batch()?;
         
         if let Some(cb) = &progress {
             cb(&format!("TRANSITION_COMPLETE"));
@@ -1237,12 +1384,7 @@ mod tests {
         let raw = RawStream::new(vec![drain_path]);
 
         // Large budget - should fit in one run
-        let cfg = Config {
-            run_budget_bytes: 1024 * 1024,
-            fan_in: 8,
-            read_buf_bytes: 4096,
-            allow_compaction: false,
-        };
+        let cfg = Config::test_config(1024 * 1024, 8);
 
         // Create runs directory
         fs::create_dir_all(base_path.join("runs")).unwrap();
@@ -1295,12 +1437,7 @@ mod tests {
         let raw = RawStream::new(vec![drain_path]);
 
         // Small budget to force multiple runs
-        let cfg = Config {
-            run_budget_bytes: 2048, // Small budget
-            fan_in: 8,
-            read_buf_bytes: 4096,
-            allow_compaction: false,
-        };
+        let cfg = Config::test_config(2048, 8);
 
         // Create runs directory
         fs::create_dir_all(base_path.join("runs")).unwrap();
@@ -1369,12 +1506,7 @@ mod tests {
         let raw = RawStream::new(vec![drain_path]);
 
         // Reasonable budget
-        let cfg = Config {
-            run_budget_bytes: 4 * 1024 * 1024, // 4 MB
-            fan_in: 8,
-            read_buf_bytes: 4096,
-            allow_compaction: false,
-        };
+        let cfg = Config::test_config(4 * 1024 * 1024, 8);
 
         // Create runs directory
         fs::create_dir_all(base_path.join("runs")).unwrap();
@@ -1595,12 +1727,7 @@ mod tests {
         let base_path = temp_dir.path().to_path_buf();
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
         
-        let cfg = Config {
-            run_budget_bytes: 1024 * 1024,
-            fan_in: 8,
-            read_buf_bytes: 4096,
-            allow_compaction: false,
-        };
+        let cfg = Config::test_config(1024 * 1024, 8);
         
         // Call on_generation_end with no data
         let new_work = store.on_generation_end(&cfg, None).unwrap();
@@ -1626,23 +1753,22 @@ mod tests {
         let base_path = temp_dir.path().to_path_buf();
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
         
-        let cfg = Config {
-            run_budget_bytes: 1024 * 1024, // 1 MB
-            fan_in: 8,
-            read_buf_bytes: 4096,
-            allow_compaction: false,
-        };
+        let cfg = Config::test_config(1024 * 1024, 8);
+        store.configure(&cfg);
         
-        // Seed the work queue with initial orthos
+        // Seed the work queue with initial ortho
         let seed = Ortho::new();
-        let gen0_work = seed.add(1);
-        store.push_segments(gen0_work.clone()).unwrap();
+        store.push_segments(vec![seed]).unwrap();
+        store.flush_all().unwrap();
+        assert!(store.work_len() > 0, "Work queue should have items after push and flush, got {}", store.work_len());
         
         // Generation 0: Process initial work
         let mut processed_gen0 = 0;
+        let mut results_gen0 = 0;
         while let Some(ortho) = store.pop_work().unwrap() {
             // Process function: expand the ortho by adding tokens 2 and 3
             let results = ortho.add(2);
+            results_gen0 += results.len();
             for r in results {
                 store.record_result(&r).unwrap();
             }
@@ -1650,6 +1776,7 @@ mod tests {
         }
         
         assert!(processed_gen0 > 0, "Should have processed some orthos");
+        assert!(results_gen0 > 0, "Should have generated some results");
         assert_eq!(store.work_len(), 0); // Work queue is empty
         
         // End generation 0 - triggers drain, compact, anti-join, and push new work
@@ -1733,17 +1860,13 @@ mod tests {
         let base_path = temp_dir.path().to_path_buf();
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
         
-        let cfg = Config {
-            run_budget_bytes: 1024 * 1024,
-            fan_in: 8,
-            read_buf_bytes: 4096,
-            allow_compaction: false,
-        };
+        let cfg = Config::test_config(1024 * 1024, 8);
+        store.configure(&cfg);
         
-        // Seed with orthos that will generate some overlaps
+        // Seed with initial ortho
         let seed = Ortho::new();
-        let initial_work = seed.add(1);
-        store.push_segments(initial_work).unwrap();
+        store.push_segments(vec![seed]).unwrap();
+        store.flush_all().unwrap();
         
         // Generation 0: Process and generate results
         while let Some(ortho) = store.pop_work().unwrap() {
