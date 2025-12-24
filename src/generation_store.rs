@@ -439,6 +439,64 @@ impl GenerationStore {
         })
     }
 
+    /// Open an existing store for reading history runs from disk
+    pub fn from_existing(base_path: PathBuf, bucket_count: usize) -> io::Result<Self> {
+        let mut store = Self::new_with_config(base_path, bucket_count)?;
+        store.load_history_runs_from_disk()?;
+        Ok(store)
+    }
+
+    fn load_history_runs_from_disk(&mut self) -> io::Result<()> {
+        self.history_runs = (0..self.bucket_count).map(|_| Vec::new()).collect();
+        self.seen_len_accepted = 0;
+
+        for bucket in 0..self.bucket_count {
+            let history_dir = self
+                .base_path
+                .join("history")
+                .join(format!("b={:02}", bucket));
+            if !history_dir.exists() {
+                continue;
+            }
+
+            let mut entries: Vec<PathBuf> = fs::read_dir(&history_dir)?
+                .filter_map(|res| res.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            entries.sort();
+
+            for path in &entries {
+                let mut file = File::open(path)?;
+                let mut all_bytes = Vec::new();
+                file.read_to_end(&mut all_bytes)?;
+
+                let mut offset = 0usize;
+                while offset < all_bytes.len() {
+                    match bincode::decode_from_slice::<Ortho, _>(
+                        &all_bytes[offset..],
+                        bincode::config::standard(),
+                    ) {
+                        Ok((_ortho, bytes_read)) => {
+                            offset += bytes_read;
+                            self.seen_len_accepted += 1;
+                        }
+                        Err(e) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Failed to decode ortho in {:?}: {}", path, e),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            self.history_runs[bucket] = entries;
+        }
+
+        Ok(())
+    }
+
     /// Create a new empty generation store
     pub fn new() -> Self {
         Self {
@@ -1537,6 +1595,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_existing_reads_history_runs() {
+        use crate::ortho::Ortho;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        // Write a single ortho into a store and finalize
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+        store.record_result(&Ortho::new()).unwrap();
+        store.on_generation_end(&cfg, None).unwrap();
+        drop(store);
+
+        // Reopen from disk and ensure history is readable
+        let reader = GenerationStore::from_existing(base_path.clone(), 8).unwrap();
+        let mut count = 0usize;
+        for bucket in 0..8 {
+            for ortho in reader.history_iter(bucket).unwrap() {
+                ortho.unwrap();
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+    }
+
     // ============ TASK 6 TESTS ============
     #[test]
     fn test_anti_join_orthos_basic() {
@@ -1911,4 +1996,3 @@ mod tests {
                  processed, new_work_gen1, store.seen_len_accepted());
     }
 }
-

@@ -921,7 +921,7 @@ fn merge_archives(
     metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
     
     // Create a temporary GenerationStore to read from the archive's results
-    let larger_store = GenerationStore::new_with_config(PathBuf::from(larger_path), 8)?;
+    let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
     
     let mut total_from_larger = 0;
     let mut impacted_from_larger = 0;
@@ -957,7 +957,7 @@ fn merge_archives(
     // Process smaller archive (needs remapping) - stream and remap into GenerationStore
     metrics.set_operation_status(format!("Streaming & Remapping Smaller Archive {}", smaller_name));
     
-    let smaller_store = GenerationStore::new_with_config(PathBuf::from(smaller_path), 8)?;
+    let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
     
     let mut total_from_smaller = 0;
     let mut impacted_from_smaller = 0;
@@ -1531,13 +1531,37 @@ impl ArchiveSaver for file_handler::ArchiveIngestion {
     }
 }
 
+fn archive_generation_config() -> Config {
+    let run_budget_bytes = 256 * 1024 * 1024; // 256MB for archive materialization
+    let read_buf_bytes = 64 * 1024;
+    let fan_in = {
+        if read_buf_bytes == 0 {
+            8
+        } else {
+            (run_budget_bytes / read_buf_bytes).clamp(8, 128)
+        }
+    };
+
+    Config {
+        run_budget_bytes,
+        fan_in,
+        read_buf_bytes,
+        allow_compaction: false,
+        work_queue_cache_size: 50_000,
+        bufwriter_capacity: 256 * 1024,
+        work_segment_size: 50_000,
+        history_cache_bytes: 8 * 1024 * 1024,
+        landing_flush_threshold: 4 * 1024 * 1024,
+    }
+}
+
 // Internal function to save archive from Vec<Ortho>
 fn save_archive_vec_internal(
     interner: &Interner,
     orthos: Vec<Ortho>,
     best_ortho: Option<&Ortho>,
     lineage: &str,
-    ortho_count: usize,
+    _ortho_count: usize,
     text_preview: &str,
     word_count: usize,
     config: &StateConfig,
@@ -1563,13 +1587,21 @@ fn save_archive_vec_internal(
     let results_dir = archive_path.join("results");
     fs::create_dir_all(&results_dir).map_err(FoldError::Io)?;
     
-    // Create a temporary GenerationStore to write orthos in the proper format
+    // Create a temporary GenerationStore to write orthos and produce history runs
     let mut temp_store = GenerationStore::new_with_config(results_dir.clone(), 8)?;
+    let cfg = archive_generation_config();
+    temp_store.configure(&cfg);
     for ortho in orthos {
-        temp_store.record_result(&ortho)?;
+        temp_store.record_result_with_threshold(&ortho, cfg.landing_flush_threshold)?;
     }
-    // Flush to ensure all orthos are written
+    temp_store.on_generation_end(&cfg, None)?;
+    let ortho_count = temp_store.seen_len_accepted() as usize;
     drop(temp_store);
+
+    // Clean up intermediate landing/work/runs for a lean archive
+    let _ = fs::remove_dir_all(results_dir.join("landing"));
+    let _ = fs::remove_dir_all(results_dir.join("work"));
+    let _ = fs::remove_dir_all(results_dir.join("runs"));
     
     // Write the interner
     let interner_path = archive_path.join("interner.bin");
@@ -1806,5 +1838,86 @@ mod tests {
         let permission_denied =
             FoldError::Io(std::io::Error::new(ErrorKind::PermissionDenied, "denied"));
         assert!(!is_concurrent_claim_error(&permission_denied));
+    }
+
+    #[test]
+    fn merge_seeds_impacted_work_queue() {
+        use tempfile::TempDir;
+
+        // Temp state
+        let temp = TempDir::new().unwrap();
+        let config = StateConfig::custom(temp.path().to_path_buf());
+        file_handler::initialize_with_config(&config).unwrap();
+
+        // Build interner A (foo bar) and impacted/non-impacted orthos
+        let interner_a = Interner::from_text("foo bar");
+        let foo_idx_a = interner_a.vocabulary().iter().position(|w| w == "foo").unwrap();
+        let bar_idx_a = interner_a.vocabulary().iter().position(|w| w == "bar").unwrap();
+
+        let impacted_a = {
+            let first = Ortho::new().add(foo_idx_a)[0].clone();
+            first.add(bar_idx_a)[0].clone()
+        };
+        let non_impacted_a = {
+            let first = Ortho::new().add(bar_idx_a)[0].clone();
+            first.add(foo_idx_a)[0].clone()
+        };
+
+        let (archive_a_path, _) = save_archive_vec_internal(
+            &interner_a,
+            vec![impacted_a.clone(), non_impacted_a],
+            Some(&impacted_a),
+            "\"A\"",
+            2,
+            "foo bar",
+            2,
+            &config,
+        )
+        .unwrap();
+
+        // Build interner B (foo baz) and impacted/non-impacted orthos
+        let interner_b = Interner::from_text("foo baz");
+        let foo_idx_b = interner_b.vocabulary().iter().position(|w| w == "foo").unwrap();
+        let baz_idx_b = interner_b.vocabulary().iter().position(|w| w == "baz").unwrap();
+
+        let impacted_b = {
+            let first = Ortho::new().add(foo_idx_b)[0].clone();
+            first.add(baz_idx_b)[0].clone()
+        };
+        let non_impacted_b = {
+            let first = Ortho::new().add(baz_idx_b)[0].clone();
+            first.add(foo_idx_b)[0].clone()
+        };
+
+        let (archive_b_path, _) = save_archive_vec_internal(
+            &interner_b,
+            vec![impacted_b.clone(), non_impacted_b],
+            Some(&impacted_b),
+            "\"B\"",
+            2,
+            "foo baz",
+            2,
+            &config,
+        )
+        .unwrap();
+
+        // Merge and verify impacted queues are non-zero
+        let metrics = Metrics::new();
+        merge_archives(
+            &archive_a_path,
+            &archive_b_path,
+            &config,
+            &metrics,
+            Role::Leader,
+        )
+        .unwrap();
+
+        let snapshot = metrics.snapshot();
+        assert!(
+            snapshot.merge.impacted_queued_a > 0 && snapshot.merge.impacted_queued_b > 0,
+            "impacted queues should be non-empty (got A:{} B:{})",
+            snapshot.merge.impacted_queued_a,
+            snapshot.merge.impacted_queued_b
+        );
     }
 }
