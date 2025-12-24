@@ -201,6 +201,7 @@ pub type ProgressCallback = Box<dyn Fn(&str) + Send>;
 pub struct BucketStats {
     pub bucket_id: usize,
     pub run_count: usize,
+    // Count of orthos currently in landing (in-memory + active log)
     pub landing_size: usize,
     pub history_size_estimate: usize,
 }
@@ -223,6 +224,7 @@ pub struct GenerationStore {
     bucket_writers: Vec<Option<BufWriter<File>>>,
     drain_counter: Vec<usize>,
     landing_buffer_sizes: Vec<usize>, // Track bytes written to each bucket writer
+    landing_counts: Vec<usize>,       // Track ortho counts in landing per bucket
     // Work queue state
     work_segments: Vec<PathBuf>,
     work_segment_counter: usize,
@@ -424,6 +426,7 @@ impl GenerationStore {
             bucket_writers: (0..bucket_count).map(|_| None).collect(),
             drain_counter: vec![0; bucket_count],
             landing_buffer_sizes: vec![0; bucket_count],
+            landing_counts: vec![0; bucket_count],
             work_segments: Vec::new(),
             work_segment_counter: 0,
             total_work_len: 0,
@@ -505,6 +508,7 @@ impl GenerationStore {
             bucket_writers: (0..8).map(|_| None).collect(),
             drain_counter: vec![0; 8],
             landing_buffer_sizes: vec![0; 8],
+            landing_counts: vec![0; 8],
             work_segments: Vec::new(),
             work_segment_counter: 0,
             total_work_len: 0,
@@ -561,6 +565,7 @@ impl GenerationStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let encoded_len = encoded.len();
         writer.write_all(&encoded)?;
+        self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
         
         // Track buffer size and flush if over threshold
         self.landing_buffer_sizes[bucket] += encoded_len;
@@ -592,6 +597,9 @@ impl GenerationStore {
         let drain_path = self.drain_log_path(bucket, drain_id);
         
         fs::rename(&active_path, &drain_path)?;
+        // Landing for this bucket has been drained; reset counters.
+        self.landing_counts[bucket] = 0;
+        self.landing_buffer_sizes[bucket] = 0;
         
         Ok(RawStream::new(vec![drain_path]))
     }
@@ -792,9 +800,9 @@ impl GenerationStore {
         self.seen_len_accepted
     }
 
-    /// Get total landing buffer size across all buckets (orthos pending acceptance)
+    /// Get total landing buffer count across all buckets (orthos pending acceptance)
     pub fn total_landing_size(&self) -> usize {
-        self.landing_buffer_sizes.iter().sum()
+        self.landing_counts.iter().sum()
     }
 
     /// Peek at the best ortho volume currently in work cache (without removing)
@@ -816,17 +824,8 @@ impl GenerationStore {
             .map(|bucket| {
                 let run_count = self.history_runs[bucket].len();
                 
-                // Get in-memory buffer size (actively accumulating)
-                let buffer_size = self.landing_buffer_sizes[bucket];
-                
-                // Get on-disk file size (what's been flushed)
-                let landing_path = self.active_log_path(bucket);
-                let file_size = std::fs::metadata(&landing_path)
-                    .map(|m| m.len() as usize)
-                    .unwrap_or(0);
-                
-                // Total landing size = in-memory + on-disk
-                let landing_size = buffer_size + file_size;
+                // Landing count represents orthos pending acceptance (buffer + active log)
+                let landing_size = self.landing_counts[bucket];
                 
                 // Estimate history size from run files
                 let history_size_estimate = self.history_runs[bucket]

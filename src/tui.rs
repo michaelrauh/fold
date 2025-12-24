@@ -798,18 +798,21 @@ impl Tui {
                         0
                     };
                     let bar = "█".repeat(bar_len);
-                    let color = if b.landing_size > 20_000 {
-                        Color::Yellow
-                    } else if b.landing_size > 0 {
-                        Color::Green
+                    let ratio = if max_landing > 0 {
+                        b.landing_size as f64 / max_landing as f64
                     } else {
-                        Color::DarkGray
+                        0.0
+                    };
+                    let color = match b.landing_size {
+                        0 => Color::DarkGray,
+                        _ if ratio > 0.66 => Color::Yellow,
+                        _ => Color::Green,
                     };
                     line1_spans.push(Span::styled(
                         format!("B{}:{:<4} ", b.bucket_id, bar),
                         Style::default().fg(color)
                     ));
-                    line1_spans.push(Span::raw(format!("{} ", format_bytes(b.landing_size))));
+                    line1_spans.push(Span::raw(format!("{} ", format_number(b.landing_size))));
                 }
                 
                 // Build landing bars for buckets 4-7
@@ -821,18 +824,21 @@ impl Tui {
                         0
                     };
                     let bar = "█".repeat(bar_len);
-                    let color = if b.landing_size > 20_000 {
-                        Color::Yellow
-                    } else if b.landing_size > 0 {
-                        Color::Green
+                    let ratio = if max_landing > 0 {
+                        b.landing_size as f64 / max_landing as f64
                     } else {
-                        Color::DarkGray
+                        0.0
+                    };
+                    let color = match b.landing_size {
+                        0 => Color::DarkGray,
+                        _ if ratio > 0.66 => Color::Yellow,
+                        _ => Color::Green,
                     };
                     line2_spans.push(Span::styled(
                         format!("B{}:{:<4} ", b.bucket_id, bar),
                         Style::default().fg(color)
                     ));
-                    line2_spans.push(Span::raw(format!("{} ", format_bytes(b.landing_size))));
+                    line2_spans.push(Span::raw(format!("{} ", format_number(b.landing_size))));
                 }
                 
                 let landing_lines = vec![

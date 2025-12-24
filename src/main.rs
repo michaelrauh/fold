@@ -364,7 +364,7 @@ fn process_txt_file(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_size(store.total_landing_size());
+    metrics.record_landing_buffer_count(store.total_landing_size());
     
     // Check cache for initial optimal ortho
     if let Some(cache_volume) = store.peek_best_volume_in_cache() {
@@ -478,7 +478,7 @@ fn process_txt_file(
                     g.seen_len_accepted = store.seen_len_accepted();
                 });
                 metrics.record_work_len(store.work_len() as usize);
-                metrics.record_landing_buffer_size(store.total_landing_size());
+                metrics.record_landing_buffer_count(store.total_landing_size());
                 
                 // Update bucket metrics for TUI visualization
                 let bucket_stats = store.bucket_stats();
@@ -640,8 +640,7 @@ fn process_txt_file(
                             _ => fold::metrics::BucketState::Pending,
                         };
                         
-                        // Update specific bucket state
-                        metrics_clone.update_bucket_metrics(vec![]); // Trigger a read-modify-write
+                        // Update specific bucket state without wiping existing metrics
                         let snapshot = metrics_clone.snapshot();
                         let mut updated_buckets = snapshot.bucket_metrics.clone();
                         if bucket_id < updated_buckets.len() {
@@ -690,7 +689,7 @@ fn process_txt_file(
             g.phase = format!("Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_size(store.total_landing_size());
+        metrics.record_landing_buffer_count(store.total_landing_size());
         
         metrics.add_log(format!(
             "Generation {} complete: {} new work items, {} total seen",
@@ -897,7 +896,7 @@ fn merge_archives(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_size(store.total_landing_size());
+    metrics.record_landing_buffer_count(store.total_landing_size());
 
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
@@ -1030,7 +1029,7 @@ fn merge_archives(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_size(store.total_landing_size());
+    metrics.record_landing_buffer_count(store.total_landing_size());
     
     // Check cache for initial optimal ortho in merge
     if let Some(cache_volume) = store.peek_best_volume_in_cache() {
@@ -1064,7 +1063,7 @@ fn merge_archives(
         });
         // Record samples for charts
         metrics.record_work_len(work_len as usize);
-        metrics.record_landing_buffer_size(store.total_landing_size());
+        metrics.record_landing_buffer_count(store.total_landing_size());
         
         // Update bucket metrics
         let bucket_stats = store.bucket_stats();
@@ -1142,7 +1141,7 @@ fn merge_archives(
                     g.seen_len_accepted = store.seen_len_accepted();
                 });
                 metrics.record_work_len(store.work_len() as usize);
-                metrics.record_landing_buffer_size(store.total_landing_size());
+                metrics.record_landing_buffer_count(store.total_landing_size());
                 
                 // Update bucket metrics for TUI visualization
                 let bucket_stats = store.bucket_stats();
@@ -1300,8 +1299,7 @@ fn merge_archives(
                             _ => fold::metrics::BucketState::Pending,
                         };
                         
-                        // Update specific bucket state
-                        metrics_clone.update_bucket_metrics(vec![]); // Trigger a read-modify-write
+                        // Update specific bucket state without wiping existing metrics
                         let snapshot = metrics_clone.snapshot();
                         let mut updated_buckets = snapshot.bucket_metrics.clone();
                         if bucket_id < updated_buckets.len() {
@@ -1350,7 +1348,7 @@ fn merge_archives(
             g.phase = format!("Merge Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_size(store.total_landing_size());
+        metrics.record_landing_buffer_count(store.total_landing_size());
         
         metrics.add_log(format!(
             "Merge Generation {} complete: {} new work, {} total seen",

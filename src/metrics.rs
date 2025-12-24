@@ -333,8 +333,8 @@ impl Metrics {
         self.record_sample(len, |inner| &mut inner.work_len_samples);
     }
 
-    pub fn record_landing_buffer_size(&self, size: usize) {
-        self.record_sample(size, |inner| &mut inner.landing_buffer_samples);
+    pub fn record_landing_buffer_count(&self, count: usize) {
+        self.record_sample(count, |inner| &mut inner.landing_buffer_samples);
     }
 
     pub fn record_seen_len_accepted(&self, len: usize) {
@@ -511,6 +511,7 @@ impl Metrics {
 pub struct BucketMetrics {
     pub bucket_id: usize,
     pub run_count: usize,
+    // Count of orthos currently pending in landing for this bucket
     pub landing_size: usize,
     pub history_size_estimate: usize,
     pub state: BucketState,
