@@ -368,6 +368,10 @@ fn process_txt_file(
     let mut sys = sysinfo::System::new();
     let mut generation = 0u64;
     
+    // Tracking for throughput calculation
+    let mut last_report_time = std::time::Instant::now();
+    let mut last_report_count = 0;
+    
     // Generational processing loop
     loop {
         let work_len = store.work_len();
@@ -378,7 +382,7 @@ fn process_txt_file(
         // Update global metrics at start of generation
         metrics.update_global(|g| {
             g.generation = generation;
-            g.phase = "Processing".to_string();
+            g.phase = format!("Gen {} Processing", generation);
             g.work_len = work_len;
             g.seen_len_accepted = store.seen_len_accepted();
             g.run_budget_bytes = cfg.run_budget_bytes;
@@ -396,6 +400,8 @@ fn process_txt_file(
                 run_count: bs.run_count,
                 landing_size: bs.landing_size,
                 history_size_estimate: bs.history_size_estimate,
+                state: fold::metrics::BucketState::Pending,
+                new_work: 0,
             }
         }).collect();
         metrics.update_bucket_metrics(bucket_metrics);
@@ -412,8 +418,28 @@ fn process_txt_file(
             gen_processed += 1;
             total_processed += 1;
 
-            // Periodic updates
-            if total_processed % 1000 == 0 {
+            // Periodic updates - more frequent for better visibility
+            if total_processed % 100 == 0 {
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(last_report_time).as_secs_f64();
+                
+                // Calculate throughput
+                let processed_since_last = total_processed - last_report_count;
+                let throughput = if elapsed > 0.0 {
+                    (processed_since_last as f64 / elapsed) as usize
+                } else {
+                    0
+                };
+                
+                // Update every second for visibility
+                if elapsed >= 1.0 {
+                    metrics.update_global(|g| {
+                        g.phase = format!("Gen {} Processing ({}/s)", generation, throughput);
+                    });
+                    last_report_time = now;
+                    last_report_count = total_processed;
+                }
+                
                 metrics.record_optimal_volume(best_ortho.volume());
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;
@@ -435,6 +461,8 @@ fn process_txt_file(
                         run_count: bs.run_count,
                         landing_size: bs.landing_size,
                         history_size_estimate: bs.history_size_estimate,
+                        state: fold::metrics::BucketState::Pending,
+                        new_work: 0,
                     }
                 }).collect();
                 metrics.update_bucket_metrics(bucket_metrics);
@@ -542,16 +570,94 @@ fn process_txt_file(
         ));
 
         // End of generation: drain, compact, anti-join, push new work
-        metrics.update_global(|g| {
-            g.phase = "Transition".to_string();
+        let gen_for_closure = generation;
+        let metrics_clone = metrics.clone_handle();
+        let progress_callback: fold::generation_store::ProgressCallback = Box::new(move |msg: &str| {
+            // Parse special bucket state messages
+            if msg.starts_with("TRANSITION_START:") {
+                if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
+                    if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
+                        // Initialize all buckets as pending
+                        let initial_buckets: Vec<_> = (0..bucket_count).map(|i| {
+                            fold::metrics::BucketMetrics {
+                                bucket_id: i,
+                                run_count: 0,
+                                landing_size: 0,
+                                history_size_estimate: 0,
+                                state: fold::metrics::BucketState::Pending,
+                                new_work: 0,
+                            }
+                        }).collect();
+                        metrics_clone.update_bucket_metrics(initial_buckets);
+                    }
+                }
+            } else if msg.starts_with("BUCKET_STATE:") {
+                // Parse: BUCKET_STATE:bucket_id:state[:new_work]
+                let parts: Vec<&str> = msg.strip_prefix("BUCKET_STATE:").unwrap().split(':').collect();
+                if parts.len() >= 2 {
+                    if let Ok(bucket_id) = parts[0].parse::<usize>() {
+                        let state_str = parts[1];
+                        let new_work = if parts.len() >= 3 { parts[2].parse::<usize>().unwrap_or(0) } else { 0 };
+                        
+                        let state = match state_str {
+                            "draining" => fold::metrics::BucketState::Draining,
+                            "sorting" => fold::metrics::BucketState::Sorting,
+                            "merging" => fold::metrics::BucketState::Merging,
+                            "antijoining" => fold::metrics::BucketState::AntiJoining,
+                            "compacting" => fold::metrics::BucketState::Compacting,
+                            "complete" => fold::metrics::BucketState::Complete,
+                            "empty" => fold::metrics::BucketState::Empty,
+                            _ => fold::metrics::BucketState::Pending,
+                        };
+                        
+                        // Update specific bucket state
+                        metrics_clone.update_bucket_metrics(vec![]); // Trigger a read-modify-write
+                        let snapshot = metrics_clone.snapshot();
+                        let mut updated_buckets = snapshot.bucket_metrics.clone();
+                        if bucket_id < updated_buckets.len() {
+                            updated_buckets[bucket_id].state = state;
+                            updated_buckets[bucket_id].new_work = new_work;
+                            metrics_clone.update_bucket_metrics(updated_buckets);
+                        }
+                    }
+                }
+            } else if msg == "TRANSITION_COMPLETE" {
+                // Reset all buckets to normal state
+                let snapshot = metrics_clone.snapshot();
+                let reset_buckets: Vec<_> = snapshot.bucket_metrics.iter().map(|b| {
+                    fold::metrics::BucketMetrics {
+                        bucket_id: b.bucket_id,
+                        run_count: b.run_count,
+                        landing_size: b.landing_size,
+                        history_size_estimate: b.history_size_estimate,
+                        state: fold::metrics::BucketState::Pending,
+                        new_work: 0,
+                    }
+                }).collect();
+                metrics_clone.update_bucket_metrics(reset_buckets);
+            }
+            
+            // Update phase display (for non-control messages)
+            if !msg.starts_with("BUCKET_STATE:") && !msg.starts_with("TRANSITION_START:") && msg != "TRANSITION_COMPLETE" {
+                metrics_clone.update_global(|g| {
+                    g.phase = format!("Gen {} → {}: {}", gen_for_closure, gen_for_closure + 1, msg);
+                });
+                metrics_clone.add_log(format!("Gen {} transition: {}", gen_for_closure, msg));
+            }
         });
-        metrics.set_operation_status(format!("Gen {} transition", generation));
-        let new_work = store.on_generation_end(&cfg)?;
+        
+        metrics.update_global(|g| {
+            g.phase = format!("Gen {} → {} transition starting", generation, generation + 1);
+        });
+        metrics.set_operation_status(format!("Gen {} → {} transition", generation, generation + 1));
+        
+        let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
         
         // Update metrics after generation transition
         metrics.update_global(|g| {
             g.work_len = store.work_len();
             g.seen_len_accepted = store.seen_len_accepted();
+            g.phase = format!("Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
         metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
@@ -879,6 +985,10 @@ fn merge_archives(
     metrics.record_work_len(store.work_len() as usize);
     metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
 
+    // Tracking for throughput calculation
+    let mut last_report_time = std::time::Instant::now();
+    let mut last_report_count = 0;
+
     loop {
         let work_len = store.work_len();
         if work_len == 0 {
@@ -888,7 +998,7 @@ fn merge_archives(
         // Update global metrics at start of merge generation
         metrics.update_global(|g| {
             g.generation = generation;
-            g.phase = "Processing".to_string();
+            g.phase = format!("Merge Gen {} Processing", generation);
             g.work_len = work_len;
             g.seen_len_accepted = store.seen_len_accepted();
             g.run_budget_bytes = cfg.run_budget_bytes;
@@ -906,6 +1016,8 @@ fn merge_archives(
                 run_count: bs.run_count,
                 landing_size: bs.landing_size,
                 history_size_estimate: bs.history_size_estimate,
+                state: fold::metrics::BucketState::Pending,
+                new_work: 0,
             }
         }).collect();
         metrics.update_bucket_metrics(bucket_metrics);
@@ -922,8 +1034,28 @@ fn merge_archives(
             gen_processed += 1;
             total_processed += 1;
 
-            // Periodic updates
-            if total_processed % 1000 == 0 {
+            // Periodic updates - more frequent for better visibility
+            if total_processed % 100 == 0 {
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(last_report_time).as_secs_f64();
+                
+                // Calculate throughput
+                let processed_since_last = total_processed - last_report_count;
+                let throughput = if elapsed > 0.0 {
+                    (processed_since_last as f64 / elapsed) as usize
+                } else {
+                    0
+                };
+                
+                // Update every second for visibility
+                if elapsed >= 1.0 {
+                    metrics.update_global(|g| {
+                        g.phase = format!("Merge Gen {} Processing ({}/s)", generation, throughput);
+                    });
+                    last_report_time = now;
+                    last_report_count = total_processed;
+                }
+                
                 metrics.record_optimal_volume(best_ortho.volume());
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;
@@ -945,6 +1077,8 @@ fn merge_archives(
                         run_count: bs.run_count,
                         landing_size: bs.landing_size,
                         history_size_estimate: bs.history_size_estimate,
+                        state: fold::metrics::BucketState::Pending,
+                        new_work: 0,
                     }
                 }).collect();
                 metrics.update_bucket_metrics(bucket_metrics);
@@ -1048,16 +1182,94 @@ fn merge_archives(
         ));
 
         // End of generation
-        metrics.update_global(|g| {
-            g.phase = "Transition".to_string();
+        let gen_for_closure = generation;
+        let metrics_clone = metrics.clone_handle();
+        let progress_callback: fold::generation_store::ProgressCallback = Box::new(move |msg: &str| {
+            // Parse special bucket state messages
+            if msg.starts_with("TRANSITION_START:") {
+                if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
+                    if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
+                        // Initialize all buckets as pending
+                        let initial_buckets: Vec<_> = (0..bucket_count).map(|i| {
+                            fold::metrics::BucketMetrics {
+                                bucket_id: i,
+                                run_count: 0,
+                                landing_size: 0,
+                                history_size_estimate: 0,
+                                state: fold::metrics::BucketState::Pending,
+                                new_work: 0,
+                            }
+                        }).collect();
+                        metrics_clone.update_bucket_metrics(initial_buckets);
+                    }
+                }
+            } else if msg.starts_with("BUCKET_STATE:") {
+                // Parse: BUCKET_STATE:bucket_id:state[:new_work]
+                let parts: Vec<&str> = msg.strip_prefix("BUCKET_STATE:").unwrap().split(':').collect();
+                if parts.len() >= 2 {
+                    if let Ok(bucket_id) = parts[0].parse::<usize>() {
+                        let state_str = parts[1];
+                        let new_work = if parts.len() >= 3 { parts[2].parse::<usize>().unwrap_or(0) } else { 0 };
+                        
+                        let state = match state_str {
+                            "draining" => fold::metrics::BucketState::Draining,
+                            "sorting" => fold::metrics::BucketState::Sorting,
+                            "merging" => fold::metrics::BucketState::Merging,
+                            "antijoining" => fold::metrics::BucketState::AntiJoining,
+                            "compacting" => fold::metrics::BucketState::Compacting,
+                            "complete" => fold::metrics::BucketState::Complete,
+                            "empty" => fold::metrics::BucketState::Empty,
+                            _ => fold::metrics::BucketState::Pending,
+                        };
+                        
+                        // Update specific bucket state
+                        metrics_clone.update_bucket_metrics(vec![]); // Trigger a read-modify-write
+                        let snapshot = metrics_clone.snapshot();
+                        let mut updated_buckets = snapshot.bucket_metrics.clone();
+                        if bucket_id < updated_buckets.len() {
+                            updated_buckets[bucket_id].state = state;
+                            updated_buckets[bucket_id].new_work = new_work;
+                            metrics_clone.update_bucket_metrics(updated_buckets);
+                        }
+                    }
+                }
+            } else if msg == "TRANSITION_COMPLETE" {
+                // Reset all buckets to normal state
+                let snapshot = metrics_clone.snapshot();
+                let reset_buckets: Vec<_> = snapshot.bucket_metrics.iter().map(|b| {
+                    fold::metrics::BucketMetrics {
+                        bucket_id: b.bucket_id,
+                        run_count: b.run_count,
+                        landing_size: b.landing_size,
+                        history_size_estimate: b.history_size_estimate,
+                        state: fold::metrics::BucketState::Pending,
+                        new_work: 0,
+                    }
+                }).collect();
+                metrics_clone.update_bucket_metrics(reset_buckets);
+            }
+            
+            // Update phase display (for non-control messages)
+            if !msg.starts_with("BUCKET_STATE:") && !msg.starts_with("TRANSITION_START:") && msg != "TRANSITION_COMPLETE" {
+                metrics_clone.update_global(|g| {
+                    g.phase = format!("Merge Gen {} → {}: {}", gen_for_closure, gen_for_closure + 1, msg);
+                });
+                metrics_clone.add_log(format!("Merge Gen {} transition: {}", gen_for_closure, msg));
+            }
         });
-        metrics.set_operation_status(format!("Merge Gen {} transition", generation));
-        let new_work = store.on_generation_end(&cfg)?;
+        
+        metrics.update_global(|g| {
+            g.phase = format!("Merge Gen {} → {} transition starting", generation, generation + 1);
+        });
+        metrics.set_operation_status(format!("Merge Gen {} → {} transition", generation, generation + 1));
+        
+        let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
         
         // Update metrics after merge generation transition
         metrics.update_global(|g| {
             g.work_len = store.work_len();
             g.seen_len_accepted = store.seen_len_accepted();
+            g.phase = format!("Merge Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
         metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);

@@ -150,6 +150,9 @@ fn compute_fan_in(budget: usize, read_buf_bytes: usize) -> usize {
 }
 
 
+/// Callback for reporting generation transition progress
+pub type ProgressCallback = Box<dyn Fn(&str) + Send>;
+
 /// Statistics for a single bucket
 #[derive(Clone, Debug)]
 pub struct BucketStats {
@@ -664,8 +667,15 @@ impl GenerationStore {
     /// 6. Pushes new work items to the work queue
     /// 
     /// TODO: After integer bootstrap is proven, replace all integer operations with ortho versions
-    pub fn on_generation_end(&mut self, cfg: &Config) -> io::Result<u64> {
+    pub fn on_generation_end(&mut self, cfg: &Config, progress: Option<&ProgressCallback>) -> io::Result<u64> {
         let mut total_new_work = 0u64;
+        let mut buckets_processed = 0;
+        let mut total_drained = 0usize;
+        let mut total_accepted = 0u64;
+        
+        if let Some(cb) = &progress {
+            cb(&format!("TRANSITION_START:{}", self.bucket_count));
+        }
         
         // Process each bucket independently
         for bucket in 0..self.bucket_count {
@@ -673,25 +683,62 @@ impl GenerationStore {
             self.flush()?;
             
             // Phase: Draining
+            if let Some(cb) = &progress {
+                cb(&format!("BUCKET_STATE:{}:draining", bucket));
+            }
             let raw = self.drain_bucket(bucket)?;
             
             if raw.files().is_empty() {
                 // No data in this bucket, skip
+                if let Some(cb) = &progress {
+                    cb(&format!("BUCKET_STATE:{}:empty", bucket));
+                }
                 continue;
             }
             
+            // Count drained orthos for metrics
+            let mut drained_count = 0usize;
+            for file_path in raw.files() {
+                if let Ok(metadata) = std::fs::metadata(file_path) {
+                    // Rough estimate: divide file size by average ortho size (~200 bytes)
+                    drained_count += (metadata.len() / 200) as usize;
+                }
+            }
+            total_drained += drained_count;
+            
+            if let Some(cb) = &progress {
+                cb(&format!("Bucket {}/{}: drained ~{} orthos", bucket, self.bucket_count, drained_count));
+            }
+            
             // Phase: Compacting
+            if let Some(cb) = &progress {
+                cb(&format!("BUCKET_STATE:{}:sorting", bucket));
+            }
             let runs = compact_landing(bucket, raw, cfg, &self.base_path)?;
             
             if runs.is_empty() {
                 // No runs generated, skip
+                if let Some(cb) = &progress {
+                    cb(&format!("Bucket {}/{}: no runs generated", bucket, self.bucket_count));
+                    cb(&format!("BUCKET_STATE:{}:empty", bucket));
+                }
                 continue;
             }
             
+            if let Some(cb) = &progress {
+                cb(&format!("Bucket {}/{}: created {} runs", bucket, self.bucket_count, runs.len()));
+            }
+            
             // Phase: Merge to unique run
+            if let Some(cb) = &progress {
+                cb(&format!("BUCKET_STATE:{}:merging", bucket));
+            }
             let unique_run = merge_unique(runs, cfg, &self.base_path)?;
             
             // Phase: Anti-join against history
+            if let Some(cb) = &progress {
+                cb(&format!("BUCKET_STATE:{}:antijoining", bucket));
+            }
             let history_iter = self.history_iter(bucket)?;
             let (new_work, seen_run, accepted) = anti_join_orthos(
                 unique_run,
@@ -699,17 +746,49 @@ impl GenerationStore {
                 &self.base_path,
             )?;
             
+            total_accepted += accepted;
+            let bucket_new_work = new_work.len();
+            
+            if let Some(cb) = &progress {
+                cb(&format!("Bucket {}/{}: accepted {} orthos, created {} new work", 
+                    bucket, self.bucket_count, accepted, bucket_new_work));
+            }
+            
             // Add seen run to history
             self.add_history_run(bucket, seen_run, accepted)?;
             
             // Optional: Compact history if needed
             if cfg.allow_compaction {
-                self.compact_history(bucket, cfg)?;
+                let pre_compact_runs = self.history_runs[bucket].len();
+                if pre_compact_runs > 64 {
+                    if let Some(cb) = &progress {
+                        cb(&format!("BUCKET_STATE:{}:compacting", bucket));
+                        cb(&format!("Bucket {}/{}: compacting {} history runs", bucket, self.bucket_count, pre_compact_runs));
+                    }
+                    self.compact_history(bucket, cfg)?;
+                    let post_compact_runs = self.history_runs[bucket].len();
+                    if let Some(cb) = &progress {
+                        cb(&format!("Bucket {}/{}: compacted {} → {} runs", bucket, self.bucket_count, pre_compact_runs, post_compact_runs));
+                    }
+                }
+            }
+            
+            // Mark bucket complete
+            if let Some(cb) = &progress {
+                cb(&format!("BUCKET_STATE:{}:complete:{}", bucket, bucket_new_work));
             }
             
             // Push new work to queue (ortho version)
-            total_new_work += new_work.len() as u64;
+            total_new_work += bucket_new_work as u64;
             self.push_segments(new_work)?;
+            
+            buckets_processed += 1;
+        }
+        
+        if let Some(cb) = &progress {
+            cb(&format!("TRANSITION_COMPLETE"));
+            cb(&format!("Transition complete: processed {} buckets, drained ~{} orthos, accepted {} orthos, created {} new work",
+                buckets_processed, total_drained, total_accepted, total_new_work));
         }
         
         Ok(total_new_work)
@@ -1524,7 +1603,7 @@ mod tests {
         };
         
         // Call on_generation_end with no data
-        let new_work = store.on_generation_end(&cfg).unwrap();
+        let new_work = store.on_generation_end(&cfg, None).unwrap();
         
         assert_eq!(new_work, 0);
         assert_eq!(store.work_len(), 0);
@@ -1574,7 +1653,7 @@ mod tests {
         assert_eq!(store.work_len(), 0); // Work queue is empty
         
         // End generation 0 - triggers drain, compact, anti-join, and push new work
-        let new_work_gen0 = store.on_generation_end(&cfg).unwrap();
+        let new_work_gen0 = store.on_generation_end(&cfg, None).unwrap();
         
         // Should have generated some new work
         assert!(new_work_gen0 > 0, "Should have new work from generation 0");
@@ -1604,7 +1683,7 @@ mod tests {
         assert!(processed_gen1 <= max_gen1_items);
         
         // End generation 1
-        let new_work_gen1 = store.on_generation_end(&cfg).unwrap();
+        let new_work_gen1 = store.on_generation_end(&cfg, None).unwrap();
         
         // Should have generated new work
         assert!(new_work_gen1 > 0, "Should have new work from generation 1");
@@ -1629,7 +1708,7 @@ mod tests {
         }
         
         // End generation 2
-        let new_work_gen2 = store.on_generation_end(&cfg).unwrap();
+        let new_work_gen2 = store.on_generation_end(&cfg, None).unwrap();
         
         // Verify the system maintains correctness with orthos:
         // - work_len tracks queue depth
@@ -1675,7 +1754,7 @@ mod tests {
             }
         }
         
-        let new_work_gen0 = store.on_generation_end(&cfg).unwrap();
+        let new_work_gen0 = store.on_generation_end(&cfg, None).unwrap();
         let seen_gen0 = store.seen_len_accepted();
         
         assert!(new_work_gen0 > 0);
@@ -1698,7 +1777,7 @@ mod tests {
             processed += 1;
         }
         
-        let new_work_gen1 = store.on_generation_end(&cfg).unwrap();
+        let new_work_gen1 = store.on_generation_end(&cfg, None).unwrap();
         
         // Seen count should grow but some duplicates should be filtered
         assert!(store.seen_len_accepted() > seen_gen0);

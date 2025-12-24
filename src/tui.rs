@@ -694,60 +694,121 @@ impl Tui {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Min(3),
-            ])
-            .split(inner);
+        // Check if we're in a transition (processing buckets)
+        let in_transition = snapshot.bucket_metrics.iter().any(|b| {
+            !matches!(b.state, crate::metrics::BucketState::Pending | crate::metrics::BucketState::Complete | crate::metrics::BucketState::Empty)
+        });
 
-        // Top: Generation stats
-        let lines_top = vec![Line::from(format!(
-            "Gen: {} │ Phase: {} │ Work: {}",
-            generation,
-            phase_str,
-            format_number(work_len as usize)
-        ))];
-        f.render_widget(Paragraph::new(lines_top), chunks[0]);
+        if in_transition && !snapshot.bucket_metrics.is_empty() {
+            // Show detailed per-bucket progress during transitions
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Min(3),
+                ])
+                .split(inner);
 
-        // Middle: Global stats
-        let lines_mid = vec![Line::from(format!(
-            "Accepted: {} │ Budget: {} │ Fan-in: {}",
-            format_number(seen as usize),
-            format_bytes(snapshot.global.run_budget_bytes),
-            snapshot.global.fan_in
-        ))];
-        f.render_widget(Paragraph::new(lines_mid), chunks[1]);
+            // Top: Generation stats
+            let lines_top = vec![Line::from(format!(
+                "Gen: {} │ {} │ Work: {}",
+                generation,
+                phase_str,
+                format_number(work_len as usize)
+            ))];
+            f.render_widget(Paragraph::new(lines_top), chunks[0]);
 
-        // Bottom: Per-bucket sparklines showing run counts
-        if !snapshot.bucket_metrics.is_empty() {
-            let bucket_count = snapshot.bucket_metrics.len();
-            let run_counts: Vec<u64> = snapshot.bucket_metrics
+            // Bottom: Per-bucket progress panel
+            let available_height = chunks[1].height as usize;
+            let bucket_lines: Vec<Line> = snapshot.bucket_metrics
                 .iter()
-                .map(|b| b.run_count as u64)
+                .take(available_height)
+                .map(|b| {
+                    let (progress_bar, state_text, color) = match b.state {
+                        crate::metrics::BucketState::Complete => ("████████", "Complete", Color::Green),
+                        crate::metrics::BucketState::Empty => ("        ", "Empty", Color::DarkGray),
+                        crate::metrics::BucketState::Draining => ("██      ", "Draining", Color::Yellow),
+                        crate::metrics::BucketState::Sorting => ("████    ", "Sorting", Color::Yellow),
+                        crate::metrics::BucketState::Merging => ("█████   ", "Merging", Color::Yellow),
+                        crate::metrics::BucketState::AntiJoining => ("██████  ", "Anti-join", Color::Yellow),
+                        crate::metrics::BucketState::Compacting => ("███████ ", "Compact", Color::Cyan),
+                        crate::metrics::BucketState::Pending => ("        ", "Pending", Color::DarkGray),
+                    };
+                    
+                    let work_info = if b.new_work > 0 {
+                        format!(" (+{} work)", format_number(b.new_work))
+                    } else {
+                        String::new()
+                    };
+                    
+                    Line::from(vec![
+                        Span::styled(format!("[{}] ", progress_bar), Style::default().fg(color)),
+                        Span::styled(format!("B{}: ", b.bucket_id), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{:<11}", state_text), Style::default().fg(color)),
+                        Span::raw(work_info),
+                    ])
+                })
                 .collect();
-            
-            let max_runs = run_counts.iter().max().copied().unwrap_or(1);
-            let total_runs: usize = snapshot.bucket_metrics.iter().map(|b| b.run_count).sum();
-            
-            let title = format!(
-                "Buckets: {} │ Total Runs: {} │ Max: {}",
-                bucket_count,
-                total_runs,
-                max_runs
-            );
-            
-            let sparkline = Sparkline::default()
-                .block(Block::default().title(title))
-                .data(&run_counts)
-                .style(Style::default().fg(Color::Cyan));
-            
-            f.render_widget(sparkline, chunks[2]);
+
+            let progress_panel = Paragraph::new(bucket_lines);
+            f.render_widget(progress_panel, chunks[1]);
         } else {
-            let placeholder = Paragraph::new(vec![Line::from("Bucket stats loading...")]);
-            f.render_widget(placeholder, chunks[2]);
+            // Normal view with sparklines when not in transition
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Length(2),
+                    Constraint::Min(3),
+                ])
+                .split(inner);
+
+            // Top: Generation stats
+            let lines_top = vec![Line::from(format!(
+                "Gen: {} │ Phase: {} │ Work: {}",
+                generation,
+                phase_str,
+                format_number(work_len as usize)
+            ))];
+            f.render_widget(Paragraph::new(lines_top), chunks[0]);
+
+            // Middle: Global stats
+            let lines_mid = vec![Line::from(format!(
+                "Accepted: {} │ Budget: {} │ Fan-in: {}",
+                format_number(seen as usize),
+                format_bytes(snapshot.global.run_budget_bytes),
+                snapshot.global.fan_in
+            ))];
+            f.render_widget(Paragraph::new(lines_mid), chunks[1]);
+
+            // Bottom: Per-bucket sparklines showing run counts
+            if !snapshot.bucket_metrics.is_empty() {
+                let bucket_count = snapshot.bucket_metrics.len();
+                let run_counts: Vec<u64> = snapshot.bucket_metrics
+                    .iter()
+                    .map(|b| b.run_count as u64)
+                    .collect();
+                
+                let max_runs = run_counts.iter().max().copied().unwrap_or(1);
+                let total_runs: usize = snapshot.bucket_metrics.iter().map(|b| b.run_count).sum();
+                
+                let title = format!(
+                    "Buckets: {} │ Total Runs: {} │ Max: {}",
+                    bucket_count,
+                    total_runs,
+                    max_runs
+                );
+                
+                let sparkline = Sparkline::default()
+                    .block(Block::default().title(title))
+                    .data(&run_counts)
+                    .style(Style::default().fg(Color::Cyan));
+                
+                f.render_widget(sparkline, chunks[2]);
+            } else {
+                let placeholder = Paragraph::new(vec![Line::from("Bucket stats loading...")]);
+                f.render_widget(placeholder, chunks[2]);
+            }
         }
     }
 

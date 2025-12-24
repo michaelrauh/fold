@@ -510,6 +510,20 @@ pub struct BucketMetrics {
     pub run_count: usize,
     pub landing_size: usize,
     pub history_size_estimate: usize,
+    pub state: BucketState,
+    pub new_work: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BucketState {
+    Pending,
+    Draining,
+    Sorting,
+    Merging,
+    AntiJoining,
+    Compacting,
+    Complete,
+    Empty,
 }
 
 #[derive(Clone, Debug)]
