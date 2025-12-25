@@ -1,5 +1,8 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main, BenchmarkId, Throughput};
-use fold::generation_store::{Config, compact_landing, merge_unique, anti_join_orthos, RawStream, Run, UniqueRun};
+use fold::generation_store::{
+    anti_join_orthos, compact_landing, merge_unique, Config, RawStream, Run, StreamedOrtho,
+    UniqueRun,
+};
 use fold::ortho::Ortho;
 use std::fs::{self, File};
 use std::io::{Write, BufWriter};
@@ -210,11 +213,15 @@ fn bench_anti_join_history_1k(c: &mut Criterion) {
     
     c.bench_function("anti_join_history_1k", |b| {
         b.iter(|| {
-            let history_iter = history.clone().into_iter().map(Ok);
+            let history_iter = history
+                .clone()
+                .into_iter()
+                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0 }));
             let (work, _run, _count) = anti_join_orthos(
                 unique_run.clone(),
                 history_iter,
-                &base_path
+                &base_path,
+                64 * 1024,
             ).unwrap();
             black_box(work);
         });
@@ -234,11 +241,15 @@ fn bench_anti_join_history_10k(c: &mut Criterion) {
     
     c.bench_function("anti_join_history_10k", |b| {
         b.iter(|| {
-            let history_iter = history.clone().into_iter().map(Ok);
+            let history_iter = history
+                .clone()
+                .into_iter()
+                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0 }));
             let (work, _run, _count) = anti_join_orthos(
                 unique_run.clone(),
                 history_iter,
-                &base_path
+                &base_path,
+                64 * 1024,
             ).unwrap();
             black_box(work);
         });
@@ -258,11 +269,15 @@ fn bench_anti_join_history_100k(c: &mut Criterion) {
     
     c.bench_function("anti_join_history_100k", |b| {
         b.iter(|| {
-            let history_iter = history.clone().into_iter().map(Ok);
+            let history_iter = history
+                .clone()
+                .into_iter()
+                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0 }));
             let (work, _run, _count) = anti_join_orthos(
                 unique_run.clone(),
                 history_iter,
-                &base_path
+                &base_path,
+                64 * 1024,
             ).unwrap();
             black_box(work);
         });
@@ -321,12 +336,13 @@ fn bench_full_generation_with_duplicates(c: &mut Criterion) {
             let unique_run = merge_unique(runs, &cfg, &base_path).unwrap();
             
             // Step 4: Anti-join against empty history (all new)
-            let empty_history = std::iter::empty();
+            let empty_history = std::iter::empty::<Result<StreamedOrtho, std::io::Error>>();
             
             let (work, _run, _count) = anti_join_orthos(
                 unique_run,
                 empty_history,
-                &base_path
+                &base_path,
+                cfg.read_buf_bytes,
             ).unwrap();
             
             black_box(work);

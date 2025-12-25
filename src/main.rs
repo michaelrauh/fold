@@ -710,15 +710,6 @@ fn process_txt_file(
         generation, store.seen_len_accepted()
     ));
 
-    // Collect all results from history for archiving
-    // For now, we'll collect from all buckets
-    let mut all_results = Vec::new();
-    for bucket in 0..8 {
-        for item in store.history_iter(bucket)? {
-            all_results.push(item?);
-        }
-    }
-
     if optimal_dirty {
         let (volume, fullness) = best_score;
         let now = std::time::SystemTime::now()
@@ -736,27 +727,33 @@ fn process_txt_file(
         });
     }
 
-    let total_orthos = all_results.len();
+    let total_orthos = store.seen_len_accepted() as usize;
     metrics.add_log(format!("Archiving: {} orthos", total_orthos));
     metrics.increment_new_orthos(total_orthos);
 
     print_optimal(&best_ortho, &interner);
 
-    // Save results as archive - write orthos directly to archive format
-    let (archive_path, lineage) = save_archive_from_vec(
-        &ingestion,
+    store.flush_all()?;
+
+    let archive_path = build_archive_path(config)?;
+    let lineage = format!("\"{}\"", ingestion.filename);
+    move_history_runs_to_archive(&store.history_run_paths(), &archive_path)?;
+    write_archive_artifacts(
+        &archive_path,
         &interner,
-        all_results,
         Some(&best_ortho),
+        &lineage,
         total_orthos,
+        &ingestion.text_preview,
+        ingestion.word_count,
     )?;
 
-    metrics.add_log(format!("Archive saved: {}", archive_path));
+    metrics.add_log(format!("Archive saved: {}", archive_path.display()));
 
     // Update largest archive
     metrics.update_largest_archive(|la| {
         if total_orthos > la.ortho_count {
-            la.filename = archive_path.clone();
+            la.filename = archive_path.to_string_lossy().to_string();
             la.ortho_count = total_orthos;
             la.lineage = lineage;
         }
@@ -927,8 +924,8 @@ fn merge_archives(
     
     // Stream all orthos from larger archive's history into our merge store
     for bucket in 0..8 {
-        for result in larger_store.history_iter(bucket)? {
-            let ortho = result?;
+        for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+            let ortho = result?.ortho;
             total_from_larger += 1;
             
             // Record to landing zone (will be deduped during generation end)
@@ -963,8 +960,8 @@ fn merge_archives(
     
     // Stream all orthos from smaller archive's history, remap, and store
     for bucket in 0..8 {
-        for result in smaller_store.history_iter(bucket)? {
-            let ortho = result?;
+        for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+            let ortho = result?.ortho;
             total_from_smaller += 1;
             
             // Remap the ortho to merged vocabulary
@@ -1368,14 +1365,6 @@ fn merge_archives(
         generation, store.seen_len_accepted()
     ));
 
-    // Collect all results from history
-    let mut all_results = Vec::new();
-    for bucket in 0..8 {
-        for item in store.history_iter(bucket)? {
-            all_results.push(item?);
-        }
-    }
-
     if optimal_dirty {
         let (volume, fullness) = best_score;
         let now = std::time::SystemTime::now()
@@ -1393,27 +1382,36 @@ fn merge_archives(
         });
     }
 
-    let total_orthos = all_results.len();
+    let total_orthos = store.seen_len_accepted() as usize;
     metrics.add_log(format!("Archiving merge: {} orthos", total_orthos));
     metrics.increment_new_orthos(total_orthos);
 
     print_optimal(&best_ortho, &merged_interner);
 
-    // Save merged results as archive
-    let (archive_path, lineage) = save_archive_from_vec(
-        &ingestion,
+    store.flush_all()?;
+
+    let archive_path = build_archive_path(config)?;
+    let lineage = format!("({} {})", lineage_a_early, lineage_b_early);
+    let text_preview = format!("{} + {}", ingestion.text_preview_a, ingestion.text_preview_b);
+    let word_count = ingestion.word_count_a + ingestion.word_count_b;
+
+    move_history_runs_to_archive(&store.history_run_paths(), &archive_path)?;
+    write_archive_artifacts(
+        &archive_path,
         &merged_interner,
-        all_results,
         Some(&best_ortho),
+        &lineage,
         total_orthos,
+        &text_preview,
+        word_count,
     )?;
 
-    metrics.add_log(format!("Merged archive saved: {}", archive_path));
+    metrics.add_log(format!("Merged archive saved: {}", archive_path.display()));
 
     // Update largest archive
     metrics.update_largest_archive(|la| {
         if total_orthos > la.ortho_count {
-            la.filename = archive_path.clone();
+            la.filename = archive_path.to_string_lossy().to_string();
             la.ortho_count = total_orthos;
             la.lineage = lineage;
         }
@@ -1453,82 +1451,7 @@ fn is_ortho_impacted_fast(ortho: &Ortho, impacted_prefixes: &[Vec<usize>]) -> bo
     requirements.iter().any(|req| impacted_prefixes.contains(req))
 }
 
-// Helper function to save archive from Vec<Ortho> using GenerationStore format
-fn save_archive_from_vec<T>(
-    ingestion: &T,
-    interner: &Interner,
-    orthos: Vec<Ortho>,
-    best_ortho: Option<&Ortho>,
-    ortho_count: usize,
-) -> Result<(String, String), FoldError>
-where
-    T: ArchiveSaver,
-{
-    ingestion.save_from_vec(interner, orthos, best_ortho, ortho_count)
-}
-
-// Trait for types that can save archives (TxtIngestion and ArchiveIngestion)
-trait ArchiveSaver {
-    fn save_from_vec(
-        &self,
-        interner: &Interner,
-        orthos: Vec<Ortho>,
-        best_ortho: Option<&Ortho>,
-        ortho_count: usize,
-    ) -> Result<(String, String), FoldError>;
-}
-
-impl ArchiveSaver for file_handler::TxtIngestion {
-    fn save_from_vec(
-        &self,
-        interner: &Interner,
-        orthos: Vec<Ortho>,
-        best_ortho: Option<&Ortho>,
-        ortho_count: usize,
-    ) -> Result<(String, String), FoldError> {
-        let lineage = format!("\"{}\"", self.filename);
-        save_archive_vec_internal(
-            interner,
-            orthos,
-            best_ortho,
-            &lineage,
-            ortho_count,
-            &self.text_preview,
-            self.word_count,
-            self.config(),
-        )
-    }
-}
-
-impl ArchiveSaver for file_handler::ArchiveIngestion {
-    fn save_from_vec(
-        &self,
-        interner: &Interner,
-        orthos: Vec<Ortho>,
-        best_ortho: Option<&Ortho>,
-        ortho_count: usize,
-    ) -> Result<(String, String), FoldError> {
-        // For merge, create compound lineage
-        let (lineage_a, lineage_b) = self.load_lineages()?;
-        let lineage = format!("({} {})", lineage_a, lineage_b);
-        
-        // Use combined text preview
-        let text_preview = format!("{} + {}", self.text_preview_a, self.text_preview_b);
-        let word_count = self.word_count_a + self.word_count_b;
-        
-        save_archive_vec_internal(
-            interner,
-            orthos,
-            best_ortho,
-            &lineage,
-            ortho_count,
-            &text_preview,
-            word_count,
-            self.config(),
-        )
-    }
-}
-
+#[allow(dead_code)]
 fn archive_generation_config() -> Config {
     let run_budget_bytes = 256 * 1024 * 1024; // 256MB for archive materialization
     let read_buf_bytes = 64 * 1024;
@@ -1554,6 +1477,7 @@ fn archive_generation_config() -> Config {
 }
 
 // Internal function to save archive from Vec<Ortho>
+#[allow(dead_code)]
 fn save_archive_vec_internal(
     interner: &Interner,
     orthos: Vec<Ortho>,
@@ -1627,6 +1551,81 @@ fn save_archive_vec_internal(
     fs::write(text_meta_path, text_metadata).map_err(FoldError::Io)?;
     
     Ok((archive_path.to_string_lossy().to_string(), lineage.to_string()))
+}
+
+fn build_archive_path(config: &StateConfig) -> Result<PathBuf, FoldError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+    let archive_name = format!("archive_{}_{}", now.as_secs(), now.subsec_nanos());
+    let archive_path = config.input_dir().join(format!("{}=.bin", archive_name));
+
+    fs::create_dir_all(&archive_path).map_err(FoldError::Io)?;
+    fs::create_dir_all(archive_path.join("results")).map_err(FoldError::Io)?;
+
+    Ok(archive_path)
+}
+
+fn move_history_runs_to_archive(
+    history_runs: &[(usize, Vec<PathBuf>)],
+    archive_path: &PathBuf,
+) -> Result<(), FoldError> {
+    let history_dir = archive_path.join("results").join("history");
+    for (bucket, runs) in history_runs {
+        let bucket_dir = history_dir.join(format!("b={:02}", bucket));
+        fs::create_dir_all(&bucket_dir).map_err(FoldError::Io)?;
+        for run_path in runs {
+            let filename = run_path
+                .file_name()
+                .ok_or_else(|| FoldError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Missing run filename",
+                )))?;
+            let dest_path = bucket_dir.join(filename);
+            fs::rename(run_path, &dest_path).map_err(FoldError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_archive_artifacts(
+    archive_path: &PathBuf,
+    interner: &Interner,
+    best_ortho: Option<&Ortho>,
+    lineage: &str,
+    ortho_count: usize,
+    text_preview: &str,
+    word_count: usize,
+) -> Result<(), FoldError> {
+    // Write the interner
+    let interner_path = archive_path.join("interner.bin");
+    let interner_bytes = bincode::encode_to_vec(interner, bincode::config::standard())?;
+    fs::write(interner_path, interner_bytes).map_err(FoldError::Io)?;
+
+    // Write optimal ortho if provided
+    if let Some(ortho) = best_ortho {
+        let optimal_bin_path = archive_path.join("optimal.bin");
+        let optimal_bytes = bincode::encode_to_vec(ortho, bincode::config::standard())?;
+        fs::write(optimal_bin_path, optimal_bytes).map_err(FoldError::Io)?;
+    }
+
+    // Write lineage
+    let lineage_path = archive_path.join("lineage.txt");
+    fs::write(lineage_path, lineage).map_err(FoldError::Io)?;
+
+    // Write metadata
+    let metadata_path = archive_path.join("metadata.txt");
+    fs::write(metadata_path, ortho_count.to_string()).map_err(FoldError::Io)?;
+
+    // Write text metadata (format: word_count on line 1, preview on line 2)
+    let text_meta_path = archive_path.join("text_meta.txt");
+    let text_metadata = format!("{}\n{}", word_count, text_preview);
+    fs::write(text_meta_path, text_metadata).map_err(FoldError::Io)?;
+
+    Ok(())
 }
 
 // Old helper functions removed (build_vocab_mapping, is_ortho_impacted_fast) - were only used by merge_archives
