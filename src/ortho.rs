@@ -1,15 +1,16 @@
 use crate::spatial;
 use bincode::Decode;
 use bincode::Encode;
-use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use rustc_hash::FxHasher;
 
 #[derive(PartialEq, Debug, Clone, Encode, Decode)]
 pub struct Ortho {
     dims: Vec<usize>,
     payload: Vec<Option<usize>>,
     up_axis: Option<usize>, // Records the last "up" transform axis (None = last expansion was over or base)
+    id: usize,              // Cached hash of dims/payload/up_axis for fast lookups
 }
 
 impl Ortho {
@@ -18,25 +19,32 @@ impl Ortho {
         payload: &Vec<Option<usize>>,
         up_axis: Option<usize>,
     ) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FxHasher::default();
         dims.hash(&mut hasher);
         payload.hash(&mut hasher);
         up_axis.hash(&mut hasher);
         (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
     }
-    pub fn new() -> Self {
-        let dims = vec![2, 2];
-        let payload = vec![None; 4];
-        let up_axis = None; // Base shape has no up transform
+
+    fn from_parts(dims: Vec<usize>, payload: Vec<Option<usize>>, up_axis: Option<usize>) -> Self {
+        let id = Self::compute_id(&dims, &payload, up_axis);
         Ortho {
             dims,
             payload,
             up_axis,
+            id,
         }
     }
 
+    pub fn new() -> Self {
+        let dims = vec![2, 2];
+        let payload = vec![None; 4];
+        let up_axis = None; // Base shape has no up transform
+        Ortho::from_parts(dims, payload, up_axis)
+    }
+
     pub fn id(&self) -> usize {
-        Self::compute_id(&self.dims, &self.payload, self.up_axis)
+        self.id
     }
     pub fn get_current_position(&self) -> usize {
         self.payload
@@ -69,11 +77,7 @@ impl Ortho {
                     new_payload[2] = Some(second);
                 }
             }
-            return vec![Ortho {
-                dims: self.dims.clone(),
-                payload: new_payload,
-                up_axis: self.up_axis,
-            }];
+            return vec![Ortho::from_parts(self.dims.clone(), new_payload, self.up_axis)];
         }
         let len = self.payload.len();
         let mut new_payload: Vec<Option<usize>> = Vec::with_capacity(len);
@@ -84,11 +88,7 @@ impl Ortho {
         if insertion_index < new_payload.len() {
             new_payload[insertion_index] = Some(value);
         }
-        vec![Ortho {
-            dims: self.dims.clone(),
-            payload: new_payload,
-            up_axis: self.up_axis,
-        }]
+        vec![Ortho::from_parts(self.dims.clone(), new_payload, self.up_axis)]
     }
     fn expand_over(
         ortho: &Ortho,
@@ -109,11 +109,7 @@ impl Ortho {
                 new_payload[pos] = old_payload_with_value.get(i).cloned().flatten();
             }
             // Over expansions set up_axis to None
-            out.push(Ortho {
-                dims: new_dims_vec,
-                payload: new_payload,
-                up_axis: None,
-            });
+            out.push(Ortho::from_parts(new_dims_vec, new_payload, None));
         }
         out
     }
@@ -139,11 +135,7 @@ impl Ortho {
             // The up child (one with extra dimension) gets the insert_axis, over children get None
             let is_up_child = new_dims_vec.len() > ortho.dims.len();
             let up_axis = if is_up_child { Some(insert_axis) } else { None };
-            out.push(Ortho {
-                dims: new_dims_vec,
-                payload: new_payload,
-                up_axis,
-            });
+            out.push(Ortho::from_parts(new_dims_vec, new_payload, up_axis));
         }
         out
     }
@@ -195,11 +187,11 @@ impl Ortho {
             .collect();
 
         // Create new ortho with remapped payload
-        Some(Ortho {
-            dims: self.dims.clone(),
-            payload: new_payload,
-            up_axis: self.up_axis,
-        })
+        Some(Ortho::from_parts(
+            self.dims.clone(),
+            new_payload,
+            self.up_axis,
+        ))
     }
 
     pub fn prefixes(&self) -> Vec<Vec<usize>> {
@@ -388,6 +380,10 @@ impl Ortho {
 mod tests {
     use super::*;
 
+    fn mk_ortho(dims: Vec<usize>, payload: Vec<Option<usize>>, up_axis: Option<usize>) -> Ortho {
+        Ortho::from_parts(dims, payload, up_axis)
+    }
+
     #[test]
     fn test_new() {
         let ortho = Ortho::new();
@@ -408,41 +404,36 @@ mod tests {
         assert_eq!(ortho.get_current_position(), 0);
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![None, None, None, None],
-                up_axis: None
-            }
-            .get_current_position(),
+            Ortho::from_parts(vec![2, 2], vec![None, None, None, None], None).get_current_position(),
             0
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(1), None, None, None],
-                up_axis: None
-            }
+            Ortho::from_parts(
+                vec![2, 2],
+                vec![Some(1), None, None, None],
+                None
+            )
             .get_current_position(),
             1
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(1), Some(2), None, None],
-                up_axis: None
-            }
+            Ortho::from_parts(
+                vec![2, 2],
+                vec![Some(1), Some(2), None, None],
+                None
+            )
             .get_current_position(),
             2
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(1), Some(2), Some(3), None],
-                up_axis: None
-            }
+            Ortho::from_parts(
+                vec![2, 2],
+                vec![Some(1), Some(2), Some(3), None],
+                None
+            )
             .get_current_position(),
             3
         );
@@ -454,51 +445,51 @@ mod tests {
         assert_eq!(ortho.get_insert_position(5), 0);
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(0), Some(15), None, None],
-                up_axis: None
-            }
+            mk_ortho(
+                vec![2, 2],
+                vec![Some(0), Some(15), None, None],
+                None
+            )
             .get_insert_position(14),
             0
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(0), Some(15), None, None],
-                up_axis: None
-            }
+            mk_ortho(
+                vec![2, 2],
+                vec![Some(0), Some(15), None, None],
+                None
+            )
             .get_insert_position(20),
             1
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(0), Some(10), Some(20), None],
-                up_axis: None
-            }
+            mk_ortho(
+                vec![2, 2],
+                vec![Some(0), Some(10), Some(20), None],
+                None
+            )
             .get_insert_position(5),
             0
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(0), Some(10), Some(20), None],
-                up_axis: None
-            }
+            mk_ortho(
+                vec![2, 2],
+                vec![Some(0), Some(10), Some(20), None],
+                None
+            )
             .get_insert_position(15),
             1
         );
 
         assert_eq!(
-            Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(0), Some(10), Some(20), None],
-                up_axis: None
-            }
+            mk_ortho(
+                vec![2, 2],
+                vec![Some(0), Some(10), Some(20), None],
+                None
+            )
             .get_insert_position(1000),
             2
         );
@@ -510,11 +501,7 @@ mod tests {
         let orthos = ortho.add(10);
         assert_eq!(
             orthos,
-            vec![Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(10), None, None, None],
-                up_axis: None
-            }]
+            vec![mk_ortho(vec![2, 2], vec![Some(10), None, None, None], None)]
         );
     }
 
@@ -526,11 +513,11 @@ mod tests {
         let orthos2 = ortho.add(2);
         assert_eq!(
             orthos2,
-            vec![Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(1), Some(2), None, None],
-                up_axis: None
-            }]
+            vec![mk_ortho(
+                vec![2, 2],
+                vec![Some(1), Some(2), None, None],
+                None
+            )]
         );
     }
 
@@ -578,54 +565,50 @@ mod tests {
         assert_eq!(
             expansions,
             vec![
-                Ortho {
-                    dims: vec![2, 3],
-                    payload: vec![Some(1), Some(2), Some(3), None, Some(4), None],
-                    up_axis: None
-                }, // Over expansion
-                Ortho {
-                    dims: vec![2, 2, 2],
-                    payload: vec![Some(1), Some(2), Some(3), None, Some(4), None, None, None],
-                    up_axis: Some(2)
-                } // Up expansion at axis 2
+                mk_ortho(
+                    vec![2, 3],
+                    vec![Some(1), Some(2), Some(3), None, Some(4), None],
+                    None
+                ), // Over expansion
+                mk_ortho(
+                    vec![2, 2, 2],
+                    vec![Some(1), Some(2), Some(3), None, Some(4), None, None, None],
+                    Some(2)
+                ) // Up expansion at axis 2
             ]
         );
     }
 
     #[test]
     fn test_insert_position_middle() {
-        let ortho = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(10), Some(20), None, None],
-            up_axis: None,
-        };
+        let ortho = mk_ortho(vec![2, 2], vec![Some(10), Some(20), None, None], None);
         let orthos = ortho.add(15);
         assert_eq!(
             orthos,
-            vec![Ortho {
-                dims: vec![2, 2],
-                payload: vec![Some(10), Some(15), Some(20), None],
-                up_axis: None
-            }]
+            vec![mk_ortho(
+                vec![2, 2],
+                vec![Some(10), Some(15), Some(20), None],
+                None
+            )]
         );
     }
 
     #[test]
     fn test_insert_position_middle_and_reorg() {
-        let ortho = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(10), None, Some(20), Some(30)],
-            up_axis: None,
-        };
+        let ortho = mk_ortho(
+            vec![2, 2],
+            vec![Some(10), None, Some(20), Some(30)],
+            None,
+        );
 
         let mut orthos = ortho.add(15);
         orthos.sort_by(|a, b| a.dims.cmp(&b.dims));
         assert_eq!(
             orthos,
             vec![
-                Ortho {
-                    dims: vec![2, 2, 2],
-                    payload: vec![
+                mk_ortho(
+                    vec![2, 2, 2],
+                    vec![
                         Some(10),
                         None,
                         Some(15),
@@ -635,13 +618,13 @@ mod tests {
                         Some(30),
                         None
                     ],
-                    up_axis: Some(0)
-                }, // Up expansion at axis 0
-                Ortho {
-                    dims: vec![2, 3],
-                    payload: vec![Some(10), Some(15), Some(20), None, Some(30), None],
-                    up_axis: None
-                }, // Over expansion
+                    Some(0)
+                ), // Up expansion at axis 0
+                mk_ortho(
+                    vec![2, 3],
+                    vec![Some(10), Some(15), Some(20), None, Some(30), None],
+                    None
+                ), // Over expansion
             ]
         );
     }
@@ -723,66 +706,25 @@ mod tests {
     #[test]
     fn test_id_version_behavior() {
         // Test that orthos with same contents have same IDs
-        let ortho_with_content_1 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(10), None, None, None],
-            up_axis: None,
-        };
-        let ortho_with_content_2 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(10), None, None, None],
-            up_axis: None,
-        };
+        let ortho_with_content_1 = mk_ortho(vec![2, 2], vec![Some(10), None, None, None], None);
+        let ortho_with_content_2 = mk_ortho(vec![2, 2], vec![Some(10), None, None, None], None);
         assert_eq!(ortho_with_content_1.id(), ortho_with_content_2.id());
 
         // Test that orthos with different contents have different IDs
-        let ortho_content_a = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(10), None, None, None],
-            up_axis: None,
-        };
-        let ortho_content_b = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(20), None, None, None],
-            up_axis: None,
-        };
+        let ortho_content_a = mk_ortho(vec![2, 2], vec![Some(10), None, None, None], None);
+        let ortho_content_b = mk_ortho(vec![2, 2], vec![Some(20), None, None, None], None);
         assert_ne!(ortho_content_a.id(), ortho_content_b.id());
     }
 
     #[test]
     fn test_id_collision_for_different_payloads() {
-        use super::*;
         // These are the payloads seen in the logs
-        let ortho0 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(0), None, None, None],
-            up_axis: None,
-        };
-        let ortho1 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(1), None, None, None],
-            up_axis: None,
-        };
-        let ortho2 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(2), None, None, None],
-            up_axis: None,
-        };
-        let ortho3 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(3), None, None, None],
-            up_axis: None,
-        };
-        let ortho4 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(4), None, None, None],
-            up_axis: None,
-        };
-        let ortho5 = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(5), None, None, None],
-            up_axis: None,
-        };
+        let ortho0 = mk_ortho(vec![2, 2], vec![Some(0), None, None, None], None);
+        let ortho1 = mk_ortho(vec![2, 2], vec![Some(1), None, None, None], None);
+        let ortho2 = mk_ortho(vec![2, 2], vec![Some(2), None, None, None], None);
+        let ortho3 = mk_ortho(vec![2, 2], vec![Some(3), None, None, None], None);
+        let ortho4 = mk_ortho(vec![2, 2], vec![Some(4), None, None, None], None);
+        let ortho5 = mk_ortho(vec![2, 2], vec![Some(5), None, None, None], None);
         let ids = vec![
             ortho0.id(),
             ortho1.id(),
@@ -842,11 +784,11 @@ mod tests {
     fn test_display_2d_simple() {
         use crate::interner::Interner;
         let interner = Interner::from_text("a b c d");
-        let ortho = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(0), Some(1), Some(2), Some(3)],
-            up_axis: None,
-        };
+        let ortho = mk_ortho(
+            vec![2, 2],
+            vec![Some(0), Some(1), Some(2), Some(3)],
+            None,
+        );
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "   a    b\n   c    d");
     }
@@ -855,11 +797,7 @@ mod tests {
     fn test_display_2d_with_nones() {
         use crate::interner::Interner;
         let interner = Interner::from_text("hello world");
-        let ortho = Ortho {
-            dims: vec![2, 2],
-            payload: vec![Some(0), Some(1), None, None],
-            up_axis: None,
-        };
+        let ortho = mk_ortho(vec![2, 2], vec![Some(0), Some(1), None, None], None);
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "hello world\n    ·     ·");
     }
@@ -868,11 +806,11 @@ mod tests {
     fn test_display_3x2() {
         use crate::interner::Interner;
         let interner = Interner::from_text("a b c d e");
-        let ortho = Ortho {
-            dims: vec![3, 2],
-            payload: vec![Some(0), Some(1), Some(2), Some(3), Some(4), None],
-            up_axis: None,
-        };
+        let ortho = mk_ortho(
+            vec![3, 2],
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4), None],
+            None,
+        );
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "   a    b\n   c    d\n   e    ·");
     }
@@ -881,9 +819,9 @@ mod tests {
     fn test_display_3d_tiled() {
         use crate::interner::Interner;
         let interner = Interner::from_text("a b c d e f g");
-        let ortho = Ortho {
-            dims: vec![2, 2, 2],
-            payload: vec![
+        let ortho = mk_ortho(
+            vec![2, 2, 2],
+            vec![
                 Some(0),
                 Some(1),
                 Some(2),
@@ -893,8 +831,8 @@ mod tests {
                 Some(6),
                 None,
             ],
-            up_axis: None,
-        };
+            None,
+        );
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(
             display_str,

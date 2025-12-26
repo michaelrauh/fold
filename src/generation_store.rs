@@ -977,6 +977,34 @@ impl GenerationStore {
         Ok(())
     }
 
+    /// Read a run of work items and enqueue them in bounded batches.
+    /// Returns the number of orthos enqueued.
+    fn enqueue_work_run(&mut self, run: Run, read_buf_bytes: usize) -> io::Result<usize> {
+        let mut reader = run.iter(read_buf_bytes)?;
+        let mut batch: Vec<Ortho> = Vec::with_capacity(self.work_segment_batch_max.max(1));
+        let mut count = 0usize;
+
+        while let Some(item) = reader.next() {
+            let streamed = item?;
+            batch.push(streamed.ortho);
+            count += 1;
+
+            if batch.len() >= self.work_segment_batch_max {
+                let flushed = std::mem::take(&mut batch);
+                self.push_segments(flushed)?;
+            }
+        }
+
+        if !batch.is_empty() {
+            self.push_segments(batch)?;
+        }
+
+        // Best-effort cleanup of the consumed run file
+        let _ = fs::remove_file(run.path());
+
+        Ok(count)
+    }
+
     /// Get the monotonic count of accepted items across all generations
     pub fn seen_len_accepted(&self) -> u64 {
         self.seen_len_accepted
@@ -1159,7 +1187,7 @@ impl GenerationStore {
                 cb(&format!("BUCKET_STATE:{}:antijoining", bucket));
             }
             let history_iter = self.history_iter_with_buffer(bucket, cfg.read_buf_bytes)?;
-            let (new_work, seen_run, accepted) = anti_join_orthos(
+            let (new_work_run, seen_run, accepted) = anti_join_orthos(
                 unique_run,
                 history_iter,
                 &self.base_path,
@@ -1167,15 +1195,17 @@ impl GenerationStore {
             )?;
             
             total_accepted += accepted;
-            let bucket_new_work = new_work.len();
             
+            // Add seen run to history
+            self.add_history_run(bucket, seen_run, accepted)?;
+
+            // Enqueue new work from run in bounded batches
+            let bucket_new_work = self.enqueue_work_run(new_work_run, cfg.read_buf_bytes)?;
+
             if let Some(cb) = &progress {
                 cb(&format!("Bucket {}/{}: accepted {} orthos, created {} new work", 
                     bucket, self.bucket_count, accepted, bucket_new_work));
             }
-            
-            // Add seen run to history
-            self.add_history_run(bucket, seen_run, accepted)?;
             
             // Optional: Compact history if needed
             if cfg.allow_compaction {
@@ -1200,7 +1230,6 @@ impl GenerationStore {
             
             // Push new work to queue (ortho version)
             total_new_work += bucket_new_work as u64;
-            self.push_segments(new_work)?;
             
             buckets_processed += 1;
         }
@@ -1415,17 +1444,24 @@ pub fn merge_unique(
         }
     }
 
-    let mut last_written_id: Option<usize> = None;
+    let mut last_written: Option<Ortho> = None;
 
     // K-way merge with deduplication by id + equality
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
         let ortho = streamed.ortho;
         
-        // Write only if different id from last written (dedupe)
-        if last_written_id.map(|last| last != item.id).unwrap_or(true) {
+        // Write only if different from last written (dedupe by id + shape/payload)
+        let is_duplicate = last_written
+            .as_ref()
+            .map(|last| last.id() == item.id && *last == ortho)
+            .unwrap_or(false);
+        if !is_duplicate {
             write_ortho_record(&mut writer, &ortho)?;
-            last_written_id = Some(item.id);
+            last_written = Some(ortho);
+        } else {
+            // Keep last_written so adjacent duplicates continue to collapse correctly
+            last_written = Some(ortho);
         }
 
         // Fetch next from same run
@@ -1525,7 +1561,7 @@ pub fn anti_join_orthos(
     mut history: impl Iterator<Item = io::Result<StreamedOrtho>>,
     base_path: &PathBuf,
     read_buf_bytes: usize,
-) -> io::Result<(Vec<Ortho>, Run, u64)> {
+) -> io::Result<(Run, Run, u64)> {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     
     static ANTI_JOIN_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1534,8 +1570,12 @@ pub fn anti_join_orthos(
     let seen_run_path = base_path.join("runs").join(format!("seen-{}.dat", anti_join_id));
     let mut seen_writer = BufWriter::new(File::create(&seen_run_path)?);
 
+    let new_work_path = base_path
+        .join("runs")
+        .join(format!("new-work-{}.dat", anti_join_id));
+    let mut new_work_writer = BufWriter::new(File::create(&new_work_path)?);
+
     let mut gen_iter = unique_gen.iter(read_buf_bytes)?;
-    let mut next_work = Vec::new();
     let mut accepted_count = 0u64;
 
     // Current values from each stream
@@ -1549,7 +1589,7 @@ pub fn anti_join_orthos(
             (Some(g), None) => {
                 // No more history - all remaining gen values are new
                 write_ortho_record(&mut seen_writer, &g.ortho)?;
-                next_work.push(g.ortho.clone());
+                write_ortho_record(&mut new_work_writer, &g.ortho)?;
                 accepted_count += 1;
                 gen_val = gen_iter.next().transpose()?;
             }
@@ -1561,7 +1601,7 @@ pub fn anti_join_orthos(
                     std::cmp::Ordering::Less => {
                         // g < h: g is new (not in history)
                         write_ortho_record(&mut seen_writer, &g.ortho)?;
-                        next_work.push(g.ortho.clone());
+                        write_ortho_record(&mut new_work_writer, &g.ortho)?;
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
                     }
@@ -1574,7 +1614,7 @@ pub fn anti_join_orthos(
                             // ID collision with different structure - treat as new
                             // Note: This is extremely rare and indicates hash collision
                             write_ortho_record(&mut seen_writer, &g.ortho)?;
-                            next_work.push(g.ortho.clone());
+                            write_ortho_record(&mut new_work_writer, &g.ortho)?;
                             accepted_count += 1;
                         }
                         gen_val = gen_iter.next().transpose()?;
@@ -1590,7 +1630,12 @@ pub fn anti_join_orthos(
     }
 
     seen_writer.flush()?;
-    Ok((next_work, Run::new(seen_run_path), accepted_count))
+    new_work_writer.flush()?;
+    Ok((
+        Run::new(new_work_path),
+        Run::new(seen_run_path),
+        accepted_count,
+    ))
 }
 
 impl Drop for GenerationStore {
@@ -1609,6 +1654,15 @@ impl Default for GenerationStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn collect_run(run: &Run, read_buf_bytes: usize) -> Vec<Ortho> {
+        let mut out = Vec::new();
+        let mut iter = run.iter(read_buf_bytes).unwrap();
+        while let Some(item) = iter.next() {
+            out.push(item.unwrap().ortho);
+        }
+        out
+    }
 
     #[test]
     fn test_compact_landing_small() {
@@ -1629,11 +1683,10 @@ mod tests {
         fs::create_dir_all(&landing_dir).unwrap();
         let drain_path = landing_dir.join("drain-0.log");
 
-        // Write orthos to drain file
+        // Write orthos to drain file using the same record format as production
         let mut file = BufWriter::new(File::create(&drain_path).unwrap());
         for ortho in &orthos {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut file, ortho).unwrap();
         }
         file.flush().unwrap();
 
@@ -1682,11 +1735,10 @@ mod tests {
         fs::create_dir_all(&landing_dir).unwrap();
         let drain_path = landing_dir.join("drain-0.log");
 
-        // Write orthos to drain file
+        // Write orthos to drain file using the same record format as production
         let mut file = BufWriter::new(File::create(&drain_path).unwrap());
         for ortho in &orthos {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut file, ortho).unwrap();
         }
         file.flush().unwrap();
 
@@ -1751,11 +1803,10 @@ mod tests {
         fs::create_dir_all(&landing_dir).unwrap();
         let drain_path = landing_dir.join("drain-0.log");
 
-        // Write orthos to drain file
+        // Write orthos to drain file using the same record format as production
         let mut file = BufWriter::new(File::create(&drain_path).unwrap());
         for ortho in &orthos {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut file, ortho).unwrap();
         }
         file.flush().unwrap();
 
@@ -1838,7 +1889,9 @@ mod tests {
         // History: ortho1, ortho3
         let history_path = base_path.join("runs").join("history.dat");
         let mut history_file = BufWriter::new(File::create(&history_path).unwrap());
-        for ortho in [&ortho1, &ortho3] {
+        let mut history_items = vec![ortho1.clone(), ortho3.clone()];
+        history_items.sort_by_key(|o| o.id());
+        for ortho in &history_items {
             write_ortho_record(&mut history_file, ortho).unwrap();
         }
         history_file.flush().unwrap();
@@ -1846,7 +1899,14 @@ mod tests {
         // Gen: ortho2, ortho3, ortho4, ortho5
         let gen_path = base_path.join("runs").join("gen.dat");
         let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
-        for ortho in [&ortho2, &ortho3, &ortho4, &ortho5] {
+        let mut gen_items = vec![
+            ortho2.clone(),
+            ortho3.clone(),
+            ortho4.clone(),
+            ortho5.clone(),
+        ];
+        gen_items.sort_by_key(|o| o.id());
+        for ortho in &gen_items {
             write_ortho_record(&mut gen_file, ortho).unwrap();
         }
         gen_file.flush().unwrap();
@@ -1855,15 +1915,17 @@ mod tests {
         let history_run = Run::new(history_path);
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
-        let (work, _seen_run, accepted) =
+        let (work_run, _seen_run, accepted) =
             anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024).unwrap();
 
         // ortho3 is already in history, so only ortho2, ortho4, ortho5 should be in work
+        let mut work = collect_run(&work_run, 64 * 1024);
+        work.sort_by_key(|o| o.id());
         assert_eq!(work.len(), 3);
         assert_eq!(accepted, 3);
-        assert_eq!(work[0], ortho2);
-        assert_eq!(work[1], ortho4);
-        assert_eq!(work[2], ortho5);
+        let mut expected = vec![ortho2, ortho4, ortho5];
+        expected.sort_by_key(|o| o.id());
+        assert_eq!(work, expected);
     }
 
     #[test]
@@ -1887,13 +1949,16 @@ mod tests {
         let unique_gen = UniqueRun::new(gen_path);
         let history_iter = std::iter::empty::<io::Result<StreamedOrtho>>();
 
-        let (work, _seen_run, accepted) =
+        let (work_run, _seen_run, accepted) =
             anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024).unwrap();
 
+        let mut work = collect_run(&work_run, 64 * 1024);
+        work.sort_by_key(|o| o.id());
+        let mut expected = vec![ortho1, ortho2];
+        expected.sort_by_key(|o| o.id());
         assert_eq!(work.len(), 2);
         assert_eq!(accepted, 2);
-        assert_eq!(work[0], ortho1);
-        assert_eq!(work[1], ortho2);
+        assert_eq!(work, expected);
     }
 
     #[test]
@@ -1924,9 +1989,10 @@ mod tests {
         let history_run = Run::new(history_path);
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
-        let (work, _seen_run, accepted) =
+        let (work_run, _seen_run, accepted) =
             anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024).unwrap();
 
+        let work = collect_run(&work_run, 64 * 1024);
         assert_eq!(work.len(), 0);
         assert_eq!(accepted, 0);
     }
