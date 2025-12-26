@@ -367,8 +367,8 @@ fn process_txt_file(
     metrics.record_landing_buffer_count(store.total_landing_size());
     
     // Check cache for initial optimal ortho
-    if let Some(cache_volume) = store.peek_best_volume_in_cache() {
-        metrics.record_optimal_volume(cache_volume);
+    if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
+        metrics.record_optimal_volume(cache_ortho.volume());
     }
 
     metrics.set_operation_status("Processing orthos".to_string());
@@ -419,6 +419,19 @@ fn process_txt_file(
             }
         }).collect();
         metrics.update_bucket_metrics(bucket_metrics);
+        
+        // Low-frequency cache check (once per generation)
+        if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
+            if cache_ortho.volume() > best_ortho.volume() {
+                let cache_score = cache_ortho.score();
+                metrics.record_optimal_volume(cache_score.0);
+                if cache_score > best_score {
+                    best_ortho = cache_ortho;
+                    best_score = cache_score;
+                    optimal_dirty = true;
+                }
+            }
+        }
 
         metrics.add_log(format!(
             "Generation {}: processing {} work items",
@@ -460,17 +473,6 @@ fn process_txt_file(
                 }
                 
                 metrics.record_optimal_volume(best_ortho.volume());
-                
-                // Also check cache for optimal ortho
-                if let Some(cache_volume) = store.peek_best_volume_in_cache() {
-                    if cache_volume > best_ortho.volume() {
-                        metrics.record_optimal_volume(cache_volume);
-                        if cache_volume > best_score.0 {
-                            best_score = (cache_volume, 0); // Don't know fullness for cached ortho
-                            optimal_dirty = true;
-                        }
-                    }
-                }
 
                 // Update work queue metrics
                 metrics.update_global(|g| {
@@ -1029,8 +1031,8 @@ fn merge_archives(
     metrics.record_landing_buffer_count(store.total_landing_size());
     
     // Check cache for initial optimal ortho in merge
-    if let Some(cache_volume) = store.peek_best_volume_in_cache() {
-        metrics.record_optimal_volume(cache_volume);
+    if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
+        metrics.record_optimal_volume(cache_ortho.volume());
     }
 
     // Tracking for throughput calculation
@@ -1075,6 +1077,19 @@ fn merge_archives(
             }
         }).collect();
         metrics.update_bucket_metrics(bucket_metrics);
+        
+        // Low-frequency cache check (once per generation)
+        if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
+            if cache_ortho.volume() > best_ortho.volume() {
+                let cache_score = cache_ortho.score();
+                metrics.record_optimal_volume(cache_score.0);
+                if cache_score > best_score {
+                    best_ortho = cache_ortho;
+                    best_score = cache_score;
+                    optimal_dirty = true;
+                }
+            }
+        }
 
         metrics.add_log(format!(
             "Merge Generation {}: processing {} work items",
@@ -1116,17 +1131,6 @@ fn merge_archives(
                 }
                 
                 metrics.record_optimal_volume(best_ortho.volume());
-                
-                // Also check cache for optimal ortho during merge
-                if let Some(cache_volume) = store.peek_best_volume_in_cache() {
-                    if cache_volume > best_ortho.volume() {
-                        metrics.record_optimal_volume(cache_volume);
-                        if cache_volume > best_score.0 {
-                            best_score = (cache_volume, 0);
-                            optimal_dirty = true;
-                        }
-                    }
-                }
                 
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -237,6 +237,7 @@ pub struct GenerationStore {
     work_segment_batch: Vec<Ortho>, // Batch for writing segments
     work_segment_batch_max: usize,  // Max batch size before flush
     cached_best_volume: Cell<Option<usize>>, // Cached best volume across work caches
+    cached_best_ortho: RefCell<Option<Ortho>>, // Cached best ortho across work caches
     best_volume_dirty: Cell<bool>, // Whether cached best needs recompute
     bufwriter_capacity: usize,      // Buffer capacity for bucket writers
     landing_flush_threshold: usize, // Threshold for flushing landing writes
@@ -525,6 +526,7 @@ impl GenerationStore {
             work_segment_batch: Vec::new(),
             work_segment_batch_max: 50_000, // Default, will be updated with config
             cached_best_volume: Cell::new(None),
+            cached_best_ortho: RefCell::new(None),
             best_volume_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024, // Default 16MB
             landing_flush_threshold: 10 * 1024 * 1024, // Default 10MB
@@ -597,6 +599,7 @@ impl GenerationStore {
             work_segment_batch: Vec::new(),
             work_segment_batch_max: 50_000,
             cached_best_volume: Cell::new(None),
+            cached_best_ortho: RefCell::new(None),
             best_volume_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024,
             landing_flush_threshold: 10 * 1024 * 1024,
@@ -695,8 +698,8 @@ impl GenerationStore {
 
         // Add items to batch
         if !self.best_volume_dirty.get() {
-            if let Some(new_max) = items.iter().map(|o| o.volume()).max() {
-                self.update_cached_best(new_max);
+            if let Some(best_item) = items.iter().max_by_key(|o| o.volume()) {
+                self.update_cached_best(best_item);
             }
         }
         self.work_segment_batch.extend(items);
@@ -794,10 +797,11 @@ impl GenerationStore {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                     .0;
                 
-                let volume = ortho.volume();
                 self.work_queue_cache.push_back(ortho);
                 if !self.best_volume_dirty.get() {
-                    self.update_cached_best(volume);
+                    if let Some(last) = self.work_queue_cache.back() {
+                        self.update_cached_best(last);
+                    }
                 }
                 
                 // Stop if cache is full
@@ -907,14 +911,6 @@ impl GenerationStore {
         self.landing_counts.iter().sum()
     }
 
-    /// Peek at the best ortho volume currently in work cache (without removing)
-    pub fn peek_best_volume_in_cache(&self) -> Option<usize> {
-        if self.best_volume_dirty.get() {
-            self.recompute_cached_best();
-        }
-        self.cached_best_volume.get()
-    }
-
     /// Get per-bucket statistics for TUI visualization
     pub fn bucket_stats(&self) -> Vec<BucketStats> {
         (0..self.bucket_count)
@@ -941,13 +937,17 @@ impl GenerationStore {
             .collect()
     }
 
-    fn update_cached_best(&self, candidate: usize) {
+    fn update_cached_best(&self, candidate: &Ortho) {
         if self.best_volume_dirty.get() {
             return;
         }
+        let candidate_volume = candidate.volume();
         match self.cached_best_volume.get() {
-            Some(current) if current >= candidate => {}
-            _ => self.cached_best_volume.set(Some(candidate)),
+            Some(current) if current >= candidate_volume => {}
+            _ => {
+                self.cached_best_volume.set(Some(candidate_volume));
+                *self.cached_best_ortho.borrow_mut() = Some(candidate.clone());
+            }
         }
     }
 
@@ -958,17 +958,32 @@ impl GenerationStore {
     }
 
     fn recompute_cached_best(&self) {
-        let cache_max = self.work_queue_cache.iter().map(|o| o.volume()).max();
-        let batch_max = self.work_segment_batch.iter().map(|o| o.volume()).max();
+        let mut best_volume: Option<usize> = None;
+        let mut best_ortho: Option<Ortho> = None;
 
-        let best = match (cache_max, batch_max) {
-            (Some(c), Some(b)) => Some(c.max(b)),
-            (Some(c), None) => Some(c),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-        self.cached_best_volume.set(best);
+        for ortho in self
+            .work_queue_cache
+            .iter()
+            .chain(self.work_segment_batch.iter())
+        {
+            let volume = ortho.volume();
+            if best_volume.map(|v| volume > v).unwrap_or(true) {
+                best_volume = Some(volume);
+                best_ortho = Some(ortho.clone());
+            }
+        }
+
+        self.cached_best_volume.set(best_volume);
+        *self.cached_best_ortho.borrow_mut() = best_ortho;
         self.best_volume_dirty.set(false);
+    }
+
+    /// Peek at the best ortho currently in work cache (without removing)
+    pub fn peek_best_ortho_in_cache(&self) -> Option<Ortho> {
+        if self.best_volume_dirty.get() {
+            self.recompute_cached_best();
+        }
+        self.cached_best_ortho.borrow().clone()
     }
 
     /// Flush all bucket writers
