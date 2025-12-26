@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::mem;
 use std::path::PathBuf;
 use crate::ortho::Ortho;
 use sysinfo::System;
@@ -299,43 +300,94 @@ impl Iterator for OrthoRunIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.offset < self.buffer.len() {
-                match bincode::decode_from_slice(
-                    &self.buffer[self.offset..],
-                    bincode::config::standard(),
-                ) {
-                    Ok((ortho, bytes_read)) => {
-                        self.offset += bytes_read;
-                        return Some(Ok(StreamedOrtho { ortho, bytes_read }));
-                    }
-                    Err(DecodeError::UnexpectedEnd { .. }) => {
-                        match self.read_more() {
-                            Ok(true) => continue,
-                            Ok(false) => {
-                                if self.offset == self.buffer.len() {
-                                    return None;
-                                } else {
-                                    return Some(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "Unexpected end of ortho stream",
-                                    )));
-                                }
-                            }
-                            Err(e) => return Some(Err(e)),
-                        }
-                    }
-                    Err(e) => {
-                        return Some(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            e.to_string(),
-                        )))
-                    }
-                }
-            } else {
+            // Ensure we have at least a header
+            if self.buffer.len().saturating_sub(self.offset) < ORTHO_RECORD_HEADER_SIZE {
                 match self.read_more() {
                     Ok(true) => continue,
-                    Ok(false) => return None,
+                    Ok(false) => {
+                        if self.offset == self.buffer.len() {
+                            return None;
+                        } else {
+                            return Some(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Unexpected end of ortho stream",
+                            )));
+                        }
+                    }
                     Err(e) => return Some(Err(e)),
+                }
+            }
+
+            let header_start = self.offset;
+            let header_end = header_start + ORTHO_RECORD_HEADER_SIZE;
+            if header_end > self.buffer.len() {
+                // Should only happen on corrupted data
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid ortho record header",
+                )));
+            }
+
+            let decoded_size_est = u64::from_le_bytes(
+                self.buffer[header_start..header_start + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let encoded_len = u64::from_le_bytes(
+                self.buffer[header_start + 8..header_end]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+
+            // Ensure full record is buffered
+            let record_end = header_end.saturating_add(encoded_len);
+            if record_end > self.buffer.len() {
+                match self.read_more() {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Unexpected end of ortho stream",
+                        )))
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+
+            let encoded_slice = &self.buffer[header_end..record_end];
+            match bincode::decode_from_slice(encoded_slice, bincode::config::standard()) {
+                Ok((ortho, bytes_read)) => {
+                    if bytes_read != encoded_len {
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Ortho length prefix mismatch",
+                        )));
+                    }
+                    self.offset = record_end;
+                    return Some(Ok(StreamedOrtho {
+                        ortho,
+                        bytes_read: encoded_len,
+                        decoded_size_est,
+                    }));
+                }
+                Err(DecodeError::UnexpectedEnd { .. }) => {
+                    // Should not happen because we ensured buffering
+                    match self.read_more() {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            return Some(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "Unexpected end of ortho stream",
+                            )))
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Err(e) => {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )))
                 }
             }
         }
@@ -400,6 +452,33 @@ impl Iterator for OrthoStreamReader {
 pub struct StreamedOrtho {
     pub ortho: Ortho,
     pub bytes_read: usize,
+    pub decoded_size_est: usize,
+}
+
+const ORTHO_RECORD_HEADER_SIZE: usize = mem::size_of::<u64>() * 2;
+
+fn estimate_decoded_size(ortho: &Ortho) -> usize {
+    // Rough estimate: struct size + vec metadata + element storage based on capacity.
+    let dims_cap = ortho.dims().capacity();
+    let payload_cap = ortho.payload().capacity();
+    let vec_overhead = mem::size_of::<Vec<usize>>() + mem::size_of::<Vec<Option<usize>>>();
+    mem::size_of::<Ortho>()
+        + vec_overhead
+        + dims_cap.saturating_mul(mem::size_of::<usize>())
+        + payload_cap.saturating_mul(mem::size_of::<Option<usize>>())
+}
+
+fn write_ortho_record<W: Write>(writer: &mut W, ortho: &Ortho) -> io::Result<usize> {
+    let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let decoded_est = estimate_decoded_size(ortho) as u64;
+    let encoded_len = encoded.len() as u64;
+
+    writer.write_all(&decoded_est.to_le_bytes())?;
+    writer.write_all(&encoded_len.to_le_bytes())?;
+    writer.write_all(&encoded)?;
+
+    Ok(ORTHO_RECORD_HEADER_SIZE + encoded.len())
 }
 
 /// Sorted and deduplicated run of orthos
@@ -646,10 +725,7 @@ impl GenerationStore {
 
         // Write ortho as bincode
         let writer = self.bucket_writers[bucket].as_mut().unwrap();
-        let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let encoded_len = encoded.len();
-        writer.write_all(&encoded)?;
+        let encoded_len = write_ortho_record(writer, ortho)?;
         self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
         
         // Track buffer size and flush if over threshold
@@ -1205,7 +1281,7 @@ pub fn compact_landing(
 
     let mut runs = Vec::new();
     let mut arena: Vec<Ortho> = Vec::new();
-    let mut current_size = 0;
+    let mut current_size: usize = 0;
 
     // Read all drain files with bounded buffering
     for file_path in raw.files() {
@@ -1217,25 +1293,26 @@ pub fn compact_landing(
                     format!("Failed to decode ortho: {}", e),
                 )
             })?;
-            arena.push(streamed.ortho);
-            current_size += streamed.bytes_read;
-
-            // Check if arena exceeds budget
-            if current_size >= cfg.run_budget_bytes {
-                // Sort by id and write run
+            let ortho_size = streamed.decoded_size_est;
+            if !arena.is_empty()
+                && current_size.saturating_add(ortho_size) > cfg.run_budget_bytes
+            {
+                // Flush before adding this item to keep arena under budget.
                 arena.sort_unstable_by_key(|o| o.id());
                 let run_id = RUN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
                 let run_path = base_path
                     .join("runs")
                     .join(format!("b={:02}-run-{}.dat", bucket, run_id));
-                
+
                 write_ortho_run(&arena, &run_path)?;
                 runs.push(Run::new(run_path));
-                
-                // Clear arena and size
+
                 arena.clear();
                 current_size = 0;
             }
+
+            arena.push(streamed.ortho);
+            current_size = current_size.saturating_add(ortho_size);
         }
     }
 
@@ -1258,9 +1335,7 @@ pub fn compact_landing(
 fn write_ortho_run(arena: &[Ortho], path: &PathBuf) -> io::Result<()> {
     let mut file = BufWriter::new(File::create(path)?);
     for ortho in arena {
-        let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        file.write_all(&encoded)?;
+        write_ortho_record(&mut file, ortho)?;
     }
     file.flush()?;
     Ok(())
@@ -1349,9 +1424,7 @@ pub fn merge_unique(
         
         // Write only if different id from last written (dedupe)
         if last_written_id.map(|last| last != item.id).unwrap_or(true) {
-            let encoded = bincode::encode_to_vec(&ortho, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            writer.write_all(&encoded)?;
+            write_ortho_record(&mut writer, &ortho)?;
             last_written_id = Some(item.id);
         }
 
@@ -1422,9 +1495,7 @@ fn merge_ortho_chunk(
     // No deduplication in intermediate passes - just merge
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
-        let encoded = bincode::encode_to_vec(&streamed.ortho, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        writer.write_all(&encoded)?;
+        write_ortho_record(&mut writer, &streamed.ortho)?;
 
         if let Some(result) = iterators[item.run_idx].next() {
             let streamed = result?;
@@ -1477,9 +1548,7 @@ pub fn anti_join_orthos(
             (None, _) => break,
             (Some(g), None) => {
                 // No more history - all remaining gen values are new
-                let encoded = bincode::encode_to_vec(&g.ortho, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                seen_writer.write_all(&encoded)?;
+                write_ortho_record(&mut seen_writer, &g.ortho)?;
                 next_work.push(g.ortho.clone());
                 accepted_count += 1;
                 gen_val = gen_iter.next().transpose()?;
@@ -1491,9 +1560,7 @@ pub fn anti_join_orthos(
                 match g_id.cmp(&h_id) {
                     std::cmp::Ordering::Less => {
                         // g < h: g is new (not in history)
-                        let encoded = bincode::encode_to_vec(&g.ortho, bincode::config::standard())
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                        seen_writer.write_all(&encoded)?;
+                        write_ortho_record(&mut seen_writer, &g.ortho)?;
                         next_work.push(g.ortho.clone());
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
@@ -1502,15 +1569,11 @@ pub fn anti_join_orthos(
                         // Same ID: check structural equality
                         if g.ortho == h.ortho {
                             // Exact duplicate - reject from work, but add to seen
-                            let encoded = bincode::encode_to_vec(&g.ortho, bincode::config::standard())
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                            seen_writer.write_all(&encoded)?;
+                            write_ortho_record(&mut seen_writer, &g.ortho)?;
                         } else {
                             // ID collision with different structure - treat as new
                             // Note: This is extremely rare and indicates hash collision
-                            let encoded = bincode::encode_to_vec(&g.ortho, bincode::config::standard())
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                            seen_writer.write_all(&encoded)?;
+                            write_ortho_record(&mut seen_writer, &g.ortho)?;
                             next_work.push(g.ortho.clone());
                             accepted_count += 1;
                         }
@@ -1776,8 +1839,7 @@ mod tests {
         let history_path = base_path.join("runs").join("history.dat");
         let mut history_file = BufWriter::new(File::create(&history_path).unwrap());
         for ortho in [&ortho1, &ortho3] {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            history_file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut history_file, ortho).unwrap();
         }
         history_file.flush().unwrap();
 
@@ -1785,8 +1847,7 @@ mod tests {
         let gen_path = base_path.join("runs").join("gen.dat");
         let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
         for ortho in [&ortho2, &ortho3, &ortho4, &ortho5] {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            gen_file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut gen_file, ortho).unwrap();
         }
         gen_file.flush().unwrap();
 
@@ -1819,8 +1880,7 @@ mod tests {
         let gen_path = base_path.join("runs").join("gen.dat");
         let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
         for ortho in [&ortho1, &ortho2] {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            gen_file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut gen_file, ortho).unwrap();
         }
         gen_file.flush().unwrap();
 
@@ -1850,16 +1910,14 @@ mod tests {
         let history_path = base_path.join("runs").join("history.dat");
         let mut history_file = BufWriter::new(File::create(&history_path).unwrap());
         for ortho in [&ortho1, &ortho2] {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
-            history_file.write_all(&encoded).unwrap();
+            write_ortho_record(&mut history_file, ortho).unwrap();
         }
         history_file.flush().unwrap();
 
         // Gen: ortho1 (subset)
         let gen_path = base_path.join("runs").join("gen.dat");
         let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
-        let encoded = bincode::encode_to_vec(&ortho1, bincode::config::standard()).unwrap();
-        gen_file.write_all(&encoded).unwrap();
+        write_ortho_record(&mut gen_file, &ortho1).unwrap();
         gen_file.flush().unwrap();
 
         let unique_gen = UniqueRun::new(gen_path);

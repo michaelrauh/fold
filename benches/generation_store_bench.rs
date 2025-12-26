@@ -6,12 +6,32 @@ use fold::generation_store::{
 use fold::ortho::Ortho;
 use std::fs::{self, File};
 use std::io::{Write, BufWriter};
+use std::mem;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Helper to create a temporary test directory
 fn setup_test_dir() -> TempDir {
     TempDir::new().expect("Failed to create temp dir")
+}
+
+fn estimate_decoded_size(ortho: &Ortho) -> usize {
+    let dims_cap = ortho.dims().capacity();
+    let payload_cap = ortho.payload().capacity();
+    let vec_overhead = mem::size_of::<Vec<usize>>() + mem::size_of::<Vec<Option<usize>>>();
+    mem::size_of::<Ortho>()
+        + vec_overhead
+        + dims_cap.saturating_mul(mem::size_of::<usize>())
+        + payload_cap.saturating_mul(mem::size_of::<Option<usize>>())
+}
+
+fn write_ortho_record(writer: &mut BufWriter<File>, ortho: &Ortho) {
+    let decoded_est = estimate_decoded_size(ortho) as u64;
+    let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
+    let encoded_len = encoded.len() as u64;
+    writer.write_all(&decoded_est.to_le_bytes()).unwrap();
+    writer.write_all(&encoded_len.to_le_bytes()).unwrap();
+    writer.write_all(&encoded).unwrap();
 }
 
 /// Helper to create a raw stream with orthos for compact_landing testing
@@ -32,8 +52,7 @@ fn create_ortho_raw_stream(temp_dir: &PathBuf, bucket: usize, count: usize) -> R
             ortho = ortho.add((i / 2) % 1000)[0].clone();
         }
         
-        let encoded = bincode::encode_to_vec(&ortho, bincode::config::standard()).unwrap();
-        writer.write_all(&encoded).unwrap();
+        write_ortho_record(&mut writer, &ortho);
     }
     writer.flush().unwrap();
     
@@ -57,8 +76,7 @@ fn create_sorted_ortho_runs(temp_dir: &PathBuf, num_runs: usize, items_per_run: 
             let mut ortho = Ortho::new();
             ortho = ortho.add(base_idx % 1000)[0].clone();
             
-            let encoded = bincode::encode_to_vec(&ortho, bincode::config::standard()).unwrap();
-            writer.write_all(&encoded).unwrap();
+            write_ortho_record(&mut writer, &ortho);
         }
         writer.flush().unwrap();
         
@@ -81,8 +99,7 @@ fn create_unique_ortho_run(temp_dir: &PathBuf, count: usize) -> UniqueRun {
         let mut ortho = Ortho::new();
         ortho = ortho.add(i)[0].clone();
         
-        let encoded = bincode::encode_to_vec(&ortho, bincode::config::standard()).unwrap();
-        writer.write_all(&encoded).unwrap();
+        write_ortho_record(&mut writer, &ortho);
     }
     writer.flush().unwrap();
     
@@ -216,7 +233,7 @@ fn bench_anti_join_history_1k(c: &mut Criterion) {
             let history_iter = history
                 .clone()
                 .into_iter()
-                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0 }));
+                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0, decoded_size_est: estimate_decoded_size(&o) }));
             let (work, _run, _count) = anti_join_orthos(
                 unique_run.clone(),
                 history_iter,
@@ -244,7 +261,7 @@ fn bench_anti_join_history_10k(c: &mut Criterion) {
             let history_iter = history
                 .clone()
                 .into_iter()
-                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0 }));
+                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0, decoded_size_est: estimate_decoded_size(&o) }));
             let (work, _run, _count) = anti_join_orthos(
                 unique_run.clone(),
                 history_iter,
@@ -272,7 +289,7 @@ fn bench_anti_join_history_100k(c: &mut Criterion) {
             let history_iter = history
                 .clone()
                 .into_iter()
-                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0 }));
+                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0, decoded_size_est: estimate_decoded_size(&o) }));
             let (work, _run, _count) = anti_join_orthos(
                 unique_run.clone(),
                 history_iter,
@@ -322,8 +339,7 @@ fn bench_full_generation_with_duplicates(c: &mut Criterion) {
                 let mut ortho = Ortho::new();
                 ortho = ortho.add(base_idx % 1000)[0].clone();
                 
-                let encoded = bincode::encode_to_vec(&ortho, bincode::config::standard()).unwrap();
-                writer.write_all(&encoded).unwrap();
+                write_ortho_record(&mut writer, &ortho);
             }
             writer.flush().unwrap();
             
