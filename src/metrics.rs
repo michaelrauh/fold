@@ -1,3 +1,4 @@
+use crate::ortho::{Dim, PayloadVal};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -172,10 +173,10 @@ impl Default for LargestArchive {
 #[derive(Clone, Debug)]
 pub struct OptimalOrtho {
     pub volume: usize,
-    pub dims: Vec<usize>,
+    pub dims: Vec<Dim>,
     pub fullness: usize,
     pub capacity: usize,
-    pub payload: Vec<Option<usize>>,
+    pub payload: Vec<Option<PayloadVal>>,
     pub vocab: Vec<String>,
     pub last_update_time: u64,
 }

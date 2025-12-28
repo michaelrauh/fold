@@ -4,15 +4,16 @@ use fold::{
     generation_store::{GenerationStore, Config, Role},
     interner::Interner,
     metrics::Metrics,
-    ortho::Ortho,
+    ortho::{payload_to_usize, Ortho, PayloadVal},
     tui::Tui,
 };
 use std::fs;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Instant;
 use sysinfo::ProcessesToUpdate;
 
 const COMPLETION_CHUNK_SIZE: usize = 1_000;
@@ -27,6 +28,7 @@ fn role_as_str(role: Role) -> &'static str {
 }
 
 fn main() -> Result<(), FoldError> {
+    let program_start = Instant::now();
     // Check for test environment variable
     let config = if let Ok(test_dir) = std::env::var("FOLD_STATE_DIR") {
         StateConfig::custom(PathBuf::from(test_dir))
@@ -264,12 +266,19 @@ fn main() -> Result<(), FoldError> {
 
     cleanup_leader_lock(&config);
 
-    match (main_result, tui_result) {
+    let result = match (main_result, tui_result) {
         (Ok(Ok(())), Some(Ok(()))) | (Ok(Ok(())), None) => Ok(()),
         (Ok(Ok(())), Some(Err(panic))) => std::panic::resume_unwind(panic),
         (Ok(Err(e)), _) => Err(e),
         (Err(panic), _) => std::panic::resume_unwind(panic),
+    };
+
+    if let Ok(()) = result {
+        let runtime = program_start.elapsed();
+        write_fold_history(&config, &metrics, runtime)?;
     }
+
+    result
 }
 
 fn process_txt_file(
@@ -326,7 +335,7 @@ fn process_txt_file(
     };
 
     // Acquire memory claim for this file
-    let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard())?.len();
+    let interner_bytes = interner.to_bytes()?.len();
     let mem_claim = acquire_memory_claim_simple(role, config, metrics, interner_bytes)?;
 
     // Initialize GenerationStore for this file (work folder becomes gen store base)
@@ -560,9 +569,15 @@ fn process_txt_file(
 
             // Get requirements from ortho
             let (forbidden, required) = ortho.get_requirements();
+            let forbidden_usize: Vec<usize> =
+                forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+            let required_usize: Vec<Vec<usize>> = required
+                .iter()
+                .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
+                .collect();
 
             // Get completions from interner
-            let completions = interner.intersect(&required, &forbidden);
+            let completions = interner.intersect(&required_usize, &forbidden_usize);
             let total_completions = completions.len();
             if total_completions > FANOUT_LOG_THRESHOLD {
                 let chunks =
@@ -575,7 +590,9 @@ fn process_txt_file(
 
             // Generate child orthos and record results
             for completion in completions {
-                let children = ortho.add(completion);
+                let completion_val =
+                    PayloadVal::try_from(completion).expect("completion overflowed u32");
+                let children = ortho.add(completion_val);
                 for child in children {
                     let candidate_score = child.score();
                     if candidate_score > best_score {
@@ -859,8 +876,7 @@ fn merge_archives(
     };
 
     // Acquire memory claim
-    let interner_bytes =
-        bincode::encode_to_vec(&merged_interner, bincode::config::standard())?.len();
+    let interner_bytes = merged_interner.to_bytes()?.len();
     let mem_claim = acquire_memory_claim_simple(role, config, metrics, interner_bytes)?;
 
     // Initialize GenerationStore for merge
@@ -927,7 +943,8 @@ fn merge_archives(
     // Stream all orthos from larger archive's history into our merge store
     for bucket in 0..8 {
         for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
-            let ortho = result?.ortho;
+            let ortho_bytes = result?.bytes;
+            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
             total_from_larger += 1;
             
             // Record to landing zone (will be deduped during generation end)
@@ -963,7 +980,8 @@ fn merge_archives(
     // Stream all orthos from smaller archive's history, remap, and store
     for bucket in 0..8 {
         for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
-            let ortho = result?.ortho;
+            let ortho_bytes = result?.bytes;
+            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
             total_from_smaller += 1;
             
             // Remap the ortho to merged vocabulary
@@ -1221,7 +1239,13 @@ fn merge_archives(
 
             // Get requirements and completions
             let (forbidden, required) = ortho.get_requirements();
-            let completions = merged_interner.intersect(&required, &forbidden);
+            let forbidden_usize: Vec<usize> =
+                forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+            let required_usize: Vec<Vec<usize>> = required
+                .iter()
+                .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
+                .collect();
+            let completions = merged_interner.intersect(&required_usize, &forbidden_usize);
 
             if completions.len() > FANOUT_LOG_THRESHOLD {
                 let chunks = (completions.len() + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
@@ -1234,7 +1258,9 @@ fn merge_archives(
 
             // Generate children
             for completion in completions {
-                let children = ortho.add(completion);
+                let completion_val =
+                    PayloadVal::try_from(completion).expect("completion overflowed u32");
+                let children = ortho.add(completion_val);
                 for child in children {
                     let candidate_score = child.score();
                     if candidate_score > best_score {
@@ -1450,9 +1476,15 @@ fn build_vocab_mapping(old_vocab: &[String], new_vocab: &[String]) -> Vec<usize>
 fn is_ortho_impacted_fast(ortho: &Ortho, impacted_prefixes: &[Vec<usize>]) -> bool {
     // Get the ortho's requirement prefixes (not the entire payload)
     let requirements = ortho.get_requirement_phrases();
+    let requirements_usize: Vec<Vec<usize>> = requirements
+        .iter()
+        .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
+        .collect();
     
     // Check if any requirement prefix matches any impacted prefix
-    requirements.iter().any(|req| impacted_prefixes.contains(req))
+    requirements_usize
+        .iter()
+        .any(|req| impacted_prefixes.contains(req))
 }
 
 #[allow(dead_code)]
@@ -1531,13 +1563,13 @@ fn save_archive_vec_internal(
     
     // Write the interner
     let interner_path = archive_path.join("interner.bin");
-    let interner_bytes = bincode::encode_to_vec(interner, bincode::config::standard())?;
+    let interner_bytes = interner.to_bytes()?;
     fs::write(interner_path, interner_bytes).map_err(FoldError::Io)?;
     
     // Write optimal ortho if provided
     if let Some(ortho) = best_ortho {
         let optimal_bin_path = archive_path.join("optimal.bin");
-        let optimal_bytes = bincode::encode_to_vec(ortho, bincode::config::standard())?;
+        let optimal_bytes = ortho.to_bytes()?;
         fs::write(optimal_bin_path, optimal_bytes).map_err(FoldError::Io)?;
     }
     
@@ -1606,13 +1638,13 @@ fn write_archive_artifacts(
 ) -> Result<(), FoldError> {
     // Write the interner
     let interner_path = archive_path.join("interner.bin");
-    let interner_bytes = bincode::encode_to_vec(interner, bincode::config::standard())?;
+    let interner_bytes = interner.to_bytes()?;
     fs::write(interner_path, interner_bytes).map_err(FoldError::Io)?;
 
     // Write optimal ortho if provided
     if let Some(ortho) = best_ortho {
         let optimal_bin_path = archive_path.join("optimal.bin");
-        let optimal_bytes = bincode::encode_to_vec(ortho, bincode::config::standard())?;
+        let optimal_bytes = ortho.to_bytes()?;
         fs::write(optimal_bin_path, optimal_bytes).map_err(FoldError::Io)?;
     }
 
@@ -1810,6 +1842,103 @@ fn is_concurrent_claim_error(err: &FoldError) -> bool {
     }
 }
 
+fn write_fold_history(
+    config: &StateConfig,
+    metrics: &Metrics,
+    runtime: std::time::Duration,
+) -> Result<(), FoldError> {
+    let history_dir = PathBuf::from("fold_history");
+    fs::create_dir_all(&history_dir).map_err(FoldError::Io)?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .as_secs();
+    let summary_path = history_dir.join(format!("run_{}.txt", timestamp));
+
+    let (ortho_count, input_words) = collect_archive_totals(config)?;
+    let disk_space_bytes = directory_size(&config.base_dir)?;
+    let summary = format!(
+        "ortho_count: {}\ndisk_space_bytes: {}\nruntime_secs: {:.3}\ninput_words: {}\n",
+        ortho_count,
+        disk_space_bytes,
+        runtime.as_secs_f64(),
+        input_words
+    );
+
+    fs::write(&summary_path, summary).map_err(FoldError::Io)?;
+    metrics.add_log(format!(
+        "Run summary written to {}",
+        summary_path.to_string_lossy()
+    ));
+    Ok(())
+}
+
+fn collect_archive_totals(config: &StateConfig) -> Result<(usize, usize), FoldError> {
+    let input_dir = config.input_dir();
+    if !input_dir.exists() {
+        return Ok((0, 0));
+    }
+
+    let mut ortho_count = 0usize;
+    let mut word_count = 0usize;
+
+    for entry in fs::read_dir(&input_dir).map_err(FoldError::Io)? {
+        let entry = entry.map_err(FoldError::Io)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+            continue;
+        }
+
+        let archive_path = path.to_string_lossy().to_string();
+        ortho_count = ortho_count.saturating_add(file_handler::load_archive_metadata(
+            &archive_path,
+        )?);
+
+        let text_meta_path = path.join("text_meta.txt");
+        let content = fs::read_to_string(&text_meta_path).map_err(FoldError::Io)?;
+        let mut lines = content.lines();
+        let first_line = lines.next().ok_or_else(|| {
+            FoldError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "text_meta.txt missing word count",
+            ))
+        })?;
+        let words = first_line.trim().parse::<usize>().map_err(|e| {
+            FoldError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e,
+            ))
+        })?;
+        word_count = word_count.saturating_add(words);
+    }
+
+    Ok((ortho_count, word_count))
+}
+
+fn directory_size(path: &Path) -> Result<u64, FoldError> {
+    fn walk(path: &Path) -> std::io::Result<u64> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            let mut total = 0u64;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                total += walk(&entry.path())?;
+            }
+            Ok(total)
+        } else if metadata.is_file() {
+            Ok(metadata.len())
+        } else {
+            Ok(0)
+        }
+    }
+
+    walk(path).map_err(FoldError::Io)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,14 +1983,16 @@ mod tests {
         let interner_a = Interner::from_text("foo bar");
         let foo_idx_a = interner_a.vocabulary().iter().position(|w| w == "foo").unwrap();
         let bar_idx_a = interner_a.vocabulary().iter().position(|w| w == "bar").unwrap();
+        let foo_val_a = PayloadVal::try_from(foo_idx_a).unwrap();
+        let bar_val_a = PayloadVal::try_from(bar_idx_a).unwrap();
 
         let impacted_a = {
-            let first = Ortho::new().add(foo_idx_a)[0].clone();
-            first.add(bar_idx_a)[0].clone()
+            let first = Ortho::new().add(foo_val_a)[0].clone();
+            first.add(bar_val_a)[0].clone()
         };
         let non_impacted_a = {
-            let first = Ortho::new().add(bar_idx_a)[0].clone();
-            first.add(foo_idx_a)[0].clone()
+            let first = Ortho::new().add(bar_val_a)[0].clone();
+            first.add(foo_val_a)[0].clone()
         };
 
         let (archive_a_path, _) = save_archive_vec_internal(
@@ -1880,14 +2011,16 @@ mod tests {
         let interner_b = Interner::from_text("foo baz");
         let foo_idx_b = interner_b.vocabulary().iter().position(|w| w == "foo").unwrap();
         let baz_idx_b = interner_b.vocabulary().iter().position(|w| w == "baz").unwrap();
+        let foo_val_b = PayloadVal::try_from(foo_idx_b).unwrap();
+        let baz_val_b = PayloadVal::try_from(baz_idx_b).unwrap();
 
         let impacted_b = {
-            let first = Ortho::new().add(foo_idx_b)[0].clone();
-            first.add(baz_idx_b)[0].clone()
+            let first = Ortho::new().add(foo_val_b)[0].clone();
+            first.add(baz_val_b)[0].clone()
         };
         let non_impacted_b = {
-            let first = Ortho::new().add(baz_idx_b)[0].clone();
-            first.add(foo_idx_b)[0].clone()
+            let first = Ortho::new().add(baz_val_b)[0].clone();
+            first.add(foo_val_b)[0].clone()
         };
 
         let (archive_b_path, _) = save_archive_vec_internal(

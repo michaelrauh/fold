@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::Ortho;
+use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
 
 /// Test filling a [3,3] ortho to see when diagonal conflicts should occur
 #[test]
@@ -21,7 +21,7 @@ fn test_filling_3x3_with_diagonal_check() {
     // Build up to a [3,2] ortho first
     let mut ortho = Ortho::new();
     for &idx in &[the_idx, south_idx, and_idx, shoulders_idx, a_idx] {
-        let children = ortho.add(idx);
+        let children = ortho.add(PayloadVal::try_from(idx).unwrap());
         ortho = children[0].clone();
     }
 
@@ -33,7 +33,7 @@ fn test_filling_3x3_with_diagonal_check() {
     println!("Payload: {:?}\n", ortho.payload());
 
     // Now add the 6th token to trigger expansion - one child should be [3,3]
-    let children = ortho.add(of_idx);
+    let children = ortho.add(PayloadVal::try_from(of_idx).unwrap());
     println!("After adding 'of', got {} children:", children.len());
     for (i, child) in children.iter().enumerate() {
         println!(
@@ -77,7 +77,13 @@ fn test_filling_3x3_with_diagonal_check() {
         }
 
         let (forbidden, required) = current.get_requirements();
-        let completions = interner.intersect(&required, &forbidden);
+        let forbidden_usize: Vec<usize> =
+            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let required_usize: Vec<Vec<usize>> = required
+            .iter()
+            .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
+            .collect();
+        let completions = interner.intersect(&required_usize, &forbidden_usize);
 
         println!("=== Step {} (position {}) ===", step, pos);
         println!("Forbidden indices: {:?}", forbidden);
@@ -85,7 +91,7 @@ fn test_filling_3x3_with_diagonal_check() {
             "Forbidden tokens: {:?}",
             forbidden
                 .iter()
-                .map(|&i| vocab[i].as_str())
+                .map(|&i| vocab[usize::try_from(i).unwrap()].as_str())
                 .collect::<Vec<_>>()
         );
         println!("Required: {:?}", required);
@@ -98,8 +104,9 @@ fn test_filling_3x3_with_diagonal_check() {
         );
 
         // Check if 'and' is in forbidden list
-        let and_in_payload = current.payload().iter().any(|opt| *opt == Some(and_idx));
-        let and_is_forbidden = forbidden.contains(&and_idx);
+        let and_val = PayloadVal::try_from(and_idx).unwrap();
+        let and_in_payload = current.payload().iter().any(|opt| *opt == Some(and_val));
+        let and_is_forbidden = forbidden_usize.contains(&and_idx);
         let and_is_completion = completions.contains(&and_idx);
 
         println!(
@@ -124,7 +131,7 @@ fn test_filling_3x3_with_diagonal_check() {
                 println!(
                     "This will demonstrate if the bug is in intersect() or get_requirements()"
                 );
-                let children = current.add(and_idx);
+                let children = current.add(and_val);
                 if !children.is_empty() {
                     current = children[0].clone();
                     println!(
@@ -146,6 +153,7 @@ fn test_filling_3x3_with_diagonal_check() {
         };
         println!("Adding token: '{}'", vocab[token_to_add]);
 
+        let token_to_add = PayloadVal::try_from(token_to_add).unwrap();
         let children = current.add(token_to_add);
         if children.is_empty() {
             break;

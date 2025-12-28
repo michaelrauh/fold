@@ -3,7 +3,7 @@ use fold::generation_store::{
     anti_join_orthos, compact_landing, merge_unique, Config, RawStream, Run, StreamedOrtho,
     UniqueRun,
 };
-use fold::ortho::Ortho;
+use fold::ortho::{Dim, Ortho, PayloadVal};
 use std::fs::{self, File};
 use std::io::{Write, BufWriter};
 use std::mem;
@@ -18,16 +18,17 @@ fn setup_test_dir() -> TempDir {
 fn estimate_decoded_size(ortho: &Ortho) -> usize {
     let dims_cap = ortho.dims().capacity();
     let payload_cap = ortho.payload().capacity();
-    let vec_overhead = mem::size_of::<Vec<usize>>() + mem::size_of::<Vec<Option<usize>>>();
+    let vec_overhead =
+        mem::size_of::<Vec<Dim>>() + mem::size_of::<Vec<Option<PayloadVal>>>();
     mem::size_of::<Ortho>()
         + vec_overhead
-        + dims_cap.saturating_mul(mem::size_of::<usize>())
-        + payload_cap.saturating_mul(mem::size_of::<Option<usize>>())
+        + dims_cap.saturating_mul(mem::size_of::<Dim>())
+        + payload_cap.saturating_mul(mem::size_of::<Option<PayloadVal>>())
 }
 
 fn write_ortho_record(writer: &mut BufWriter<File>, ortho: &Ortho) {
     let decoded_est = estimate_decoded_size(ortho) as u64;
-    let encoded = bincode::encode_to_vec(ortho, bincode::config::standard()).unwrap();
+    let encoded = ortho.to_bytes().unwrap();
     let encoded_len = encoded.len() as u64;
     writer.write_all(&decoded_est.to_le_bytes()).unwrap();
     writer.write_all(&encoded_len.to_le_bytes()).unwrap();
@@ -47,9 +48,13 @@ fn create_ortho_raw_stream(temp_dir: &PathBuf, bucket: usize, count: usize) -> R
         // Create orthos by starting with new() and adding values
         let mut ortho = Ortho::new();
         // Add values to build up the ortho
-        ortho = ortho.add(i % 1000)[0].clone();
+        ortho = ortho
+            .add(PayloadVal::try_from(i % 1000).unwrap())[0]
+            .clone();
         if i % 100 < 50 {
-            ortho = ortho.add((i / 2) % 1000)[0].clone();
+            ortho = ortho
+                .add(PayloadVal::try_from((i / 2) % 1000).unwrap())[0]
+                .clone();
         }
         
         write_ortho_record(&mut writer, &ortho);
@@ -74,7 +79,9 @@ fn create_sorted_ortho_runs(temp_dir: &PathBuf, num_runs: usize, items_per_run: 
         for i in 0..items_per_run {
             let base_idx = run_idx * items_per_run / 2 + i;
             let mut ortho = Ortho::new();
-            ortho = ortho.add(base_idx % 1000)[0].clone();
+            ortho = ortho
+                .add(PayloadVal::try_from(base_idx % 1000).unwrap())[0]
+                .clone();
             
             write_ortho_record(&mut writer, &ortho);
         }
@@ -97,7 +104,7 @@ fn create_unique_ortho_run(temp_dir: &PathBuf, count: usize) -> UniqueRun {
     for i in 0..count {
         // Create orthos by starting with new() and adding values
         let mut ortho = Ortho::new();
-        ortho = ortho.add(i)[0].clone();
+        ortho = ortho.add(PayloadVal::try_from(i).unwrap())[0].clone();
         
         write_ortho_record(&mut writer, &ortho);
     }
@@ -113,7 +120,7 @@ fn create_history_orthos(history_size: usize) -> Vec<Ortho> {
     // Create history orthos for even numbers only (so odd numbers are new)
     for i in (0..history_size * 2).step_by(2) {
         let mut ortho = Ortho::new();
-        ortho = ortho.add(i)[0].clone();
+        ortho = ortho.add(PayloadVal::try_from(i).unwrap())[0].clone();
         history.push(ortho);
     }
     
@@ -337,7 +344,9 @@ fn bench_full_generation_with_duplicates(c: &mut Criterion) {
                 // Every other value is a duplicate
                 let base_idx = i / 2;
                 let mut ortho = Ortho::new();
-                ortho = ortho.add(base_idx % 1000)[0].clone();
+                ortho = ortho
+                    .add(PayloadVal::try_from(base_idx % 1000).unwrap())[0]
+                    .clone();
                 
                 write_ortho_record(&mut writer, &ortho);
             }

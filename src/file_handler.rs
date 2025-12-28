@@ -731,9 +731,7 @@ fn find_archives(input_dir: &str) -> Result<Vec<(String, u64)>, FoldError> {
 pub fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
     let interner_path = format!("{}/interner.bin", archive_path);
     let interner_bytes = fs::read(&interner_path).map_err(|e| FoldError::Io(e))?;
-    let (interner, _): (Interner, usize) =
-        bincode::decode_from_slice(&interner_bytes, bincode::config::standard())?;
-    Ok(interner)
+    Interner::from_bytes(&interner_bytes)
 }
 
 fn get_results_path(archive_path: &str) -> String {
@@ -1199,9 +1197,7 @@ pub fn load_archive_metadata(archive_path: &str) -> Result<usize, FoldError> {
 pub fn load_optimal_ortho(archive_path: &str) -> Result<Ortho, FoldError> {
     let optimal_bin_path = format!("{}/optimal.bin", archive_path);
     let optimal_bytes = fs::read(&optimal_bin_path).map_err(|e| FoldError::Io(e))?;
-    let (ortho, _): (Ortho, usize) =
-        bincode::decode_from_slice(&optimal_bytes, bincode::config::standard())?;
-    Ok(ortho)
+    Ortho::from_bytes(&optimal_bytes)
 }
 
 /// Find the largest archive by ortho count (uses default config)

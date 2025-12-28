@@ -131,8 +131,7 @@ fn test_complete_merge_lifecycle() {
     fs::write(archive_a.join("lineage.txt"), "\"a\"").unwrap();
     fs::write(archive_a.join("text_meta.txt"), "3\ntest data a").unwrap();
     let interner_a = Interner::from_text("test a");
-    let interner_a_bytes =
-        bincode::encode_to_vec(&interner_a, bincode::config::standard()).unwrap();
+    let interner_a_bytes = interner_a.to_bytes().unwrap();
     fs::write(archive_a.join("interner.bin"), interner_a_bytes).unwrap();
 
     let archive_b = config.input_dir().join("archive_b.bin");
@@ -142,8 +141,7 @@ fn test_complete_merge_lifecycle() {
     fs::write(archive_b.join("lineage.txt"), "\"b\"").unwrap();
     fs::write(archive_b.join("text_meta.txt"), "2\ntest b").unwrap();
     let interner_b = Interner::from_text("test b");
-    let interner_b_bytes =
-        bincode::encode_to_vec(&interner_b, bincode::config::standard()).unwrap();
+    let interner_b_bytes = interner_b.to_bytes().unwrap();
     fs::write(archive_b.join("interner.bin"), interner_b_bytes).unwrap();
 
     println!("✓ Step 1: Two archives in input/ (NO heartbeats)");

@@ -1,6 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use fold::interner::Interner;
-use fold::ortho::Ortho;
+use fold::ortho::{Ortho, PayloadVal};
 
 fn bench_ortho_new(c: &mut Criterion) {
     c.bench_function("ortho_new", |b| b.iter(|| Ortho::new()));
@@ -8,14 +8,14 @@ fn bench_ortho_new(c: &mut Criterion) {
 
 fn bench_ortho_add_simple(c: &mut Criterion) {
     let ortho = Ortho::new();
-    c.bench_function("ortho_add_simple", |b| b.iter(|| ortho.add(black_box(10))));
+    c.bench_function("ortho_add_simple", |b| b.iter(|| ortho.add(black_box(10u32))));
 }
 
 fn bench_ortho_add_multiple(c: &mut Criterion) {
     let ortho = Ortho::new();
     let ortho1 = ortho.add(1)[0].clone();
     c.bench_function("ortho_add_multiple", |b| {
-        b.iter(|| ortho1.add(black_box(2)))
+        b.iter(|| ortho1.add(black_box(2u32)))
     });
 }
 
@@ -33,7 +33,7 @@ fn bench_ortho_add_shape_expansion(c: &mut Criterion) {
     let ortho = ortho.add(3)[0].clone();
     let ortho = ortho.add(4)[0].clone();
     c.bench_function("ortho_add_shape_expansion", |b| {
-        b.iter(|| ortho.add(black_box(5)))
+        b.iter(|| ortho.add(black_box(5u32)))
     });
 }
 

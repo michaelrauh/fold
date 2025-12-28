@@ -2,8 +2,8 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum FoldError {
-    Serialization(Box<bincode::error::EncodeError>),
-    Deserialization(Box<bincode::error::DecodeError>),
+    Serialization(String),
+    Deserialization(String),
     Io(std::io::Error),
     Interner(String),
     Other(String),
@@ -22,30 +22,6 @@ impl fmt::Display for FoldError {
 }
 
 impl std::error::Error for FoldError {}
-
-impl From<Box<bincode::error::EncodeError>> for FoldError {
-    fn from(err: Box<bincode::error::EncodeError>) -> Self {
-        FoldError::Serialization(err)
-    }
-}
-
-impl From<bincode::error::EncodeError> for FoldError {
-    fn from(err: bincode::error::EncodeError) -> Self {
-        FoldError::Serialization(Box::new(err))
-    }
-}
-
-impl From<Box<bincode::error::DecodeError>> for FoldError {
-    fn from(err: Box<bincode::error::DecodeError>) -> Self {
-        FoldError::Deserialization(err)
-    }
-}
-
-impl From<bincode::error::DecodeError> for FoldError {
-    fn from(err: bincode::error::DecodeError) -> Self {
-        FoldError::Deserialization(Box::new(err))
-    }
-}
 
 impl From<std::io::Error> for FoldError {
     fn from(err: std::io::Error) -> Self {

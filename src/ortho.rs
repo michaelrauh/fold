@@ -1,32 +1,41 @@
-use crate::spatial;
-use bincode::Decode;
-use bincode::Encode;
+use crate::{spatial, FoldError};
+use bytecheck::CheckBytes;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use rustc_hash::FxHasher;
 
-#[derive(PartialEq, Debug, Clone, Encode, Decode)]
+pub type Dim = u8;
+pub type PayloadVal = u32;
+pub type OrthoId = u64;
+
+pub fn dim_to_usize(value: Dim) -> usize {
+    usize::try_from(value).expect("dim overflowed usize")
+}
+
+pub fn payload_to_usize(value: PayloadVal) -> usize {
+    usize::try_from(value).expect("payload value overflowed usize")
+}
+
+#[derive(PartialEq, Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive_attr(derive(Debug, PartialEq, CheckBytes))]
 pub struct Ortho {
-    dims: Vec<usize>,
-    payload: Vec<Option<usize>>,
-    up_axis: Option<usize>, // Records the last "up" transform axis (None = last expansion was over or base)
-    id: usize,              // Cached hash of dims/payload/up_axis for fast lookups
+    dims: Vec<Dim>,
+    payload: Vec<Option<PayloadVal>>,
+    up_axis: Option<Dim>, // Records the last "up" transform axis (None = last expansion was over or base)
+    id: OrthoId,          // Cached hash of dims/payload/up_axis for fast lookups
 }
 
 impl Ortho {
-    fn compute_id(
-        dims: &Vec<usize>,
-        payload: &Vec<Option<usize>>,
-        up_axis: Option<usize>,
-    ) -> usize {
+    fn compute_id(dims: &[Dim], payload: &[Option<PayloadVal>], up_axis: Option<Dim>) -> OrthoId {
         let mut hasher = FxHasher::default();
         dims.hash(&mut hasher);
         payload.hash(&mut hasher);
         up_axis.hash(&mut hasher);
-        (hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF) as usize
+        hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF
     }
 
-    fn from_parts(dims: Vec<usize>, payload: Vec<Option<usize>>, up_axis: Option<usize>) -> Self {
+    fn from_parts(dims: Vec<Dim>, payload: Vec<Option<PayloadVal>>, up_axis: Option<Dim>) -> Self {
         let id = Self::compute_id(&dims, &payload, up_axis);
         Ortho {
             dims,
@@ -43,8 +52,12 @@ impl Ortho {
         Ortho::from_parts(dims, payload, up_axis)
     }
 
-    pub fn id(&self) -> usize {
+    pub fn id(&self) -> OrthoId {
         self.id
+    }
+
+    pub fn archived_id(archived: &rkyv::Archived<Ortho>) -> OrthoId {
+        archived.id
     }
     pub fn get_current_position(&self) -> usize {
         self.payload
@@ -52,7 +65,7 @@ impl Ortho {
             .position(|x| x.is_none())
             .unwrap_or(self.payload.len())
     }
-    pub fn add(&self, value: usize) -> Vec<Self> {
+    pub fn add(&self, value: PayloadVal) -> Vec<Self> {
         let insertion_index = self.get_current_position();
         let total_empty = self.payload.iter().filter(|x| x.is_none()).count();
         if total_empty == 1 {
@@ -69,7 +82,7 @@ impl Ortho {
             }
         }
         if insertion_index == 2 && self.dims.as_slice() == [2, 2] {
-            let mut new_payload: Vec<Option<usize>> = self.payload.clone();
+            let mut new_payload: Vec<Option<PayloadVal>> = self.payload.clone();
             new_payload[insertion_index] = Some(value);
             if let (Some(second), Some(third)) = (new_payload[1], new_payload[2]) {
                 if second > third {
@@ -80,7 +93,7 @@ impl Ortho {
             return vec![Ortho::from_parts(self.dims.clone(), new_payload, self.up_axis)];
         }
         let len = self.payload.len();
-        let mut new_payload: Vec<Option<usize>> = Vec::with_capacity(len);
+        let mut new_payload: Vec<Option<PayloadVal>> = Vec::with_capacity(len);
         unsafe {
             new_payload.set_len(len);
             std::ptr::copy_nonoverlapping(self.payload.as_ptr(), new_payload.as_mut_ptr(), len);
@@ -92,8 +105,8 @@ impl Ortho {
     }
     fn expand_over(
         ortho: &Ortho,
-        expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
-        value: usize,
+        expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
+        value: PayloadVal,
     ) -> Vec<Ortho> {
         let mut old_payload_with_value = ortho.payload.clone();
         let insert_pos = old_payload_with_value
@@ -115,8 +128,8 @@ impl Ortho {
     }
     fn expand_up(
         ortho: &Ortho,
-        expansions: Vec<(Vec<usize>, usize, Vec<usize>)>,
-        value: usize,
+        expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
+        value: PayloadVal,
         insert_axis: usize,
     ) -> Vec<Ortho> {
         let mut old_payload_with_value = ortho.payload.clone();
@@ -134,12 +147,16 @@ impl Ortho {
             }
             // The up child (one with extra dimension) gets the insert_axis, over children get None
             let is_up_child = new_dims_vec.len() > ortho.dims.len();
-            let up_axis = if is_up_child { Some(insert_axis) } else { None };
+            let up_axis = if is_up_child {
+                Some(Dim::try_from(insert_axis).expect("insert axis overflowed u8"))
+            } else {
+                None
+            };
             out.push(Ortho::from_parts(new_dims_vec, new_payload, up_axis));
         }
         out
     }
-    fn get_insert_position(&self, to_add: usize) -> usize {
+    fn get_insert_position(&self, to_add: PayloadVal) -> usize {
         let axis_positions = spatial::get_axis_positions(&self.dims);
         let mut idx = 0;
         for &pos in axis_positions.iter() {
@@ -152,27 +169,27 @@ impl Ortho {
         }
         idx
     }
-    pub fn get_requirements(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+    pub fn get_requirements(&self) -> (Vec<PayloadVal>, Vec<Vec<PayloadVal>>) {
         let pos = self.get_current_position();
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims, self.up_axis);
-        let forbidden: Vec<usize> = diagonals
+        let forbidden: Vec<PayloadVal> = diagonals
             .into_iter()
             .filter_map(|i| self.payload.get(i).and_then(|v| *v))
             .collect();
-        let required: Vec<Vec<usize>> = prefixes
+        let required: Vec<Vec<PayloadVal>> = prefixes
             .into_iter()
             .filter(|prefix| !prefix.is_empty())
             .map(|prefix| {
                 prefix
                     .iter()
                     .filter_map(|&i| self.payload.get(i).cloned().flatten())
-                    .collect::<Vec<usize>>()
+                    .collect::<Vec<PayloadVal>>()
             })
             .collect();
         (forbidden, required)
     }
 
-    pub fn get_requirement_phrases(&self) -> Vec<Vec<usize>> {
+    pub fn get_requirement_phrases(&self) -> Vec<Vec<PayloadVal>> {
         let (_forbidden, required) = self.get_requirements();
         required
     }
@@ -180,10 +197,16 @@ impl Ortho {
     /// Remap an ortho's payload to use new vocabulary indices
     pub fn remap(&self, vocab_map: &[usize]) -> Option<Self> {
         // Remap payload: translate old vocab indices to new vocab indices
-        let new_payload: Vec<Option<usize>> = self
+        let new_payload: Vec<Option<PayloadVal>> = self
             .payload
             .iter()
-            .map(|opt_idx| opt_idx.map(|old_idx| vocab_map[old_idx]))
+            .map(|opt_idx| {
+                opt_idx.map(|old_idx| {
+                    let idx = usize::try_from(old_idx).expect("payload value overflowed usize");
+                    let mapped = vocab_map[idx];
+                    PayloadVal::try_from(mapped).expect("vocab map value overflowed u32")
+                })
+            })
             .collect();
 
         // Create new ortho with remapped payload
@@ -194,13 +217,13 @@ impl Ortho {
         ))
     }
 
-    pub fn prefixes(&self) -> Vec<Vec<usize>> {
+    pub fn prefixes(&self) -> Vec<Vec<PayloadVal>> {
         let mut result = Vec::new();
         for pos in 0..self.payload.len() {
             let (prefixes, _diagonals) = spatial::get_requirements(pos, &self.dims, self.up_axis);
             for prefix in prefixes {
                 if !prefix.is_empty() {
-                    let values: Vec<usize> = prefix
+                    let values: Vec<PayloadVal> = prefix
                         .iter()
                         .filter_map(|&i| self.payload.get(i).cloned().flatten())
                         .collect();
@@ -212,7 +235,7 @@ impl Ortho {
         }
         result
     }
-    pub fn prefixes_for_last_filled(&self) -> Vec<Vec<usize>> {
+    pub fn prefixes_for_last_filled(&self) -> Vec<Vec<PayloadVal>> {
         if self.get_current_position() == 0 {
             return vec![];
         }
@@ -225,25 +248,25 @@ impl Ortho {
                 prefix
                     .iter()
                     .filter_map(|&i| self.payload.get(i).cloned().flatten())
-                    .collect::<Vec<usize>>()
+                    .collect::<Vec<PayloadVal>>()
             })
             .filter(|v| !v.is_empty())
             .collect()
     }
-    pub fn dims(&self) -> &Vec<usize> {
+    pub fn dims(&self) -> &Vec<Dim> {
         &self.dims
     }
-    pub fn payload(&self) -> &Vec<Option<usize>> {
+    pub fn payload(&self) -> &Vec<Option<PayloadVal>> {
         &self.payload
     }
-    pub fn up_axis(&self) -> Option<usize> {
+    pub fn up_axis(&self) -> Option<Dim> {
         self.up_axis
     }
     fn compute_score_components(&self) -> (usize, usize) {
         let volume = self
             .dims
             .iter()
-            .map(|x| x.saturating_sub(1))
+            .map(|x| usize::from(*x).saturating_sub(1))
             .product::<usize>();
         let fullness = self.payload.iter().filter(|x| x.is_some()).count();
         (volume, fullness)
@@ -256,6 +279,16 @@ impl Ortho {
     }
     pub fn fullness(&self) -> usize {
         self.score().1
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FoldError> {
+        rkyv::to_bytes::<_, 256>(self)
+            .map(|buf| buf.to_vec())
+            .map_err(|e| FoldError::Serialization(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FoldError> {
+        rkyv::from_bytes::<Ortho>(bytes).map_err(|e| FoldError::Deserialization(e.to_string()))
     }
 
     fn get_index_at_coord(&self, coord: &[usize]) -> Option<usize> {
@@ -278,8 +311,8 @@ impl<'a> OrthoDisplay<'a> {
 
 impl<'a> fmt::Display for OrthoDisplay<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rows = self.ortho.dims[self.ortho.dims.len() - 2];
-        let cols = self.ortho.dims[self.ortho.dims.len() - 1];
+        let rows = dim_to_usize(self.ortho.dims[self.ortho.dims.len() - 2]);
+        let cols = dim_to_usize(self.ortho.dims[self.ortho.dims.len() - 1]);
         let higher_dims = &self.ortho.dims[..self.ortho.dims.len() - 2];
 
         let max_width = self
@@ -287,17 +320,17 @@ impl<'a> fmt::Display for OrthoDisplay<'a> {
             .payload
             .iter()
             .filter_map(|&opt| opt)
-            .map(|token_id| self.interner.string_for_index(token_id).len())
+            .map(|token_id| self.interner.string_for_index(payload_to_usize(token_id)).len())
             .max()
             .unwrap_or(1)
             .max(4);
 
-        let format_cell = |token_id: Option<usize>| -> String {
+        let format_cell = |token_id: Option<PayloadVal>| -> String {
             token_id
                 .map(|id| {
                     format!(
                         "{:>width$}",
-                        self.interner.string_for_index(id),
+                        self.interner.string_for_index(payload_to_usize(id)),
                         width = max_width
                     )
                 })
@@ -356,16 +389,17 @@ impl Ortho {
         OrthoDisplay::new(self, interner)
     }
 
-    fn generate_tile_coords(dims: &[usize]) -> Vec<Vec<usize>> {
+    fn generate_tile_coords(dims: &[Dim]) -> Vec<Vec<usize>> {
         if dims.is_empty() {
             return vec![vec![]];
         }
 
-        let total: usize = dims.iter().product();
+        let dims_usize: Vec<usize> = dims.iter().map(|&d| dim_to_usize(d)).collect();
+        let total: usize = dims_usize.iter().product();
         (0..total)
             .map(|mut idx| {
-                let mut coord = Vec::with_capacity(dims.len());
-                for &dim_size in dims.iter().rev() {
+                let mut coord = Vec::with_capacity(dims_usize.len());
+                for &dim_size in dims_usize.iter().rev() {
                     coord.push(idx % dim_size);
                     idx /= dim_size;
                 }
@@ -380,8 +414,27 @@ impl Ortho {
 mod tests {
     use super::*;
 
+    fn to_dims(dims: Vec<usize>) -> Vec<Dim> {
+        dims.into_iter()
+            .map(|d| Dim::try_from(d).expect("dim overflowed u8"))
+            .collect()
+    }
+
+    fn to_payload(payload: Vec<Option<usize>>) -> Vec<Option<PayloadVal>> {
+        payload
+            .into_iter()
+            .map(|v| {
+                v.map(|x| PayloadVal::try_from(x).expect("payload value overflowed u32"))
+            })
+            .collect()
+    }
+
     fn mk_ortho(dims: Vec<usize>, payload: Vec<Option<usize>>, up_axis: Option<usize>) -> Ortho {
-        Ortho::from_parts(dims, payload, up_axis)
+        Ortho::from_parts(
+            to_dims(dims),
+            to_payload(payload),
+            up_axis.map(|a| Dim::try_from(a).expect("up_axis overflowed u8")),
+        )
     }
 
     #[test]
@@ -404,12 +457,12 @@ mod tests {
         assert_eq!(ortho.get_current_position(), 0);
 
         assert_eq!(
-            Ortho::from_parts(vec![2, 2], vec![None, None, None, None], None).get_current_position(),
+            mk_ortho(vec![2, 2], vec![None, None, None, None], None).get_current_position(),
             0
         );
 
         assert_eq!(
-            Ortho::from_parts(
+            mk_ortho(
                 vec![2, 2],
                 vec![Some(1), None, None, None],
                 None
@@ -419,7 +472,7 @@ mod tests {
         );
 
         assert_eq!(
-            Ortho::from_parts(
+            mk_ortho(
                 vec![2, 2],
                 vec![Some(1), Some(2), None, None],
                 None
@@ -429,7 +482,7 @@ mod tests {
         );
 
         assert_eq!(
-            Ortho::from_parts(
+            mk_ortho(
                 vec![2, 2],
                 vec![Some(1), Some(2), Some(3), None],
                 None
@@ -633,8 +686,8 @@ mod tests {
     fn test_get_requirements_empty() {
         let ortho = Ortho::new();
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, Vec::<usize>::new());
-        assert_eq!(required, Vec::<Vec<usize>>::new());
+        assert_eq!(forbidden, Vec::<PayloadVal>::new());
+        assert_eq!(required, Vec::<Vec<PayloadVal>>::new());
     }
 
     #[test]
@@ -642,7 +695,7 @@ mod tests {
         let ortho = Ortho::new();
         let ortho = &ortho.add(10)[0];
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, Vec::<usize>::new());
+        assert_eq!(forbidden, Vec::<PayloadVal>::new());
         assert_eq!(required, vec![vec![10]]);
     }
 
@@ -682,7 +735,7 @@ mod tests {
         let ortho = &ortho.add(2)[0];
         let ortho = &ortho.add(3)[0];
         let (forbidden, required) = ortho.get_requirements();
-        assert_eq!(forbidden, Vec::<usize>::new());
+        assert_eq!(forbidden, Vec::<PayloadVal>::new());
         assert_eq!(required, vec![vec![2], vec![3]]);
     }
 
@@ -763,11 +816,8 @@ mod tests {
         let children1 = o1.add(40);
         let children2 = o2.add(40);
         // Normalize each child to (dims, filled_values_in_order)
-        fn norm(o: &Ortho) -> (Vec<usize>, Vec<usize>) {
-            (
-                o.dims.clone(),
-                o.payload.iter().filter_map(|x| *x).collect(),
-            )
+        fn norm(o: &Ortho) -> (Vec<Dim>, Vec<PayloadVal>) {
+            (o.dims.clone(), o.payload.iter().filter_map(|x| *x).collect())
         }
         let mut norms1: Vec<_> = children1.iter().map(norm).collect();
         let mut norms2: Vec<_> = children2.iter().map(norm).collect();
@@ -874,7 +924,7 @@ mod tests {
             let volume = ortho
                 .dims()
                 .iter()
-                .map(|x| x.saturating_sub(1))
+                .map(|x| usize::from(*x).saturating_sub(1))
                 .product::<usize>();
             let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
             (volume, fullness)

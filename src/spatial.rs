@@ -5,8 +5,14 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{cell::RefCell, cmp::Ordering};
 
+type Dim = u8;
+
+fn dim_to_usize(value: Dim) -> usize {
+    usize::from(value)
+}
+
 // Cache key: (dims, up_axis)
-type MetaCacheKey = (Vec<usize>, Option<usize>);
+type MetaCacheKey = (Vec<Dim>, Option<Dim>);
 
 // Consolidated metadata per (dims, up_axis) pair - fully cached
 struct DimMeta {
@@ -18,7 +24,7 @@ struct DimMeta {
 }
 
 impl DimMeta {
-    fn new(dims: &[usize], up_axis: Option<usize>) -> Self {
+    fn new(dims: &[Dim], up_axis: Option<Dim>) -> Self {
         let indices_in_order = indices_in_order_compute(dims);
         let location_to_index: FxHashMap<Vec<usize>, usize> = indices_in_order
             .iter()
@@ -71,8 +77,8 @@ impl DimMeta {
 /// up_axis = None -> over expansion.
 /// up_axis = Some(axis) -> up expansion at that axis.
 fn enrich_diagonals(
-    dims: &[usize],
-    up_axis: Option<usize>,
+    dims: &[Dim],
+    up_axis: Option<Dim>,
     base_diagonals: &[Vec<usize>],
     indices_in_order: &[Vec<usize>],
     location_to_index: &FxHashMap<Vec<usize>, usize>,
@@ -98,7 +104,7 @@ fn enrich_diagonals(
         }
         Some(axis) => {
             // Up expansion: parent has one fewer dimension
-            remap_for_up_internal(&parent_dims, axis, location_to_index)
+            remap_for_up_internal(&parent_dims, dim_to_usize(axis), location_to_index)
                 .into_iter()
                 .collect()
         }
@@ -109,7 +115,7 @@ fn enrich_diagonals(
     }
 
     // Enrich each position's diagonals
-    let total = dims.iter().product::<usize>();
+    let total: usize = dims.iter().map(|&d| dim_to_usize(d)).product();
     (0..total)
         .map(|loc| {
             let mut diagonals = base_diagonals[loc].clone();
@@ -137,7 +143,7 @@ fn enrich_diagonals(
 
 /// Internal remap that doesn't call get_meta to avoid nested borrow
 fn remap_internal(
-    old_dims: &[usize],
+    old_dims: &[Dim],
     new_location_to_index: &FxHashMap<Vec<usize>, usize>,
 ) -> Vec<usize> {
     let old_positions = indices_in_order_compute(old_dims);
@@ -149,7 +155,7 @@ fn remap_internal(
 
 /// Internal remap_for_up that doesn't call get_meta to avoid nested borrow
 fn remap_for_up_internal(
-    old_dims: &[usize],
+    old_dims: &[Dim],
     position: usize,
     new_location_to_index: &FxHashMap<Vec<usize>, usize>,
 ) -> Vec<usize> {
@@ -161,7 +167,7 @@ fn remap_for_up_internal(
 }
 
 /// Internal pad that doesn't call get_meta to avoid nested borrow
-fn pad_internal(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
+fn pad_internal(dims: &[Dim], position: usize) -> Vec<Vec<usize>> {
     let indices = indices_in_order_compute(dims);
     let insert_pos = dims.len().saturating_sub(position);
     indices
@@ -175,14 +181,14 @@ fn pad_internal(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
 
 thread_local! {
     static DIM_META_CACHE: RefCell<FxHashMap<MetaCacheKey, Rc<DimMeta>>> = RefCell::new(FxHashMap::default());
-    static EXPAND_UP_CACHE: RefCell<FxHashMap<(Vec<usize>, usize), Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
-    static EXPAND_OVER_CACHE: RefCell<FxHashMap<Vec<usize>, Vec<(Vec<usize>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
+    static EXPAND_UP_CACHE: RefCell<FxHashMap<(Vec<Dim>, usize), Vec<(Vec<Dim>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
+    static EXPAND_OVER_CACHE: RefCell<FxHashMap<Vec<Dim>, Vec<(Vec<Dim>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
 }
 
 static META_HITS: AtomicUsize = AtomicUsize::new(0);
 static META_MISSES: AtomicUsize = AtomicUsize::new(0);
 
-fn get_meta_with_axis(dims: &[usize], up_axis: Option<usize>) -> Rc<DimMeta> {
+fn get_meta_with_axis(dims: &[Dim], up_axis: Option<Dim>) -> Rc<DimMeta> {
     DIM_META_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let key = (dims.to_vec(), up_axis);
@@ -198,7 +204,7 @@ fn get_meta_with_axis(dims: &[usize], up_axis: Option<usize>) -> Rc<DimMeta> {
 }
 
 // Helper for APIs that don't depend on up_axis (axis positions, location-to-index, etc.)
-fn get_meta(dims: &[usize]) -> Rc<DimMeta> {
+fn get_meta(dims: &[Dim]) -> Rc<DimMeta> {
     get_meta_with_axis(dims, None)
 }
 
@@ -212,8 +218,8 @@ pub fn meta_stats() -> (usize, usize) {
 /// Get requirements for a position - fully cached lookup
 pub fn get_requirements(
     loc: usize,
-    dims: &[usize],
-    up_axis: Option<usize>,
+    dims: &[Dim],
+    up_axis: Option<Dim>,
 ) -> (Vec<Vec<usize>>, Vec<usize>) {
     let meta = get_meta_with_axis(dims, up_axis);
     (
@@ -222,19 +228,19 @@ pub fn get_requirements(
     )
 }
 
-pub fn get_axis_positions(dims: &[usize]) -> Vec<usize> {
+pub fn get_axis_positions(dims: &[Dim]) -> Vec<usize> {
     get_meta(dims).axis_positions.clone()
 }
 
-pub fn get_location_to_index(dims: &[usize]) -> FxHashMap<Vec<usize>, usize> {
+pub fn get_location_to_index(dims: &[Dim]) -> FxHashMap<Vec<usize>, usize> {
     get_meta(dims).location_to_index.clone()
 }
 
-pub fn is_base(dims: &[usize]) -> bool {
+pub fn is_base(dims: &[Dim]) -> bool {
     dims.iter().all(|&x| x == 2)
 }
 
-pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
+pub fn expand_up(old_dims: &[Dim], position: usize) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
     let key = (old_dims.to_vec(), position);
     EXPAND_UP_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -248,7 +254,7 @@ pub fn expand_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize,
     })
 }
 
-pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
+pub fn expand_over(old_dims: &[Dim]) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
     let key = old_dims.to_vec();
     EXPAND_OVER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -262,21 +268,21 @@ pub fn expand_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     })
 }
 
-pub fn capacity(dims: &[usize]) -> usize {
-    dims.iter().product()
+pub fn capacity(dims: &[Dim]) -> usize {
+    dims.iter().map(|&d| usize::from(d)).product()
 }
 
 fn apply_mapping(positions: &[Vec<usize>], mapping: &FxHashMap<Vec<usize>, usize>) -> Vec<usize> {
     positions.iter().map(|pos| mapping[pos]).collect()
 }
 
-fn remap(old_dims: &[usize], new_dims: &[usize]) -> Vec<usize> {
+fn remap(old_dims: &[Dim], new_dims: &[Dim]) -> Vec<usize> {
     let old_positions = get_meta(old_dims).indices_in_order.clone();
     let mapping = get_meta(new_dims).location_to_index.clone();
     apply_mapping(&old_positions, &mapping)
 }
 
-fn remap_for_up(old_dims: &[usize], position: usize) -> Vec<usize> {
+fn remap_for_up(old_dims: &[Dim], position: usize) -> Vec<usize> {
     let padded_positions = pad(old_dims, position);
     let mut new_dims = old_dims.to_vec();
     new_dims.insert(position, 2);
@@ -284,7 +290,7 @@ fn remap_for_up(old_dims: &[usize], position: usize) -> Vec<usize> {
     apply_mapping(&padded_positions, &mapping)
 }
 
-fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
+fn pad(dims: &[Dim], position: usize) -> Vec<Vec<usize>> {
     get_meta(dims)
         .indices_in_order
         .iter()
@@ -292,11 +298,11 @@ fn pad(dims: &[usize], position: usize) -> Vec<Vec<usize>> {
         .map(|mut indices| {
             indices.insert(dims.len() - position, 0);
             indices
-        })
-        .collect()
+            })
+            .collect()
 }
 
-fn parent(dims: &[usize]) -> Option<Vec<usize>> {
+fn parent(dims: &[Dim]) -> Option<Vec<Dim>> {
     // Root shape [2,2] has no parent
     if dims == &[2, 2] {
         return None;
@@ -324,7 +330,7 @@ fn parent(dims: &[usize]) -> Option<Vec<usize>> {
     Some(p)
 }
 
-fn next_dims_over(old_dims: &[usize]) -> Vec<Vec<usize>> {
+fn next_dims_over(old_dims: &[Dim]) -> Vec<Vec<Dim>> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -348,7 +354,7 @@ fn next_dims_over(old_dims: &[usize]) -> Vec<Vec<usize>> {
     candidates
 }
 
-fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
+fn expand_for_over(old_dims: &[Dim]) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
     let over_dims = next_dims_over(old_dims);
     let mut results = Vec::with_capacity(over_dims.len());
     for new_dims in over_dims {
@@ -360,7 +366,7 @@ fn expand_for_over(old_dims: &[usize]) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
     results
 }
 
-fn expand_for_up(old_dims: &[usize], position: usize) -> Vec<(Vec<usize>, usize, Vec<usize>)> {
+fn expand_for_up(old_dims: &[Dim], position: usize) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
     let mut over_results = expand_for_over(old_dims);
     let mut up_dims = old_dims.to_vec();
     up_dims.insert(position, 2);
@@ -395,23 +401,25 @@ fn impacted_locations(
 }
 
 fn get_impacted_phrase_locations_compute(
-    dims: &[usize],
+    dims: &[Dim],
     index_to_location: &FxHashMap<usize, Vec<usize>>,
     location_to_index: &FxHashMap<Vec<usize>, usize>,
     _indices_in_order: &[Vec<usize>],
 ) -> Vec<Vec<Vec<usize>>> {
-    (0..dims.iter().product::<usize>())
+    let total: usize = dims.iter().map(|&d| dim_to_usize(d)).product();
+    (0..total)
         .map(|location| impacted_locations(location, index_to_location, location_to_index))
         .collect()
 }
 
 fn get_diagonals_compute(
-    dims: &[usize],
+    dims: &[Dim],
     index_to_location: &FxHashMap<usize, Vec<usize>>,
     location_to_index: &FxHashMap<Vec<usize>, usize>,
     indices: &[Vec<usize>],
 ) -> Vec<Vec<usize>> {
-    (0..dims.iter().product::<usize>())
+    let total: usize = dims.iter().map(|&d| dim_to_usize(d)).product();
+    (0..total)
         .map(|location| {
             let current_index = &index_to_location[&location];
             let current_distance: usize = current_index.iter().sum();
@@ -426,11 +434,15 @@ fn get_diagonals_compute(
         .collect_vec()
 }
 
-fn index_array(dims: &[usize]) -> Vec<Vec<usize>> {
-    cartesian_product(dims.iter().map(|x| (0..*x).collect()).collect())
+fn index_array(dims: &[Dim]) -> Vec<Vec<usize>> {
+    let ranges: Vec<Vec<usize>> = dims
+        .iter()
+        .map(|x| (0..dim_to_usize(*x)).collect())
+        .collect();
+    cartesian_product(ranges)
 }
 
-fn indices_in_order_compute(dims: &[usize]) -> Vec<Vec<usize>> {
+fn indices_in_order_compute(dims: &[Dim]) -> Vec<Vec<usize>> {
     order_by_distance(index_array(dims))
 }
 

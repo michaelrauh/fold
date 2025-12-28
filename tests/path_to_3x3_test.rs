@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::Ortho;
+use fold::ortho::{Ortho, PayloadVal};
 
 /// Trace through the expansion path to reach [3,3]
 #[test]
@@ -23,7 +23,7 @@ fn test_path_to_3x3() {
             ortho.get_current_position()
         );
 
-        let children = ortho.add(token_idx);
+        let children = ortho.add(PayloadVal::try_from(token_idx).unwrap());
         println!("Generated {} children:", children.len());
         for (i, child) in children.iter().enumerate() {
             println!(

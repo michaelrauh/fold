@@ -1,4 +1,5 @@
 use crate::metrics::{MetricSample, Metrics, MetricsSnapshot, StatusHistoryEntry};
+use crate::ortho::{dim_to_usize, payload_to_usize, Dim, PayloadVal};
 use crate::spatial;
 use crossterm::{
     cursor::Show,
@@ -1013,8 +1014,8 @@ impl Tui {
 
     fn format_ortho_display(
         &self,
-        dims: &[usize],
-        payload: &[Option<usize>],
+        dims: &[Dim],
+        payload: &[Option<PayloadVal>],
         vocab: &[String],
         max_width: usize,
         max_height: usize,
@@ -1023,8 +1024,8 @@ impl Tui {
             return vec!["Invalid dimensions".to_string()];
         }
 
-        let rows = dims[dims.len() - 2];
-        let cols = dims[dims.len() - 1];
+        let rows = dim_to_usize(dims[dims.len() - 2]);
+        let cols = dim_to_usize(dims[dims.len() - 1]);
         let higher_dims = &dims[..dims.len() - 2];
 
         // Use spatial module to get proper coordinate mapping
@@ -1034,16 +1035,16 @@ impl Tui {
         let max_token_width = payload
             .iter()
             .filter_map(|&opt| opt)
-            .filter_map(|idx| vocab.get(idx))
+            .filter_map(|idx| vocab.get(payload_to_usize(idx)))
             .map(|s| s.len())
             .max()
             .unwrap_or(1)
             .max(4)
             .min(10); // Cap at 10 to avoid overflow
 
-        let format_cell = |token_id: Option<usize>| -> String {
+        let format_cell = |token_id: Option<PayloadVal>| -> String {
             token_id
-                .and_then(|id| vocab.get(id))
+                .and_then(|id| vocab.get(payload_to_usize(id)))
                 .map(|s| {
                     format!(
                         "{:>width$}",
@@ -1080,13 +1081,13 @@ impl Tui {
         }
 
         // Generate all possible coordinate combinations for higher dimensions
-        fn generate_coords(dims: &[usize], current: Vec<usize>, all: &mut Vec<Vec<usize>>) {
+        fn generate_coords(dims: &[Dim], current: Vec<usize>, all: &mut Vec<Vec<usize>>) {
             if current.len() == dims.len() {
                 all.push(current);
                 return;
             }
             let dim_idx = current.len();
-            for i in 0..dims[dim_idx] {
+            for i in 0..dim_to_usize(dims[dim_idx]) {
                 let mut next = current.clone();
                 next.push(i);
                 generate_coords(dims, next, all);

@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::Ortho;
+use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
 
 /// Test that simulates the worker loop logic to see if it can create
 /// an ortho with duplicate tokens on the same diagonal
@@ -11,6 +11,7 @@ fn test_worker_loop_prevents_duplicates() {
 
     let vocab = interner.vocabulary();
     let and_idx = vocab.iter().position(|w| w == "and").unwrap();
+    let and_val = PayloadVal::try_from(and_idx).unwrap();
 
     println!("Vocabulary: {:?}", vocab);
     println!("'and' is at index: {}", and_idx);
@@ -28,7 +29,13 @@ fn test_worker_loop_prevents_duplicates() {
         }
 
         let (forbidden, required) = ortho.get_requirements();
-        let completions = interner.intersect(&required, &forbidden);
+        let forbidden_usize: Vec<usize> =
+            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let required_usize: Vec<Vec<usize>> = required
+            .iter()
+            .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
+            .collect();
+        let completions = interner.intersect(&required_usize, &forbidden_usize);
 
         println!(
             "\nStep {}: ortho dims={:?}, payload={:?}",
@@ -49,7 +56,7 @@ fn test_worker_loop_prevents_duplicates() {
         // Check if "and" is in completions
         if completions.contains(&and_idx) {
             println!("  -> Adding 'and'");
-            let children = ortho.add(and_idx);
+            let children = ortho.add(and_val);
             if children.is_empty() {
                 println!("  -> No children created!");
                 break;
@@ -63,7 +70,7 @@ fn test_worker_loop_prevents_duplicates() {
             let and_positions: Vec<usize> = payload
                 .iter()
                 .enumerate()
-                .filter_map(|(i, opt)| if *opt == Some(and_idx) { Some(i) } else { None })
+                .filter_map(|(i, opt)| if *opt == Some(and_val) { Some(i) } else { None })
                 .collect();
 
             if !and_positions.is_empty() {
@@ -79,7 +86,7 @@ fn test_worker_loop_prevents_duplicates() {
     let final_and_count = ortho
         .payload()
         .iter()
-        .filter(|opt| **opt == Some(and_idx))
+        .filter(|opt| **opt == Some(and_val))
         .count();
     println!(
         "\nFinal ortho has 'and' appearing {} times",
@@ -103,12 +110,16 @@ fn test_3x3_duplicate_and() {
     let south_idx = vocab.iter().position(|w| w == "south").unwrap();
     let and_idx = vocab.iter().position(|w| w == "and").unwrap();
     let shoulders_idx = vocab.iter().position(|w| w == "shoulders").unwrap();
+    let the_val = PayloadVal::try_from(the_idx).unwrap();
+    let south_val = PayloadVal::try_from(south_idx).unwrap();
+    let and_val = PayloadVal::try_from(and_idx).unwrap();
+    let shoulders_val = PayloadVal::try_from(shoulders_idx).unwrap();
 
     // Build ortho step by step to a 3x3
     let mut ortho = Ortho::new();
 
     // Position 0: [0,0] - distance 0
-    ortho = ortho.add(the_idx)[0].clone();
+    ortho = ortho.add(the_val)[0].clone();
     println!(
         "After adding 'The': dims={:?}, payload={:?}",
         ortho.dims(),
@@ -116,7 +127,7 @@ fn test_3x3_duplicate_and() {
     );
 
     // Position 1: [0,1] - distance 1
-    ortho = ortho.add(south_idx)[0].clone();
+    ortho = ortho.add(south_val)[0].clone();
     println!(
         "After adding 'south': dims={:?}, payload={:?}",
         ortho.dims(),
@@ -124,7 +135,7 @@ fn test_3x3_duplicate_and() {
     );
 
     // Position 2: [1,0] - distance 1 (diagonal with position 1)
-    ortho = ortho.add(shoulders_idx)[0].clone();
+    ortho = ortho.add(shoulders_val)[0].clone();
     println!(
         "After adding 'shoulders': dims={:?}, payload={:?}",
         ortho.dims(),
@@ -132,7 +143,7 @@ fn test_3x3_duplicate_and() {
     );
 
     // Position 3: [0,2] or [1,1] depending on expansion - will trigger expansion
-    let children = ortho.add(and_idx);
+    let children = ortho.add(and_val);
     println!(
         "After adding 'and' to position 3: got {} children",
         children.len()
@@ -153,11 +164,17 @@ fn test_3x3_duplicate_and() {
 
         // Verify position 4 [1,1] (distance 2) has position 3 [0,2] on its diagonal
         let (forbidden, required) = ortho.get_requirements();
+        let forbidden_usize: Vec<usize> =
+            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let required_usize: Vec<Vec<usize>> = required
+            .iter()
+            .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
+            .collect();
         println!("\nFor position 4 [1,1]:");
         println!("  Required: {:?}", required);
         println!("  Forbidden (token indices): {:?}", forbidden);
 
-        let completions = interner.intersect(&required, &forbidden);
+        let completions = interner.intersect(&required_usize, &forbidden_usize);
         println!(
             "  Completions: {:?}",
             completions
@@ -167,7 +184,7 @@ fn test_3x3_duplicate_and() {
         );
 
         // If position 3 has 'and', it should be forbidden at position 4 if they're on the same diagonal
-        if ortho.payload().get(3) == Some(&Some(and_idx)) {
+        if ortho.payload().get(3) == Some(&Some(and_val)) {
             assert!(
                 !completions.contains(&and_idx),
                 "'and' should be forbidden at position 4 since it's at position 3 (same diagonal)"

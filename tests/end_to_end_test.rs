@@ -211,14 +211,11 @@ fn test_end_to_end_tiny_input() {
     use fold::interner::Interner;
     
     let optimal_data = fs::read(&optimal_bin_path).unwrap();
-    let optimal_ortho: Ortho = bincode::decode_from_slice(&optimal_data, bincode::config::standard())
-        .expect("Failed to decode optimal ortho")
-        .0;
+    let optimal_ortho: Ortho = Ortho::from_bytes(&optimal_data).expect("Failed to decode optimal ortho");
     
     let interner_data = fs::read(&interner_path).unwrap();
-    let interner: Interner = bincode::decode_from_slice(&interner_data, bincode::config::standard())
-        .expect("Failed to decode interner")
-        .0;
+    let interner: Interner =
+        Interner::from_bytes(&interner_data).expect("Failed to decode interner");
     
     println!("[test] Optimal ortho dimensions: {:?}", optimal_ortho.dims());
     println!("[test] Optimal ortho volume: {}", optimal_ortho.volume());
@@ -234,8 +231,8 @@ fn test_end_to_end_tiny_input() {
     
     // For a 2D ortho, display as a grid
     if optimal_ortho.dims().len() == 2 {
-        let rows = optimal_ortho.dims()[0];
-        let cols = optimal_ortho.dims()[1];
+        let rows = usize::from(optimal_ortho.dims()[0]);
+        let cols = usize::from(optimal_ortho.dims()[1]);
         
         println!("[test] {}x{} ortho:", rows, cols);
         for row in 0..rows {
@@ -247,8 +244,8 @@ fn test_end_to_end_tiny_input() {
                     .and_then(|&idx| optimal_ortho.payload().get(idx))
                     .and_then(|&opt| opt)
                     .and_then(|token_id| {
-                        if token_id < interner.vocab_size() {
-                            Some(interner.string_for_index(token_id))
+                        if token_id < interner.vocab_size().try_into().unwrap() {
+                            Some(interner.string_for_index(token_id.try_into().unwrap()))
                         } else {
                             None
                         }
@@ -268,8 +265,8 @@ fn test_end_to_end_tiny_input() {
     println!("[test] Payload ({} entries):", optimal_ortho.payload().len());
     for (i, &token_id_opt) in optimal_ortho.payload().iter().enumerate() {
         let word = if let Some(token_id) = token_id_opt {
-            if token_id < interner.vocab_size() {
-                interner.string_for_index(token_id)
+            if token_id < interner.vocab_size().try_into().unwrap() {
+                interner.string_for_index(token_id.try_into().unwrap())
             } else {
                 "<out of bounds>"
             }
@@ -283,14 +280,21 @@ fn test_end_to_end_tiny_input() {
     println!("[test] \nDimensional breakdown:");
     for (dim_idx, &dim_size) in optimal_ortho.dims().iter().enumerate() {
         println!("[test]   Dimension {}: {} values", dim_idx, dim_size);
-        let start_idx = optimal_ortho.dims().iter().take(dim_idx).sum::<usize>();
-        let end_idx = start_idx + dim_size;
+        let start_idx = optimal_ortho
+            .dims()
+            .iter()
+            .take(dim_idx)
+            .map(|d| usize::from(*d))
+            .sum::<usize>();
+        let end_idx = start_idx + usize::from(dim_size);
         let tokens: Vec<String> = optimal_ortho.payload()[start_idx..end_idx]
             .iter()
             .map(|&tid_opt| {
                 if let Some(tid) = tid_opt {
-                    if tid < interner.vocab_size() {
-                        interner.string_for_index(tid).to_string()
+                    if tid < interner.vocab_size().try_into().unwrap() {
+                        interner
+                            .string_for_index(tid.try_into().unwrap())
+                            .to_string()
                     } else {
                         format!("<out of bounds: {}>", tid)
                     }
@@ -322,7 +326,7 @@ fn test_end_to_end_tiny_input() {
     
     // The optimal should be 2x2 or 2x3 depending on how the merge happened
     let dims = optimal_ortho.dims();
-    let total_cells = dims.iter().product::<usize>();
+    let total_cells = dims.iter().map(|d| usize::from(*d)).product::<usize>();
     assert!(
         total_cells >= 4 && total_cells <= 6,
         "Expected 4-6 cells in optimal ortho, got {}",

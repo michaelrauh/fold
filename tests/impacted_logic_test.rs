@@ -1,4 +1,7 @@
-use fold::{interner::Interner, ortho::Ortho};
+use fold::{
+    interner::Interner,
+    ortho::{payload_to_usize, Ortho},
+};
 
 /// Test that demonstrates the bug: is_ortho_impacted_fast uses payload instead of requirements
 #[test]
@@ -28,6 +31,10 @@ fn test_impacted_should_check_requirements_not_payload() {
 
     // Get the ortho's requirements (prefixes it's trying to satisfy)
     let requirements = ortho.get_requirement_phrases();
+    let requirements_usize: Vec<Vec<usize>> = requirements
+        .iter()
+        .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
+        .collect();
 
     // The current buggy implementation would check if the entire payload [0,1,2] 
     // matches an impacted prefix. But it should check if ANY requirement prefix matches.
@@ -39,14 +46,15 @@ fn test_impacted_should_check_requirements_not_payload() {
     let b_idx = vocab_merged.iter().position(|w| w == &vocab_a[1]).unwrap();
 
     // Check if requirements contain the impacted prefix
-    let has_impacted_requirement = requirements.iter().any(|req| {
-        impacted_a.contains(&vec![a_idx, b_idx]) && req == &vec![a_idx, b_idx]
+    let impacted_key = vec![a_idx, b_idx];
+    let has_impacted_requirement = requirements_usize.iter().any(|req| {
+        impacted_a.contains(&impacted_key) && req == &impacted_key
     });
 
     // This ortho SHOULD be marked as impacted because one of its requirement prefixes
     // [a, b] matches an impacted key
     assert!(
-        has_impacted_requirement || impacted_a.iter().any(|imp| requirements.contains(imp)),
+        has_impacted_requirement || impacted_a.iter().any(|imp| requirements_usize.contains(imp)),
         "Ortho should be impacted because its requirements include the changed prefix [a,b]"
     );
 }
@@ -92,12 +100,18 @@ fn test_impacted_keys_must_be_in_merged_space_for_smaller_archive() {
 
     // Get requirements from the REMAPPED ortho
     let remapped_requirements = remapped_ortho.get_requirement_phrases();
+    let remapped_requirements_usize: Vec<Vec<usize>> = remapped_requirements
+        .iter()
+        .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
+        .collect();
 
     // The impacted_a keys are already in MERGED space (returned by merged.impacted_keys)
     // So we can directly compare remapped requirements against impacted_a
     
     // This should work correctly - both are in merged space
-    let is_impacted = remapped_requirements.iter().any(|req| impacted_a.contains(req));
+    let is_impacted = remapped_requirements_usize
+        .iter()
+        .any(|req| impacted_a.contains(req));
 
     // The bug would be if we compared remapped_requirements against keys in A's original space
     // That would be comparing apples (merged indices) to oranges (A's indices)
@@ -204,12 +218,14 @@ fn test_complete_impacted_ortho_scenario() {
     let ortho_a1_impacted = final_ortho_a1
         .get_requirement_phrases()
         .iter()
-        .any(|req| impacted_a.contains(req));
+        .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect::<Vec<_>>())
+        .any(|req| impacted_a.contains(&req));
 
     let ortho_a2_impacted = final_ortho_a2
         .get_requirement_phrases()
         .iter()
-        .any(|req| impacted_a.contains(req));
+        .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect::<Vec<_>>())
+        .any(|req| impacted_a.contains(&req));
 
     println!("Ortho A1 requirements: {:?}", final_ortho_a1.get_requirement_phrases());
     println!("Ortho A1 impacted: {}", ortho_a1_impacted);

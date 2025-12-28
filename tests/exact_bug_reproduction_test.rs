@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::Ortho;
+use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
 
 /// This test reproduces the EXACT bug from the user's report:
 /// "and" appears at [0,2] (position 3) and [1,1] (position 4), both in shell 2
@@ -16,12 +16,16 @@ fn test_and_duplicate_in_shell_2() {
     let south_idx = vocab.iter().position(|w| w == "south").unwrap();
     let and_idx = vocab.iter().position(|w| w == "and").unwrap();
     let shoulders_idx = vocab.iter().position(|w| w == "shoulders").unwrap();
+    let the_val = PayloadVal::try_from(the_idx).unwrap();
+    let south_val = PayloadVal::try_from(south_idx).unwrap();
+    let and_val = PayloadVal::try_from(and_idx).unwrap();
+    let shoulders_val = PayloadVal::try_from(shoulders_idx).unwrap();
 
     // First build a [2,2] with 'the' and 'south'
     let mut ortho = Ortho::new();
-    ortho = ortho.add(the_idx)[0].clone();
-    ortho = ortho.add(south_idx)[0].clone();
-    ortho = ortho.add(shoulders_idx)[0].clone();
+    ortho = ortho.add(the_val)[0].clone();
+    ortho = ortho.add(south_val)[0].clone();
+    ortho = ortho.add(shoulders_val)[0].clone();
 
     println!(
         "After 3 additions: dims={:?}, payload={:?}",
@@ -30,7 +34,7 @@ fn test_and_duplicate_in_shell_2() {
     );
 
     // Add 'and' at position 3 - this will trigger expansion
-    let children = ortho.add(and_idx);
+    let children = ortho.add(and_val);
     println!("\nAfter adding 'and', got {} children:", children.len());
     for (i, child) in children.iter().enumerate() {
         println!(
@@ -61,14 +65,21 @@ fn test_and_duplicate_in_shell_2() {
 
         let _pos = ortho.get_current_position();
         let (forbidden, required) = ortho.get_requirements();
-        let completions = interner.intersect(&required, &forbidden);
+        let forbidden_usize: Vec<usize> =
+            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let required_usize: Vec<Vec<usize>> = required
+            .iter()
+            .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
+            .collect();
+        let completions = interner.intersect(&required_usize, &forbidden_usize);
 
         if completions.is_empty() {
             break;
         }
 
         // Add first completion
-        let children = ortho.add(completions[0]);
+        let completion_val = PayloadVal::try_from(completions[0]).unwrap();
+        let children = ortho.add(completion_val);
         if children.is_empty() {
             break;
         }
@@ -99,7 +110,7 @@ fn test_and_duplicate_in_shell_2() {
         .payload()
         .iter()
         .enumerate()
-        .filter_map(|(i, opt)| if *opt == Some(and_idx) { Some(i) } else { None })
+        .filter_map(|(i, opt)| if *opt == Some(and_val) { Some(i) } else { None })
         .collect();
 
     println!("\n'and' is at positions: {:?}", and_positions);

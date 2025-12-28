@@ -17,7 +17,11 @@ fn test_optimal_ortho_saved_and_loaded() {
     ortho = ortho.add(1).into_iter().next().unwrap();
 
     // Calculate expected score
-    let volume = ortho.dims().iter().map(|&d| d - 1).product::<usize>();
+    let volume = ortho
+        .dims()
+        .iter()
+        .map(|&d| usize::from(d).saturating_sub(1))
+        .product::<usize>();
     let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
 
     // Manually create archive structure (simulating what main.rs does)
@@ -25,12 +29,12 @@ fn test_optimal_ortho_saved_and_loaded() {
 
     // Save interner
     let interner_path = archive_path.join("interner.bin");
-    let interner_bytes = bincode::encode_to_vec(&interner, bincode::config::standard()).unwrap();
+    let interner_bytes = interner.to_bytes().unwrap();
     fs::write(interner_path, interner_bytes).unwrap();
 
     // Save optimal ortho in binary format
     let optimal_bin_path = archive_path.join("optimal.bin");
-    let optimal_bytes = bincode::encode_to_vec(&ortho, bincode::config::standard()).unwrap();
+    let optimal_bytes = ortho.to_bytes().unwrap();
     fs::write(optimal_bin_path, optimal_bytes).unwrap();
 
     // Write other required files
@@ -53,7 +57,7 @@ fn test_optimal_ortho_saved_and_loaded() {
     let loaded_volume = loaded_ortho
         .dims()
         .iter()
-        .map(|&d| d - 1)
+        .map(|&d| usize::from(d).saturating_sub(1))
         .product::<usize>();
     let loaded_fullness = loaded_ortho
         .payload()

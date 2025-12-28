@@ -4,9 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::PathBuf;
-use crate::ortho::Ortho;
+use crate::ortho::{Ortho, OrthoId};
 use sysinfo::System;
-use bincode::error::DecodeError;
 
 /// Role of the worker in the system
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,42 +353,18 @@ impl Iterator for OrthoRunIterator {
                 }
             }
 
-            let encoded_slice = &self.buffer[header_end..record_end];
-            match bincode::decode_from_slice(encoded_slice, bincode::config::standard()) {
-                Ok((ortho, bytes_read)) => {
-                    if bytes_read != encoded_len {
-                        return Some(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Ortho length prefix mismatch",
-                        )));
-                    }
-                    self.offset = record_end;
-                    return Some(Ok(StreamedOrtho {
-                        ortho,
-                        bytes_read: encoded_len,
-                        decoded_size_est,
-                    }));
-                }
-                Err(DecodeError::UnexpectedEnd { .. }) => {
-                    // Should not happen because we ensured buffering
-                    match self.read_more() {
-                        Ok(true) => continue,
-                        Ok(false) => {
-                            return Some(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "Unexpected end of ortho stream",
-                            )))
-                        }
-                        Err(e) => return Some(Err(e)),
-                    }
-                }
-                Err(e) => {
-                    return Some(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        e.to_string(),
-                    )))
-                }
-            }
+            let mut encoded_slice = rkyv::AlignedVec::with_capacity(encoded_len);
+            encoded_slice.extend_from_slice(&self.buffer[header_end..record_end]);
+            // No validation: assume bytes are trusted rkyv output.
+            let archived = unsafe { rkyv::archived_root::<Ortho>(&encoded_slice) };
+            let id = Ortho::archived_id(archived);
+            self.offset = record_end;
+            return Some(Ok(StreamedOrtho {
+                bytes: encoded_slice,
+                bytes_read: encoded_len,
+                decoded_size_est,
+                id,
+            }));
         }
     }
 }
@@ -450,9 +425,21 @@ impl Iterator for OrthoStreamReader {
 /// Streamed ortho with its encoded byte length
 #[derive(Clone)]
 pub struct StreamedOrtho {
-    pub ortho: Ortho,
+    pub bytes: rkyv::AlignedVec,
     pub bytes_read: usize,
     pub decoded_size_est: usize,
+    pub id: OrthoId,
+}
+
+impl StreamedOrtho {
+    fn archived(&self) -> &rkyv::Archived<Ortho> {
+        // Safe because bytes come from rkyv::to_bytes and remain owned here.
+        unsafe { rkyv::archived_root::<Ortho>(&self.bytes) }
+    }
+}
+
+fn archived_eq(a: &StreamedOrtho, b: &StreamedOrtho) -> bool {
+    a.archived() == b.archived()
 }
 
 const ORTHO_RECORD_HEADER_SIZE: usize = mem::size_of::<u64>() * 2;
@@ -461,15 +448,17 @@ fn estimate_decoded_size(ortho: &Ortho) -> usize {
     // Rough estimate: struct size + vec metadata + element storage based on capacity.
     let dims_cap = ortho.dims().capacity();
     let payload_cap = ortho.payload().capacity();
-    let vec_overhead = mem::size_of::<Vec<usize>>() + mem::size_of::<Vec<Option<usize>>>();
+    let vec_overhead = mem::size_of::<Vec<crate::ortho::Dim>>()
+        + mem::size_of::<Vec<Option<crate::ortho::PayloadVal>>>();
     mem::size_of::<Ortho>()
         + vec_overhead
-        + dims_cap.saturating_mul(mem::size_of::<usize>())
-        + payload_cap.saturating_mul(mem::size_of::<Option<usize>>())
+        + dims_cap.saturating_mul(mem::size_of::<crate::ortho::Dim>())
+        + payload_cap.saturating_mul(mem::size_of::<Option<crate::ortho::PayloadVal>>())
 }
 
 fn write_ortho_record<W: Write>(writer: &mut W, ortho: &Ortho) -> io::Result<usize> {
-    let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
+    let encoded = ortho
+        .to_bytes()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let decoded_est = estimate_decoded_size(ortho) as u64;
     let encoded_len = encoded.len() as u64;
@@ -479,6 +468,21 @@ fn write_ortho_record<W: Write>(writer: &mut W, ortho: &Ortho) -> io::Result<usi
     writer.write_all(&encoded)?;
 
     Ok(ORTHO_RECORD_HEADER_SIZE + encoded.len())
+}
+
+fn write_ortho_record_bytes<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    decoded_size_est: usize,
+) -> io::Result<usize> {
+    let decoded_est = decoded_size_est as u64;
+    let encoded_len = bytes.len() as u64;
+
+    writer.write_all(&decoded_est.to_le_bytes())?;
+    writer.write_all(&encoded_len.to_le_bytes())?;
+    writer.write_all(bytes)?;
+
+    Ok(ORTHO_RECORD_HEADER_SIZE + bytes.len())
 }
 
 /// Sorted and deduplicated run of orthos
@@ -723,7 +727,7 @@ impl GenerationStore {
             self.bucket_writers[bucket] = Some(BufWriter::with_capacity(self.bufwriter_capacity, file));
         }
 
-        // Write ortho as bincode
+        // Write ortho using rkyv
         let writer = self.bucket_writers[bucket].as_mut().unwrap();
         let encoded_len = write_ortho_record(writer, ortho)?;
         self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
@@ -804,7 +808,8 @@ impl GenerationStore {
         let mut file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&segment_path)?);
         file.write_all(&count.to_le_bytes())?;
         for ortho in &self.work_segment_batch {
-            let encoded = bincode::encode_to_vec(ortho, bincode::config::standard())
+            let encoded = ortho
+                .to_bytes()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             file.write_all(&(encoded.len() as u64).to_le_bytes())?;
             file.write_all(&encoded)?;
@@ -869,9 +874,8 @@ impl GenerationStore {
 
                 let mut ortho_bytes = vec![0u8; len];
                 file.read_exact(&mut ortho_bytes)?;
-                let ortho: Ortho = bincode::decode_from_slice(&ortho_bytes, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-                    .0;
+                let ortho: Ortho = Ortho::from_bytes(&ortho_bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 
                 self.work_queue_cache.push_back(ortho);
                 if !self.best_volume_dirty.get() {
@@ -981,12 +985,14 @@ impl GenerationStore {
     /// Returns the number of orthos enqueued.
     fn enqueue_work_run(&mut self, run: Run, read_buf_bytes: usize) -> io::Result<usize> {
         let mut reader = run.iter(read_buf_bytes)?;
-        let mut batch: Vec<Ortho> = Vec::with_capacity(self.work_segment_batch_max.max(1));
+    let mut batch: Vec<Ortho> = Vec::with_capacity(self.work_segment_batch_max.max(1));
         let mut count = 0usize;
 
         while let Some(item) = reader.next() {
             let streamed = item?;
-            batch.push(streamed.ortho);
+            let ortho = Ortho::from_bytes(streamed.bytes.as_ref())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            batch.push(ortho);
             count += 1;
 
             if batch.len() >= self.work_segment_batch_max {
@@ -1309,7 +1315,7 @@ pub fn compact_landing(
     static RUN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let mut runs = Vec::new();
-    let mut arena: Vec<Ortho> = Vec::new();
+    let mut arena: Vec<StreamedOrtho> = Vec::new();
     let mut current_size: usize = 0;
 
     // Read all drain files with bounded buffering
@@ -1327,33 +1333,33 @@ pub fn compact_landing(
                 && current_size.saturating_add(ortho_size) > cfg.run_budget_bytes
             {
                 // Flush before adding this item to keep arena under budget.
-                arena.sort_unstable_by_key(|o| o.id());
+                arena.sort_unstable_by_key(|o| o.id);
                 let run_id = RUN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
                 let run_path = base_path
                     .join("runs")
                     .join(format!("b={:02}-run-{}.dat", bucket, run_id));
 
-                write_ortho_run(&arena, &run_path)?;
+                write_streamed_run(&arena, &run_path)?;
                 runs.push(Run::new(run_path));
 
                 arena.clear();
                 current_size = 0;
             }
 
-            arena.push(streamed.ortho);
+            arena.push(streamed);
             current_size = current_size.saturating_add(ortho_size);
         }
     }
 
     // Write any remaining items in arena
     if !arena.is_empty() {
-        arena.sort_unstable_by_key(|o| o.id());
+        arena.sort_unstable_by_key(|o| o.id);
         let run_id = RUN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
         let run_path = base_path
             .join("runs")
             .join(format!("b={:02}-run-{}.dat", bucket, run_id));
         
-        write_ortho_run(&arena, &run_path)?;
+        write_streamed_run(&arena, &run_path)?;
         runs.push(Run::new(run_path));
     }
 
@@ -1367,6 +1373,20 @@ fn write_ortho_run(arena: &[Ortho], path: &PathBuf) -> io::Result<()> {
         write_ortho_record(&mut file, ortho)?;
     }
     file.flush()?;
+    Ok(())
+}
+
+fn write_streamed_run(arena: &[StreamedOrtho], path: &PathBuf) -> io::Result<()> {
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut writer = BufWriter::with_capacity(64 * 1024, File::create(path)?);
+    for streamed in arena {
+        write_ortho_record_bytes(&mut writer, &streamed.bytes, streamed.decoded_size_est)?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -1407,7 +1427,7 @@ pub fn merge_unique(
 
     #[derive(Eq, PartialEq)]
     struct HeapItem {
-        id: usize,
+        id: OrthoId,
         run_idx: usize,
     }
     
@@ -1438,36 +1458,35 @@ pub fn merge_unique(
     for (idx, iter) in iterators.iter_mut().enumerate() {
         if let Some(result) = iter.next() {
             let streamed = result?;
-            let id = streamed.ortho.id();
+            let id = streamed.id;
             current_orthos[idx] = Some(streamed);
             heap.push(HeapItem { id, run_idx: idx });
         }
     }
 
-    let mut last_written: Option<Ortho> = None;
+    let mut last_written: Option<StreamedOrtho> = None;
 
     // K-way merge with deduplication by id + equality
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
-        let ortho = streamed.ortho;
         
         // Write only if different from last written (dedupe by id + shape/payload)
         let is_duplicate = last_written
             .as_ref()
-            .map(|last| last.id() == item.id && *last == ortho)
+            .map(|last| last.id == item.id && archived_eq(last, &streamed))
             .unwrap_or(false);
         if !is_duplicate {
-            write_ortho_record(&mut writer, &ortho)?;
-            last_written = Some(ortho);
+            write_ortho_record_bytes(&mut writer, &streamed.bytes, streamed.decoded_size_est)?;
+            last_written = Some(streamed);
         } else {
             // Keep last_written so adjacent duplicates continue to collapse correctly
-            last_written = Some(ortho);
+            last_written = Some(streamed);
         }
 
         // Fetch next from same run
         if let Some(result) = iterators[item.run_idx].next() {
             let streamed = result?;
-            let id = streamed.ortho.id();
+            let id = streamed.id;
             current_orthos[item.run_idx] = Some(streamed);
             heap.push(HeapItem { id, run_idx: item.run_idx });
         }
@@ -1494,7 +1513,7 @@ fn merge_ortho_chunk(
 
     #[derive(Eq, PartialEq)]
     struct HeapItem {
-        id: usize,
+        id: OrthoId,
         run_idx: usize,
     }
     
@@ -1522,7 +1541,7 @@ fn merge_ortho_chunk(
     for (idx, iter) in iterators.iter_mut().enumerate() {
         if let Some(result) = iter.next() {
             let streamed = result?;
-            let id = streamed.ortho.id();
+            let id = streamed.id;
             current_orthos[idx] = Some(streamed);
             heap.push(HeapItem { id, run_idx: idx });
         }
@@ -1531,11 +1550,11 @@ fn merge_ortho_chunk(
     // No deduplication in intermediate passes - just merge
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
-        write_ortho_record(&mut writer, &streamed.ortho)?;
+        write_ortho_record_bytes(&mut writer, &streamed.bytes, streamed.decoded_size_est)?;
 
         if let Some(result) = iterators[item.run_idx].next() {
             let streamed = result?;
-            let id = streamed.ortho.id();
+            let id = streamed.id;
             current_orthos[item.run_idx] = Some(streamed);
             heap.push(HeapItem { id, run_idx: item.run_idx });
         }
@@ -1588,33 +1607,45 @@ pub fn anti_join_orthos(
             (None, _) => break,
             (Some(g), None) => {
                 // No more history - all remaining gen values are new
-                write_ortho_record(&mut seen_writer, &g.ortho)?;
-                write_ortho_record(&mut new_work_writer, &g.ortho)?;
+                write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est)?;
+                write_ortho_record_bytes(&mut new_work_writer, &g.bytes, g.decoded_size_est)?;
                 accepted_count += 1;
                 gen_val = gen_iter.next().transpose()?;
             }
             (Some(g), Some(h)) => {
-                let g_id = g.ortho.id();
-                let h_id = h.ortho.id();
+                let g_id = g.id;
+                let h_id = h.id;
                 
                 match g_id.cmp(&h_id) {
                     std::cmp::Ordering::Less => {
                         // g < h: g is new (not in history)
-                        write_ortho_record(&mut seen_writer, &g.ortho)?;
-                        write_ortho_record(&mut new_work_writer, &g.ortho)?;
+                        write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est)?;
+                        write_ortho_record_bytes(&mut new_work_writer, &g.bytes, g.decoded_size_est)?;
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
                     }
                     std::cmp::Ordering::Equal => {
                         // Same ID: check structural equality
-                        if g.ortho == h.ortho {
+                        if archived_eq(g, h) {
                             // Exact duplicate - reject from work, but add to seen
-                            write_ortho_record(&mut seen_writer, &g.ortho)?;
+                            write_ortho_record_bytes(
+                                &mut seen_writer,
+                                &g.bytes,
+                                g.decoded_size_est,
+                            )?;
                         } else {
                             // ID collision with different structure - treat as new
                             // Note: This is extremely rare and indicates hash collision
-                            write_ortho_record(&mut seen_writer, &g.ortho)?;
-                            write_ortho_record(&mut new_work_writer, &g.ortho)?;
+                            write_ortho_record_bytes(
+                                &mut seen_writer,
+                                &g.bytes,
+                                g.decoded_size_est,
+                            )?;
+                            write_ortho_record_bytes(
+                                &mut new_work_writer,
+                                &g.bytes,
+                                g.decoded_size_est,
+                            )?;
                             accepted_count += 1;
                         }
                         gen_val = gen_iter.next().transpose()?;
@@ -1659,7 +1690,8 @@ mod tests {
         let mut out = Vec::new();
         let mut iter = run.iter(read_buf_bytes).unwrap();
         while let Some(item) = iter.next() {
-            out.push(item.unwrap().ortho);
+            let s = item.unwrap();
+            out.push(Ortho::from_bytes(&s.bytes).unwrap());
         }
         out
     }
@@ -1705,7 +1737,8 @@ mod tests {
         // Read back and verify sorted by id
         let mut result = vec![];
         for item in runs[0].iter(64 * 1024).unwrap() {
-            result.push(item.unwrap().ortho);
+            let s = item.unwrap();
+            result.push(Ortho::from_bytes(&s.bytes).unwrap());
         }
 
         assert_eq!(result.len(), orthos.len());
@@ -1759,7 +1792,8 @@ mod tests {
         let mut all_orthos = vec![];
         for run in &runs {
             for item in run.iter(64 * 1024).unwrap() {
-                all_orthos.push(item.unwrap().ortho);
+                let s = item.unwrap();
+                all_orthos.push(Ortho::from_bytes(s.bytes.as_ref()).unwrap());
             }
         }
 
@@ -1769,7 +1803,7 @@ mod tests {
         for run in &runs {
             let mut prev_id = None;
             for item in run.iter(64 * 1024).unwrap() {
-                let ortho = item.unwrap().ortho;
+        let ortho = Ortho::from_bytes(item.unwrap().bytes.as_ref()).unwrap();
                 let id = ortho.id();
                 if let Some(p) = prev_id {
                     assert!(id >= p, "Run should be sorted by id");
@@ -1792,7 +1826,8 @@ mod tests {
         let base = Ortho::new();
         for i in 0..count {
             // Create simple variations
-            let children = base.add(i as usize);
+            let children = base
+                .add(crate::ortho::PayloadVal::try_from(i).expect("test payload overflowed u32"));
             if !children.is_empty() {
                 orthos.push(children[0].clone());
             }
@@ -1834,7 +1869,7 @@ mod tests {
         for run in &runs {
             let mut prev_id = None;
             for item in run.iter(64 * 1024).unwrap() {
-                let ortho = item.unwrap().ortho;
+                let ortho = Ortho::from_bytes(item.unwrap().bytes.as_ref()).unwrap();
                 let id = ortho.id();
                 if let Some(p) = prev_id {
                     assert!(id >= p, "Run should be sorted by id");

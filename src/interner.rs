@@ -1,5 +1,7 @@
-use crate::splitter::Splitter;
+use bytecheck::CheckBytes;
+use crate::{splitter::Splitter, FoldError};
 use fixedbitset::FixedBitSet;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -9,32 +11,34 @@ pub struct Interner {
     prefix_to_completions: HashMap<Vec<usize>, FixedBitSet>,
 }
 
-// Custom Encode/Decode for Interner
-impl bincode::Encode for Interner {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> Result<(), bincode::error::EncodeError> {
-        self.version.encode(encoder)?;
-        self.vocabulary.encode(encoder)?;
-        // Serialize prefix_to_completions as Vec<(Vec<usize>, Vec<u32>)>
+#[derive(Archive, Serialize, Deserialize)]
+#[archive_attr(derive(Debug, CheckBytes))]
+struct InternerSerializable {
+    version: usize,
+    vocabulary: Vec<String>,
+    prefix_to_completions: Vec<(Vec<usize>, Vec<u32>)>,
+}
+
+impl Interner {
+    fn to_serializable(&self) -> InternerSerializable {
         let prefix_vec: Vec<(Vec<usize>, Vec<u32>)> = self
             .prefix_to_completions
             .iter()
             .map(|(k, v)| (k.clone(), v.ones().map(|x| x as u32).collect()))
             .collect();
-        prefix_vec.encode(encoder)?;
-        Ok(())
+        InternerSerializable {
+            version: self.version,
+            vocabulary: self.vocabulary.clone(),
+            prefix_to_completions: prefix_vec,
+        }
     }
-}
 
-impl<Context> bincode::Decode<Context> for Interner {
-    fn decode<D: bincode::de::Decoder>(
-        decoder: &mut D,
-    ) -> Result<Self, bincode::error::DecodeError> {
-        let version = usize::decode(decoder)?;
-        let vocabulary = Vec::<String>::decode(decoder)?;
-        let prefix_vec = Vec::<(Vec<usize>, Vec<u32>)>::decode(decoder)?;
+    fn from_serializable(serialized: InternerSerializable) -> Self {
+        let InternerSerializable {
+            version,
+            vocabulary,
+            prefix_to_completions: prefix_vec,
+        } = serialized;
         let mut prefix_to_completions = HashMap::new();
         let vocab_len = vocabulary.len();
         for (prefix, completions) in prefix_vec {
@@ -45,15 +49,25 @@ impl<Context> bincode::Decode<Context> for Interner {
             }
             prefix_to_completions.insert(prefix, fbs);
         }
-        Ok(Interner {
+        Interner {
             version,
             vocabulary,
             prefix_to_completions,
-        })
+        }
     }
-}
 
-impl Interner {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FoldError> {
+        rkyv::to_bytes::<_, 256>(&self.to_serializable())
+            .map(|buf| buf.to_vec())
+            .map_err(|e| FoldError::Serialization(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FoldError> {
+        let serialized: InternerSerializable =
+            rkyv::from_bytes(bytes).map_err(|e| FoldError::Deserialization(e.to_string()))?;
+        Ok(Self::from_serializable(serialized))
+    }
+
     pub fn from_text(text: &str) -> Self {
         let splitter = Splitter::new();
         let vocab = splitter.vocabulary(text);
