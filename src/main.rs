@@ -389,6 +389,7 @@ fn process_txt_file(
     // Tracking for throughput calculation
     let mut last_report_time = std::time::Instant::now();
     let mut last_report_count = 0;
+    let mut last_housekeeping = std::time::Instant::now();
     
     // Generational processing loop
     loop {
@@ -452,14 +453,15 @@ fn process_txt_file(
         
         let gen_start = std::time::Instant::now();
         let accepted_before = store.seen_len_accepted();
+        last_housekeeping = std::time::Instant::now();
 
         // Process all work in this generation
         while let Some(ortho) = store.pop_work()? {
             gen_processed += 1;
             total_processed += 1;
 
-            // Periodic updates - more frequent for better visibility
-            if total_processed % 100 == 0 {
+            // Periodic updates on a time cadence
+            if last_housekeeping.elapsed().as_millis() >= 1000 {
                 // Update progress for current generation
                 metrics.update_operation(|op| {
                     op.progress_current = gen_processed;
@@ -484,6 +486,7 @@ fn process_txt_file(
                     last_report_time = now;
                     last_report_count = total_processed;
                 }
+                last_housekeeping = now;
                 
                 metrics.record_optimal_volume(best_ortho.volume());
 
@@ -703,14 +706,17 @@ fn process_txt_file(
         });
         metrics.set_operation_status(format!("Gen {} → {} transition", generation, generation + 1));
         
+        let processing_secs = gen_start.elapsed().as_secs_f64();
+        let transition_start = std::time::Instant::now();
         let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
-        let duration_secs = gen_start.elapsed().as_secs_f64();
+        let transition_secs = transition_start.elapsed().as_secs_f64();
         let accepted_delta = store
             .seen_len_accepted()
             .saturating_sub(accepted_before);
         generation_stats.push(GenerationStat {
             generation,
-            duration_secs,
+            processing_secs,
+            transition_secs,
             accepted: accepted_delta,
             new_work,
         });
@@ -730,10 +736,8 @@ fn process_txt_file(
         ));
         
         generation += 1;
-
-        // Limit generations for safety
-        if generation > 100 {
-            metrics.add_log("Reached generation limit (100); stopping".to_string());
+        if new_work == 0 && store.work_len() == 0 {
+            metrics.add_log("No new work after transition; stopping generations".to_string());
             break;
         }
     }
@@ -1072,6 +1076,7 @@ fn merge_archives(
     // Tracking for throughput calculation
     let mut last_report_time = std::time::Instant::now();
     let mut last_report_count = 0;
+    let mut last_housekeeping = std::time::Instant::now();
 
     loop {
         let work_len = store.work_len();
@@ -1140,8 +1145,8 @@ fn merge_archives(
             gen_processed += 1;
             total_processed += 1;
 
-            // Periodic updates - more frequent for better visibility
-            if total_processed % 100 == 0 {
+            // Periodic updates on a time cadence
+            if last_housekeeping.elapsed().as_millis() >= 1000 {
                 // Update progress for current generation
                 metrics.update_operation(|op| {
                     op.progress_current = gen_processed;
@@ -1166,6 +1171,7 @@ fn merge_archives(
                     last_report_time = now;
                     last_report_count = total_processed;
                 }
+                last_housekeeping = now;
                 
                 metrics.record_optimal_volume(best_ortho.volume());
                 
@@ -1385,14 +1391,17 @@ fn merge_archives(
         });
         metrics.set_operation_status(format!("Merge Gen {} → {} transition", generation, generation + 1));
         
+        let processing_secs = gen_start.elapsed().as_secs_f64();
+        let transition_start = std::time::Instant::now();
         let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
-        let duration_secs = gen_start.elapsed().as_secs_f64();
+        let transition_secs = transition_start.elapsed().as_secs_f64();
         let accepted_delta = store
             .seen_len_accepted()
             .saturating_sub(accepted_before);
         generation_stats.push(GenerationStat {
             generation,
-            duration_secs,
+            processing_secs,
+            transition_secs,
             accepted: accepted_delta,
             new_work,
         });
@@ -1413,8 +1422,8 @@ fn merge_archives(
         
         generation += 1;
 
-        if generation > 100 {
-            metrics.add_log("Reached merge generation limit (100)".to_string());
+        if new_work == 0 && store.work_len() == 0 {
+            metrics.add_log("No new work after transition; stopping merge generations".to_string());
             break;
         }
     }
@@ -1891,6 +1900,10 @@ fn write_fold_history(
     let disk_space_bytes = directory_size(&config.base_dir)?;
     let mut summary = String::new();
     summary.push_str(&format!(
+        "=== RUN START input_words={} ===\n",
+        input_words
+    ));
+    summary.push_str(&format!(
         "ortho_count: {}\ndisk_space_bytes: {}\nruntime_secs: {:.3}\ninput_words: {}\n",
         ortho_count,
         disk_space_bytes,
@@ -1902,8 +1915,8 @@ fn write_fold_history(
         summary.push_str("generation_stats:\n");
         for stat in snapshot.generation_stats.iter() {
             summary.push_str(&format!(
-                "  gen {}: duration_secs={:.3} accepted={} new_work={}\n",
-                stat.generation, stat.duration_secs, stat.accepted, stat.new_work
+                "  gen {}: processing_secs={:.3} transition_secs={:.3} accepted={} new_work={}\n",
+                stat.generation, stat.processing_secs, stat.transition_secs, stat.accepted, stat.new_work
             ));
         }
     }
@@ -1924,12 +1937,17 @@ fn write_fold_history(
         summary.push_str(&format!("  fullness={}\n", opt.fullness));
         summary.push_str(&format!("  capacity={}\n", opt.capacity));
         if !opt.payload.is_empty() {
+            let vocab = opt.vocab;
             let payload_str = opt
                 .payload
                 .iter()
                 .map(|p| {
                     if let Some(v) = p {
-                        payload_to_usize(*v).to_string()
+                        let idx = payload_to_usize(*v);
+                        vocab
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| idx.to_string())
                     } else {
                         "None".to_string()
                     }
@@ -1939,6 +1957,7 @@ fn write_fold_history(
             summary.push_str(&format!("  payload=[{}]\n", payload_str));
         }
     }
+    summary.push_str("=== RUN END ===\n");
 
     fs::write(&summary_path, summary).map_err(FoldError::Io)?;
     metrics.add_log(format!(

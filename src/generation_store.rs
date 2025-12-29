@@ -834,6 +834,19 @@ impl GenerationStore {
             self.handle_removed_volume(ortho.volume());
             return Ok(Some(ortho));
         }
+
+        // If everything is empty except the unflushed batch, load it directly
+        if self.work_queue_cache.is_empty()
+            && self.work_segments.is_empty()
+            && !self.work_segment_batch.is_empty()
+        {
+            let batch_len = self.work_segment_batch.len() as u64;
+            self.total_work_len = self.total_work_len.saturating_add(batch_len);
+            let batch = std::mem::take(&mut self.work_segment_batch);
+            for ortho in batch {
+                self.work_queue_cache.push_back(ortho);
+            }
+        }
         
         // Cache is empty, refill from disk segments
         self.refill_work_cache()?;
@@ -2137,6 +2150,24 @@ mod tests {
         assert_eq!(new_work, 0);
         assert_eq!(store.work_len(), 0);
         assert_eq!(store.seen_len_accepted(), 0);
+    }
+
+    #[test]
+    fn pop_work_reads_unflushed_batch() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+
+        let cfg = Config::test_config(1024 * 1024, 8);
+        store.configure(&cfg);
+
+        let ortho = Ortho::new();
+        store.push_segments(vec![ortho.clone()]).unwrap();
+        assert_eq!(store.work_len(), 1);
+
+        let popped = store.pop_work().unwrap();
+        assert!(popped.is_some());
+        assert_eq!(store.work_len(), 0);
     }
 
     #[test]

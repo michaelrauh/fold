@@ -43,11 +43,12 @@ def parse_stats(path: pathlib.Path) -> Tuple[List[int], List[float], Dict[int, L
         total_runtimes.append(runtime)
 
         for line in block.splitlines():
-            m_gen = re.match(r"\s*gen\s+(\d+):\s+duration_secs=([0-9.]+)", line)
+            m_gen = re.match(r"\s*gen\s+(\d+):\s+processing_secs=([0-9.]+)\s+transition_secs=([0-9.]+)", line)
             if m_gen:
                 gen_idx = int(m_gen.group(1))
-                dur = float(m_gen.group(2))
-                gen_durations[gen_idx].append((words, dur))
+                proc = float(m_gen.group(2))
+                trans = float(m_gen.group(3))
+                gen_durations[gen_idx].append((words, proc + trans))
 
     return input_sizes, total_runtimes, gen_durations
 
@@ -64,9 +65,9 @@ def parse_runs(path: pathlib.Path) -> List[Tuple[int, List[float]]]:
         words = int(m_words.group(1))
         gens: List[Tuple[int, float]] = []
         for line in block.splitlines():
-            m = re.match(r"\s*gen\s+(\d+):\s+duration_secs=([0-9.]+)", line)
+            m = re.match(r"\s*gen\s+(\d+):\s+processing_secs=([0-9.]+)\s+transition_secs=([0-9.]+)", line)
             if m:
-                gens.append((int(m.group(1)), float(m.group(2))))
+                gens.append((int(m.group(1)), float(m.group(2)) + float(m.group(3))))
         if gens:
             gens.sort(key=lambda x: x[0])
             max_idx = max(g[0] for g in gens)

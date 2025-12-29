@@ -33,11 +33,12 @@ def parse_runs(path: pathlib.Path) -> Dict[int, List[Tuple[int, float]]]:
         if words < MIN_WORDS:
             continue
         for line in block.splitlines():
-            m = re.match(r"\s*gen\s+(\d+):\s+duration_secs=([0-9.]+)", line)
+            m = re.match(r"\s*gen\s+(\d+):\s+processing_secs=([0-9.]+)\s+transition_secs=([0-9.]+)", line)
             if m:
                 gen = int(m.group(1))
-                dur = float(m.group(2))
-                by_gen.setdefault(gen, []).append((words, dur))
+                proc = float(m.group(2))
+                trans = float(m.group(3))
+                by_gen.setdefault(gen, []).append((words, proc + trans))
     # sort points per gen
     for gen in by_gen:
         by_gen[gen].sort(key=lambda x: x[0])

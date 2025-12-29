@@ -184,7 +184,8 @@ pub struct OptimalOrtho {
 #[derive(Clone, Debug)]
 pub struct GenerationStat {
     pub generation: u64,
-    pub duration_secs: f64,
+    pub processing_secs: f64,
+    pub transition_secs: f64,
     pub accepted: u64,
     pub new_work: u64,
 }
