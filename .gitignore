@@ -3,6 +3,11 @@
 .vscode/
 /interner_data
 /fold_state
+fold_history 
+charts 
+.mplcache 
+.cache 
+.DS_Store 
 
 # Added by cargo
 #

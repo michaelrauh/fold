@@ -3,7 +3,7 @@ use fold::{
     file_handler::{self, MemClaimGuard, StateConfig},
     generation_store::{GenerationStore, Config, Role},
     interner::Interner,
-    metrics::Metrics,
+    metrics::{GenerationStat, Metrics},
     ortho::{payload_to_usize, Ortho, PayloadVal},
     tui::Tui,
 };
@@ -384,6 +384,7 @@ fn process_txt_file(
 
     let mut sys = sysinfo::System::new();
     let mut generation = 0u64;
+    let mut generation_stats: Vec<GenerationStat> = Vec::new();
     
     // Tracking for throughput calculation
     let mut last_report_time = std::time::Instant::now();
@@ -449,6 +450,9 @@ fn process_txt_file(
         
         let mut gen_processed = 0;
         
+        let gen_start = std::time::Instant::now();
+        let accepted_before = store.seen_len_accepted();
+
         // Process all work in this generation
         while let Some(ortho) = store.pop_work()? {
             gen_processed += 1;
@@ -700,6 +704,16 @@ fn process_txt_file(
         metrics.set_operation_status(format!("Gen {} → {} transition", generation, generation + 1));
         
         let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
+        let duration_secs = gen_start.elapsed().as_secs_f64();
+        let accepted_delta = store
+            .seen_len_accepted()
+            .saturating_sub(accepted_before);
+        generation_stats.push(GenerationStat {
+            generation,
+            duration_secs,
+            accepted: accepted_delta,
+            new_work,
+        });
         
         // Update metrics after generation transition
         metrics.update_global(|g| {
@@ -779,6 +793,7 @@ fn process_txt_file(
     });
 
     metrics.update_global(|g| g.processed_chunks += 1);
+    metrics.set_generation_stats(generation_stats);
 
     // Cleanup work folder
     ingestion.cleanup()?;
@@ -1033,6 +1048,7 @@ fn merge_archives(
     let mut sys = sysinfo::System::new();
     let mut generation = 0u64;
     let mut total_processed = 0;
+    let mut generation_stats: Vec<GenerationStat> = Vec::new();
 
     metrics.set_operation_status("Processing merge generations".to_string());
 
@@ -1115,6 +1131,9 @@ fn merge_archives(
         ));
 
         let mut gen_processed = 0;
+
+        let gen_start = std::time::Instant::now();
+        let accepted_before = store.seen_len_accepted();
 
         // Process all work in this generation
         while let Some(ortho) = store.pop_work()? {
@@ -1367,6 +1386,16 @@ fn merge_archives(
         metrics.set_operation_status(format!("Merge Gen {} → {} transition", generation, generation + 1));
         
         let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
+        let duration_secs = gen_start.elapsed().as_secs_f64();
+        let accepted_delta = store
+            .seen_len_accepted()
+            .saturating_sub(accepted_before);
+        generation_stats.push(GenerationStat {
+            generation,
+            duration_secs,
+            accepted: accepted_delta,
+            new_work,
+        });
         
         // Update metrics after merge generation transition
         metrics.update_global(|g| {
@@ -1448,6 +1477,7 @@ fn merge_archives(
     });
 
     metrics.update_global(|g| g.processed_chunks += 1);
+    metrics.set_generation_stats(generation_stats);
 
     // Update merge metrics on completion
     metrics.update_merge(|m| {
@@ -1856,15 +1886,59 @@ fn write_fold_history(
         .as_secs();
     let summary_path = history_dir.join(format!("run_{}.txt", timestamp));
 
+    let snapshot = metrics.snapshot();
     let (ortho_count, input_words) = collect_archive_totals(config)?;
     let disk_space_bytes = directory_size(&config.base_dir)?;
-    let summary = format!(
+    let mut summary = String::new();
+    summary.push_str(&format!(
         "ortho_count: {}\ndisk_space_bytes: {}\nruntime_secs: {:.3}\ninput_words: {}\n",
         ortho_count,
         disk_space_bytes,
         runtime.as_secs_f64(),
         input_words
-    );
+    ));
+
+    if !snapshot.generation_stats.is_empty() {
+        summary.push_str("generation_stats:\n");
+        for stat in snapshot.generation_stats.iter() {
+            summary.push_str(&format!(
+                "  gen {}: duration_secs={:.3} accepted={} new_work={}\n",
+                stat.generation, stat.duration_secs, stat.accepted, stat.new_work
+            ));
+        }
+    }
+
+    let opt = snapshot.optimal_ortho;
+    if !opt.dims.is_empty() || !opt.payload.is_empty() {
+        summary.push_str("optimal_ortho:\n");
+        if !opt.dims.is_empty() {
+            let dims_str = opt
+                .dims
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            summary.push_str(&format!("  dims=[{}]\n", dims_str));
+        }
+        summary.push_str(&format!("  volume={}\n", opt.volume));
+        summary.push_str(&format!("  fullness={}\n", opt.fullness));
+        summary.push_str(&format!("  capacity={}\n", opt.capacity));
+        if !opt.payload.is_empty() {
+            let payload_str = opt
+                .payload
+                .iter()
+                .map(|p| {
+                    if let Some(v) = p {
+                        payload_to_usize(*v).to_string()
+                    } else {
+                        "None".to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            summary.push_str(&format!("  payload=[{}]\n", payload_str));
+        }
+    }
 
     fs::write(&summary_path, summary).map_err(FoldError::Io)?;
     metrics.add_log(format!(

@@ -181,6 +181,14 @@ pub struct OptimalOrtho {
     pub last_update_time: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct GenerationStat {
+    pub generation: u64,
+    pub duration_secs: f64,
+    pub accepted: u64,
+    pub new_work: u64,
+}
+
 impl Default for OptimalOrtho {
     fn default() -> Self {
         Self {
@@ -211,6 +219,7 @@ struct MetricsInner {
     merge: MergeStatus,
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
+    generation_stats: Vec<GenerationStat>,
 
     seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
@@ -235,6 +244,7 @@ impl Metrics {
                 merge: MergeStatus::default(),
                 largest_archive: LargestArchive::default(),
                 optimal_ortho: OptimalOrtho::default(),
+                generation_stats: Vec::new(),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 work_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -313,6 +323,11 @@ impl Metrics {
     pub fn update_largest_archive(&self, update: impl FnOnce(&mut LargestArchive)) {
         let mut inner = self.inner.lock().unwrap();
         update(&mut inner.largest_archive);
+    }
+
+    pub fn set_generation_stats(&self, stats: Vec<GenerationStat>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.generation_stats = stats;
     }
 
     pub fn update_optimal_ortho(&self, update: impl FnOnce(&mut OptimalOrtho)) {
@@ -504,6 +519,7 @@ impl Metrics {
             status_duration_stats: inner.status_duration_stats.clone(),
             logs: inner.logs.iter().cloned().collect(),
             bucket_metrics: inner.bucket_metrics.clone(),
+            generation_stats: inner.generation_stats.clone(),
         }
     }
 }
@@ -538,6 +554,7 @@ pub struct MetricsSnapshot {
     pub merge: MergeStatus,
     pub largest_archive: LargestArchive,
     pub optimal_ortho: OptimalOrtho,
+    pub generation_stats: Vec<GenerationStat>,
     pub seen_history_samples: Vec<MetricSample>,
     pub optimal_volume_samples: Vec<MetricSample>,
     pub work_len_samples: Vec<MetricSample>,

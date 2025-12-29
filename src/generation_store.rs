@@ -1363,6 +1363,11 @@ pub fn compact_landing(
         runs.push(Run::new(run_path));
     }
 
+    // Best-effort cleanup of drained landing files now that they are incorporated.
+    for file_path in raw.files() {
+        let _ = fs::remove_file(file_path);
+    }
+
     Ok(runs)
 }
 
@@ -1406,6 +1411,12 @@ pub fn merge_unique(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot merge empty run list"));
     }
 
+    let cleanup_runs = |paths: &[Run]| {
+        for r in paths {
+            let _ = fs::remove_file(r.path());
+        }
+    };
+
     static MERGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     // Multi-pass merge if needed
@@ -1414,6 +1425,7 @@ pub fn merge_unique(
         
         for chunk in runs.chunks(cfg.fan_in) {
             let merged = merge_ortho_chunk(chunk, cfg, base_path)?;
+            cleanup_runs(chunk);
             next_pass_runs.push(merged);
         }
         
@@ -1493,6 +1505,8 @@ pub fn merge_unique(
     }
 
     writer.flush()?;
+    cleanup_runs(&runs);
+
     Ok(UniqueRun::new(unique_path))
 }
 
@@ -1667,6 +1681,12 @@ pub fn anti_join_orthos(
         Run::new(seen_run_path),
         accepted_count,
     ))
+}
+
+impl Drop for UniqueRun {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 impl Drop for GenerationStore {

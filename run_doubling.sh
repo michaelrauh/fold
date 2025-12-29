@@ -16,8 +16,27 @@ if [[ "$TOTAL_LINES" -eq 0 ]]; then
   exit 1
 fi
 
-n=1
-while [[ "$n" -le "$TOTAL_LINES" ]]; do
+# Fixed line counts for ~5k and ~10k words in e.txt (approx)
+START_LINES=507
+END_LINES=1026
+SAMPLES=10  # inclusive count
+
+samples=()
+if [[ "$START_LINES" -le "$END_LINES" && "$END_LINES" -le "$TOTAL_LINES" ]]; then
+  step=$(( (END_LINES - START_LINES) / (SAMPLES - 1) ))
+  for ((i=0; i<SAMPLES; i++)); do
+    n=$((START_LINES + i * step))
+    samples+=("$n")
+  done
+else
+  echo "Start/end lines exceed file; falling back to start/end only" >&2
+  samples=("$START_LINES" "$END_LINES")
+fi
+
+# Sort and dedupe
+IFS=$'\n' read -r -d '' -a samples < <(printf "%s\n" "${samples[@]}" | sort -n -u && printf '\0')
+
+for n in "${samples[@]}"; do
   echo "=== Running with n=$n (of $TOTAL_LINES lines) ==="
   rm -rf ./fold_state
   mkdir -p ./fold_state/input
@@ -29,7 +48,6 @@ while [[ "$n" -le "$TOTAL_LINES" ]]; do
   fi
 
   rm -rf ./fold_state
-  n=$((n * 2))
 done
 
 echo "Completed runs up to $TOTAL_LINES lines."
