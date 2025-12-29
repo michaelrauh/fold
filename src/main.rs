@@ -736,7 +736,7 @@ fn process_txt_file(
         ));
         
         generation += 1;
-        if new_work == 0 && store.work_len() == 0 {
+        if new_work == 0 {
             metrics.add_log("No new work after transition; stopping generations".to_string());
             break;
         }
@@ -1422,7 +1422,7 @@ fn merge_archives(
         
         generation += 1;
 
-        if new_work == 0 && store.work_len() == 0 {
+        if new_work == 0 {
             metrics.add_log("No new work after transition; stopping merge generations".to_string());
             break;
         }

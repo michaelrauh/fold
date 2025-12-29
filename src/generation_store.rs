@@ -863,7 +863,8 @@ impl GenerationStore {
     
     /// Refill work queue cache from disk segments
     fn refill_work_cache(&mut self) -> io::Result<()> {
-        while self.work_queue_cache.len() < self.work_queue_cache_max && !self.work_segments.is_empty() {
+        let target_max = self.work_queue_cache_max.max(1);
+        while self.work_queue_cache.len() < target_max && !self.work_segments.is_empty() {
             // Take next segment
             let segment_path = self.work_segments.remove(0);
             let mut file = File::open(&segment_path)?;
@@ -918,7 +919,7 @@ impl GenerationStore {
 
     /// Configure the store with Config settings
     pub fn configure(&mut self, cfg: &Config) {
-        self.work_queue_cache_max = cfg.work_queue_cache_size;
+        self.work_queue_cache_max = cfg.work_queue_cache_size.max(1);
         self.work_segment_batch_max = cfg.work_segment_size;
         self.bufwriter_capacity = cfg.bufwriter_capacity;
         self.landing_flush_threshold = cfg.landing_flush_threshold;
@@ -2168,6 +2169,23 @@ mod tests {
         let popped = store.pop_work().unwrap();
         assert!(popped.is_some());
         assert_eq!(store.work_len(), 0);
+    }
+
+    #[test]
+    fn pop_work_handles_zero_cache_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+
+        let mut cfg = Config::test_config(1024 * 1024, 8);
+        cfg.work_queue_cache_size = 0;
+        cfg.work_segment_size = usize::MAX; // prevent auto-flush
+        store.configure(&cfg);
+
+        let ortho = Ortho::new();
+        store.push_segments(vec![ortho]).unwrap();
+
+        assert!(store.pop_work().unwrap().is_some());
     }
 
     #[test]
