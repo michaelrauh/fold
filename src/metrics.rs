@@ -31,6 +31,8 @@ pub struct StatusDurationStats {
 pub struct GlobalMetrics {
     pub mode: String,
     pub role: String,
+    pub run_input_words: usize,
+    pub run_disk_bytes: u64,
     pub interner_version: usize,
     pub vocab_size: usize,
     pub total_chunks: usize,
@@ -60,6 +62,8 @@ impl Default for GlobalMetrics {
         Self {
             mode: "Starting".to_string(),
             role: String::new(),
+            run_input_words: 0,
+            run_disk_bytes: 0,
             interner_version: 0,
             vocab_size: 0,
             total_chunks: 0,

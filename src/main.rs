@@ -287,6 +287,7 @@ fn process_txt_file(
     metrics: &Metrics,
     role: Role,
 ) -> Result<(), FoldError> {
+    let run_start = Instant::now();
     // Ingest the text file
     let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)?;
     let remaining_chunks = file_handler::count_all_chunks_with_config(config)?;
@@ -309,6 +310,11 @@ fn process_txt_file(
         "Ingested: {} ({} remaining)",
         ingestion.filename, remaining_chunks
     ));
+    // Record run-level metadata up front so history write doesn't need to rewalk disk
+    metrics.update_global(|g| {
+        g.run_input_words = ingestion.word_count;
+        g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
+    });
 
     // Build interner from the text
     let interner = Interner::from_text(&ingestion.text);
@@ -802,6 +808,12 @@ fn process_txt_file(
     // Cleanup work folder
     ingestion.cleanup()?;
 
+    // Capture final disk usage and write a per-ingest history entry
+    metrics.update_global(|g| {
+        g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
+    });
+    write_fold_history(config, metrics, run_start.elapsed())?;
+
     Ok(())
 }
 
@@ -812,6 +824,7 @@ fn merge_archives(
     metrics: &Metrics,
     role: Role,
 ) -> Result<(), FoldError> {
+    let run_start = Instant::now();
     // Get archive ortho counts for display BEFORE ingest moves them
     let orthos_a = file_handler::load_archive_metadata(archive_a_path).unwrap_or(0);
     let orthos_b = file_handler::load_archive_metadata(archive_b_path).unwrap_or(0);
@@ -884,6 +897,11 @@ fn merge_archives(
         merged_interner.vocabulary().len(),
         if a_is_smaller { "A" } else { "B" }
     ));
+    // Record run-level metadata up front so history write doesn't need to rewalk disk
+    metrics.update_global(|g| {
+        g.run_input_words = ingestion.word_count_a.saturating_add(ingestion.word_count_b);
+        g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
+    });
 
     // Get memory configuration
     let Some(cfg) = Config::compute_config(role) else {
@@ -1497,6 +1515,12 @@ fn merge_archives(
     // Cleanup
     ingestion.cleanup()?;
 
+    // Capture final disk usage and write a per-merge history entry
+    metrics.update_global(|g| {
+        g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
+    });
+    write_fold_history(config, metrics, run_start.elapsed())?;
+
     Ok(())
 }
 
@@ -1889,15 +1913,30 @@ fn write_fold_history(
     let history_dir = PathBuf::from("fold_history");
     fs::create_dir_all(&history_dir).map_err(FoldError::Io)?;
 
+    let snapshot = metrics.snapshot();
+    let role_label = if snapshot.global.role.is_empty() {
+        "unknown".to_string()
+    } else {
+        snapshot.global.role.clone()
+    };
+    let pid = std::process::id();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
         .as_secs();
-    let summary_path = history_dir.join(format!("run_{}.txt", timestamp));
+    let summary_path = history_dir.join(format!("run_{}_role={}_pid={}.txt", timestamp, role_label, pid));
 
-    let snapshot = metrics.snapshot();
-    let (ortho_count, input_words) = collect_archive_totals(config)?;
-    let disk_space_bytes = directory_size(&config.base_dir)?;
+    let input_words = if snapshot.global.run_input_words > 0 {
+        snapshot.global.run_input_words
+    } else {
+        collect_archive_totals(config)?.1
+    };
+    let ortho_count = snapshot.global.seen_len_accepted as usize;
+    let disk_space_bytes = if snapshot.global.run_disk_bytes > 0 {
+        snapshot.global.run_disk_bytes
+    } else {
+        directory_size(&config.base_dir)?
+    };
     let mut summary = String::new();
     summary.push_str(&format!(
         "=== RUN START input_words={} ===\n",

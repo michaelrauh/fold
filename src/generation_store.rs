@@ -61,7 +61,7 @@ impl Config {
     /// - Target 85% total RAM usage aggressively
     /// - Leader: Scale down only above 85% usage
     /// - Follower: Scale down starting at 70% usage
-    /// - Allocate budget across: run_budget (30%), work cache (25%), buffers (20%), history cache (25%)
+    /// - Allocate budget across: run_budget (70%), work cache (10%), buffers (10%), history cache (10%)
     /// - Follower bails if run_budget < 128MB when already at lowest budget and RSS stays above minimum target
     pub fn compute_config(role: Role) -> Option<Self> {
         let (used_bytes, total_bytes, _headroom_bytes) = get_memory_state();
@@ -103,10 +103,10 @@ impl Config {
         }
         
         // Allocate budget across subsystems
-        let run_budget_bytes = (budget as f64 * 0.30) as usize;      // 30% for LSM runs
-        let work_cache_budget = (budget as f64 * 0.25) as usize;     // 25% for work queue cache
-        let buffer_budget = (budget as f64 * 0.20) as usize;         // 20% for write buffers
-        let history_cache_bytes = (budget as f64 * 0.25) as usize;   // 25% for history caching
+        let run_budget_bytes = (budget as f64 * 0.70) as usize;      // 70% for LSM runs
+        let work_cache_budget = (budget as f64 * 0.10) as usize;     // 10% for work queue cache
+        let buffer_budget = (budget as f64 * 0.10) as usize;         // 10% for write buffers
+        let history_cache_bytes = (budget as f64 * 0.10) as usize;   // 10% for history caching
         
         // Work queue cache: assume ~200 bytes per ortho
         let work_queue_cache_size = work_cache_budget / 200;
@@ -121,7 +121,8 @@ impl Config {
         // Landing flush threshold: 1-10MB depending on buffer capacity
         let landing_flush_threshold = bufwriter_capacity.clamp(1024 * 1024, 10 * 1024 * 1024);
         
-        let read_buf_bytes = 64 * 1024; // 64KB read buffer
+        // Derive read buffer from run budget: target ~256KB-2MB per run
+        let read_buf_bytes = (run_budget_bytes / 256).clamp(256 * 1024, 2 * 1024 * 1024);
         let fan_in = compute_fan_in(run_budget_bytes, read_buf_bytes);
         
         Some(Self {
@@ -186,13 +187,13 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
     (used_raw as usize, total_raw as usize)
 }
 
-/// Calculate fan_in: clamp(budget / read_buf, 8, 128)
+/// Calculate fan_in: clamp(budget / read_buf, 8, 256)
 fn compute_fan_in(budget: usize, read_buf_bytes: usize) -> usize {
     if read_buf_bytes == 0 {
         return 8;
     }
     let raw_fan_in = budget / read_buf_bytes;
-    raw_fan_in.clamp(8, 128)
+    raw_fan_in.clamp(8, 256)
 }
 
 
@@ -1385,16 +1386,6 @@ pub fn compact_landing(
     Ok(runs)
 }
 
-/// Write an ortho run to disk
-fn write_ortho_run(arena: &[Ortho], path: &PathBuf) -> io::Result<()> {
-    let mut file = BufWriter::new(File::create(path)?);
-    for ortho in arena {
-        write_ortho_record(&mut file, ortho)?;
-    }
-    file.flush()?;
-    Ok(())
-}
-
 fn write_streamed_run(arena: &[StreamedOrtho], path: &PathBuf) -> io::Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -2068,8 +2059,8 @@ mod tests {
 
     #[test]
     fn test_compute_fan_in() {
-        // fan_in = clamp(budget / read_buf, 8, 128)
-        let read_buf = 64 * 1024; // 64KB
+        // fan_in = clamp(budget / read_buf, 8, 256)
+        let read_buf = 512 * 1024; // 512KB
         
         // Small budget: should clamp to 8
         assert_eq!(compute_fan_in(100_000, read_buf), 8);
@@ -2077,11 +2068,11 @@ mod tests {
         // Medium budget: should be in range
         let budget = 1_000_000_000; // 1GB
         let fan_in = compute_fan_in(budget, read_buf);
-        assert!(fan_in >= 8 && fan_in <= 128);
+        assert!(fan_in >= 8 && fan_in <= 256);
         
         // Large budget: should clamp to 128
         let budget = 100_000_000_000; // 100GB
-        assert_eq!(compute_fan_in(budget, read_buf), 128);
+        assert_eq!(compute_fan_in(budget, read_buf), 256);
         
         // Zero read_buf: should return 8
         assert_eq!(compute_fan_in(1_000_000, 0), 8);
@@ -2099,10 +2090,11 @@ mod tests {
         let config = config.unwrap();
         
         // run_budget should be 70% of some budget
-        // fan_in should be between 8 and 128
-        assert!(config.fan_in >= 8 && config.fan_in <= 128);
+        // fan_in should be between 8 and 256
+        assert!(config.fan_in >= 8 && config.fan_in <= 256);
         assert!(config.run_budget_bytes > 0);
-        assert_eq!(config.read_buf_bytes, 64 * 1024);
+        assert!(config.read_buf_bytes >= 256 * 1024);
+        assert!(config.read_buf_bytes <= 2 * 1024 * 1024);
         assert!(config.allow_compaction);
     }
 
@@ -2113,9 +2105,10 @@ mod tests {
         
         // May bail out if system memory is very constrained, but typically should succeed
         if let Some(config) = config {
-            assert!(config.fan_in >= 8 && config.fan_in <= 128);
+            assert!(config.fan_in >= 8 && config.fan_in <= 256);
             assert!(config.run_budget_bytes > 0);
-            assert_eq!(config.read_buf_bytes, 64 * 1024);
+            assert!(config.read_buf_bytes >= 256 * 1024);
+            assert!(config.read_buf_bytes <= 2 * 1024 * 1024);
             assert!(config.allow_compaction);
         }
         // If None, follower decided to bail due to memory pressure
@@ -2302,6 +2295,92 @@ mod tests {
         println!("  Gen 2: {} orthos -> {} new work", processed_gen2, new_work_gen2);
         println!("  Final work queue: {}", store.work_len());
         println!("  Final seen count: {}", store.seen_len_accepted());
+    }
+
+    #[test]
+    fn test_shapes_over_many_generations() {
+        // Walk through many generations and dump the best shape seen each time.
+        // Keeps work bounded to avoid blowing up the test runtime.
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+
+        let mut cfg = Config::test_config(2 * 1024 * 1024, 8);
+        cfg.work_queue_cache_size = 16;
+        store.configure(&cfg);
+
+        // Seed with a base ortho and one that is almost full to force an "up" expansion path
+        let mut prefilled = Ortho::new();
+        for v in [1u32, 2, 3] {
+            prefilled = prefilled.add(v).into_iter().next().unwrap();
+        }
+        store.push_segments(vec![Ortho::new(), prefilled]).unwrap();
+        store.flush_all().unwrap();
+
+        let mut shapes: Vec<String> = Vec::new();
+        let max_per_gen = 5usize;
+        let mut best_so_far: Option<(Vec<usize>, usize, usize)> =
+            Some((vec![2, 2], 1, 0)); // dims, volume, fullness
+        let mut seen_shapes: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for gen_idx in 0..=30 {
+            let mut processed = 0usize;
+            let mut best_this_gen: Option<(Vec<usize>, usize, usize)> = None;
+            let mut new_shapes_this_gen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+            while let Some(ortho) = store.pop_work().unwrap() {
+                let val = 2 + (gen_idx as u32 % 5);
+                for child in ortho.add(val) {
+                    let dims: Vec<usize> = child.dims().iter().map(|d| *d as usize).collect();
+                    let vol = child.volume();
+                    let full = child.fullness();
+                    let sig = format!("{:?}", dims);
+                    if seen_shapes.insert(sig.clone()) {
+                        new_shapes_this_gen.insert(sig);
+                    }
+                    if best_this_gen
+                        .as_ref()
+                        .map_or(true, |(_, v, f)| vol > *v || (vol == *v && full > *f))
+                    {
+                        best_this_gen = Some((dims.clone(), vol, full));
+                    }
+                    if best_so_far
+                        .as_ref()
+                        .map_or(true, |(_, v, f)| vol > *v || (vol == *v && full > *f))
+                    {
+                        best_so_far = Some((dims.clone(), vol, full));
+                    }
+                    store.record_result(&child).unwrap();
+                    processed += 1;
+                    if processed >= max_per_gen {
+                        // Re-queue the current work item to keep the queue alive across generations.
+                        store.push_segments(vec![child]).unwrap();
+                        break;
+                    }
+                }
+                if processed >= max_per_gen {
+                    break;
+                }
+            }
+
+            let _ = store.on_generation_end(&cfg, None).unwrap();
+
+            let desc = format!(
+                "gen {}: {} new shapes [{}]",
+                gen_idx,
+                new_shapes_this_gen.len(),
+                new_shapes_this_gen
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!("{}", desc);
+            shapes.push(desc);
+        }
+
+        // Should have logged all generations up to 30 (inclusive)
+        assert_eq!(shapes.len(), 31);
     }
 
     #[test]
