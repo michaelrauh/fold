@@ -395,7 +395,7 @@ fn process_txt_file(
     // Tracking for throughput calculation
     let mut last_report_time = std::time::Instant::now();
     let mut last_report_count = 0;
-    let mut last_housekeeping = std::time::Instant::now();
+    let mut last_housekeeping: std::time::Instant;
     
     // Generational processing loop
     loop {

@@ -461,6 +461,7 @@ dependencies = [
  "rkyv",
  "rustc-hash",
  "serde",
+ "serde_json",
  "smallvec",
  "sysinfo",
  "tempfile",

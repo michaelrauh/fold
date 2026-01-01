@@ -643,6 +643,332 @@ mod tests {
         assert!(bitset.contains(b_idx));
         assert!(bitset.contains(c_idx));
     }
+
+    // Helper to split text the same way as Splitter for earliest-position tracking.
+    fn tokenize_sentences(text: &str) -> Vec<Vec<String>> {
+        let filter_char = |c: char| {
+            if c.is_alphabetic() || c.is_whitespace() || c == '\'' {
+                c
+            } else {
+                ' '
+            }
+        };
+
+        text.split("\n\n")
+            .flat_map(|paragraph| paragraph.split(|c| matches!(c, '.' | '?' | ';' | '!' | ',')))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|sentence| {
+                sentence
+                    .chars()
+                    .map(filter_char)
+                    .collect::<String>()
+                    .split_whitespace()
+                    .map(|w| w.to_lowercase())
+                    .filter(|w| !w.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .filter(|words| !words.is_empty())
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn build_full_interner_from_e_txt() {
+        let text =
+            std::fs::read_to_string("e.txt").expect("e.txt must exist in workspace root for test");
+        let interner = Interner::from_text(&text);
+        println!(
+            "Built interner: vocab={}, prefixes={}",
+            interner.vocabulary().len(),
+            interner.prefix_to_completions.len()
+        );
+        assert!(interner.vocabulary().len() > 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn export_full_interner_bin_and_json() -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::Path;
+
+        #[derive(serde::Serialize)]
+        struct CompletionEntry {
+            word: String,
+            word_id: usize,
+            first_pos: usize,
+        }
+
+        #[derive(serde::Serialize)]
+        struct KeyEntry {
+            words: Vec<String>,
+            completions: Vec<CompletionEntry>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct Export {
+            vocab: Vec<String>,
+            #[serde(rename = "maxSentence")]
+            max_sentence: usize,
+            keys: Vec<KeyEntry>,
+        }
+
+        let text = fs::read_to_string("e.txt")?;
+        let interner = Interner::from_text(&text);
+
+        // Stage 1: write bincode
+        let bin_path = Path::new("target/interner_full.bin");
+        if let Some(parent) = bin_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = interner.to_bytes()?;
+        fs::write(bin_path, &bytes)?;
+        println!(
+            "Wrote interner bincode to {} ({} bytes)",
+            bin_path.display(),
+            bytes.len()
+        );
+
+        // Stage 2: compute earliest positions and write JSON
+        let vocab = interner.vocabulary.clone();
+        let mut word_to_idx = HashMap::new();
+        for (idx, word) in vocab.iter().enumerate() {
+            word_to_idx.insert(word.clone(), idx);
+        }
+
+        let sentences = tokenize_sentences(&text);
+        let max_sentence = sentences.len();
+        let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
+
+        for (s_idx, words) in sentences.iter().enumerate() {
+            let len = words.len();
+            for start in 0..len {
+                let mut prefix_indices = Vec::new();
+                for j in (start + 1)..len {
+                    if let Some(&prev_idx) = word_to_idx.get(&words[j - 1]) {
+                        prefix_indices.push(prev_idx);
+                    } else {
+                        break;
+                    }
+                    if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
+                        first_positions
+                            .entry((prefix_indices.clone(), comp_idx))
+                            .or_insert(s_idx);
+                    }
+                }
+            }
+        }
+
+        let mut keys_export = Vec::with_capacity(interner.prefix_to_completions.len());
+        for (prefix, bitset) in &interner.prefix_to_completions {
+            let words = prefix
+                .iter()
+                .map(|&idx| interner.vocabulary[idx].clone())
+                .collect::<Vec<String>>();
+
+            let mut completions_vec = Vec::new();
+            for completion_idx in bitset.ones() {
+                let word = interner.vocabulary[completion_idx].clone();
+                let first_pos = first_positions
+                    .get(&(prefix.clone(), completion_idx))
+                    .copied()
+                    .unwrap_or(max_sentence);
+                completions_vec.push(CompletionEntry {
+                    word,
+                    word_id: completion_idx,
+                    first_pos,
+                });
+            }
+            completions_vec.sort_by_key(|c| (c.first_pos, c.word_id));
+
+            keys_export.push(KeyEntry {
+                words,
+                completions: completions_vec,
+            });
+        }
+
+        // Sort by completion count descending for better default ordering
+        keys_export.sort_by(|a, b| b.completions.len().cmp(&a.completions.len()));
+
+        let export = Export {
+            vocab,
+            max_sentence: max_sentence,
+            keys: keys_export,
+        };
+
+        let out_path = Path::new("target/interner_full_export.json");
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::File::create(out_path)?;
+        serde_json::to_writer_pretty(file, &export)?;
+        println!(
+            "Exported interner JSON to {} ({} sentences)",
+            out_path.display(),
+            max_sentence
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn export_full_interner_chunked() -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::HashMap;
+        use std::fs;
+        use std::path::Path;
+
+        #[derive(serde::Serialize)]
+        struct CompletionEntry {
+            word: String,
+            word_id: usize,
+            first_pos: usize,
+        }
+
+        #[derive(serde::Serialize)]
+        struct KeyEntry {
+            words: Vec<String>,
+            completions: Vec<CompletionEntry>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct IndexEntry {
+            words: Vec<String>,
+            completion_count: usize,
+            chunk: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct IndexFile {
+            vocab: Vec<String>,
+            #[serde(rename = "maxSentence")]
+            max_sentence: usize,
+            keys: Vec<IndexEntry>,
+        }
+
+        let text = fs::read_to_string("e.txt")?;
+        let interner = Interner::from_text(&text);
+
+        // Build vocab map
+        let vocab = interner.vocabulary.clone();
+        let mut word_to_idx = HashMap::new();
+        for (idx, word) in vocab.iter().enumerate() {
+            word_to_idx.insert(word.clone(), idx);
+        }
+
+        // Sentence tokenization for earliest positions
+        let sentences = tokenize_sentences(&text);
+        let max_sentence = sentences.len();
+        let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
+
+        for (s_idx, words) in sentences.iter().enumerate() {
+            let len = words.len();
+            for start in 0..len {
+                let mut prefix_indices = Vec::new();
+                for j in (start + 1)..len {
+                    if let Some(&prev_idx) = word_to_idx.get(&words[j - 1]) {
+                        prefix_indices.push(prev_idx);
+                    } else {
+                        break;
+                    }
+                    if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
+                        first_positions
+                            .entry((prefix_indices.clone(), comp_idx))
+                            .or_insert(s_idx);
+                    }
+                }
+            }
+        }
+
+        // Prepare sorted keys for stable chunking (by completion count desc)
+        let mut prefixes: Vec<_> = interner.prefix_to_completions.iter().collect();
+        prefixes.sort_by(|(_, bs_a), (_, bs_b)| {
+            let ca = bs_a.count_ones(..);
+            let cb = bs_b.count_ones(..);
+            cb.cmp(&ca)
+        });
+
+        let chunk_size: usize = 10_000; // keys per chunk
+        let mut chunk_id: usize = 1;
+        let mut chunk_keys: Vec<KeyEntry> = Vec::with_capacity(chunk_size);
+        let mut index_entries: Vec<IndexEntry> = Vec::with_capacity(prefixes.len());
+
+        let chunk_dir = Path::new("target");
+        fs::create_dir_all(chunk_dir)?;
+
+        let flush_chunk = |chunk_id: usize, chunk_keys: &mut Vec<KeyEntry>| -> Result<(), Box<dyn std::error::Error>> {
+            if chunk_keys.is_empty() {
+                return Ok(());
+            }
+            let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
+            let chunk_path = chunk_dir.join(&chunk_name);
+            let file = fs::File::create(&chunk_path)?;
+            serde_json::to_writer_pretty(file, &serde_json::json!({ "keys": chunk_keys }))?;
+            chunk_keys.clear();
+            Ok(())
+        };
+
+        for (prefix, bitset) in prefixes {
+            let words = prefix
+                .iter()
+                .map(|&idx| interner.vocabulary[idx].clone())
+                .collect::<Vec<String>>();
+
+            let mut completions_vec = Vec::new();
+            for completion_idx in bitset.ones() {
+                let word = interner.vocabulary[completion_idx].clone();
+                let first_pos = first_positions
+                    .get(&(prefix.clone(), completion_idx))
+                    .copied()
+                    .unwrap_or(max_sentence);
+                completions_vec.push(CompletionEntry {
+                    word,
+                    word_id: completion_idx,
+                    first_pos,
+                });
+            }
+            completions_vec.sort_by_key(|c| (c.first_pos, c.word_id));
+
+            let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
+            index_entries.push(IndexEntry {
+                words: words.clone(),
+                completion_count: completions_vec.len(),
+                chunk: chunk_name.clone(),
+            });
+
+            chunk_keys.push(KeyEntry {
+                words,
+                completions: completions_vec,
+            });
+
+            if chunk_keys.len() >= chunk_size {
+                flush_chunk(chunk_id, &mut chunk_keys)?;
+                chunk_id += 1;
+            }
+        }
+
+        // Flush remaining
+        flush_chunk(chunk_id, &mut chunk_keys)?;
+
+        // Write index
+        let index = IndexFile {
+            vocab,
+            max_sentence,
+            keys: index_entries,
+        };
+        let index_path = chunk_dir.join("interner_index.json");
+        let index_file = fs::File::create(&index_path)?;
+        serde_json::to_writer_pretty(index_file, &index)?;
+        println!(
+            "Exported chunked interner: index={} ({} keys), chunks up to {:04}",
+            index_path.display(),
+            index.keys.len(),
+            chunk_id
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

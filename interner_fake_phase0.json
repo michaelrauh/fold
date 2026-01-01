@@ -1,0 +1,22 @@
+{
+  "vocab": ["that","i","was","believe","alone","and"],
+  "maxSentence": 30,
+  "keys": [
+    {
+      "words": ["that"],
+      "completions": [
+        {"word":"i","word_id":1,"first_pos":3},
+        {"word":"was","word_id":2,"first_pos":7},
+        {"word":"alone","word_id":4,"first_pos":22}
+      ]
+    },
+    {
+      "words": ["that","i"],
+      "completions": [
+        {"word":"was","word_id":2,"first_pos":4},
+        {"word":"believe","word_id":3,"first_pos":12},
+        {"word":"and","word_id":5,"first_pos":28}
+      ]
+    }
+  ]
+}
