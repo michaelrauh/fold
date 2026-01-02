@@ -697,7 +697,7 @@ mod tests {
         struct CompletionEntry {
             word: String,
             word_id: usize,
-            first_pos: usize,
+            first_word_pos: usize,
         }
 
         #[derive(serde::Serialize)]
@@ -709,8 +709,8 @@ mod tests {
         #[derive(serde::Serialize)]
         struct Export {
             vocab: Vec<String>,
-            #[serde(rename = "maxSentence")]
-            max_sentence: usize,
+            max_words: usize,
+            bucket_size_words: usize,
             keys: Vec<KeyEntry>,
         }
 
@@ -730,7 +730,7 @@ mod tests {
             bytes.len()
         );
 
-        // Stage 2: compute earliest positions and write JSON
+        // Stage 2: compute earliest word positions and write JSON
         let vocab = interner.vocabulary.clone();
         let mut word_to_idx = HashMap::new();
         for (idx, word) in vocab.iter().enumerate() {
@@ -738,10 +738,9 @@ mod tests {
         }
 
         let sentences = tokenize_sentences(&text);
-        let max_sentence = sentences.len();
         let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
-
-        for (s_idx, words) in sentences.iter().enumerate() {
+        let mut total_words = 0usize;
+        for words in sentences.iter() {
             let len = words.len();
             for start in 0..len {
                 let mut prefix_indices = Vec::new();
@@ -752,12 +751,14 @@ mod tests {
                         break;
                     }
                     if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
+                        let word_pos = total_words + j;
                         first_positions
                             .entry((prefix_indices.clone(), comp_idx))
-                            .or_insert(s_idx);
+                            .or_insert(word_pos);
                     }
                 }
             }
+            total_words += len;
         }
 
         let mut keys_export = Vec::with_capacity(interner.prefix_to_completions.len());
@@ -770,17 +771,17 @@ mod tests {
             let mut completions_vec = Vec::new();
             for completion_idx in bitset.ones() {
                 let word = interner.vocabulary[completion_idx].clone();
-                let first_pos = first_positions
+                let first_word_pos = first_positions
                     .get(&(prefix.clone(), completion_idx))
                     .copied()
-                    .unwrap_or(max_sentence);
+                    .unwrap_or(total_words);
                 completions_vec.push(CompletionEntry {
                     word,
                     word_id: completion_idx,
-                    first_pos,
+                    first_word_pos,
                 });
             }
-            completions_vec.sort_by_key(|c| (c.first_pos, c.word_id));
+            completions_vec.sort_by_key(|c| (c.first_word_pos, c.word_id));
 
             keys_export.push(KeyEntry {
                 words,
@@ -793,7 +794,8 @@ mod tests {
 
         let export = Export {
             vocab,
-            max_sentence: max_sentence,
+            max_words: total_words,
+            bucket_size_words: 500,
             keys: keys_export,
         };
 
@@ -804,9 +806,9 @@ mod tests {
         let file = fs::File::create(out_path)?;
         serde_json::to_writer_pretty(file, &export)?;
         println!(
-            "Exported interner JSON to {} ({} sentences)",
+            "Exported interner JSON to {} ({} words)",
             out_path.display(),
-            max_sentence
+            total_words
         );
 
         Ok(())
@@ -823,7 +825,7 @@ mod tests {
         struct CompletionEntry {
             word: String,
             word_id: usize,
-            first_pos: usize,
+            first_word_pos: usize,
         }
 
         #[derive(serde::Serialize)]
@@ -835,16 +837,20 @@ mod tests {
         #[derive(serde::Serialize)]
         struct IndexEntry {
             words: Vec<String>,
-            completion_count: usize,
+            completion_count: u32,
+            counts_by_word_bucket: Vec<u32>,
             chunk: String,
         }
 
         #[derive(serde::Serialize)]
         struct IndexFile {
             vocab: Vec<String>,
-            #[serde(rename = "maxSentence")]
-            max_sentence: usize,
+            max_words: usize,
+            bucket_size_words: usize,
             keys: Vec<IndexEntry>,
+            /// Filenames (one per bucket) containing key indices sorted by cumulative count (desc) at that bucket.
+            /// Each sidecar is a binary little-endian u32 array of key indices.
+            order_bucket_files: Vec<String>,
         }
 
         let text = fs::read_to_string("e.txt")?;
@@ -857,12 +863,11 @@ mod tests {
             word_to_idx.insert(word.clone(), idx);
         }
 
-        // Sentence tokenization for earliest positions
+        // Tokenization for earliest word positions
         let sentences = tokenize_sentences(&text);
-        let max_sentence = sentences.len();
         let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
-
-        for (s_idx, words) in sentences.iter().enumerate() {
+        let mut total_words = 0usize;
+        for words in sentences.iter() {
             let len = words.len();
             for start in 0..len {
                 let mut prefix_indices = Vec::new();
@@ -873,12 +878,14 @@ mod tests {
                         break;
                     }
                     if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
+                        let word_pos = total_words + j;
                         first_positions
                             .entry((prefix_indices.clone(), comp_idx))
-                            .or_insert(s_idx);
+                            .or_insert(word_pos);
                     }
                 }
             }
+            total_words += len;
         }
 
         // Prepare sorted keys for stable chunking (by completion count desc)
@@ -889,25 +896,34 @@ mod tests {
             cb.cmp(&ca)
         });
 
+        let bucket_size_words: usize = 500;
+        let bucket_count = if total_words == 0 {
+            0
+        } else {
+            (total_words + bucket_size_words - 1) / bucket_size_words
+        };
+
         let chunk_size: usize = 10_000; // keys per chunk
         let mut chunk_id: usize = 1;
         let mut chunk_keys: Vec<KeyEntry> = Vec::with_capacity(chunk_size);
         let mut index_entries: Vec<IndexEntry> = Vec::with_capacity(prefixes.len());
+        let mut per_key_bucket_counts: Vec<Vec<u32>> = Vec::with_capacity(prefixes.len());
 
         let chunk_dir = Path::new("target");
         fs::create_dir_all(chunk_dir)?;
 
-        let flush_chunk = |chunk_id: usize, chunk_keys: &mut Vec<KeyEntry>| -> Result<(), Box<dyn std::error::Error>> {
-            if chunk_keys.is_empty() {
-                return Ok(());
-            }
-            let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
-            let chunk_path = chunk_dir.join(&chunk_name);
-            let file = fs::File::create(&chunk_path)?;
-            serde_json::to_writer_pretty(file, &serde_json::json!({ "keys": chunk_keys }))?;
-            chunk_keys.clear();
-            Ok(())
-        };
+        let flush_chunk =
+            |chunk_id: usize, chunk_keys: &mut Vec<KeyEntry>| -> Result<(), Box<dyn std::error::Error>> {
+                if chunk_keys.is_empty() {
+                    return Ok(());
+                }
+                let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
+                let chunk_path = chunk_dir.join(&chunk_name);
+                let file = fs::File::create(&chunk_path)?;
+                serde_json::to_writer(file, &serde_json::json!({ "keys": chunk_keys }))?;
+                chunk_keys.clear();
+                Ok(())
+            };
 
         for (prefix, bitset) in prefixes {
             let words = prefix
@@ -916,26 +932,48 @@ mod tests {
                 .collect::<Vec<String>>();
 
             let mut completions_vec = Vec::new();
+            let mut bucket_counts: Vec<u32> = vec![0u32; bucket_count];
             for completion_idx in bitset.ones() {
                 let word = interner.vocabulary[completion_idx].clone();
-                let first_pos = first_positions
+                let first_word_pos = first_positions
                     .get(&(prefix.clone(), completion_idx))
                     .copied()
-                    .unwrap_or(max_sentence);
+                    .unwrap_or(total_words);
+                if !bucket_counts.is_empty() {
+                    let idx = (first_word_pos.min(total_words.saturating_sub(1))) / bucket_size_words;
+                    if let Some(slot) = bucket_counts.get_mut(idx) {
+                        *slot += 1;
+                    }
+                }
                 completions_vec.push(CompletionEntry {
                     word,
                     word_id: completion_idx,
-                    first_pos,
+                    first_word_pos,
                 });
             }
-            completions_vec.sort_by_key(|c| (c.first_pos, c.word_id));
+            completions_vec.sort_by_key(|c| (c.first_word_pos, c.word_id));
+
+            // Make bucket counts cumulative
+            for i in 1..bucket_counts.len() {
+                let prev = bucket_counts[i - 1];
+                if let Some(slot) = bucket_counts.get_mut(i) {
+                    *slot += prev;
+                }
+            }
+            let completion_count = if bucket_counts.is_empty() {
+                completions_vec.len() as u32
+            } else {
+                *bucket_counts.last().unwrap_or(&0)
+            };
 
             let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
             index_entries.push(IndexEntry {
                 words: words.clone(),
-                completion_count: completions_vec.len(),
+                completion_count,
+                counts_by_word_bucket: bucket_counts.clone(),
                 chunk: chunk_name.clone(),
             });
+            per_key_bucket_counts.push(bucket_counts);
 
             chunk_keys.push(KeyEntry {
                 words,
@@ -951,15 +989,46 @@ mod tests {
         // Flush remaining
         flush_chunk(chunk_id, &mut chunk_keys)?;
 
+        // Build pre-sorted orders per bucket (descending by cumulative count) and write sidecars.
+        let mut order_bucket_files: Vec<String> = Vec::with_capacity(bucket_count);
+        for bucket_idx in 0..bucket_count {
+            let mut pairs: Vec<(u32, usize)> = per_key_bucket_counts
+                .iter()
+                .enumerate()
+                .map(|(idx, counts)| {
+                    let c = counts.get(bucket_idx).copied().unwrap_or(0);
+                    (c, idx)
+                })
+                .collect();
+            pairs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let order: Vec<u32> = pairs
+                .into_iter()
+                .map(|(_, idx)| idx as u32)
+                .collect();
+
+            let fname = format!("interner_orders_{:04}.bin", bucket_idx);
+            let path = chunk_dir.join(&fname);
+            {
+                use std::io::Write;
+                let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+                for idx in order {
+                    file.write_all(&idx.to_le_bytes())?;
+                }
+            }
+            order_bucket_files.push(fname);
+        }
+
         // Write index
         let index = IndexFile {
             vocab,
-            max_sentence,
+            max_words: total_words,
+            bucket_size_words,
             keys: index_entries,
+            order_bucket_files,
         };
         let index_path = chunk_dir.join("interner_index.json");
         let index_file = fs::File::create(&index_path)?;
-        serde_json::to_writer_pretty(index_file, &index)?;
+        serde_json::to_writer(index_file, &index)?;
         println!(
             "Exported chunked interner: index={} ({} keys), chunks up to {:04}",
             index_path.display(),
