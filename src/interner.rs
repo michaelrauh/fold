@@ -239,6 +239,13 @@ impl Interner {
         &self.vocabulary
     }
 
+    /// Iterate over all prefix -> completions entries.
+    pub fn prefix_entries(
+        &self,
+    ) -> impl Iterator<Item = (&Vec<usize>, &FixedBitSet)> {
+        self.prefix_to_completions.iter()
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocabulary.len()
     }
@@ -1035,6 +1042,144 @@ mod tests {
             index.keys.len(),
             chunk_id
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn export_small_ortho_archive() -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::{HashMap, HashSet};
+        use std::fs;
+        use std::path::PathBuf;
+
+        #[derive(serde::Serialize)]
+        struct OrthoCandidate {
+            word: String,
+            min_input: usize,
+            child_id: crate::ortho::OrthoId,
+        }
+
+        #[derive(serde::Serialize)]
+        struct OrthoRecord {
+            ortho_id: crate::ortho::OrthoId,
+            required_keys: Vec<Vec<String>>,
+            candidates: Vec<OrthoCandidate>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct OrthoArchive {
+            stride_words: usize,
+            records: Vec<OrthoRecord>,
+        }
+
+        // Small corpus to keep the test fast.
+        let text = "the quick brown fox jumps over the lazy dog";
+        let interner = Interner::from_text(text);
+
+        // Build vocab map
+        let vocab = interner.vocabulary.clone();
+        let mut word_to_idx = HashMap::new();
+        for (idx, word) in vocab.iter().enumerate() {
+            word_to_idx.insert(word.clone(), idx);
+        }
+
+        // Earliest word positions per (prefix, completion) for min_input calculation.
+        let sentences = tokenize_sentences(text);
+        let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
+        let mut total_words = 0usize;
+        for words in sentences.iter() {
+            let len = words.len();
+            for start in 0..len {
+                let mut prefix_indices = Vec::new();
+                for j in (start + 1)..len {
+                    if let Some(&prev_idx) = word_to_idx.get(&words[j - 1]) {
+                        prefix_indices.push(prev_idx);
+                    } else {
+                        break;
+                    }
+                    if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
+                        let word_pos = total_words + j;
+                        first_positions
+                            .entry((prefix_indices.clone(), comp_idx))
+                            .or_insert(word_pos);
+                    }
+                }
+            }
+            total_words += len;
+        }
+
+        // Build a tiny ortho archive: just the empty ortho and its candidates.
+        let mut records = Vec::new();
+        let ortho = crate::ortho::Ortho::new();
+        let (_forbidden, required_raw) = ortho.get_requirements();
+        let required_keys: Vec<Vec<String>> = required_raw
+            .iter()
+            .map(|prefix| prefix.iter().filter_map(|p| vocab.get(*p as usize).cloned()).collect())
+            .collect();
+
+        // Compute candidates by intersecting completions for required prefixes.
+        let mut required_sets = Vec::new();
+        for prefix in required_raw.iter() {
+            if prefix.is_empty() {
+                continue;
+            }
+            let ids: Vec<usize> = prefix.iter().map(|p| *p as usize).collect();
+            if let Some(bits) = interner.completions_for_prefix(&ids) {
+                required_sets.push(bits);
+            }
+        }
+        let candidate_ids: HashSet<usize> = if required_sets.is_empty() {
+            (0..interner.vocabulary.len()).collect()
+        } else {
+            // Intersect bitsets
+            let mut acc = required_sets[0].clone();
+            for bs in required_sets.iter().skip(1) {
+                acc.intersect_with(bs);
+            }
+            acc.ones().collect()
+        };
+
+        let mut candidates = Vec::new();
+        for cid in candidate_ids {
+            let word = interner.vocabulary[cid].clone();
+            let min_input = required_raw
+                .iter()
+                .filter_map(|pref| {
+                    let ids: Vec<usize> = pref.iter().map(|p| *p as usize).collect();
+                    first_positions.get(&(ids, cid)).copied()
+                })
+                .max()
+                .unwrap_or(0);
+            // Child id: apply the word to the ortho (first variant)
+            let child_id = ortho.add(cid as u32).get(0).map(|o| o.id()).unwrap_or(0);
+            candidates.push(OrthoCandidate {
+                word,
+                min_input,
+                child_id,
+            });
+        }
+        candidates.sort_by_key(|c| (c.min_input, c.word.clone()));
+
+        records.push(OrthoRecord {
+            ortho_id: ortho.id(),
+            required_keys,
+            candidates,
+        });
+
+        let archive = OrthoArchive {
+            stride_words: 500,
+            records,
+        };
+
+        let out_dir = PathBuf::from("target/ortho_export_test");
+        fs::create_dir_all(&out_dir)?;
+        let out_path = out_dir.join("ortho_index_0500.json");
+        let file = fs::File::create(&out_path)?;
+        serde_json::to_writer_pretty(file, &archive)?;
+
+        assert!(out_path.exists());
+        assert!(!archive.records.is_empty());
+        assert!(archive.records[0].candidates.len() > 0);
 
         Ok(())
     }

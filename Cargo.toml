@@ -2,6 +2,7 @@
 name = "fold"
 version = "0.1.0"
 edition = "2024"
+default-run = "fold"
 
 [dependencies]
 bytecheck = "0.6"
@@ -10,6 +11,7 @@ fixedbitset = "0.5.7"
 itertools = "0.12"
 rkyv = { version = "0.7", features = ["validation"] }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
 rustc-hash = "1.1"
 hashbrown = { version = "0.14", features = ["serde"] }
 nohash-hasher = "0.2"
@@ -19,12 +21,12 @@ ratatui = "0.29"
 crossterm = "0.28"
 ctrlc = "3.4"
 tempfile = "3.8"
+anyhow = "1.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.8"
 filetime = "0.2"
-serde_json = "1.0"
 
 [[bench]]
 name = "spatial_bench"
