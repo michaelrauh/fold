@@ -14,3 +14,4 @@ charts
 # already existing elements were commented out
 
 #/target
+data/interner_export/
