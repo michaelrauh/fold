@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// Test filling a [3,3] ortho to see when diagonal conflicts should occur
 #[test]
@@ -77,8 +77,7 @@ fn test_filling_3x3_with_diagonal_check() {
         }
 
         let (forbidden, required) = current.get_requirements();
-        let forbidden_usize: Vec<usize> =
-            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let forbidden_usize: Vec<usize> = forbidden.iter().map(|v| payload_to_usize(*v)).collect();
         let required_usize: Vec<Vec<usize>> = required
             .iter()
             .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())

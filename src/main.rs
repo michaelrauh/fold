@@ -1,10 +1,11 @@
 use fold::{
     FoldError,
     file_handler::{self, MemClaimGuard, StateConfig},
-    generation_store::{GenerationStore, Config, Role},
+    generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
+    generation_store::{Config, GenerationStore, Role},
     interner::Interner,
     metrics::{GenerationStat, Metrics},
-    ortho::{payload_to_usize, Ortho, PayloadVal},
+    ortho::{Ortho, PayloadVal, payload_to_usize},
     tui::Tui,
 };
 use std::fs;
@@ -15,9 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 use sysinfo::ProcessesToUpdate;
-
-const COMPLETION_CHUNK_SIZE: usize = 1_000;
-const FANOUT_LOG_THRESHOLD: usize = COMPLETION_CHUNK_SIZE;
 
 // Helper to convert Role to string
 fn role_as_str(role: Role) -> &'static str {
@@ -188,7 +186,13 @@ fn main() -> Result<(), FoldError> {
                             metrics.add_log("MODE 2: Processing text file".to_string());
 
                             let txt_file = txt_file.unwrap();
-                            match process_txt_file(txt_file.clone(), &config, &metrics, role) {
+                            match process_txt_file(
+                                txt_file.clone(),
+                                &config,
+                                &metrics,
+                                role,
+                                &should_quit,
+                            ) {
                                 Ok(()) => {}
                                 Err(e) if is_concurrent_claim_error(&e) => {
                                     metrics.add_log(format!(
@@ -208,7 +212,13 @@ fn main() -> Result<(), FoldError> {
                             metrics.clear_chart_history();
                             metrics.add_log("MODE 2: Processing text file".to_string());
 
-                            match process_txt_file(txt_file.clone(), &config, &metrics, role) {
+                            match process_txt_file(
+                                txt_file.clone(),
+                                &config,
+                                &metrics,
+                                role,
+                                &should_quit,
+                            ) {
                                 Ok(()) => {}
                                 Err(e) if is_concurrent_claim_error(&e) => {
                                     metrics.add_log(format!(
@@ -286,6 +296,7 @@ fn process_txt_file(
     config: &StateConfig,
     metrics: &Metrics,
     role: Role,
+    should_quit: &AtomicBool,
 ) -> Result<(), FoldError> {
     let run_start = Instant::now();
     // Ingest the text file
@@ -345,7 +356,10 @@ fn process_txt_file(
     let mem_claim = acquire_memory_claim_simple(role, config, metrics, interner_bytes)?;
 
     // Initialize GenerationStore for this file (work folder becomes gen store base)
-    let store_path = PathBuf::from(ingestion.work_queue_path()).parent().unwrap().to_path_buf();
+    let store_path = PathBuf::from(ingestion.work_queue_path())
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let mut store = GenerationStore::new_with_config(store_path, 8)?;
     store.configure(&cfg);
 
@@ -358,309 +372,48 @@ fn process_txt_file(
         cfg.work_segment_size
     ));
 
-    // Seed with empty ortho
-    let seed_ortho = Ortho::new();
-    let mut best_ortho = seed_ortho.clone();
-    let mut best_score = best_ortho.score();
-    let mut global_score = metrics.optimal_score();
-    let mut optimal_dirty = false;
-    let mut total_processed = 0;
+    let mut housekeeping = || -> Result<(), FoldError> {
+        ingestion.touch_heartbeat()?;
+        mem_claim.touch()?;
+        touch_leader_lock_if_owner(config)?;
+        Ok(())
+    };
 
-    // Push seed to work queue
-    store.push_segments(vec![seed_ortho])?;
-
-    // Initialize metrics with initial state
-    metrics.update_global(|g| {
-        g.generation = 0;
-        g.phase = "Idle".to_string();
-        g.work_len = store.work_len();
-        g.seen_len_accepted = store.seen_len_accepted();
-        g.run_budget_bytes = cfg.run_budget_bytes;
-        g.fan_in = cfg.fan_in;
-    });
-    metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
-    
-    // Check cache for initial optimal ortho
-    if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
-        metrics.record_optimal_volume(cache_ortho.volume());
-    }
-
-    metrics.set_operation_status("Processing orthos".to_string());
-
-    let mut sys = sysinfo::System::new();
-    let mut generation = 0u64;
-    let mut generation_stats: Vec<GenerationStat> = Vec::new();
-    
-    // Tracking for throughput calculation
-    let mut last_report_time = std::time::Instant::now();
-    let mut last_report_count = 0;
-    let mut last_housekeeping: std::time::Instant;
-    
-    // Generational processing loop
-    loop {
-        let work_len = store.work_len();
-        if work_len == 0 {
-            break;
-        }
-
-        // Update global metrics at start of generation
-        metrics.update_global(|g| {
-            g.generation = generation;
-            g.phase = format!("Gen {} Processing", generation);
-            g.work_len = work_len;
-            g.seen_len_accepted = store.seen_len_accepted();
-            g.run_budget_bytes = cfg.run_budget_bytes;
-            g.fan_in = cfg.fan_in;
-        });
-        // Set progress tracking for this generation
-        metrics.update_operation(|op| {
-            op.progress_total = work_len as usize;
-            op.progress_current = 0;
-        });
-        metrics.set_operation_status(format!("Processing Gen {}", generation));
-        // Record samples for charts
-        metrics.record_work_len(work_len as usize);
-        metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
-        
-        // Update bucket metrics
-        let bucket_stats = store.bucket_stats();
-        let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
-            fold::metrics::BucketMetrics {
-                bucket_id: bs.bucket_id,
-                run_count: bs.run_count,
-                landing_size: bs.landing_size,
-                history_size_estimate: bs.history_size_estimate,
-                state: fold::metrics::BucketState::Pending,
-                new_work: 0,
-            }
-        }).collect();
-        metrics.update_bucket_metrics(bucket_metrics);
-        
-        // Low-frequency cache check (once per generation)
-        if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
-            if cache_ortho.volume() > best_ortho.volume() {
-                let cache_score = cache_ortho.score();
-                metrics.record_optimal_volume(cache_score.0);
-                if cache_score > best_score {
-                    best_ortho = cache_ortho;
-                    best_score = cache_score;
-                    optimal_dirty = true;
-                }
-            }
-        }
-
-        metrics.add_log(format!(
-            "Generation {}: processing {} work items",
-            generation, work_len
-        ));
-        
-        let mut gen_processed = 0;
-        
-        let gen_start = std::time::Instant::now();
-        let accepted_before = store.seen_len_accepted();
-        last_housekeeping = std::time::Instant::now();
-
-        // Process all work in this generation
-        while let Some(ortho) = store.pop_work()? {
-            gen_processed += 1;
-            total_processed += 1;
-
-            // Periodic updates on a time cadence
-            if last_housekeeping.elapsed().as_millis() >= 1000 {
-                // Update progress for current generation
-                metrics.update_operation(|op| {
-                    op.progress_current = gen_processed;
-                });
-                
-                let now = std::time::Instant::now();
-                let elapsed = now.duration_since(last_report_time).as_secs_f64();
-                
-                // Calculate throughput
-                let processed_since_last = total_processed - last_report_count;
-                let throughput = if elapsed > 0.0 {
-                    (processed_since_last as f64 / elapsed) as usize
-                } else {
-                    0
-                };
-                
-                // Update every second for visibility
-                if elapsed >= 1.0 {
-                    metrics.update_global(|g| {
-                        g.phase = format!("Gen {} Processing ({}/s)", generation, throughput);
-                    });
-                    last_report_time = now;
-                    last_report_count = total_processed;
-                }
-                last_housekeeping = now;
-                
-                metrics.record_optimal_volume(best_ortho.volume());
-
-                // Update work queue metrics
-                metrics.update_global(|g| {
-                    g.work_len = store.work_len();
-                    g.seen_len_accepted = store.seen_len_accepted();
-                });
-                metrics.record_work_len(store.work_len() as usize);
-                metrics.record_landing_buffer_count(store.total_landing_size());
-                
-                // Update bucket metrics for TUI visualization
-                let bucket_stats = store.bucket_stats();
-                let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
-                    fold::metrics::BucketMetrics {
-                        bucket_id: bs.bucket_id,
-                        run_count: bs.run_count,
-                        landing_size: bs.landing_size,
-                        history_size_estimate: bs.history_size_estimate,
-                        state: fold::metrics::BucketState::Pending,
-                        new_work: 0,
-                    }
-                }).collect();
-                metrics.update_bucket_metrics(bucket_metrics);
-
-                if optimal_dirty {
-                    let (volume, fullness) = best_score;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    metrics.update_optimal_ortho(|opt| {
-                        opt.volume = volume;
-                        opt.dims = best_ortho.dims().clone();
-                        opt.fullness = fullness;
-                        opt.capacity = best_ortho.payload().len();
-                        opt.payload = best_ortho.payload().clone();
-                        opt.vocab = interner.vocabulary().to_vec();
-                        opt.last_update_time = now;
-                    });
-                    optimal_dirty = false;
-                }
-
-                // Update RAM and check follower bail-out
-                sys.refresh_memory();
-                let (used_bytes, total_bytes) =
-                    normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-                let proc_rss_bytes = current_process_rss_bytes(&mut sys);
-                let percent = if total_bytes > 0 {
-                    ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
-                } else {
-                    0
-                };
-                let jobs_count =
-                    file_handler::count_running_jobs_with_config(config).unwrap_or(0);
-                metrics.update_global(|g| {
-                    g.ram_bytes = used_bytes;
-                    g.process_rss_bytes = proc_rss_bytes;
-                    g.system_memory_percent = percent;
-                    g.distinct_jobs_count = jobs_count;
-                });
-
-                // Follower bail-out on memory pressure
-                if role == Role::Follower && percent >= 85 {
-                    metrics.add_log(format!(
-                        "Follower exiting: memory pressure (used {} MB / total {} MB)",
-                        used_bytes / 1_048_576,
-                        total_bytes / 1_048_576
-                    ));
-                    return Err(FoldError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Follower exiting: memory pressure",
-                    )));
-                }
-            }
-
-            if total_processed % 50000 == 0 {
-                metrics.add_log(format!("Progress: {} orthos processed", total_processed));
-            }
-
-            if total_processed % 100000 == 0 {
-                print_optimal(&best_ortho, &interner);
-                ingestion.touch_heartbeat()?;
-                mem_claim.touch()?;
-                touch_leader_lock_if_owner(config)?;
-            }
-
-            // Get requirements from ortho
-            let (forbidden, required) = ortho.get_requirements();
-            let forbidden_usize: Vec<usize> =
-                forbidden.iter().map(|v| payload_to_usize(*v)).collect();
-            let required_usize: Vec<Vec<usize>> = required
-                .iter()
-                .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
-                .collect();
-
-            // Get completions from interner
-            let completions = interner.intersect(&required_usize, &forbidden_usize);
-            let total_completions = completions.len();
-            if total_completions > FANOUT_LOG_THRESHOLD {
-                let chunks =
-                    (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
-                metrics.add_log(format!(
-                    "Fanout: {} completions; processing in {} chunks of {}",
-                    total_completions, chunks, COMPLETION_CHUNK_SIZE
-                ));
-            }
-
-            // Generate child orthos and record results
-            for completion in completions {
-                let completion_val =
-                    PayloadVal::try_from(completion).expect("completion overflowed u32");
-                let children = ortho.add(completion_val);
-                for child in children {
-                    let candidate_score = child.score();
-                    if candidate_score > best_score {
-                        best_ortho = child.clone();
-                        best_score = candidate_score;
-                    }
-                    if candidate_score > global_score {
-                        global_score = candidate_score;
-                        optimal_dirty = true;
-                    }
-                    
-                    // Record result to landing zone
-                    store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
-                    
-                    // Increment new orthos counter for each generated ortho
-                    metrics.increment_new_orthos(1);
-                }
-            }
-        }
-
-        metrics.add_log(format!(
-            "Generation {}: processed {} orthos",
-            generation, gen_processed
-        ));
-
-        // End of generation: drain, compact, anti-join, push new work
-        let gen_for_closure = generation;
-        let metrics_clone = metrics.clone_handle();
-        let progress_callback: fold::generation_store::ProgressCallback = Box::new(move |msg: &str| {
-            // Parse special bucket state messages
+    let metrics_handle = metrics.clone_handle();
+    let progress_factory = move |gen_for_closure: u64| {
+        let metrics_clone = metrics_handle.clone_handle();
+        Some(Box::new(move |msg: &str| {
             if msg.starts_with("TRANSITION_START:") {
                 if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
                     if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
-                        // Initialize all buckets as pending
-                        let initial_buckets: Vec<_> = (0..bucket_count).map(|i| {
-                            fold::metrics::BucketMetrics {
+                        let initial_buckets: Vec<_> = (0..bucket_count)
+                            .map(|i| fold::metrics::BucketMetrics {
                                 bucket_id: i,
                                 run_count: 0,
                                 landing_size: 0,
                                 history_size_estimate: 0,
                                 state: fold::metrics::BucketState::Pending,
                                 new_work: 0,
-                            }
-                        }).collect();
+                            })
+                            .collect();
                         metrics_clone.update_bucket_metrics(initial_buckets);
                     }
                 }
             } else if msg.starts_with("BUCKET_STATE:") {
-                // Parse: BUCKET_STATE:bucket_id:state[:new_work]
-                let parts: Vec<&str> = msg.strip_prefix("BUCKET_STATE:").unwrap().split(':').collect();
+                let parts: Vec<&str> = msg
+                    .strip_prefix("BUCKET_STATE:")
+                    .unwrap()
+                    .split(':')
+                    .collect();
                 if parts.len() >= 2 {
                     if let Ok(bucket_id) = parts[0].parse::<usize>() {
                         let state_str = parts[1];
-                        let new_work = if parts.len() >= 3 { parts[2].parse::<usize>().unwrap_or(0) } else { 0 };
-                        
+                        let new_work = if parts.len() >= 3 {
+                            parts[2].parse::<usize>().unwrap_or(0)
+                        } else {
+                            0
+                        };
+
                         let state = match state_str {
                             "draining" => fold::metrics::BucketState::Draining,
                             "sorting" => fold::metrics::BucketState::Sorting,
@@ -671,8 +424,7 @@ fn process_txt_file(
                             "empty" => fold::metrics::BucketState::Empty,
                             _ => fold::metrics::BucketState::Pending,
                         };
-                        
-                        // Update specific bucket state without wiping existing metrics
+
                         let snapshot = metrics_clone.snapshot();
                         let mut updated_buckets = snapshot.bucket_metrics.clone();
                         if bucket_id < updated_buckets.len() {
@@ -683,88 +435,66 @@ fn process_txt_file(
                     }
                 }
             } else if msg == "TRANSITION_COMPLETE" {
-                // Reset all buckets to normal state
                 let snapshot = metrics_clone.snapshot();
-                let reset_buckets: Vec<_> = snapshot.bucket_metrics.iter().map(|b| {
-                    fold::metrics::BucketMetrics {
+                let reset_buckets: Vec<_> = snapshot
+                    .bucket_metrics
+                    .iter()
+                    .map(|b| fold::metrics::BucketMetrics {
                         bucket_id: b.bucket_id,
                         run_count: b.run_count,
                         landing_size: b.landing_size,
                         history_size_estimate: b.history_size_estimate,
                         state: fold::metrics::BucketState::Pending,
                         new_work: 0,
-                    }
-                }).collect();
+                    })
+                    .collect();
                 metrics_clone.update_bucket_metrics(reset_buckets);
             }
-            
-            // Update phase display (for non-control messages)
-            if !msg.starts_with("BUCKET_STATE:") && !msg.starts_with("TRANSITION_START:") && msg != "TRANSITION_COMPLETE" {
+
+            if !msg.starts_with("BUCKET_STATE:")
+                && !msg.starts_with("TRANSITION_START:")
+                && msg != "TRANSITION_COMPLETE"
+            {
                 metrics_clone.update_global(|g| {
                     g.phase = format!("Gen {} → {}: {}", gen_for_closure, gen_for_closure + 1, msg);
                 });
                 metrics_clone.add_log(format!("Gen {} transition: {}", gen_for_closure, msg));
             }
-        });
-        
-        metrics.update_global(|g| {
-            g.phase = format!("Gen {} → {} transition starting", generation, generation + 1);
-        });
-        metrics.set_operation_status(format!("Gen {} → {} transition", generation, generation + 1));
-        
-        let processing_secs = gen_start.elapsed().as_secs_f64();
-        let transition_start = std::time::Instant::now();
-        let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
-        let transition_secs = transition_start.elapsed().as_secs_f64();
-        let accepted_delta = store
-            .seen_len_accepted()
-            .saturating_sub(accepted_before);
-        generation_stats.push(GenerationStat {
-            generation,
-            processing_secs,
-            transition_secs,
-            accepted: accepted_delta,
-            new_work,
-        });
-        
-        // Update metrics after generation transition
-        metrics.update_global(|g| {
-            g.work_len = store.work_len();
-            g.seen_len_accepted = store.seen_len_accepted();
-            g.phase = format!("Gen {} complete", generation);
-        });
-        metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
-        
-        metrics.add_log(format!(
-            "Generation {} complete: {} new work items, {} total seen",
-            generation, new_work, store.seen_len_accepted()
-        ));
-        
-        generation += 1;
-        if new_work == 0 {
-            metrics.add_log("No new work after transition; stopping generations".to_string());
-            break;
-        }
-    }
+        }) as fold::generation_store::ProgressCallback)
+    };
+
+    let run_result = run_generation_loop(
+        &interner,
+        &mut store,
+        &cfg,
+        role,
+        metrics,
+        || should_quit.load(Ordering::Relaxed),
+        &mut housekeeping,
+        progress_factory,
+        Some(config),
+    )?;
+
+    let generation_stats = run_result.generation_stats.clone();
 
     metrics.add_log(format!(
         "Completed {} generations, {} total orthos",
-        generation, store.seen_len_accepted()
+        generation_stats.len(),
+        store.seen_len_accepted()
     ));
 
-    if optimal_dirty {
-        let (volume, fullness) = best_score;
+    if run_result.optimal_dirty {
+        let (volume, fullness) = run_result.best_score;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         metrics.update_optimal_ortho(|opt| {
             opt.volume = volume;
-            opt.dims = best_ortho.dims().clone();
+            opt.dims = run_result.best_ortho.dims().clone();
             opt.fullness = fullness;
-            opt.capacity = best_ortho.payload().len();
-            opt.payload = best_ortho.payload().clone();
+            opt.capacity = run_result.best_ortho.payload().len();
+            opt.payload = run_result.best_ortho.payload().clone();
             opt.vocab = interner.vocabulary().to_vec();
             opt.last_update_time = now;
         });
@@ -774,7 +504,7 @@ fn process_txt_file(
     metrics.add_log(format!("Archiving: {} orthos", total_orthos));
     metrics.increment_new_orthos(total_orthos);
 
-    print_optimal(&best_ortho, &interner);
+    print_optimal(&run_result.best_ortho, &interner);
 
     store.flush_all()?;
 
@@ -784,7 +514,7 @@ fn process_txt_file(
     write_archive_artifacts(
         &archive_path,
         &interner,
-        Some(&best_ortho),
+        Some(&run_result.best_ortho),
         &lineage,
         total_orthos,
         &ingestion.text_preview,
@@ -803,7 +533,7 @@ fn process_txt_file(
     });
 
     metrics.update_global(|g| g.processed_chunks += 1);
-    metrics.set_generation_stats(generation_stats);
+    metrics.set_generation_stats(run_result.generation_stats);
 
     // Cleanup work folder
     ingestion.cleanup()?;
@@ -899,7 +629,9 @@ fn merge_archives(
     ));
     // Record run-level metadata up front so history write doesn't need to rewalk disk
     metrics.update_global(|g| {
-        g.run_input_words = ingestion.word_count_a.saturating_add(ingestion.word_count_b);
+        g.run_input_words = ingestion
+            .word_count_a
+            .saturating_add(ingestion.word_count_b);
         g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
     });
 
@@ -917,7 +649,10 @@ fn merge_archives(
     let mem_claim = acquire_memory_claim_simple(role, config, metrics, interner_bytes)?;
 
     // Initialize GenerationStore for merge
-    let store_path = PathBuf::from(ingestion.work_queue_path()).parent().unwrap().to_path_buf();
+    let store_path = PathBuf::from(ingestion.work_queue_path())
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let mut store = GenerationStore::new_with_config(store_path, 8)?;
     store.configure(&cfg);
 
@@ -970,29 +705,29 @@ fn merge_archives(
 
     // Process larger archive (no remapping needed) - stream directly into GenerationStore
     metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
-    
+
     // Create a temporary GenerationStore to read from the archive's results
     let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
-    
+
     let mut total_from_larger = 0;
     let mut impacted_from_larger = 0;
-    
+
     // Stream all orthos from larger archive's history into our merge store
     for bucket in 0..8 {
         for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
             let ortho_bytes = result?.bytes;
             let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
             total_from_larger += 1;
-            
+
             // Record to landing zone (will be deduped during generation end)
             store.record_result(&ortho)?;
-            
+
             // If impacted, also seed to work queue
             if is_ortho_impacted_fast(&ortho, larger_impacted_ref) {
                 store.push_segments(vec![ortho])?;
                 impacted_from_larger += 1;
             }
-            
+
             if total_from_larger % 10000 == 0 {
                 ingestion.touch_heartbeat()?;
                 mem_claim.touch()?;
@@ -1000,39 +735,42 @@ fn merge_archives(
             }
         }
     }
-    
+
     metrics.add_log(format!(
         "Loaded {} orthos from larger archive {} ({} impacted)",
         total_from_larger, larger_name, impacted_from_larger
     ));
 
     // Process smaller archive (needs remapping) - stream and remap into GenerationStore
-    metrics.set_operation_status(format!("Streaming & Remapping Smaller Archive {}", smaller_name));
-    
+    metrics.set_operation_status(format!(
+        "Streaming & Remapping Smaller Archive {}",
+        smaller_name
+    ));
+
     let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
-    
+
     let mut total_from_smaller = 0;
     let mut impacted_from_smaller = 0;
-    
+
     // Stream all orthos from smaller archive's history, remap, and store
     for bucket in 0..8 {
         for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
             let ortho_bytes = result?.bytes;
             let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
             total_from_smaller += 1;
-            
+
             // Remap the ortho to merged vocabulary
             if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
                 // Record remapped ortho to landing zone
                 store.record_result(&remapped)?;
-                
+
                 // If impacted, also seed to work queue
                 if is_ortho_impacted_fast(&remapped, smaller_impacted_ref) {
                     store.push_segments(vec![remapped])?;
                     impacted_from_smaller += 1;
                 }
             }
-            
+
             if total_from_smaller % 10000 == 0 {
                 ingestion.touch_heartbeat()?;
                 mem_claim.touch()?;
@@ -1040,7 +778,7 @@ fn merge_archives(
             }
         }
     }
-    
+
     metrics.add_log(format!(
         "Loaded & remapped {} orthos from smaller archive {} ({} impacted)",
         total_from_smaller, smaller_name, impacted_from_smaller
@@ -1062,8 +800,16 @@ fn merge_archives(
     metrics.add_log(format!(
         "Rehydration complete: {} work items ready (A:{} B:{})",
         store.work_len(),
-        if a_is_smaller { impacted_from_smaller } else { impacted_from_larger },
-        if a_is_smaller { impacted_from_larger } else { impacted_from_smaller }
+        if a_is_smaller {
+            impacted_from_smaller
+        } else {
+            impacted_from_larger
+        },
+        if a_is_smaller {
+            impacted_from_larger
+        } else {
+            impacted_from_smaller
+        }
     ));
 
     // Now process generations just like in process_txt_file
@@ -1085,7 +831,7 @@ fn merge_archives(
     });
     metrics.record_work_len(store.work_len() as usize);
     metrics.record_landing_buffer_count(store.total_landing_size());
-    
+
     // Check cache for initial optimal ortho in merge
     if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
         metrics.record_optimal_volume(cache_ortho.volume());
@@ -1120,21 +866,22 @@ fn merge_archives(
         // Record samples for charts
         metrics.record_work_len(work_len as usize);
         metrics.record_landing_buffer_count(store.total_landing_size());
-        
+
         // Update bucket metrics
         let bucket_stats = store.bucket_stats();
-        let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
-            fold::metrics::BucketMetrics {
+        let bucket_metrics: Vec<_> = bucket_stats
+            .into_iter()
+            .map(|bs| fold::metrics::BucketMetrics {
                 bucket_id: bs.bucket_id,
                 run_count: bs.run_count,
                 landing_size: bs.landing_size,
                 history_size_estimate: bs.history_size_estimate,
                 state: fold::metrics::BucketState::Pending,
                 new_work: 0,
-            }
-        }).collect();
+            })
+            .collect();
         metrics.update_bucket_metrics(bucket_metrics);
-        
+
         // Low-frequency cache check (once per generation)
         if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
             if cache_ortho.volume() > best_ortho.volume() {
@@ -1169,10 +916,10 @@ fn merge_archives(
                 metrics.update_operation(|op| {
                     op.progress_current = gen_processed;
                 });
-                
+
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(last_report_time).as_secs_f64();
-                
+
                 // Calculate throughput
                 let processed_since_last = total_processed - last_report_count;
                 let throughput = if elapsed > 0.0 {
@@ -1180,7 +927,7 @@ fn merge_archives(
                 } else {
                     0
                 };
-                
+
                 // Update every second for visibility
                 if elapsed >= 1.0 {
                     metrics.update_global(|g| {
@@ -1190,9 +937,9 @@ fn merge_archives(
                     last_report_count = total_processed;
                 }
                 last_housekeeping = now;
-                
+
                 metrics.record_optimal_volume(best_ortho.volume());
-                
+
                 metrics.update_operation(|op| {
                     op.progress_current = total_processed;
                 });
@@ -1204,19 +951,20 @@ fn merge_archives(
                 });
                 metrics.record_work_len(store.work_len() as usize);
                 metrics.record_landing_buffer_count(store.total_landing_size());
-                
+
                 // Update bucket metrics for TUI visualization
                 let bucket_stats = store.bucket_stats();
-                let bucket_metrics: Vec<_> = bucket_stats.into_iter().map(|bs| {
-                    fold::metrics::BucketMetrics {
+                let bucket_metrics: Vec<_> = bucket_stats
+                    .into_iter()
+                    .map(|bs| fold::metrics::BucketMetrics {
                         bucket_id: bs.bucket_id,
                         run_count: bs.run_count,
                         landing_size: bs.landing_size,
                         history_size_estimate: bs.history_size_estimate,
                         state: fold::metrics::BucketState::Pending,
                         new_work: 0,
-                    }
-                }).collect();
+                    })
+                    .collect();
                 metrics.update_bucket_metrics(bucket_metrics);
 
                 if optimal_dirty {
@@ -1247,8 +995,7 @@ fn merge_archives(
                 } else {
                     0
                 };
-                let jobs_count =
-                    file_handler::count_running_jobs_with_config(config).unwrap_or(0);
+                let jobs_count = file_handler::count_running_jobs_with_config(config).unwrap_or(0);
                 metrics.update_global(|g| {
                     g.ram_bytes = used_bytes;
                     g.process_rss_bytes = proc_rss_bytes;
@@ -1258,10 +1005,7 @@ fn merge_archives(
 
                 // Follower bail-out
                 if role == Role::Follower && percent >= 85 {
-                    metrics.add_log(format!(
-                        "Follower exiting: memory pressure ({}%)",
-                        percent
-                    ));
+                    metrics.add_log(format!("Follower exiting: memory pressure ({}%)", percent));
                     return Err(FoldError::Io(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "Follower: memory pressure",
@@ -1270,7 +1014,10 @@ fn merge_archives(
             }
 
             if total_processed % 50000 == 0 {
-                metrics.add_log(format!("Merge progress: {} orthos processed", total_processed));
+                metrics.add_log(format!(
+                    "Merge progress: {} orthos processed",
+                    total_processed
+                ));
             }
 
             if total_processed % 100000 == 0 {
@@ -1291,7 +1038,8 @@ fn merge_archives(
             let completions = merged_interner.intersect(&required_usize, &forbidden_usize);
 
             if completions.len() > FANOUT_LOG_THRESHOLD {
-                let chunks = (completions.len() + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
+                let chunks =
+                    (completions.len() + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
                 metrics.add_log(format!(
                     "Fanout: {} completions; {} chunks",
                     completions.len(),
@@ -1314,9 +1062,9 @@ fn merge_archives(
                         global_score = candidate_score;
                         optimal_dirty = true;
                     }
-                    
+
                     store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
-                    
+
                     // Increment new orthos counter for each generated ortho
                     metrics.increment_new_orthos(1);
                 }
@@ -1331,91 +1079,117 @@ fn merge_archives(
         // End of generation
         let gen_for_closure = generation;
         let metrics_clone = metrics.clone_handle();
-        let progress_callback: fold::generation_store::ProgressCallback = Box::new(move |msg: &str| {
-            // Parse special bucket state messages
-            if msg.starts_with("TRANSITION_START:") {
-                if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
-                    if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
-                        // Initialize all buckets as pending
-                        let initial_buckets: Vec<_> = (0..bucket_count).map(|i| {
-                            fold::metrics::BucketMetrics {
-                                bucket_id: i,
-                                run_count: 0,
-                                landing_size: 0,
-                                history_size_estimate: 0,
-                                state: fold::metrics::BucketState::Pending,
-                                new_work: 0,
-                            }
-                        }).collect();
-                        metrics_clone.update_bucket_metrics(initial_buckets);
-                    }
-                }
-            } else if msg.starts_with("BUCKET_STATE:") {
-                // Parse: BUCKET_STATE:bucket_id:state[:new_work]
-                let parts: Vec<&str> = msg.strip_prefix("BUCKET_STATE:").unwrap().split(':').collect();
-                if parts.len() >= 2 {
-                    if let Ok(bucket_id) = parts[0].parse::<usize>() {
-                        let state_str = parts[1];
-                        let new_work = if parts.len() >= 3 { parts[2].parse::<usize>().unwrap_or(0) } else { 0 };
-                        
-                        let state = match state_str {
-                            "draining" => fold::metrics::BucketState::Draining,
-                            "sorting" => fold::metrics::BucketState::Sorting,
-                            "merging" => fold::metrics::BucketState::Merging,
-                            "antijoining" => fold::metrics::BucketState::AntiJoining,
-                            "compacting" => fold::metrics::BucketState::Compacting,
-                            "complete" => fold::metrics::BucketState::Complete,
-                            "empty" => fold::metrics::BucketState::Empty,
-                            _ => fold::metrics::BucketState::Pending,
-                        };
-                        
-                        // Update specific bucket state without wiping existing metrics
-                        let snapshot = metrics_clone.snapshot();
-                        let mut updated_buckets = snapshot.bucket_metrics.clone();
-                        if bucket_id < updated_buckets.len() {
-                            updated_buckets[bucket_id].state = state;
-                            updated_buckets[bucket_id].new_work = new_work;
-                            metrics_clone.update_bucket_metrics(updated_buckets);
+        let progress_callback: fold::generation_store::ProgressCallback =
+            Box::new(move |msg: &str| {
+                // Parse special bucket state messages
+                if msg.starts_with("TRANSITION_START:") {
+                    if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
+                        if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
+                            // Initialize all buckets as pending
+                            let initial_buckets: Vec<_> = (0..bucket_count)
+                                .map(|i| fold::metrics::BucketMetrics {
+                                    bucket_id: i,
+                                    run_count: 0,
+                                    landing_size: 0,
+                                    history_size_estimate: 0,
+                                    state: fold::metrics::BucketState::Pending,
+                                    new_work: 0,
+                                })
+                                .collect();
+                            metrics_clone.update_bucket_metrics(initial_buckets);
                         }
                     }
-                }
-            } else if msg == "TRANSITION_COMPLETE" {
-                // Reset all buckets to normal state
-                let snapshot = metrics_clone.snapshot();
-                let reset_buckets: Vec<_> = snapshot.bucket_metrics.iter().map(|b| {
-                    fold::metrics::BucketMetrics {
-                        bucket_id: b.bucket_id,
-                        run_count: b.run_count,
-                        landing_size: b.landing_size,
-                        history_size_estimate: b.history_size_estimate,
-                        state: fold::metrics::BucketState::Pending,
-                        new_work: 0,
+                } else if msg.starts_with("BUCKET_STATE:") {
+                    // Parse: BUCKET_STATE:bucket_id:state[:new_work]
+                    let parts: Vec<&str> = msg
+                        .strip_prefix("BUCKET_STATE:")
+                        .unwrap()
+                        .split(':')
+                        .collect();
+                    if parts.len() >= 2 {
+                        if let Ok(bucket_id) = parts[0].parse::<usize>() {
+                            let state_str = parts[1];
+                            let new_work = if parts.len() >= 3 {
+                                parts[2].parse::<usize>().unwrap_or(0)
+                            } else {
+                                0
+                            };
+
+                            let state = match state_str {
+                                "draining" => fold::metrics::BucketState::Draining,
+                                "sorting" => fold::metrics::BucketState::Sorting,
+                                "merging" => fold::metrics::BucketState::Merging,
+                                "antijoining" => fold::metrics::BucketState::AntiJoining,
+                                "compacting" => fold::metrics::BucketState::Compacting,
+                                "complete" => fold::metrics::BucketState::Complete,
+                                "empty" => fold::metrics::BucketState::Empty,
+                                _ => fold::metrics::BucketState::Pending,
+                            };
+
+                            // Update specific bucket state without wiping existing metrics
+                            let snapshot = metrics_clone.snapshot();
+                            let mut updated_buckets = snapshot.bucket_metrics.clone();
+                            if bucket_id < updated_buckets.len() {
+                                updated_buckets[bucket_id].state = state;
+                                updated_buckets[bucket_id].new_work = new_work;
+                                metrics_clone.update_bucket_metrics(updated_buckets);
+                            }
+                        }
                     }
-                }).collect();
-                metrics_clone.update_bucket_metrics(reset_buckets);
-            }
-            
-            // Update phase display (for non-control messages)
-            if !msg.starts_with("BUCKET_STATE:") && !msg.starts_with("TRANSITION_START:") && msg != "TRANSITION_COMPLETE" {
-                metrics_clone.update_global(|g| {
-                    g.phase = format!("Merge Gen {} → {}: {}", gen_for_closure, gen_for_closure + 1, msg);
-                });
-                metrics_clone.add_log(format!("Merge Gen {} transition: {}", gen_for_closure, msg));
-            }
-        });
-        
+                } else if msg == "TRANSITION_COMPLETE" {
+                    // Reset all buckets to normal state
+                    let snapshot = metrics_clone.snapshot();
+                    let reset_buckets: Vec<_> = snapshot
+                        .bucket_metrics
+                        .iter()
+                        .map(|b| fold::metrics::BucketMetrics {
+                            bucket_id: b.bucket_id,
+                            run_count: b.run_count,
+                            landing_size: b.landing_size,
+                            history_size_estimate: b.history_size_estimate,
+                            state: fold::metrics::BucketState::Pending,
+                            new_work: 0,
+                        })
+                        .collect();
+                    metrics_clone.update_bucket_metrics(reset_buckets);
+                }
+
+                // Update phase display (for non-control messages)
+                if !msg.starts_with("BUCKET_STATE:")
+                    && !msg.starts_with("TRANSITION_START:")
+                    && msg != "TRANSITION_COMPLETE"
+                {
+                    metrics_clone.update_global(|g| {
+                        g.phase = format!(
+                            "Merge Gen {} → {}: {}",
+                            gen_for_closure,
+                            gen_for_closure + 1,
+                            msg
+                        );
+                    });
+                    metrics_clone
+                        .add_log(format!("Merge Gen {} transition: {}", gen_for_closure, msg));
+                }
+            });
+
         metrics.update_global(|g| {
-            g.phase = format!("Merge Gen {} → {} transition starting", generation, generation + 1);
+            g.phase = format!(
+                "Merge Gen {} → {} transition starting",
+                generation,
+                generation + 1
+            );
         });
-        metrics.set_operation_status(format!("Merge Gen {} → {} transition", generation, generation + 1));
-        
+        metrics.set_operation_status(format!(
+            "Merge Gen {} → {} transition",
+            generation,
+            generation + 1
+        ));
+
         let processing_secs = gen_start.elapsed().as_secs_f64();
         let transition_start = std::time::Instant::now();
         let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
         let transition_secs = transition_start.elapsed().as_secs_f64();
-        let accepted_delta = store
-            .seen_len_accepted()
-            .saturating_sub(accepted_before);
+        let accepted_delta = store.seen_len_accepted().saturating_sub(accepted_before);
         generation_stats.push(GenerationStat {
             generation,
             processing_secs,
@@ -1423,7 +1197,7 @@ fn merge_archives(
             accepted: accepted_delta,
             new_work,
         });
-        
+
         // Update metrics after merge generation transition
         metrics.update_global(|g| {
             g.work_len = store.work_len();
@@ -1432,12 +1206,14 @@ fn merge_archives(
         });
         metrics.record_work_len(store.work_len() as usize);
         metrics.record_landing_buffer_count(store.total_landing_size());
-        
+
         metrics.add_log(format!(
             "Merge Generation {} complete: {} new work, {} total seen",
-            generation, new_work, store.seen_len_accepted()
+            generation,
+            new_work,
+            store.seen_len_accepted()
         ));
-        
+
         generation += 1;
 
         if new_work == 0 {
@@ -1448,7 +1224,8 @@ fn merge_archives(
 
     metrics.add_log(format!(
         "Merge completed {} generations, {} total orthos",
-        generation, store.seen_len_accepted()
+        generation,
+        store.seen_len_accepted()
     ));
 
     if optimal_dirty {
@@ -1478,7 +1255,10 @@ fn merge_archives(
 
     let archive_path = build_archive_path(config)?;
     let lineage = format!("({} {})", lineage_a_early, lineage_b_early);
-    let text_preview = format!("{} + {}", ingestion.text_preview_a, ingestion.text_preview_b);
+    let text_preview = format!(
+        "{} + {}",
+        ingestion.text_preview_a, ingestion.text_preview_b
+    );
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
 
     move_history_runs_to_archive(&store.history_run_paths(), &archive_path)?;
@@ -1543,7 +1323,7 @@ fn is_ortho_impacted_fast(ortho: &Ortho, impacted_prefixes: &[Vec<usize>]) -> bo
         .iter()
         .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
         .collect();
-    
+
     // Check if any requirement prefix matches any impacted prefix
     requirements_usize
         .iter()
@@ -1588,26 +1368,22 @@ fn save_archive_vec_internal(
     config: &StateConfig,
 ) -> Result<(String, String), FoldError> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-    
+
     // Create unique archive path
-    let archive_name = format!(
-        "archive_{}_{}",
-        now.as_secs(),
-        now.subsec_nanos()
-    );
+    let archive_name = format!("archive_{}_{}", now.as_secs(), now.subsec_nanos());
     let archive_path = config.input_dir().join(format!("{}=.bin", archive_name));
-    
+
     // Create archive directory
     fs::create_dir_all(&archive_path).map_err(FoldError::Io)?;
-    
+
     // Write orthos using GenerationStore format (history runs)
     let results_dir = archive_path.join("results");
     fs::create_dir_all(&results_dir).map_err(FoldError::Io)?;
-    
+
     // Create a temporary GenerationStore to write orthos and produce history runs
     let mut temp_store = GenerationStore::new_with_config(results_dir.clone(), 8)?;
     let cfg = archive_generation_config();
@@ -1623,33 +1399,36 @@ fn save_archive_vec_internal(
     let _ = fs::remove_dir_all(results_dir.join("landing"));
     let _ = fs::remove_dir_all(results_dir.join("work"));
     let _ = fs::remove_dir_all(results_dir.join("runs"));
-    
+
     // Write the interner
     let interner_path = archive_path.join("interner.bin");
     let interner_bytes = interner.to_bytes()?;
     fs::write(interner_path, interner_bytes).map_err(FoldError::Io)?;
-    
+
     // Write optimal ortho if provided
     if let Some(ortho) = best_ortho {
         let optimal_bin_path = archive_path.join("optimal.bin");
         let optimal_bytes = ortho.to_bytes()?;
         fs::write(optimal_bin_path, optimal_bytes).map_err(FoldError::Io)?;
     }
-    
+
     // Write lineage
     let lineage_path = archive_path.join("lineage.txt");
     fs::write(lineage_path, lineage).map_err(FoldError::Io)?;
-    
+
     // Write metadata
     let metadata_path = archive_path.join("metadata.txt");
     fs::write(metadata_path, ortho_count.to_string()).map_err(FoldError::Io)?;
-    
+
     // Write text metadata (format: word_count on line 1, preview on line 2)
     let text_meta_path = archive_path.join("text_meta.txt");
     let text_metadata = format!("{}\n{}", word_count, text_preview);
     fs::write(text_meta_path, text_metadata).map_err(FoldError::Io)?;
-    
-    Ok((archive_path.to_string_lossy().to_string(), lineage.to_string()))
+
+    Ok((
+        archive_path.to_string_lossy().to_string(),
+        lineage.to_string(),
+    ))
 }
 
 fn build_archive_path(config: &StateConfig) -> Result<PathBuf, FoldError> {
@@ -1677,12 +1456,12 @@ fn move_history_runs_to_archive(
         let bucket_dir = history_dir.join(format!("b={:02}", bucket));
         fs::create_dir_all(&bucket_dir).map_err(FoldError::Io)?;
         for run_path in runs {
-            let filename = run_path
-                .file_name()
-                .ok_or_else(|| FoldError::Io(std::io::Error::new(
+            let filename = run_path.file_name().ok_or_else(|| {
+                FoldError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Missing run filename",
-                )))?;
+                ))
+            })?;
             let dest_path = bucket_dir.join(filename);
             fs::rename(run_path, &dest_path).map_err(FoldError::Io)?;
         }
@@ -1816,8 +1595,8 @@ fn ensure_leader_lock(config: &StateConfig) -> Result<Role, FoldError> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
             .as_secs();
-        use std::io::Write;
         use std::fs::OpenOptions;
+        use std::io::Write;
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1924,7 +1703,10 @@ fn write_fold_history(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
         .as_secs();
-    let summary_path = history_dir.join(format!("run_{}_role={}_pid={}.txt", timestamp, role_label, pid));
+    let summary_path = history_dir.join(format!(
+        "run_{}_role={}_pid={}.txt",
+        timestamp, role_label, pid
+    ));
 
     let input_words = if snapshot.global.run_input_words > 0 {
         snapshot.global.run_input_words
@@ -1938,10 +1720,7 @@ fn write_fold_history(
         directory_size(&config.base_dir)?
     };
     let mut summary = String::new();
-    summary.push_str(&format!(
-        "=== RUN START input_words={} ===\n",
-        input_words
-    ));
+    summary.push_str(&format!("=== RUN START input_words={} ===\n", input_words));
     summary.push_str(&format!(
         "ortho_count: {}\ndisk_space_bytes: {}\nruntime_secs: {:.3}\ninput_words: {}\n",
         ortho_count,
@@ -1955,7 +1734,11 @@ fn write_fold_history(
         for stat in snapshot.generation_stats.iter() {
             summary.push_str(&format!(
                 "  gen {}: processing_secs={:.3} transition_secs={:.3} accepted={} new_work={}\n",
-                stat.generation, stat.processing_secs, stat.transition_secs, stat.accepted, stat.new_work
+                stat.generation,
+                stat.processing_secs,
+                stat.transition_secs,
+                stat.accepted,
+                stat.new_work
             ));
         }
     }
@@ -1983,10 +1766,7 @@ fn write_fold_history(
                 .map(|p| {
                     if let Some(v) = p {
                         let idx = payload_to_usize(*v);
-                        vocab
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or_else(|| idx.to_string())
+                        vocab.get(idx).cloned().unwrap_or_else(|| idx.to_string())
                     } else {
                         "None".to_string()
                     }
@@ -2026,9 +1806,8 @@ fn collect_archive_totals(config: &StateConfig) -> Result<(usize, usize), FoldEr
         }
 
         let archive_path = path.to_string_lossy().to_string();
-        ortho_count = ortho_count.saturating_add(file_handler::load_archive_metadata(
-            &archive_path,
-        )?);
+        ortho_count =
+            ortho_count.saturating_add(file_handler::load_archive_metadata(&archive_path)?);
 
         let text_meta_path = path.join("text_meta.txt");
         let content = fs::read_to_string(&text_meta_path).map_err(FoldError::Io)?;
@@ -2039,12 +1818,10 @@ fn collect_archive_totals(config: &StateConfig) -> Result<(usize, usize), FoldEr
                 "text_meta.txt missing word count",
             ))
         })?;
-        let words = first_line.trim().parse::<usize>().map_err(|e| {
-            FoldError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e,
-            ))
-        })?;
+        let words = first_line
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         word_count = word_count.saturating_add(words);
     }
 
@@ -2113,8 +1890,16 @@ mod tests {
 
         // Build interner A (foo bar) and impacted/non-impacted orthos
         let interner_a = Interner::from_text("foo bar");
-        let foo_idx_a = interner_a.vocabulary().iter().position(|w| w == "foo").unwrap();
-        let bar_idx_a = interner_a.vocabulary().iter().position(|w| w == "bar").unwrap();
+        let foo_idx_a = interner_a
+            .vocabulary()
+            .iter()
+            .position(|w| w == "foo")
+            .unwrap();
+        let bar_idx_a = interner_a
+            .vocabulary()
+            .iter()
+            .position(|w| w == "bar")
+            .unwrap();
         let foo_val_a = PayloadVal::try_from(foo_idx_a).unwrap();
         let bar_val_a = PayloadVal::try_from(bar_idx_a).unwrap();
 
@@ -2141,8 +1926,16 @@ mod tests {
 
         // Build interner B (foo baz) and impacted/non-impacted orthos
         let interner_b = Interner::from_text("foo baz");
-        let foo_idx_b = interner_b.vocabulary().iter().position(|w| w == "foo").unwrap();
-        let baz_idx_b = interner_b.vocabulary().iter().position(|w| w == "baz").unwrap();
+        let foo_idx_b = interner_b
+            .vocabulary()
+            .iter()
+            .position(|w| w == "foo")
+            .unwrap();
+        let baz_idx_b = interner_b
+            .vocabulary()
+            .iter()
+            .position(|w| w == "baz")
+            .unwrap();
         let foo_val_b = PayloadVal::try_from(foo_idx_b).unwrap();
         let baz_val_b = PayloadVal::try_from(baz_idx_b).unwrap();
 

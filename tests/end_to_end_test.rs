@@ -1,5 +1,5 @@
 use std::fs;
-use std::process::{Command, Child};
+use std::process::{Child, Command};
 use std::thread;
 use std::time::Duration;
 
@@ -69,7 +69,7 @@ fn test_end_to_end_tiny_input() {
     // Kill the fold process
     fold_process.kill().ok();
     let output = fold_process.wait_with_output().ok();
-    
+
     // Print stdout and stderr
     if let Some(output) = output {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -111,7 +111,7 @@ fn test_end_to_end_tiny_input() {
             let name = entry.file_name();
             let path = entry.path();
             println!("[test]   - {}", name.to_string_lossy());
-            
+
             // If it's a directory, show its contents too
             if path.is_dir() && name != "mem_claims" {
                 if let Ok(sub_entries) = fs::read_dir(&path) {
@@ -127,7 +127,10 @@ fn test_end_to_end_tiny_input() {
                                 // Show contents of work directories
                                 if let Ok(work_entries) = fs::read_dir(&sub_path) {
                                     for work_entry in work_entries.filter_map(|e| e.ok()) {
-                                        println!("[test]           - {}", work_entry.file_name().to_string_lossy());
+                                        println!(
+                                            "[test]           - {}",
+                                            work_entry.file_name().to_string_lossy()
+                                        );
                                     }
                                 }
                             } else {
@@ -185,10 +188,13 @@ fn test_end_to_end_tiny_input() {
         }
     }
 
-    assert!(largest_archive.is_some(), "Could not find any valid archive");
+    assert!(
+        largest_archive.is_some(),
+        "Could not find any valid archive"
+    );
     let archive = largest_archive.unwrap();
     let archive_path = archive.path();
-    
+
     println!(
         "[test] Checking archive: {} (size: {} orthos)",
         archive.file_name().to_string_lossy(),
@@ -202,38 +208,48 @@ fn test_end_to_end_tiny_input() {
     let results_path = archive_path.join("results");
 
     assert!(interner_path.exists(), "interner.bin not found in archive");
-    assert!(optimal_bin_path.exists(), "optimal.bin not found in archive");
+    assert!(
+        optimal_bin_path.exists(),
+        "optimal.bin not found in archive"
+    );
     assert!(lineage_path.exists(), "lineage.txt not found in archive");
-    assert!(results_path.exists(), "results directory not found in archive");
+    assert!(
+        results_path.exists(),
+        "results directory not found in archive"
+    );
 
     // Load and verify optimal ortho
-    use fold::ortho::Ortho;
     use fold::interner::Interner;
-    
+    use fold::ortho::Ortho;
+
     let optimal_data = fs::read(&optimal_bin_path).unwrap();
-    let optimal_ortho: Ortho = Ortho::from_bytes(&optimal_data).expect("Failed to decode optimal ortho");
-    
+    let optimal_ortho: Ortho =
+        Ortho::from_bytes(&optimal_data).expect("Failed to decode optimal ortho");
+
     let interner_data = fs::read(&interner_path).unwrap();
     let interner: Interner =
         Interner::from_bytes(&interner_data).expect("Failed to decode interner");
-    
-    println!("[test] Optimal ortho dimensions: {:?}", optimal_ortho.dims());
+
+    println!(
+        "[test] Optimal ortho dimensions: {:?}",
+        optimal_ortho.dims()
+    );
     println!("[test] Optimal ortho volume: {}", optimal_ortho.volume());
     println!("[test] Vocabulary: {:?}", interner.vocabulary());
-    
+
     // Use the spatial module to properly visualize the ortho like the TUI does
     use fold::spatial;
-    
+
     println!("[test] \n=== TUI-STYLE ORTHO VISUALIZATION ===");
-    
+
     // Get the proper coordinate mapping
     let location_to_index = spatial::get_location_to_index(optimal_ortho.dims());
-    
+
     // For a 2D ortho, display as a grid
     if optimal_ortho.dims().len() == 2 {
         let rows = usize::from(optimal_ortho.dims()[0]);
         let cols = usize::from(optimal_ortho.dims()[1]);
-        
+
         println!("[test] {}x{} ortho:", rows, cols);
         for row in 0..rows {
             let mut row_str = String::new();
@@ -257,12 +273,15 @@ fn test_end_to_end_tiny_input() {
         }
     }
     println!("[test] ===================================\n");
-    
+
     // Print the full ortho structure
     println!("[test] \n=== RAW PAYLOAD STRUCTURE ===");
     println!("[test] Ortho ID: {}", optimal_ortho.id());
     println!("[test] Dimensions: {:?}", optimal_ortho.dims());
-    println!("[test] Payload ({} entries):", optimal_ortho.payload().len());
+    println!(
+        "[test] Payload ({} entries):",
+        optimal_ortho.payload().len()
+    );
     for (i, &token_id_opt) in optimal_ortho.payload().iter().enumerate() {
         let word = if let Some(token_id) = token_id_opt {
             if token_id < interner.vocab_size().try_into().unwrap() {
@@ -273,9 +292,12 @@ fn test_end_to_end_tiny_input() {
         } else {
             "<empty>"
         };
-        println!("[test]   [{}] token_id={:?} word=\"{}\"", i, token_id_opt, word);
+        println!(
+            "[test]   [{}] token_id={:?} word=\"{}\"",
+            i, token_id_opt, word
+        );
     }
-    
+
     // Print the dimensional structure
     println!("[test] \nDimensional breakdown:");
     for (dim_idx, &dim_size) in optimal_ortho.dims().iter().enumerate() {
@@ -306,7 +328,7 @@ fn test_end_to_end_tiny_input() {
         println!("[test]      {:?}", tokens);
     }
     println!("[test] ================================\n");
-    
+
     // For inputs "a b c d." and "a c b d.", we expect a 2x2 ortho:
     // Dimension 0: {a}
     // Dimension 1: {b, c}
@@ -314,16 +336,28 @@ fn test_end_to_end_tiny_input() {
     //   a b
     //   a c
     // Or some variation depending on processing order
-    
+
     // Verify basic properties
     assert_eq!(optimal_ortho.dims().len(), 2, "Expected 2 dimensions");
-    
+
     let vocab = interner.vocabulary();
-    assert!(vocab.contains(&"a".to_string()), "Vocabulary should contain 'a'");
-    assert!(vocab.contains(&"b".to_string()), "Vocabulary should contain 'b'");
-    assert!(vocab.contains(&"c".to_string()), "Vocabulary should contain 'c'");
-    assert!(vocab.contains(&"d".to_string()), "Vocabulary should contain 'd'");
-    
+    assert!(
+        vocab.contains(&"a".to_string()),
+        "Vocabulary should contain 'a'"
+    );
+    assert!(
+        vocab.contains(&"b".to_string()),
+        "Vocabulary should contain 'b'"
+    );
+    assert!(
+        vocab.contains(&"c".to_string()),
+        "Vocabulary should contain 'c'"
+    );
+    assert!(
+        vocab.contains(&"d".to_string()),
+        "Vocabulary should contain 'd'"
+    );
+
     // The optimal should be 2x2 or 2x3 depending on how the merge happened
     let dims = optimal_ortho.dims();
     let total_cells = dims.iter().map(|d| usize::from(*d)).product::<usize>();
@@ -332,13 +366,13 @@ fn test_end_to_end_tiny_input() {
         "Expected 4-6 cells in optimal ortho, got {}",
         total_cells
     );
-    
+
     println!("[test] ✓ Verified optimal ortho structure");
-    
+
     // Read and verify lineage
     let lineage_content = fs::read_to_string(&lineage_path).unwrap();
     println!("[test] Lineage: {}", lineage_content);
-    
+
     // Lineage should reference the source files
     assert!(
         lineage_content.contains("test") || lineage_content.contains("("),

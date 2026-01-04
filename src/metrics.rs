@@ -228,7 +228,7 @@ struct MetricsInner {
 
     seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
-    
+
     // Generational store metrics
     work_len_samples: VecDeque<MetricSample>,
     landing_buffer_samples: VecDeque<MetricSample>,

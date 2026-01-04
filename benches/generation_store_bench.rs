@@ -1,11 +1,11 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main, BenchmarkId, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use fold::generation_store::{
-    anti_join_orthos, compact_landing, merge_unique, Config, RawStream, Run, StreamedOrtho,
-    UniqueRun,
+    Config, RawStream, Run, StreamedOrtho, UniqueRun, anti_join_orthos, compact_landing,
+    merge_unique,
 };
 use fold::ortho::{Dim, Ortho, PayloadVal};
 use std::fs::{self, File};
-use std::io::{Write, BufWriter};
+use std::io::{BufWriter, Write};
 use std::mem;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -18,8 +18,7 @@ fn setup_test_dir() -> TempDir {
 fn estimate_decoded_size(ortho: &Ortho) -> usize {
     let dims_cap = ortho.dims().capacity();
     let payload_cap = ortho.payload().capacity();
-    let vec_overhead =
-        mem::size_of::<Vec<Dim>>() + mem::size_of::<Vec<Option<PayloadVal>>>();
+    let vec_overhead = mem::size_of::<Vec<Dim>>() + mem::size_of::<Vec<Option<PayloadVal>>>();
     mem::size_of::<Ortho>()
         + vec_overhead
         + dims_cap.saturating_mul(mem::size_of::<Dim>())
@@ -39,28 +38,24 @@ fn write_ortho_record(writer: &mut BufWriter<File>, ortho: &Ortho) {
 fn create_ortho_raw_stream(temp_dir: &PathBuf, bucket: usize, count: usize) -> RawStream {
     let landing_dir = temp_dir.join("landing").join(format!("b={:02}", bucket));
     fs::create_dir_all(&landing_dir).unwrap();
-    
+
     // Create a drain file with orthos
     let drain_file = landing_dir.join("drain-0.log");
     let mut writer = BufWriter::new(File::create(&drain_file).unwrap());
-    
+
     for i in 0..count {
         // Create orthos by starting with new() and adding values
         let mut ortho = Ortho::new();
         // Add values to build up the ortho
-        ortho = ortho
-            .add(PayloadVal::try_from(i % 1000).unwrap())[0]
-            .clone();
+        ortho = ortho.add(PayloadVal::try_from(i % 1000).unwrap())[0].clone();
         if i % 100 < 50 {
-            ortho = ortho
-                .add(PayloadVal::try_from((i / 2) % 1000).unwrap())[0]
-                .clone();
+            ortho = ortho.add(PayloadVal::try_from((i / 2) % 1000).unwrap())[0].clone();
         }
-        
+
         write_ortho_record(&mut writer, &ortho);
     }
     writer.flush().unwrap();
-    
+
     RawStream::new(vec![drain_file])
 }
 
@@ -68,28 +63,26 @@ fn create_ortho_raw_stream(temp_dir: &PathBuf, bucket: usize, count: usize) -> R
 fn create_sorted_ortho_runs(temp_dir: &PathBuf, num_runs: usize, items_per_run: usize) -> Vec<Run> {
     let runs_dir = temp_dir.join("runs");
     fs::create_dir_all(&runs_dir).unwrap();
-    
+
     let mut runs = Vec::new();
-    
+
     for run_idx in 0..num_runs {
         let run_path = runs_dir.join(format!("run-{}.dat", run_idx));
         let mut writer = BufWriter::new(File::create(&run_path).unwrap());
-        
+
         // Write sorted orthos with some overlap between runs
         for i in 0..items_per_run {
             let base_idx = run_idx * items_per_run / 2 + i;
             let mut ortho = Ortho::new();
-            ortho = ortho
-                .add(PayloadVal::try_from(base_idx % 1000).unwrap())[0]
-                .clone();
-            
+            ortho = ortho.add(PayloadVal::try_from(base_idx % 1000).unwrap())[0].clone();
+
             write_ortho_record(&mut writer, &ortho);
         }
         writer.flush().unwrap();
-        
+
         runs.push(Run::new(run_path));
     }
-    
+
     runs
 }
 
@@ -97,33 +90,33 @@ fn create_sorted_ortho_runs(temp_dir: &PathBuf, num_runs: usize, items_per_run: 
 fn create_unique_ortho_run(temp_dir: &PathBuf, count: usize) -> UniqueRun {
     let runs_dir = temp_dir.join("runs");
     fs::create_dir_all(&runs_dir).unwrap();
-    
+
     let unique_path = runs_dir.join("unique.dat");
     let mut writer = BufWriter::new(File::create(&unique_path).unwrap());
-    
+
     for i in 0..count {
         // Create orthos by starting with new() and adding values
         let mut ortho = Ortho::new();
         ortho = ortho.add(PayloadVal::try_from(i).unwrap())[0].clone();
-        
+
         write_ortho_record(&mut writer, &ortho);
     }
     writer.flush().unwrap();
-    
+
     UniqueRun::new(unique_path)
 }
 
 /// Helper to create history orthos for anti-join testing
 fn create_history_orthos(history_size: usize) -> Vec<Ortho> {
     let mut history = Vec::new();
-    
+
     // Create history orthos for even numbers only (so odd numbers are new)
     for i in (0..history_size * 2).step_by(2) {
         let mut ortho = Ortho::new();
         ortho = ortho.add(PayloadVal::try_from(i).unwrap())[0].clone();
         history.push(ortho);
     }
-    
+
     // Sort by ID for anti-join
     history.sort_by_key(|o| o.id());
     history
@@ -146,10 +139,10 @@ fn bench_sort_throughput_128mb(c: &mut Criterion) {
         history_cache_bytes: 1024 * 1024,
         landing_flush_threshold: 64 * 1024,
     };
-    
+
     // Create orthos for benchmarking (scaled down for reasonable test time)
     let count = 100_000;
-    
+
     c.bench_function("compact_landing_128mb_100k_orthos", |b| {
         b.iter(|| {
             let temp_dir = setup_test_dir();
@@ -175,10 +168,10 @@ fn bench_sort_throughput_512mb(c: &mut Criterion) {
         history_cache_bytes: 1024 * 1024,
         landing_flush_threshold: 64 * 1024,
     };
-    
+
     // Create orthos for benchmarking
     let count = 100_000;
-    
+
     c.bench_function("compact_landing_512mb_100k_orthos", |b| {
         b.iter(|| {
             let temp_dir = setup_test_dir();
@@ -204,10 +197,10 @@ fn bench_sort_throughput_2gb(c: &mut Criterion) {
         history_cache_bytes: 1024 * 1024,
         landing_flush_threshold: 64 * 1024,
     };
-    
+
     // Create orthos for benchmarking
     let count = 100_000;
-    
+
     c.bench_function("compact_landing_2gb_100k_orthos", |b| {
         b.iter(|| {
             let temp_dir = setup_test_dir();
@@ -228,25 +221,24 @@ fn bench_anti_join_history_1k(c: &mut Criterion) {
     let temp_dir = setup_test_dir();
     let base_path = temp_dir.path().to_path_buf();
     fs::create_dir_all(base_path.join("runs")).unwrap();
-    
+
     // Create unique run with 10k orthos
     let unique_run = create_unique_ortho_run(&base_path, 10_000);
-    
+
     // Create history with 1k orthos (even numbers)
     let history = create_history_orthos(1_000);
-    
+
     c.bench_function("anti_join_history_1k", |b| {
         b.iter(|| {
-            let history_iter = history
-                .clone()
-                .into_iter()
-                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0, decoded_size_est: estimate_decoded_size(&o) }));
-            let (work, _run, _count) = anti_join_orthos(
-                unique_run.clone(),
-                history_iter,
-                &base_path,
-                64 * 1024,
-            ).unwrap();
+            let history_iter = history.clone().into_iter().map(|o| {
+                Ok(StreamedOrtho {
+                    ortho: o,
+                    bytes_read: 0,
+                    decoded_size_est: estimate_decoded_size(&o),
+                })
+            });
+            let (work, _run, _count) =
+                anti_join_orthos(unique_run.clone(), history_iter, &base_path, 64 * 1024).unwrap();
             black_box(work);
         });
     });
@@ -256,25 +248,24 @@ fn bench_anti_join_history_10k(c: &mut Criterion) {
     let temp_dir = setup_test_dir();
     let base_path = temp_dir.path().to_path_buf();
     fs::create_dir_all(base_path.join("runs")).unwrap();
-    
+
     // Create unique run with 100k orthos
     let unique_run = create_unique_ortho_run(&base_path, 100_000);
-    
+
     // Create history with 10k orthos (even numbers)
     let history = create_history_orthos(10_000);
-    
+
     c.bench_function("anti_join_history_10k", |b| {
         b.iter(|| {
-            let history_iter = history
-                .clone()
-                .into_iter()
-                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0, decoded_size_est: estimate_decoded_size(&o) }));
-            let (work, _run, _count) = anti_join_orthos(
-                unique_run.clone(),
-                history_iter,
-                &base_path,
-                64 * 1024,
-            ).unwrap();
+            let history_iter = history.clone().into_iter().map(|o| {
+                Ok(StreamedOrtho {
+                    ortho: o,
+                    bytes_read: 0,
+                    decoded_size_est: estimate_decoded_size(&o),
+                })
+            });
+            let (work, _run, _count) =
+                anti_join_orthos(unique_run.clone(), history_iter, &base_path, 64 * 1024).unwrap();
             black_box(work);
         });
     });
@@ -284,25 +275,24 @@ fn bench_anti_join_history_100k(c: &mut Criterion) {
     let temp_dir = setup_test_dir();
     let base_path = temp_dir.path().to_path_buf();
     fs::create_dir_all(base_path.join("runs")).unwrap();
-    
+
     // Create unique run with 1M orthos
     let unique_run = create_unique_ortho_run(&base_path, 1_000_000);
-    
+
     // Create history with 100k orthos (even numbers)
     let history = create_history_orthos(100_000);
-    
+
     c.bench_function("anti_join_history_100k", |b| {
         b.iter(|| {
-            let history_iter = history
-                .clone()
-                .into_iter()
-                .map(|o| Ok(StreamedOrtho { ortho: o, bytes_read: 0, decoded_size_est: estimate_decoded_size(&o) }));
-            let (work, _run, _count) = anti_join_orthos(
-                unique_run.clone(),
-                history_iter,
-                &base_path,
-                64 * 1024,
-            ).unwrap();
+            let history_iter = history.clone().into_iter().map(|o| {
+                Ok(StreamedOrtho {
+                    ortho: o,
+                    bytes_read: 0,
+                    decoded_size_est: estimate_decoded_size(&o),
+                })
+            });
+            let (work, _run, _count) =
+                anti_join_orthos(unique_run.clone(), history_iter, &base_path, 64 * 1024).unwrap();
             black_box(work);
         });
     });
@@ -324,52 +314,47 @@ fn bench_full_generation_with_duplicates(c: &mut Criterion) {
         history_cache_bytes: 1024 * 1024,
         landing_flush_threshold: 64 * 1024,
     };
-    
+
     c.bench_function("full_generation_1m_ints_50pct_dupes", |b| {
         b.iter(|| {
             // Create fresh temp dir for each iteration
             let temp_dir = setup_test_dir();
             let base_path = temp_dir.path().to_path_buf();
             fs::create_dir_all(base_path.join("runs")).unwrap();
-            
+
             // Step 1: Create raw stream with orthos, 50% duplicates
             let landing_dir = base_path.join("landing").join("b=00");
             fs::create_dir_all(&landing_dir).unwrap();
-            
+
             let drain_file = landing_dir.join("drain-test.log");
             let mut writer = BufWriter::new(File::create(&drain_file).unwrap());
-            
+
             // Create 50k orthos with 50% duplicates (reduced from 1M for reasonable bench time)
             for i in 0..50_000 {
                 // Every other value is a duplicate
                 let base_idx = i / 2;
                 let mut ortho = Ortho::new();
-                ortho = ortho
-                    .add(PayloadVal::try_from(base_idx % 1000).unwrap())[0]
-                    .clone();
-                
+                ortho = ortho.add(PayloadVal::try_from(base_idx % 1000).unwrap())[0].clone();
+
                 write_ortho_record(&mut writer, &ortho);
             }
             writer.flush().unwrap();
-            
+
             let raw = RawStream::new(vec![drain_file]);
-            
+
             // Step 2: Compact landing into sorted runs
             let runs = compact_landing(0, raw, &cfg, &base_path).unwrap();
-            
+
             // Step 3: Merge runs into unique run
             let unique_run = merge_unique(runs, &cfg, &base_path).unwrap();
-            
+
             // Step 4: Anti-join against empty history (all new)
             let empty_history = std::iter::empty::<Result<StreamedOrtho, std::io::Error>>();
-            
-            let (work, _run, _count) = anti_join_orthos(
-                unique_run,
-                empty_history,
-                &base_path,
-                cfg.read_buf_bytes,
-            ).unwrap();
-            
+
+            let (work, _run, _count) =
+                anti_join_orthos(unique_run, empty_history, &base_path, cfg.read_buf_bytes)
+                    .unwrap();
+
             black_box(work);
             // No need to cleanup - temp_dir drops automatically
         });
@@ -378,7 +363,7 @@ fn bench_full_generation_with_duplicates(c: &mut Criterion) {
 
 fn bench_merge_unique_varying_runs(c: &mut Criterion) {
     let mut group = c.benchmark_group("merge_unique_fan_in");
-    
+
     let cfg = Config {
         run_budget_bytes: 512 * 1024 * 1024,
         fan_in: 32,
@@ -390,25 +375,21 @@ fn bench_merge_unique_varying_runs(c: &mut Criterion) {
         history_cache_bytes: 1024 * 1024,
         landing_flush_threshold: 64 * 1024,
     };
-    
+
     for num_runs in [4, 8, 16, 32, 64].iter() {
         group.throughput(Throughput::Elements((*num_runs * 10_000) as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(num_runs),
-            num_runs,
-            |b, _| {
-                b.iter(|| {
-                    let temp_dir = setup_test_dir();
-                    let base_path = temp_dir.path().to_path_buf();
-                    // Create runs with 10k items each
-                    let runs = create_sorted_ortho_runs(&base_path, *num_runs, 10_000);
-                    let unique = merge_unique(runs, &cfg, &base_path).unwrap();
-                    black_box(unique);
-                });
-            }
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(num_runs), num_runs, |b, _| {
+            b.iter(|| {
+                let temp_dir = setup_test_dir();
+                let base_path = temp_dir.path().to_path_buf();
+                // Create runs with 10k items each
+                let runs = create_sorted_ortho_runs(&base_path, *num_runs, 10_000);
+                let unique = merge_unique(runs, &cfg, &base_path).unwrap();
+                black_box(unique);
+            });
+        });
     }
-    
+
     group.finish();
 }
 

@@ -1,10 +1,10 @@
+use crate::ortho::{Ortho, OrthoId};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::PathBuf;
-use crate::ortho::{Ortho, OrthoId};
 use sysinfo::System;
 
 /// Role of the worker in the system
@@ -31,10 +31,10 @@ pub struct Config {
     pub fan_in: usize,
     pub read_buf_bytes: usize,
     pub allow_compaction: bool,
-    pub work_queue_cache_size: usize,  // Max orthos to keep in memory
-    pub bufwriter_capacity: usize,      // Buffer size for each bucket writer
-    pub work_segment_size: usize,       // Orthos per segment file
-    pub history_cache_bytes: usize,     // RAM budget for caching history runs
+    pub work_queue_cache_size: usize, // Max orthos to keep in memory
+    pub bufwriter_capacity: usize,    // Buffer size for each bucket writer
+    pub work_segment_size: usize,     // Orthos per segment file
+    pub history_cache_bytes: usize,   // RAM budget for caching history runs
     pub landing_flush_threshold: usize, // Bytes before forcing flush
 }
 
@@ -56,7 +56,7 @@ impl Config {
     }
 
     /// Compute config based on role and current system memory state
-    /// 
+    ///
     /// RAM Policy:
     /// - Target 85% total RAM usage aggressively
     /// - Leader: Scale down only above 85% usage
@@ -66,23 +66,23 @@ impl Config {
     pub fn compute_config(role: Role) -> Option<Self> {
         let (used_bytes, total_bytes, _headroom_bytes) = get_memory_state();
         let used_pct = (used_bytes as f64 / total_bytes as f64) * 100.0;
-        
+
         // Target 85% of total RAM
         let target_usage_bytes = (total_bytes as f64 * 0.85) as usize;
         let available_bytes = target_usage_bytes.saturating_sub(used_bytes);
-        
+
         // Define scale-down thresholds based on role
         let scale_threshold = match role {
-            Role::Leader => 85.0,  // Start scaling down at 85%
+            Role::Leader => 85.0,   // Start scaling down at 85%
             Role::Follower => 70.0, // Start scaling down at 70%
         };
-        
+
         // Base budgets (at low usage)
         let (base_budget, min_budget) = match role {
             Role::Leader => (available_bytes, 2_000_000_000), // Use all available, min 2GB
             Role::Follower => (available_bytes.min(4_000_000_000), 256_000_000), // Cap at 4GB, min 256MB
         };
-        
+
         // Scale down budget if above threshold
         let budget = if used_pct > scale_threshold {
             // Linear scale-down from 100% at threshold to min at 95%
@@ -93,7 +93,7 @@ impl Config {
         } else {
             base_budget
         };
-        
+
         // Check follower bail-out condition
         if role == Role::Follower {
             let run_budget = (budget as f64 * 0.3) as usize;
@@ -101,30 +101,30 @@ impl Config {
                 return None;
             }
         }
-        
+
         // Allocate budget across subsystems
-        let run_budget_bytes = (budget as f64 * 0.70) as usize;      // 70% for LSM runs
-        let work_cache_budget = (budget as f64 * 0.10) as usize;     // 10% for work queue cache
-        let buffer_budget = (budget as f64 * 0.10) as usize;         // 10% for write buffers
-        let history_cache_bytes = (budget as f64 * 0.10) as usize;   // 10% for history caching
-        
+        let run_budget_bytes = (budget as f64 * 0.70) as usize; // 70% for LSM runs
+        let work_cache_budget = (budget as f64 * 0.10) as usize; // 10% for work queue cache
+        let buffer_budget = (budget as f64 * 0.10) as usize; // 10% for write buffers
+        let history_cache_bytes = (budget as f64 * 0.10) as usize; // 10% for history caching
+
         // Work queue cache: assume ~200 bytes per ortho
         let work_queue_cache_size = work_cache_budget / 200;
-        
+
         // BufWriter capacity: divide among 8 buckets, min 64KB, max 16MB per bucket
         let bufwriter_capacity = (buffer_budget / 8).clamp(64 * 1024, 16 * 1024 * 1024);
-        
+
         // Work segment size: larger segments = fewer files, assume ~200 bytes per ortho
         // Target segments of ~10MB each = 50k orthos
         let work_segment_size = 50_000;
-        
+
         // Landing flush threshold: 1-10MB depending on buffer capacity
         let landing_flush_threshold = bufwriter_capacity.clamp(1024 * 1024, 10 * 1024 * 1024);
-        
+
         // Derive read buffer from run budget: target ~256KB-2MB per run
         let read_buf_bytes = (run_budget_bytes / 256).clamp(256 * 1024, 2 * 1024 * 1024);
         let fan_in = compute_fan_in(run_budget_bytes, read_buf_bytes);
-        
+
         Some(Self {
             run_budget_bytes,
             fan_in,
@@ -143,14 +143,14 @@ impl Config {
 fn get_memory_state() -> (usize, usize, usize) {
     let mut sys = System::new_all();
     sys.refresh_memory();
-    
+
     let total_raw = sys.total_memory();
     let used_raw = sys.used_memory();
-    
+
     // Use the same normalization as main.rs for consistency
     let (used_bytes, total_bytes) = normalize_sysinfo_mem(total_raw, used_raw);
     let headroom_bytes = total_bytes.saturating_sub(used_bytes);
-    
+
     (used_bytes, total_bytes, headroom_bytes)
 }
 
@@ -196,7 +196,6 @@ fn compute_fan_in(budget: usize, read_buf_bytes: usize) -> usize {
     raw_fan_in.clamp(8, 256)
 }
 
-
 /// Callback for reporting generation transition progress
 pub type ProgressCallback = Box<dyn Fn(&str) + Send>;
 
@@ -234,17 +233,17 @@ pub struct GenerationStore {
     work_segment_counter: usize,
     total_work_len: u64,
     work_queue_cache: VecDeque<Ortho>, // In-memory cache of work items
-    work_queue_cache_max: usize,   // Max cache size
-    work_segment_batch: Vec<Ortho>, // Batch for writing segments
-    work_segment_batch_max: usize,  // Max batch size before flush
+    work_queue_cache_max: usize,       // Max cache size
+    work_segment_batch: Vec<Ortho>,    // Batch for writing segments
+    work_segment_batch_max: usize,     // Max batch size before flush
     cached_best_volume: Cell<Option<usize>>, // Cached best volume across work caches
     cached_best_ortho: RefCell<Option<Ortho>>, // Cached best ortho across work caches
-    best_volume_dirty: Cell<bool>, // Whether cached best needs recompute
-    bufwriter_capacity: usize,      // Buffer capacity for bucket writers
-    landing_flush_threshold: usize, // Threshold for flushing landing writes
+    best_volume_dirty: Cell<bool>,     // Whether cached best needs recompute
+    bufwriter_capacity: usize,         // Buffer capacity for bucket writers
+    landing_flush_threshold: usize,    // Threshold for flushing landing writes
     // History state
     history_runs: Vec<Vec<PathBuf>>, // Per-bucket list of history run files
-    seen_len_accepted: u64, // Monotonic count of accepted items across all generations
+    seen_len_accepted: u64,          // Monotonic count of accepted items across all generations
     #[allow(dead_code)]
     history_cache: std::collections::HashMap<PathBuf, Vec<u8>>, // Cached history run contents (future optimization)
 }
@@ -348,7 +347,7 @@ impl Iterator for OrthoRunIterator {
                         return Some(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "Unexpected end of ortho stream",
-                        )))
+                        )));
                     }
                     Err(e) => return Some(Err(e)),
                 }
@@ -532,15 +531,16 @@ impl HistoryIterator {
 
     fn advance_to_next_run(&mut self) -> io::Result<()> {
         self.current_run_iter = None;
-        
+
         if self.current_run_index >= self.run_files.len() {
             return Ok(());
         }
 
-        let reader = OrthoStreamReader::new(&self.run_files[self.current_run_index], self.read_buf_bytes)?;
+        let reader =
+            OrthoStreamReader::new(&self.run_files[self.current_run_index], self.read_buf_bytes)?;
         self.current_run_iter = Some(reader);
         self.current_run_index += 1;
-        
+
         Ok(())
     }
 }
@@ -571,7 +571,10 @@ impl GenerationStore {
     /// Create a new generation store with specified base path and bucket count
     pub fn new_with_config(base_path: PathBuf, bucket_count: usize) -> io::Result<Self> {
         // Bucket count must be a power of two
-        assert!(bucket_count.is_power_of_two(), "bucket_count must be power of two");
+        assert!(
+            bucket_count.is_power_of_two(),
+            "bucket_count must be power of two"
+        );
 
         // Create landing directory structure
         for bucket in 0..bucket_count {
@@ -715,31 +718,33 @@ impl GenerationStore {
     }
 
     /// Record a result with configurable flush threshold
-    pub fn record_result_with_threshold(&mut self, ortho: &Ortho, flush_threshold: usize) -> io::Result<()> {
+    pub fn record_result_with_threshold(
+        &mut self,
+        ortho: &Ortho,
+        flush_threshold: usize,
+    ) -> io::Result<()> {
         let bucket = (ortho.id() as u64 & (self.bucket_count - 1) as u64) as usize;
-        
+
         // Get or create writer for this bucket with configured buffer capacity
         if self.bucket_writers[bucket].is_none() {
             let path = self.active_log_path(bucket);
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
-            self.bucket_writers[bucket] = Some(BufWriter::with_capacity(self.bufwriter_capacity, file));
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            self.bucket_writers[bucket] =
+                Some(BufWriter::with_capacity(self.bufwriter_capacity, file));
         }
 
         // Write ortho using rkyv
         let writer = self.bucket_writers[bucket].as_mut().unwrap();
         let encoded_len = write_ortho_record(writer, ortho)?;
         self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
-        
+
         // Track buffer size and flush if over threshold
         self.landing_buffer_sizes[bucket] += encoded_len;
         if self.landing_buffer_sizes[bucket] >= flush_threshold {
             writer.flush()?;
             self.landing_buffer_sizes[bucket] = 0;
         }
-        
+
         Ok(())
     }
 
@@ -751,7 +756,7 @@ impl GenerationStore {
         }
 
         let active_path = self.active_log_path(bucket);
-        
+
         // Check if active log exists
         if !active_path.exists() {
             return Ok(RawStream::new(vec![]));
@@ -761,12 +766,12 @@ impl GenerationStore {
         let drain_id = self.drain_counter[bucket];
         self.drain_counter[bucket] += 1;
         let drain_path = self.drain_log_path(bucket, drain_id);
-        
+
         fs::rename(&active_path, &drain_path)?;
         // Landing for this bucket has been drained; reset counters.
         self.landing_counts[bucket] = 0;
         self.landing_buffer_sizes[bucket] = 0;
-        
+
         Ok(RawStream::new(vec![drain_path]))
     }
 
@@ -784,7 +789,7 @@ impl GenerationStore {
             }
         }
         self.work_segment_batch.extend(items);
-        
+
         // Flush batch if it exceeds max size
         if self.work_segment_batch.len() >= self.work_segment_batch_max {
             self.flush_work_segment_batch()?;
@@ -792,7 +797,7 @@ impl GenerationStore {
 
         Ok(())
     }
-    
+
     /// Flush the work segment batch to disk
     fn flush_work_segment_batch(&mut self) -> io::Result<()> {
         if self.work_segment_batch.is_empty() {
@@ -800,7 +805,8 @@ impl GenerationStore {
         }
 
         let count = self.work_segment_batch.len() as u64;
-        let segment_path = self.base_path
+        let segment_path = self
+            .base_path
             .join("work")
             .join(format!("segment-{}.dat", self.work_segment_counter));
         self.work_segment_counter += 1;
@@ -848,20 +854,20 @@ impl GenerationStore {
                 self.work_queue_cache.push_back(ortho);
             }
         }
-        
+
         // Cache is empty, refill from disk segments
         self.refill_work_cache()?;
-        
+
         // Pop from cache after refill
         if let Some(ortho) = self.work_queue_cache.pop_front() {
             self.total_work_len -= 1;
             self.handle_removed_volume(ortho.volume());
             return Ok(Some(ortho));
         }
-        
+
         Ok(None)
     }
-    
+
     /// Refill work queue cache from disk segments
     fn refill_work_cache(&mut self) -> io::Result<()> {
         let target_max = self.work_queue_cache_max.max(1);
@@ -891,14 +897,14 @@ impl GenerationStore {
                 file.read_exact(&mut ortho_bytes)?;
                 let ortho: Ortho = Ortho::from_bytes(&ortho_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                
+
                 self.work_queue_cache.push_back(ortho);
                 if !self.best_volume_dirty.get() {
                     if let Some(last) = self.work_queue_cache.back() {
                         self.update_cached_best(last);
                     }
                 }
-                
+
                 // Stop if cache is full
                 if self.work_queue_cache.len() >= self.work_queue_cache_max {
                     break;
@@ -908,13 +914,13 @@ impl GenerationStore {
             // Delete consumed segment
             drop(file);
             fs::remove_file(&segment_path)?;
-            
+
             // Stop if cache is full
             if self.work_queue_cache.len() >= self.work_queue_cache_max {
                 break;
             }
         }
-        
+
         Ok(())
     }
 
@@ -925,15 +931,15 @@ impl GenerationStore {
         self.bufwriter_capacity = cfg.bufwriter_capacity;
         self.landing_flush_threshold = cfg.landing_flush_threshold;
     }
-    
+
     /// Flush all pending buffers (landing + work segments)
     pub fn flush_all(&mut self) -> io::Result<()> {
         // Flush all bucket writers
         self.flush()?;
-        
+
         // Flush work segment batch
         self.flush_work_segment_batch()?;
-        
+
         Ok(())
     }
 
@@ -962,7 +968,11 @@ impl GenerationStore {
 
     /// Iterate over history for a bucket
     /// Returns an iterator over all orthos in history runs for this bucket
-    pub fn history_iter_with_buffer(&self, bucket: usize, read_buf_bytes: usize) -> io::Result<HistoryIterator> {
+    pub fn history_iter_with_buffer(
+        &self,
+        bucket: usize,
+        read_buf_bytes: usize,
+    ) -> io::Result<HistoryIterator> {
         assert!(bucket < self.bucket_count, "Invalid bucket index");
         HistoryIterator::new(&self.history_runs[bucket], read_buf_bytes)
     }
@@ -978,21 +988,24 @@ impl GenerationStore {
     /// The run is moved to the history directory and tracked
     pub fn add_history_run(&mut self, bucket: usize, run: Run, accepted: u64) -> io::Result<()> {
         assert!(bucket < self.bucket_count, "Invalid bucket index");
-        
+
         // Move run file to history directory with unique name
-        let history_dir = self.base_path.join("history").join(format!("b={:02}", bucket));
+        let history_dir = self
+            .base_path
+            .join("history")
+            .join(format!("b={:02}", bucket));
         let run_id = self.history_runs[bucket].len();
         let dest_path = history_dir.join(format!("history-{}.dat", run_id));
-        
+
         // Move the run file to history
         fs::rename(run.path(), &dest_path)?;
-        
+
         // Track the history run
         self.history_runs[bucket].push(dest_path);
-        
+
         // Update accepted count (monotonic)
         self.seen_len_accepted += accepted;
-        
+
         Ok(())
     }
 
@@ -1000,7 +1013,7 @@ impl GenerationStore {
     /// Returns the number of orthos enqueued.
     fn enqueue_work_run(&mut self, run: Run, read_buf_bytes: usize) -> io::Result<usize> {
         let mut reader = run.iter(read_buf_bytes)?;
-    let mut batch: Vec<Ortho> = Vec::with_capacity(self.work_segment_batch_max.max(1));
+        let mut batch: Vec<Ortho> = Vec::with_capacity(self.work_segment_batch_max.max(1));
         let mut count = 0usize;
 
         while let Some(item) = reader.next() {
@@ -1041,17 +1054,17 @@ impl GenerationStore {
         (0..self.bucket_count)
             .map(|bucket| {
                 let run_count = self.history_runs[bucket].len();
-                
+
                 // Landing count represents orthos pending acceptance (buffer + active log)
                 let landing_size = self.landing_counts[bucket];
-                
+
                 // Estimate history size from run files
                 let history_size_estimate = self.history_runs[bucket]
                     .iter()
                     .filter_map(|path| std::fs::metadata(path).ok())
                     .map(|m| m.len() as usize)
                     .sum();
-                
+
                 BucketStats {
                     bucket_id: bucket,
                     run_count,
@@ -1122,7 +1135,7 @@ impl GenerationStore {
     }
 
     /// Process the end of a generation: drain, compact, anti-join, and push new work
-    /// 
+    ///
     /// This is the core generational transition that:
     /// 1. Drains all buckets from landing to raw streams
     /// 2. Compacts each raw stream into sorted runs
@@ -1130,32 +1143,36 @@ impl GenerationStore {
     /// 4. Anti-joins each unique run against history
     /// 5. Adds accepted runs to history
     /// 6. Pushes new work items to the work queue
-    /// 
+    ///
     /// TODO: After integer bootstrap is proven, replace all integer operations with ortho versions
-    pub fn on_generation_end(&mut self, cfg: &Config, progress: Option<&ProgressCallback>) -> io::Result<u64> {
+    pub fn on_generation_end(
+        &mut self,
+        cfg: &Config,
+        progress: Option<&ProgressCallback>,
+    ) -> io::Result<u64> {
         let mut total_new_work = 0u64;
         let mut buckets_processed = 0;
         let mut total_drained = 0usize;
         let mut total_accepted = 0u64;
-        
+
         // Flush all pending writes before transition
         self.flush_all()?;
-        
+
         if let Some(cb) = &progress {
             cb(&format!("TRANSITION_START:{}", self.bucket_count));
         }
-        
+
         // Process each bucket independently
         for bucket in 0..self.bucket_count {
             // Flush writers before draining
             self.flush()?;
-            
+
             // Phase: Draining
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:draining", bucket));
             }
             let raw = self.drain_bucket(bucket)?;
-            
+
             if raw.files().is_empty() {
                 // No data in this bucket, skip
                 if let Some(cb) = &progress {
@@ -1163,7 +1180,7 @@ impl GenerationStore {
                 }
                 continue;
             }
-            
+
             // Count drained orthos for metrics
             let mut drained_count = 0usize;
             for file_path in raw.files() {
@@ -1173,36 +1190,47 @@ impl GenerationStore {
                 }
             }
             total_drained += drained_count;
-            
+
             if let Some(cb) = &progress {
-                cb(&format!("Bucket {}/{}: drained ~{} orthos", bucket, self.bucket_count, drained_count));
+                cb(&format!(
+                    "Bucket {}/{}: drained ~{} orthos",
+                    bucket, self.bucket_count, drained_count
+                ));
             }
-            
+
             // Phase: Compacting
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:sorting", bucket));
             }
             let runs = compact_landing(bucket, raw, cfg, &self.base_path)?;
-            
+
             if runs.is_empty() {
                 // No runs generated, skip
                 if let Some(cb) = &progress {
-                    cb(&format!("Bucket {}/{}: no runs generated", bucket, self.bucket_count));
+                    cb(&format!(
+                        "Bucket {}/{}: no runs generated",
+                        bucket, self.bucket_count
+                    ));
                     cb(&format!("BUCKET_STATE:{}:empty", bucket));
                 }
                 continue;
             }
-            
+
             if let Some(cb) = &progress {
-                cb(&format!("Bucket {}/{}: created {} runs", bucket, self.bucket_count, runs.len()));
+                cb(&format!(
+                    "Bucket {}/{}: created {} runs",
+                    bucket,
+                    self.bucket_count,
+                    runs.len()
+                ));
             }
-            
+
             // Phase: Merge to unique run
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:merging", bucket));
             }
             let unique_run = merge_unique(runs, cfg, &self.base_path)?;
-            
+
             // Phase: Anti-join against history
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:antijoining", bucket));
@@ -1214,9 +1242,9 @@ impl GenerationStore {
                 &self.base_path,
                 cfg.read_buf_bytes,
             )?;
-            
+
             total_accepted += accepted;
-            
+
             // Add seen run to history
             self.add_history_run(bucket, seen_run, accepted)?;
 
@@ -1224,101 +1252,115 @@ impl GenerationStore {
             let bucket_new_work = self.enqueue_work_run(new_work_run, cfg.read_buf_bytes)?;
 
             if let Some(cb) = &progress {
-                cb(&format!("Bucket {}/{}: accepted {} orthos, created {} new work", 
-                    bucket, self.bucket_count, accepted, bucket_new_work));
+                cb(&format!(
+                    "Bucket {}/{}: accepted {} orthos, created {} new work",
+                    bucket, self.bucket_count, accepted, bucket_new_work
+                ));
             }
-            
+
             // Optional: Compact history if needed
             if cfg.allow_compaction {
                 let pre_compact_runs = self.history_runs[bucket].len();
                 if pre_compact_runs > 64 {
                     if let Some(cb) = &progress {
                         cb(&format!("BUCKET_STATE:{}:compacting", bucket));
-                        cb(&format!("Bucket {}/{}: compacting {} history runs", bucket, self.bucket_count, pre_compact_runs));
+                        cb(&format!(
+                            "Bucket {}/{}: compacting {} history runs",
+                            bucket, self.bucket_count, pre_compact_runs
+                        ));
                     }
                     self.compact_history(bucket, cfg)?;
                     let post_compact_runs = self.history_runs[bucket].len();
                     if let Some(cb) = &progress {
-                        cb(&format!("Bucket {}/{}: compacted {} → {} runs", bucket, self.bucket_count, pre_compact_runs, post_compact_runs));
+                        cb(&format!(
+                            "Bucket {}/{}: compacted {} → {} runs",
+                            bucket, self.bucket_count, pre_compact_runs, post_compact_runs
+                        ));
                     }
                 }
             }
-            
+
             // Mark bucket complete
             if let Some(cb) = &progress {
-                cb(&format!("BUCKET_STATE:{}:complete:{}", bucket, bucket_new_work));
+                cb(&format!(
+                    "BUCKET_STATE:{}:complete:{}",
+                    bucket, bucket_new_work
+                ));
             }
-            
+
             // Push new work to queue (ortho version)
             total_new_work += bucket_new_work as u64;
-            
+
             buckets_processed += 1;
         }
-        
+
         // Flush all pending work to disk
         self.flush_work_segment_batch()?;
-        
+
         if let Some(cb) = &progress {
             cb(&format!("TRANSITION_COMPLETE"));
-            cb(&format!("Transition complete: processed {} buckets, drained ~{} orthos, accepted {} orthos, created {} new work",
-                buckets_processed, total_drained, total_accepted, total_new_work));
+            cb(&format!(
+                "Transition complete: processed {} buckets, drained ~{} orthos, accepted {} orthos, created {} new work",
+                buckets_processed, total_drained, total_accepted, total_new_work
+            ));
         }
-        
+
         Ok(total_new_work)
     }
 
-
-
     /// Compact history runs for a bucket when count exceeds threshold
-    /// 
+    ///
     /// Merges a subset of runs to keep run count bounded. This is optional
     /// and correctness does not depend on it. Triggered when run count > 64.
     pub fn compact_history(&mut self, bucket: usize, cfg: &Config) -> io::Result<()> {
         assert!(bucket < self.bucket_count, "Invalid bucket index");
-        
+
         let run_count = self.history_runs[bucket].len();
-        
+
         // Only compact if we exceed the threshold
         if run_count <= 64 {
             return Ok(());
         }
-        
+
         // Merge the oldest half of runs (keep most recent ones separate for better performance)
         let merge_count = run_count / 2;
         if merge_count < 2 {
             return Ok(()); // Need at least 2 runs to merge
         }
-        
+
         // Collect runs to merge (oldest ones)
         let runs_to_merge: Vec<Run> = self.history_runs[bucket][..merge_count]
             .iter()
             .map(|path| Run::new(path.clone()))
             .collect();
-        
+
         // Merge them into a single unique run
         let merged = merge_unique(runs_to_merge, cfg, &self.base_path)?;
-        
+
         // Move merged run to history with next available ID
-        let history_dir = self.base_path.join("history").join(format!("b={:02}", bucket));
+        let history_dir = self
+            .base_path
+            .join("history")
+            .join(format!("b={:02}", bucket));
         let new_run_id = self.history_runs[bucket].len();
         let dest_path = history_dir.join(format!("history-{}.dat", new_run_id));
         fs::rename(merged.path(), &dest_path)?;
-        
+
         // Remove old runs from tracking and delete their files
         let old_runs: Vec<PathBuf> = self.history_runs[bucket].drain(..merge_count).collect();
         for old_path in old_runs {
             let _ = fs::remove_file(&old_path); // Best effort deletion
         }
-        
+
         // Add merged run to tracking
         self.history_runs[bucket].push(dest_path);
-        
+
         Ok(())
     }
 }
 
 /// External sort run generation using arena-based approach
-/// 
+///
 /// Reads raw stream data from ortho landing files, sorts in-memory by id with a budget, and writes runs on overflow.
 pub fn compact_landing(
     bucket: usize,
@@ -1344,9 +1386,7 @@ pub fn compact_landing(
                 )
             })?;
             let ortho_size = streamed.decoded_size_est;
-            if !arena.is_empty()
-                && current_size.saturating_add(ortho_size) > cfg.run_budget_bytes
-            {
+            if !arena.is_empty() && current_size.saturating_add(ortho_size) > cfg.run_budget_bytes {
                 // Flush before adding this item to keep arena under budget.
                 arena.sort_unstable_by_key(|o| o.id);
                 let run_id = RUN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1373,7 +1413,7 @@ pub fn compact_landing(
         let run_path = base_path
             .join("runs")
             .join(format!("b={:02}-run-{}.dat", bucket, run_id));
-        
+
         write_streamed_run(&arena, &run_path)?;
         runs.push(Run::new(run_path));
     }
@@ -1401,7 +1441,7 @@ fn write_streamed_run(arena: &[StreamedOrtho], path: &PathBuf) -> io::Result<()>
 }
 
 /// K-way merge with deduplication
-/// 
+///
 /// Performs a k-way merge of sorted ortho runs, respecting fan-in limits and dropping
 /// adjacent duplicates by id. Multi-pass merge is used if number of runs exceeds fan-in.
 pub fn merge_unique(
@@ -1411,9 +1451,12 @@ pub fn merge_unique(
 ) -> io::Result<UniqueRun> {
     use std::collections::BinaryHeap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    
+
     if runs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot merge empty run list"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cannot merge empty run list",
+        ));
     }
 
     let cleanup_runs = |paths: &[Run]| {
@@ -1427,19 +1470,21 @@ pub fn merge_unique(
     // Multi-pass merge if needed
     while runs.len() > cfg.fan_in {
         let mut next_pass_runs = Vec::new();
-        
+
         for chunk in runs.chunks(cfg.fan_in) {
             let merged = merge_ortho_chunk(chunk, cfg, base_path)?;
             cleanup_runs(chunk);
             next_pass_runs.push(merged);
         }
-        
+
         runs = next_pass_runs;
     }
 
     // Final pass - merge all remaining runs into a UniqueRun
     let merge_id = MERGE_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-    let unique_path = base_path.join("runs").join(format!("unique-{}.dat", merge_id));
+    let unique_path = base_path
+        .join("runs")
+        .join(format!("unique-{}.dat", merge_id));
     let mut writer = BufWriter::new(File::create(&unique_path)?);
 
     #[derive(Eq, PartialEq)]
@@ -1447,14 +1492,14 @@ pub fn merge_unique(
         id: OrthoId,
         run_idx: usize,
     }
-    
+
     impl Ord for HeapItem {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
             // Reverse for min-heap
             other.id.cmp(&self.id)
         }
     }
-    
+
     impl PartialOrd for HeapItem {
         fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
             Some(self.cmp(other))
@@ -1486,7 +1531,7 @@ pub fn merge_unique(
     // K-way merge with deduplication by id + equality
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
-        
+
         // Write only if different from last written (dedupe by id + shape/payload)
         let is_duplicate = last_written
             .as_ref()
@@ -1505,7 +1550,10 @@ pub fn merge_unique(
             let streamed = result?;
             let id = streamed.id;
             current_orthos[item.run_idx] = Some(streamed);
-            heap.push(HeapItem { id, run_idx: item.run_idx });
+            heap.push(HeapItem {
+                id,
+                run_idx: item.run_idx,
+            });
         }
     }
 
@@ -1516,18 +1564,16 @@ pub fn merge_unique(
 }
 
 /// Helper to merge a chunk of ortho runs (for multi-pass)
-fn merge_ortho_chunk(
-    runs: &[Run],
-    cfg: &Config,
-    base_path: &PathBuf,
-) -> io::Result<Run> {
+fn merge_ortho_chunk(runs: &[Run], cfg: &Config, base_path: &PathBuf) -> io::Result<Run> {
     use std::collections::BinaryHeap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    
+
     static CHUNK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let chunk_id = CHUNK_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-    let chunk_path = base_path.join("runs").join(format!("chunk-{}.dat", chunk_id));
+    let chunk_path = base_path
+        .join("runs")
+        .join(format!("chunk-{}.dat", chunk_id));
     let mut writer = BufWriter::new(File::create(&chunk_path)?);
 
     #[derive(Eq, PartialEq)]
@@ -1535,13 +1581,13 @@ fn merge_ortho_chunk(
         id: OrthoId,
         run_idx: usize,
     }
-    
+
     impl Ord for HeapItem {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
             other.id.cmp(&self.id)
         }
     }
-    
+
     impl PartialOrd for HeapItem {
         fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
             Some(self.cmp(other))
@@ -1575,7 +1621,10 @@ fn merge_ortho_chunk(
             let streamed = result?;
             let id = streamed.id;
             current_orthos[item.run_idx] = Some(streamed);
-            heap.push(HeapItem { id, run_idx: item.run_idx });
+            heap.push(HeapItem {
+                id,
+                run_idx: item.run_idx,
+            });
         }
     }
 
@@ -1585,11 +1634,11 @@ fn merge_ortho_chunk(
 
 /// Anti-join: streaming merge that emits orthos from gen that are NOT in history
 /// Returns: (next-work orthos, new seen run, accepted count)
-/// 
+///
 /// Semantics:
 /// - Emit x iff x ∈ gen and x ∉ history  
 /// - Compares orthos by id + equality
-/// 
+///
 /// Example:
 /// History: [ortho_a(id=1), ortho_b(id=3), ortho_c(id=5)]
 /// Gen: [ortho_d(id=2), ortho_e(id=3), ortho_f(id=4), ortho_g(id=5), ortho_h(id=6)]
@@ -1601,11 +1650,13 @@ pub fn anti_join_orthos(
     read_buf_bytes: usize,
 ) -> io::Result<(Run, Run, u64)> {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    
+
     static ANTI_JOIN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let anti_join_id = ANTI_JOIN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-    let seen_run_path = base_path.join("runs").join(format!("seen-{}.dat", anti_join_id));
+    let seen_run_path = base_path
+        .join("runs")
+        .join(format!("seen-{}.dat", anti_join_id));
     let mut seen_writer = BufWriter::new(File::create(&seen_run_path)?);
 
     let new_work_path = base_path
@@ -1634,12 +1685,16 @@ pub fn anti_join_orthos(
             (Some(g), Some(h)) => {
                 let g_id = g.id;
                 let h_id = h.id;
-                
+
                 match g_id.cmp(&h_id) {
                     std::cmp::Ordering::Less => {
                         // g < h: g is new (not in history)
                         write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est)?;
-                        write_ortho_record_bytes(&mut new_work_writer, &g.bytes, g.decoded_size_est)?;
+                        write_ortho_record_bytes(
+                            &mut new_work_writer,
+                            &g.bytes,
+                            g.decoded_size_est,
+                        )?;
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
                     }
@@ -1828,7 +1883,7 @@ mod tests {
         for run in &runs {
             let mut prev_id = None;
             for item in run.iter(64 * 1024).unwrap() {
-        let ortho = Ortho::from_bytes(item.unwrap().bytes.as_ref()).unwrap();
+                let ortho = Ortho::from_bytes(item.unwrap().bytes.as_ref()).unwrap();
                 let id = ortho.id();
                 if let Some(p) = prev_id {
                     assert!(id >= p, "Run should be sorted by id");
@@ -2061,19 +2116,19 @@ mod tests {
     fn test_compute_fan_in() {
         // fan_in = clamp(budget / read_buf, 8, 256)
         let read_buf = 512 * 1024; // 512KB
-        
+
         // Small budget: should clamp to 8
         assert_eq!(compute_fan_in(100_000, read_buf), 8);
-        
+
         // Medium budget: should be in range
         let budget = 1_000_000_000; // 1GB
         let fan_in = compute_fan_in(budget, read_buf);
         assert!(fan_in >= 8 && fan_in <= 256);
-        
+
         // Large budget: should clamp to 128
         let budget = 100_000_000_000; // 100GB
         assert_eq!(compute_fan_in(budget, read_buf), 256);
-        
+
         // Zero read_buf: should return 8
         assert_eq!(compute_fan_in(1_000_000, 0), 8);
     }
@@ -2083,12 +2138,12 @@ mod tests {
         // This test validates the structure but cannot control actual system memory
         // In real usage, leader at low memory pressure should get max budget (6GB)
         let config = Config::compute_config(Role::Leader);
-        
+
         // Should not bail out
         assert!(config.is_some());
-        
+
         let config = config.unwrap();
-        
+
         // run_budget should be 70% of some budget
         // fan_in should be between 8 and 256
         assert!(config.fan_in >= 8 && config.fan_in <= 256);
@@ -2102,7 +2157,7 @@ mod tests {
     fn test_compute_config_follower() {
         // Follower should have smaller budget than leader
         let config = Config::compute_config(Role::Follower);
-        
+
         // May bail out if system memory is very constrained, but typically should succeed
         if let Some(config) = config {
             assert!(config.fan_in >= 8 && config.fan_in <= 256);
@@ -2120,7 +2175,7 @@ mod tests {
         let budget = 1_000_000_000; // 1GB
         let run_budget = (budget as f64 * 0.7) as usize;
         assert_eq!(run_budget, 700_000_000);
-        
+
         // Test edge case: very small budget
         let budget = 128_000_000; // 128MB
         let run_budget = (budget as f64 * 0.7) as usize;
@@ -2135,12 +2190,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_path_buf();
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
-        
+
         let cfg = Config::test_config(1024 * 1024, 8);
-        
+
         // Call on_generation_end with no data
         let new_work = store.on_generation_end(&cfg, None).unwrap();
-        
+
         assert_eq!(new_work, 0);
         assert_eq!(store.work_len(), 0);
         assert_eq!(store.seen_len_accepted(), 0);
@@ -2185,27 +2240,31 @@ mod tests {
     fn test_ortho_pipeline_full_generations() {
         // Test the full ortho pipeline through multiple generations
         // This is the ortho version of the integer pipeline test
-        // 
+        //
         // Loop pattern:
         //   while let Some(ortho) = store.pop_work() {
         //       let results = process_ortho(ortho);
         //       for r in results { store.record_result(&r); }
         //   }
         //   store.on_generation_end();
-        
+
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_path_buf();
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
-        
+
         let cfg = Config::test_config(1024 * 1024, 8);
         store.configure(&cfg);
-        
+
         // Seed the work queue with initial ortho
         let seed = Ortho::new();
         store.push_segments(vec![seed]).unwrap();
         store.flush_all().unwrap();
-        assert!(store.work_len() > 0, "Work queue should have items after push and flush, got {}", store.work_len());
-        
+        assert!(
+            store.work_len() > 0,
+            "Work queue should have items after push and flush, got {}",
+            store.work_len()
+        );
+
         // Generation 0: Process initial work
         let mut processed_gen0 = 0;
         let mut results_gen0 = 0;
@@ -2218,21 +2277,21 @@ mod tests {
             }
             processed_gen0 += 1;
         }
-        
+
         assert!(processed_gen0 > 0, "Should have processed some orthos");
         assert!(results_gen0 > 0, "Should have generated some results");
         assert_eq!(store.work_len(), 0); // Work queue is empty
-        
+
         // End generation 0 - triggers drain, compact, anti-join, and push new work
         let new_work_gen0 = store.on_generation_end(&cfg, None).unwrap();
-        
+
         // Should have generated some new work
         assert!(new_work_gen0 > 0, "Should have new work from generation 0");
         assert_eq!(store.work_len(), new_work_gen0);
-        
+
         // Check that seen_len_accepted has been updated
         assert_eq!(store.seen_len_accepted(), new_work_gen0);
-        
+
         // Generation 1: Process the new work
         let mut processed_gen1 = 0;
         let max_gen1_items = 10; // Limit to avoid explosion
@@ -2242,7 +2301,7 @@ mod tests {
                 store.push_segments(vec![ortho]).unwrap();
                 break;
             }
-            
+
             // Same process function
             let results = ortho.add(3);
             for r in results {
@@ -2250,18 +2309,18 @@ mod tests {
             }
             processed_gen1 += 1;
         }
-        
+
         assert!(processed_gen1 <= max_gen1_items);
-        
+
         // End generation 1
         let new_work_gen1 = store.on_generation_end(&cfg, None).unwrap();
-        
+
         // Should have generated new work
         assert!(new_work_gen1 > 0, "Should have new work from generation 1");
-        
+
         // Seen count should have increased
         assert!(store.seen_len_accepted() > new_work_gen0);
-        
+
         // Generation 2: Process more work
         let mut processed_gen2 = 0;
         let max_gen2_items = 10;
@@ -2270,17 +2329,17 @@ mod tests {
                 store.push_segments(vec![ortho]).unwrap();
                 break;
             }
-            
+
             let results = ortho.add(4);
             for r in results {
                 store.record_result(&r).unwrap();
             }
             processed_gen2 += 1;
         }
-        
+
         // End generation 2
         let new_work_gen2 = store.on_generation_end(&cfg, None).unwrap();
-        
+
         // Verify the system maintains correctness with orthos:
         // - work_len tracks queue depth
         // - seen_len_accepted is monotonic
@@ -2288,11 +2347,20 @@ mod tests {
         // - deduplication by ortho.id() works correctly
         assert!(store.work_len() > 0);
         assert!(store.seen_len_accepted() >= new_work_gen0);
-        
+
         println!("Completed 3 ortho generations:");
-        println!("  Gen 0: {} orthos -> {} new work", processed_gen0, new_work_gen0);
-        println!("  Gen 1: {} orthos -> {} new work", processed_gen1, new_work_gen1);
-        println!("  Gen 2: {} orthos -> {} new work", processed_gen2, new_work_gen2);
+        println!(
+            "  Gen 0: {} orthos -> {} new work",
+            processed_gen0, new_work_gen0
+        );
+        println!(
+            "  Gen 1: {} orthos -> {} new work",
+            processed_gen1, new_work_gen1
+        );
+        println!(
+            "  Gen 2: {} orthos -> {} new work",
+            processed_gen2, new_work_gen2
+        );
         println!("  Final work queue: {}", store.work_len());
         println!("  Final seen count: {}", store.seen_len_accepted());
     }
@@ -2319,14 +2387,14 @@ mod tests {
 
         let mut shapes: Vec<String> = Vec::new();
         let max_per_gen = 5usize;
-        let mut best_so_far: Option<(Vec<usize>, usize, usize)> =
-            Some((vec![2, 2], 1, 0)); // dims, volume, fullness
+        let mut best_so_far: Option<(Vec<usize>, usize, usize)> = Some((vec![2, 2], 1, 0)); // dims, volume, fullness
         let mut seen_shapes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for gen_idx in 0..=30 {
             let mut processed = 0usize;
             let mut best_this_gen: Option<(Vec<usize>, usize, usize)> = None;
-            let mut new_shapes_this_gen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut new_shapes_this_gen: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
 
             while let Some(ortho) = store.pop_work().unwrap() {
                 let val = 2 + (gen_idx as u32 % 5);
@@ -2389,15 +2457,15 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_path_buf();
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
-        
+
         let cfg = Config::test_config(1024 * 1024, 8);
         store.configure(&cfg);
-        
+
         // Seed with initial ortho
         let seed = Ortho::new();
         store.push_segments(vec![seed]).unwrap();
         store.flush_all().unwrap();
-        
+
         // Generation 0: Process and generate results
         while let Some(ortho) = store.pop_work().unwrap() {
             // Generate children - some may overlap with siblings
@@ -2406,13 +2474,13 @@ mod tests {
                 store.record_result(&r).unwrap();
             }
         }
-        
+
         let new_work_gen0 = store.on_generation_end(&cfg, None).unwrap();
         let seen_gen0 = store.seen_len_accepted();
-        
+
         assert!(new_work_gen0 > 0);
         assert_eq!(seen_gen0, new_work_gen0);
-        
+
         // Generation 1: Process again - should see some duplicates filtered
         let mut processed = 0;
         let max_items = 5;
@@ -2421,7 +2489,7 @@ mod tests {
                 store.push_segments(vec![ortho]).unwrap();
                 break;
             }
-            
+
             // Generate more children
             let results = ortho.add(3);
             for r in results {
@@ -2429,15 +2497,19 @@ mod tests {
             }
             processed += 1;
         }
-        
+
         let new_work_gen1 = store.on_generation_end(&cfg, None).unwrap();
-        
+
         // Seen count should grow but some duplicates should be filtered
         assert!(store.seen_len_accepted() > seen_gen0);
-        
+
         println!("Ortho duplicate filtering test:");
         println!("  Gen 0: {} new work, {} seen", new_work_gen0, seen_gen0);
-        println!("  Gen 1: {} processed, {} new work, {} total seen", 
-                 processed, new_work_gen1, store.seen_len_accepted());
+        println!(
+            "  Gen 1: {} processed, {} new work, {} total seen",
+            processed,
+            new_work_gen1,
+            store.seen_len_accepted()
+        );
     }
 }

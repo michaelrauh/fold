@@ -1,9 +1,9 @@
-use crate::{spatial, FoldError};
+use crate::{FoldError, spatial};
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
+use rustc_hash::FxHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use rustc_hash::FxHasher;
 
 pub type Dim = u8;
 pub type PayloadVal = u32;
@@ -90,7 +90,11 @@ impl Ortho {
                     new_payload[2] = Some(second);
                 }
             }
-            return vec![Ortho::from_parts(self.dims.clone(), new_payload, self.up_axis)];
+            return vec![Ortho::from_parts(
+                self.dims.clone(),
+                new_payload,
+                self.up_axis,
+            )];
         }
         let len = self.payload.len();
         let mut new_payload: Vec<Option<PayloadVal>> = Vec::with_capacity(len);
@@ -101,7 +105,11 @@ impl Ortho {
         if insertion_index < new_payload.len() {
             new_payload[insertion_index] = Some(value);
         }
-        vec![Ortho::from_parts(self.dims.clone(), new_payload, self.up_axis)]
+        vec![Ortho::from_parts(
+            self.dims.clone(),
+            new_payload,
+            self.up_axis,
+        )]
     }
     fn expand_over(
         ortho: &Ortho,
@@ -320,7 +328,11 @@ impl<'a> fmt::Display for OrthoDisplay<'a> {
             .payload
             .iter()
             .filter_map(|&opt| opt)
-            .map(|token_id| self.interner.string_for_index(payload_to_usize(token_id)).len())
+            .map(|token_id| {
+                self.interner
+                    .string_for_index(payload_to_usize(token_id))
+                    .len()
+            })
             .max()
             .unwrap_or(1)
             .max(4);
@@ -423,9 +435,7 @@ mod tests {
     fn to_payload(payload: Vec<Option<usize>>) -> Vec<Option<PayloadVal>> {
         payload
             .into_iter()
-            .map(|v| {
-                v.map(|x| PayloadVal::try_from(x).expect("payload value overflowed u32"))
-            })
+            .map(|v| v.map(|x| PayloadVal::try_from(x).expect("payload value overflowed u32")))
             .collect()
     }
 
@@ -462,32 +472,18 @@ mod tests {
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(1), None, None, None],
-                None
-            )
-            .get_current_position(),
+            mk_ortho(vec![2, 2], vec![Some(1), None, None, None], None).get_current_position(),
             1
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(1), Some(2), None, None],
-                None
-            )
-            .get_current_position(),
+            mk_ortho(vec![2, 2], vec![Some(1), Some(2), None, None], None).get_current_position(),
             2
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(1), Some(2), Some(3), None],
-                None
-            )
-            .get_current_position(),
+            mk_ortho(vec![2, 2], vec![Some(1), Some(2), Some(3), None], None)
+                .get_current_position(),
             3
         );
     }
@@ -498,52 +494,30 @@ mod tests {
         assert_eq!(ortho.get_insert_position(5), 0);
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(0), Some(15), None, None],
-                None
-            )
-            .get_insert_position(14),
+            mk_ortho(vec![2, 2], vec![Some(0), Some(15), None, None], None).get_insert_position(14),
             0
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(0), Some(15), None, None],
-                None
-            )
-            .get_insert_position(20),
+            mk_ortho(vec![2, 2], vec![Some(0), Some(15), None, None], None).get_insert_position(20),
             1
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(0), Some(10), Some(20), None],
-                None
-            )
-            .get_insert_position(5),
+            mk_ortho(vec![2, 2], vec![Some(0), Some(10), Some(20), None], None)
+                .get_insert_position(5),
             0
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(0), Some(10), Some(20), None],
-                None
-            )
-            .get_insert_position(15),
+            mk_ortho(vec![2, 2], vec![Some(0), Some(10), Some(20), None], None)
+                .get_insert_position(15),
             1
         );
 
         assert_eq!(
-            mk_ortho(
-                vec![2, 2],
-                vec![Some(0), Some(10), Some(20), None],
-                None
-            )
-            .get_insert_position(1000),
+            mk_ortho(vec![2, 2], vec![Some(0), Some(10), Some(20), None], None)
+                .get_insert_position(1000),
             2
         );
     }
@@ -648,11 +622,7 @@ mod tests {
 
     #[test]
     fn test_insert_position_middle_and_reorg() {
-        let ortho = mk_ortho(
-            vec![2, 2],
-            vec![Some(10), None, Some(20), Some(30)],
-            None,
-        );
+        let ortho = mk_ortho(vec![2, 2], vec![Some(10), None, Some(20), Some(30)], None);
 
         let mut orthos = ortho.add(15);
         orthos.sort_by(|a, b| a.dims.cmp(&b.dims));
@@ -817,7 +787,10 @@ mod tests {
         let children2 = o2.add(40);
         // Normalize each child to (dims, filled_values_in_order)
         fn norm(o: &Ortho) -> (Vec<Dim>, Vec<PayloadVal>) {
-            (o.dims.clone(), o.payload.iter().filter_map(|x| *x).collect())
+            (
+                o.dims.clone(),
+                o.payload.iter().filter_map(|x| *x).collect(),
+            )
         }
         let mut norms1: Vec<_> = children1.iter().map(norm).collect();
         let mut norms2: Vec<_> = children2.iter().map(norm).collect();
@@ -834,11 +807,7 @@ mod tests {
     fn test_display_2d_simple() {
         use crate::interner::Interner;
         let interner = Interner::from_text("a b c d");
-        let ortho = mk_ortho(
-            vec![2, 2],
-            vec![Some(0), Some(1), Some(2), Some(3)],
-            None,
-        );
+        let ortho = mk_ortho(vec![2, 2], vec![Some(0), Some(1), Some(2), Some(3)], None);
         let display_str = format!("{}", ortho.display(&interner));
         assert_eq!(display_str, "   a    b\n   c    d");
     }

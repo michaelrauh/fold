@@ -1,12 +1,12 @@
 use filetime::{FileTime, set_file_mtime};
-use fold::generation_store::GenerationStore;
 use fold::file_handler::{self, StateConfig};
+use fold::generation_store::GenerationStore;
 use fold::interner::Interner;
 use fold::ortho::Ortho;
 use std::fs;
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use std::path::PathBuf;
 
 #[test]
 fn test_complete_txt_lifecycle() {
@@ -47,17 +47,17 @@ fn test_complete_txt_lifecycle() {
 
     // === STEP 3: Work begins - GenerationStore created ===
     let work_queue_path = ingestion.work_queue_path();
-    let store_path = PathBuf::from(&work_queue_path).parent().unwrap().to_path_buf();
-    
+    let store_path = PathBuf::from(&work_queue_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
     let mut store = GenerationStore::new_with_config(store_path.clone(), 8).unwrap();
     store.push_segments(vec![Ortho::new()]).unwrap();
     store.record_result(&Ortho::new()).unwrap();
 
     println!("✓ Step 3: Work directory created with GenerationStore");
-    assert!(
-        store_path.exists(),
-        "Store path should exist"
-    );
+    assert!(store_path.exists(), "Store path should exist");
 
     // === STEP 4: Heartbeat is touched during work ===
     let original_mtime = fs::metadata(&heartbeat).unwrap().modified().unwrap();
@@ -203,17 +203,17 @@ fn test_complete_merge_lifecycle() {
 
     // === STEP 3: Merge work begins - GenerationStore created ===
     let work_queue_path = ingestion.work_queue_path();
-    let merge_store_path = PathBuf::from(&work_queue_path).parent().unwrap().to_path_buf();
+    let merge_store_path = PathBuf::from(&work_queue_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
 
     let mut merge_store = GenerationStore::new_with_config(merge_store_path.clone(), 8).unwrap();
     merge_store.push_segments(vec![Ortho::new()]).unwrap();
     merge_store.record_result(&Ortho::new()).unwrap();
 
     println!("✓ Step 3: Merge work directories created");
-    assert!(
-        merge_store_path.exists(),
-        "Merge store path should exist"
-    );
+    assert!(merge_store_path.exists(), "Merge store path should exist");
 
     // === STEP 4: Heartbeat is touched during merge ===
     let original_mtime = fs::metadata(&merge_heartbeat).unwrap().modified().unwrap();

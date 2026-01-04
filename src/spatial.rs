@@ -298,8 +298,8 @@ fn pad(dims: &[Dim], position: usize) -> Vec<Vec<usize>> {
         .map(|mut indices| {
             indices.insert(dims.len() - position, 0);
             indices
-            })
-            .collect()
+        })
+        .collect()
 }
 
 fn parent(dims: &[Dim]) -> Option<Vec<Dim>> {

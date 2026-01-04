@@ -67,12 +67,12 @@ fn test_archive_merge_creates_heartbeat() {
     );
 
     // Ingest them for merging (this moves them to in_process and adds heartbeats)
-    let merge_ingestion =
-        file_handler::ingest_archives_with_config(
-            archive_a.to_str().unwrap(),
-            archive_b.to_str().unwrap(),
-            &config
-        ).unwrap();
+    let merge_ingestion = file_handler::ingest_archives_with_config(
+        archive_a.to_str().unwrap(),
+        archive_b.to_str().unwrap(),
+        &config,
+    )
+    .unwrap();
 
     // After moving to in_process, archives should have heartbeats
     let in_process_dir = config.in_process_dir();

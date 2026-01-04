@@ -1,4 +1,8 @@
+use fold::error::FoldError;
+use fold::generation_runner::run_generation_loop;
+use fold::generation_store::{Config, GenerationStore, Role};
 use fold::interner::Interner;
+use fold::metrics::Metrics;
 use fold::ortho::{Ortho, OrthoId};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -37,6 +41,7 @@ struct IndexFile {
 #[derive(serde::Serialize)]
 struct OrthoCandidate {
     word: String,
+    word_id: usize,
     min_input: usize,
     child_id: OrthoId,
 }
@@ -45,7 +50,9 @@ struct OrthoCandidate {
 struct OrthoRecord {
     ortho_id: OrthoId,
     required_keys: Vec<Vec<String>>,
+    forbidden_keys: Vec<String>,
     candidates: Vec<OrthoCandidate>,
+    display: String,
 }
 
 #[derive(serde::Serialize)]
@@ -99,6 +106,7 @@ fn export_interner_chunked(interner: &Interner, text: &str, out_dir: &Path) -> a
 
     let sentences = tokenize_sentences(text);
     let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
+    let mut word_first_pos: HashMap<usize, usize> = HashMap::new();
     let mut total_words = 0usize;
     for words in sentences.iter() {
         let len = words.len();
@@ -112,6 +120,7 @@ fn export_interner_chunked(interner: &Interner, text: &str, out_dir: &Path) -> a
                 }
                 if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
                     let word_pos = total_words + j;
+                    word_first_pos.entry(comp_idx).or_insert(word_pos);
                     first_positions
                         .entry((prefix_indices.clone(), comp_idx))
                         .or_insert(word_pos);
@@ -141,18 +150,17 @@ fn export_interner_chunked(interner: &Interner, text: &str, out_dir: &Path) -> a
     let mut index_entries: Vec<IndexEntry> = Vec::with_capacity(prefixes.len());
     let mut per_key_bucket_counts: Vec<Vec<u32>> = Vec::with_capacity(prefixes.len());
 
-    let flush_chunk =
-        |chunk_id: usize, chunk_keys: &mut Vec<KeyEntry>| -> anyhow::Result<()> {
-            if chunk_keys.is_empty() {
-                return Ok(());
-            }
-            let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
-            let chunk_path = out_dir.join(&chunk_name);
-            let file = fs::File::create(&chunk_path)?;
-            serde_json::to_writer(file, &serde_json::json!({ "keys": chunk_keys }))?;
-            chunk_keys.clear();
-            Ok(())
-        };
+    let flush_chunk = |chunk_id: usize, chunk_keys: &mut Vec<KeyEntry>| -> anyhow::Result<()> {
+        if chunk_keys.is_empty() {
+            return Ok(());
+        }
+        let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
+        let chunk_path = out_dir.join(&chunk_name);
+        let file = fs::File::create(&chunk_path)?;
+        serde_json::to_writer(file, &serde_json::json!({ "keys": chunk_keys }))?;
+        chunk_keys.clear();
+        Ok(())
+    };
 
     for (prefix, bitset) in prefixes {
         let words = prefix
@@ -262,7 +270,12 @@ fn export_interner_chunked(interner: &Interner, text: &str, out_dir: &Path) -> a
     Ok(())
 }
 
-fn export_ortho_archive(interner: &Interner, text: &str, stride_words: usize, out_dir: &Path) -> anyhow::Result<()> {
+fn export_ortho_archive(
+    interner: &Interner,
+    text: &str,
+    stride_words: usize,
+    out_dir: &Path,
+) -> anyhow::Result<()> {
     fs::create_dir_all(out_dir)?;
 
     let vocab: Vec<String> = interner.vocabulary().to_vec();
@@ -273,6 +286,7 @@ fn export_ortho_archive(interner: &Interner, text: &str, stride_words: usize, ou
 
     let sentences = tokenize_sentences(text);
     let mut first_positions: HashMap<(Vec<usize>, usize), usize> = HashMap::new();
+    let mut word_first_pos: HashMap<usize, usize> = HashMap::new();
     let mut total_words = 0usize;
     for words in sentences.iter() {
         let len = words.len();
@@ -286,6 +300,7 @@ fn export_ortho_archive(interner: &Interner, text: &str, stride_words: usize, ou
                 }
                 if let Some(&comp_idx) = word_to_idx.get(&words[j]) {
                     let word_pos = total_words + j;
+                    word_first_pos.entry(comp_idx).or_insert(word_pos);
                     first_positions
                         .entry((prefix_indices.clone(), comp_idx))
                         .or_insert(word_pos);
@@ -295,62 +310,142 @@ fn export_ortho_archive(interner: &Interner, text: &str, stride_words: usize, ou
         total_words += len;
     }
 
-    let mut records = Vec::new();
-    let ortho = Ortho::new();
-    let (_forbidden, required_raw) = ortho.get_requirements();
-    let required_keys: Vec<Vec<String>> = required_raw
-        .iter()
-        .map(|prefix| prefix.iter().filter_map(|p| vocab.get(*p as usize).cloned()).collect())
-        .collect();
-
-    let mut required_sets = Vec::new();
-    for prefix in required_raw.iter() {
-        if prefix.is_empty() {
-            continue;
-        }
-        let ids: Vec<usize> = prefix.iter().map(|p| *p as usize).collect();
-        if let Some(bits) = interner.completions_for_prefix(&ids) {
-            required_sets.push(bits);
-        }
+    println!(
+        "Ortho export: stride={} words -> building store",
+        stride_words
+    );
+    // Prepare generation store using the same configuration logic as main (leader role).
+    let cfg = Config::compute_config(Role::Leader)
+        .ok_or_else(|| anyhow::anyhow!("insufficient memory for generation config"))?;
+    let work_dir = out_dir.join(format!("work_{}", stride_words));
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)?;
     }
-    let candidate_ids: HashSet<usize> = if required_sets.is_empty() {
-        (0..interner.vocabulary().len()).collect()
-    } else {
-        let mut acc = required_sets[0].clone();
-        for bs in required_sets.iter().skip(1) {
-            acc.intersect_with(bs);
+    let mut store = GenerationStore::new_with_config(work_dir.clone(), 8)?;
+    store.configure(&cfg);
+
+    let metrics = Metrics::new();
+    let mut noop_housekeeping = || -> Result<(), FoldError> { Ok(()) };
+    let progress_factory = |_gen: u64| -> Option<fold::generation_store::ProgressCallback> { None };
+
+    println!("Ortho export: stride={} running generations…", stride_words);
+    run_generation_loop(
+        interner,
+        &mut store,
+        &cfg,
+        Role::Leader,
+        &metrics,
+        || false,
+        &mut noop_housekeeping,
+        progress_factory,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    store.flush_all()?;
+
+    let make_record = |ortho: &Ortho| -> OrthoRecord {
+        let (forbidden_raw, required_raw) = ortho.get_requirements();
+        let required_keys: Vec<Vec<String>> = required_raw
+            .iter()
+            .map(|prefix| {
+                prefix
+                    .iter()
+                    .filter_map(|p| vocab.get(*p as usize).cloned())
+                    .collect()
+            })
+            .collect();
+        let forbidden_keys: Vec<String> = forbidden_raw
+            .iter()
+            .filter_map(|p| vocab.get(*p as usize).cloned())
+            .collect();
+
+        let mut required_sets = Vec::new();
+        for prefix in required_raw.iter() {
+            if prefix.is_empty() {
+                continue;
+            }
+            let ids: Vec<usize> = prefix.iter().map(|p| *p as usize).collect();
+            if let Some(bits) = interner.completions_for_prefix(&ids) {
+                required_sets.push(bits);
+            }
         }
-        acc.ones().collect()
+        let candidate_ids: HashSet<usize> = if required_sets.is_empty() {
+            (0..interner.vocabulary().len()).collect()
+        } else {
+            let mut acc = required_sets[0].clone();
+            for bs in required_sets.iter().skip(1) {
+                acc.intersect_with(bs);
+            }
+            acc.ones().collect()
+        };
+
+        let mut candidates = Vec::new();
+        let forbidden_set: HashSet<usize> = forbidden_raw.iter().map(|v| *v as usize).collect();
+        for cid in candidate_ids {
+            if forbidden_set.contains(&cid) {
+                continue;
+            }
+            let word = interner.vocabulary()[cid].clone();
+            let min_input = if required_raw.is_empty() {
+                *word_first_pos.get(&cid).unwrap_or(&total_words)
+            } else {
+                required_raw
+                    .iter()
+                    .filter_map(|pref| {
+                        let ids: Vec<usize> = pref.iter().map(|p| *p as usize).collect();
+                        first_positions.get(&(ids, cid)).copied()
+                    })
+                    .max()
+                    .unwrap_or(total_words)
+            };
+            let child_opt = ortho.add(cid as u32).get(0).cloned();
+            let child_id = child_opt.as_ref().map(|o| o.id()).unwrap_or(0);
+            candidates.push(OrthoCandidate {
+                word,
+                word_id: cid,
+                min_input,
+                child_id,
+            });
+        }
+        candidates.sort_by_key(|c| (c.min_input, c.word.clone()));
+
+        let display = ortho.display(interner).to_string();
+
+        OrthoRecord {
+            ortho_id: ortho.id(),
+            required_keys,
+            forbidden_keys,
+            candidates,
+            display,
+        }
     };
 
-    let mut candidates = Vec::new();
-    for cid in candidate_ids {
-        let word = interner.vocabulary()[cid].clone();
-        let min_input = required_raw
-            .iter()
-            .filter_map(|pref| {
-                let ids: Vec<usize> = pref.iter().map(|p| *p as usize).collect();
-                first_positions.get(&(ids, cid)).copied()
-            })
-            .max()
-            .unwrap_or(0);
-        if min_input > stride_words {
-            continue;
-        }
-        let child_id = ortho.add(cid as u32).get(0).map(|o| o.id()).unwrap_or(0);
-        candidates.push(OrthoCandidate {
-            word,
-            min_input,
-            child_id,
-        });
+    println!("Ortho export: stride={} collecting records…", stride_words);
+    let mut records = Vec::new();
+    let mut id_index = HashSet::new();
+    // Ensure the empty ortho is present
+    let root = Ortho::new();
+    if id_index.insert(root.id()) {
+        records.push(make_record(&root));
     }
-    candidates.sort_by_key(|c| (c.min_input, c.word.clone()));
-
-    records.push(OrthoRecord {
-        ortho_id: ortho.id(),
-        required_keys,
-        candidates,
-    });
+    for bucket in 0..8 {
+        let mut bucket_count = 0usize;
+        for res in store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+            let ortho_bytes = res?.bytes;
+            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
+            if !id_index.insert(ortho.id()) {
+                continue;
+            }
+            records.push(make_record(&ortho));
+            bucket_count += 1;
+            if bucket_count % 10_000 == 0 {
+                println!(
+                    "  stride={} bucket={} … {} records",
+                    stride_words, bucket, bucket_count
+                );
+            }
+        }
+    }
 
     let archive = OrthoArchive {
         stride_words,
@@ -376,8 +471,13 @@ fn main() -> anyhow::Result<()> {
     let text = fs::read_to_string("e.txt")?;
 
     // Interner export (full text) to data/interner_export
+    println!("Interner export: building interner for full text…");
     let interner = Interner::from_text(&text);
     let interner_out = PathBuf::from("data/interner_export");
+    println!(
+        "Interner export: writing chunks/index to {}",
+        interner_out.display()
+    );
     export_interner_chunked(&interner, &text, &interner_out)?;
 
     // Ortho exports for small strides (500, 1000 words)

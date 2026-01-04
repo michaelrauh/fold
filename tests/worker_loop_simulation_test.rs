@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// Test that simulates the worker loop logic to see if it can create
 /// an ortho with duplicate tokens on the same diagonal
@@ -29,8 +29,7 @@ fn test_worker_loop_prevents_duplicates() {
         }
 
         let (forbidden, required) = ortho.get_requirements();
-        let forbidden_usize: Vec<usize> =
-            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let forbidden_usize: Vec<usize> = forbidden.iter().map(|v| payload_to_usize(*v)).collect();
         let required_usize: Vec<Vec<usize>> = required
             .iter()
             .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
@@ -164,8 +163,7 @@ fn test_3x3_duplicate_and() {
 
         // Verify position 4 [1,1] (distance 2) has position 3 [0,2] on its diagonal
         let (forbidden, required) = ortho.get_requirements();
-        let forbidden_usize: Vec<usize> =
-            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let forbidden_usize: Vec<usize> = forbidden.iter().map(|v| payload_to_usize(*v)).collect();
         let required_usize: Vec<Vec<usize>> = required
             .iter()
             .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())

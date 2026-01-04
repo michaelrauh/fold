@@ -31,3 +31,13 @@ Linear plan
    - Build GT views over stats.txt/multistats.txt for timing/growth trends.
 6) Comprehensive Lepiter docs:
    - End-to-end pages: data formats/paths, interner views, ortho explorer, cross-links, examples.
+
+Extract generation loop for reuse (export & tooling)
+----------------------------------------------------
+1) Map dependencies: list what the current generation loop in `main.rs` captures (Interner, GenerationStore, Metrics handle, Role/config, mem_claim, file_handler helpers, ingestion/merge metadata, best_ortho/best_score, optimal_dirty).
+2) Factor ingest/merge setup: move “ingest text” and “ingest merge” into helpers that return (interner, store, lineage/meta, config, role, mem_claim, metrics handle).
+3) Isolate loop body: extract the `while let Some(ortho)` loop plus generation-end transition into a function that takes the prepared context and returns (best_ortho, stats, maybe archive paths).
+4) Decouple side-effects: push TUI/threading, heartbeat/mem-claim touches, and metrics UI updates behind callbacks so the loop can run headless (for exports/tests).
+5) Rewire `main`: call the new helpers/functions so behavior stays identical.
+6) Repoint exporter: have `export_data.rs` call the extracted generation runner instead of its own BFS.
+7) Test & measure: cargo test/export; verify archives match prior behavior and performance is acceptable.

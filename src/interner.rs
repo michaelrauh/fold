@@ -1,5 +1,5 @@
+use crate::{FoldError, splitter::Splitter};
 use bytecheck::CheckBytes;
-use crate::{splitter::Splitter, FoldError};
 use fixedbitset::FixedBitSet;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
@@ -240,9 +240,7 @@ impl Interner {
     }
 
     /// Iterate over all prefix -> completions entries.
-    pub fn prefix_entries(
-        &self,
-    ) -> impl Iterator<Item = (&Vec<usize>, &FixedBitSet)> {
+    pub fn prefix_entries(&self) -> impl Iterator<Item = (&Vec<usize>, &FixedBitSet)> {
         self.prefix_to_completions.iter()
     }
 
@@ -919,18 +917,19 @@ mod tests {
         let chunk_dir = Path::new("target");
         fs::create_dir_all(chunk_dir)?;
 
-        let flush_chunk =
-            |chunk_id: usize, chunk_keys: &mut Vec<KeyEntry>| -> Result<(), Box<dyn std::error::Error>> {
-                if chunk_keys.is_empty() {
-                    return Ok(());
-                }
-                let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
-                let chunk_path = chunk_dir.join(&chunk_name);
-                let file = fs::File::create(&chunk_path)?;
-                serde_json::to_writer(file, &serde_json::json!({ "keys": chunk_keys }))?;
-                chunk_keys.clear();
-                Ok(())
-            };
+        let flush_chunk = |chunk_id: usize,
+                           chunk_keys: &mut Vec<KeyEntry>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            if chunk_keys.is_empty() {
+                return Ok(());
+            }
+            let chunk_name = format!("interner_keys_{:04}.json", chunk_id);
+            let chunk_path = chunk_dir.join(&chunk_name);
+            let file = fs::File::create(&chunk_path)?;
+            serde_json::to_writer(file, &serde_json::json!({ "keys": chunk_keys }))?;
+            chunk_keys.clear();
+            Ok(())
+        };
 
         for (prefix, bitset) in prefixes {
             let words = prefix
@@ -947,7 +946,8 @@ mod tests {
                     .copied()
                     .unwrap_or(total_words);
                 if !bucket_counts.is_empty() {
-                    let idx = (first_word_pos.min(total_words.saturating_sub(1))) / bucket_size_words;
+                    let idx =
+                        (first_word_pos.min(total_words.saturating_sub(1))) / bucket_size_words;
                     if let Some(slot) = bucket_counts.get_mut(idx) {
                         *slot += 1;
                     }
@@ -1008,10 +1008,7 @@ mod tests {
                 })
                 .collect();
             pairs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            let order: Vec<u32> = pairs
-                .into_iter()
-                .map(|(_, idx)| idx as u32)
-                .collect();
+            let order: Vec<u32> = pairs.into_iter().map(|(_, idx)| idx as u32).collect();
 
             let fname = format!("interner_orders_{:04}.bin", bucket_idx);
             let path = chunk_dir.join(&fname);
@@ -1114,7 +1111,12 @@ mod tests {
         let (_forbidden, required_raw) = ortho.get_requirements();
         let required_keys: Vec<Vec<String>> = required_raw
             .iter()
-            .map(|prefix| prefix.iter().filter_map(|p| vocab.get(*p as usize).cloned()).collect())
+            .map(|prefix| {
+                prefix
+                    .iter()
+                    .filter_map(|p| vocab.get(*p as usize).cloned())
+                    .collect()
+            })
             .collect();
 
         // Compute candidates by intersecting completions for required prefixes.

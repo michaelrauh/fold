@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// This test reproduces the EXACT bug from the user's report:
 /// "and" appears at [0,2] (position 3) and [1,1] (position 4), both in shell 2
@@ -65,8 +65,7 @@ fn test_and_duplicate_in_shell_2() {
 
         let _pos = ortho.get_current_position();
         let (forbidden, required) = ortho.get_requirements();
-        let forbidden_usize: Vec<usize> =
-            forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+        let forbidden_usize: Vec<usize> = forbidden.iter().map(|v| payload_to_usize(*v)).collect();
         let required_usize: Vec<Vec<usize>> = required
             .iter()
             .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())

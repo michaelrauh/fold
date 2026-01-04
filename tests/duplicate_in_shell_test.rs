@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{payload_to_usize, Ortho, PayloadVal};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// This test verifies the diagonal/shell logic.
 /// In a 2x2 grid being filled:
@@ -33,8 +33,7 @@ fn test_duplicate_token_in_same_shell_forbidden() {
     // Now check requirements for position 2: [1,0] - distance 1
     // Position 1 [0,1] is on the diagonal (both at distance 1)
     let (forbidden, required) = ortho.get_requirements();
-    let forbidden_usize: Vec<usize> =
-        forbidden.iter().map(|v| payload_to_usize(*v)).collect();
+    let forbidden_usize: Vec<usize> = forbidden.iter().map(|v| payload_to_usize(*v)).collect();
     let required_usize: Vec<Vec<usize>> = required
         .iter()
         .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())

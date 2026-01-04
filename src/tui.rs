@@ -1,5 +1,5 @@
 use crate::metrics::{MetricSample, Metrics, MetricsSnapshot, StatusHistoryEntry};
-use crate::ortho::{dim_to_usize, payload_to_usize, Dim, PayloadVal};
+use crate::ortho::{Dim, PayloadVal, dim_to_usize, payload_to_usize};
 use crate::spatial;
 use crossterm::{
     cursor::Show,
@@ -256,7 +256,12 @@ impl Tui {
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
-            let seen_peak = snapshot.landing_buffer_samples.iter().map(|s| s.value).max().unwrap_or(0);
+            let seen_peak = snapshot
+                .landing_buffer_samples
+                .iter()
+                .map(|s| s.value)
+                .max()
+                .unwrap_or(0);
 
             if seen_peak > 0 {
                 progress_ratio = seen_current as f64 / seen_peak as f64;
@@ -593,7 +598,12 @@ impl Tui {
                 .last()
                 .map(|s| s.value)
                 .unwrap_or(0);
-            let peak = snapshot.work_len_samples.iter().map(|s| s.value).max().unwrap_or(0);
+            let peak = snapshot
+                .work_len_samples
+                .iter()
+                .map(|s| s.value)
+                .max()
+                .unwrap_or(0);
             let rate = if snapshot.work_len_samples.len() >= 10 {
                 let prev_idx = snapshot.work_len_samples.len().saturating_sub(10);
                 let prev = snapshot.work_len_samples[prev_idx].value;
@@ -653,11 +663,7 @@ impl Tui {
             } else {
                 0
             };
-            (
-                current_raw as u64,
-                rate,
-                baseline_raw as u64,
-            )
+            (current_raw as u64, rate, baseline_raw as u64)
         } else {
             (0, 0, 0)
         };
@@ -691,23 +697,27 @@ impl Tui {
         let work_len = snapshot.global.work_len;
         let seen = snapshot.global.seen_len_accepted;
 
-        let block = Block::default().borders(Borders::ALL).title("Generational Store");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Generational Store");
         let inner = block.inner(area);
         f.render_widget(block, area);
 
         // Check if we're in a transition (processing buckets)
         let in_transition = snapshot.bucket_metrics.iter().any(|b| {
-            !matches!(b.state, crate::metrics::BucketState::Pending | crate::metrics::BucketState::Complete | crate::metrics::BucketState::Empty)
+            !matches!(
+                b.state,
+                crate::metrics::BucketState::Pending
+                    | crate::metrics::BucketState::Complete
+                    | crate::metrics::BucketState::Empty
+            )
         });
 
         if in_transition && !snapshot.bucket_metrics.is_empty() {
             // TRANSITION MODE: Show detailed per-bucket progress
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Min(3),
-                ])
+                .constraints([Constraint::Length(1), Constraint::Min(3)])
                 .split(inner);
 
             // Top: Generation transition header
@@ -720,21 +730,38 @@ impl Tui {
 
             // Bottom: Per-bucket progress panel (up to 8 buckets)
             let available_height = chunks[1].height as usize;
-            let bucket_lines: Vec<Line> = snapshot.bucket_metrics
+            let bucket_lines: Vec<Line> = snapshot
+                .bucket_metrics
                 .iter()
                 .take(available_height)
                 .map(|b| {
                     let (progress_bar, state_text, color) = match b.state {
-                        crate::metrics::BucketState::Complete => ("████████", "Complete", Color::Green),
-                        crate::metrics::BucketState::Empty => ("        ", "Empty", Color::DarkGray),
-                        crate::metrics::BucketState::Draining => ("██      ", "Draining", Color::Yellow),
-                        crate::metrics::BucketState::Sorting => ("████    ", "Sorting", Color::Yellow),
-                        crate::metrics::BucketState::Merging => ("█████   ", "Merging", Color::Yellow),
-                        crate::metrics::BucketState::AntiJoining => ("██████  ", "Anti-join", Color::Yellow),
-                        crate::metrics::BucketState::Compacting => ("███████ ", "Compact", Color::Cyan),
-                        crate::metrics::BucketState::Pending => ("        ", "Pending", Color::DarkGray),
+                        crate::metrics::BucketState::Complete => {
+                            ("████████", "Complete", Color::Green)
+                        }
+                        crate::metrics::BucketState::Empty => {
+                            ("        ", "Empty", Color::DarkGray)
+                        }
+                        crate::metrics::BucketState::Draining => {
+                            ("██      ", "Draining", Color::Yellow)
+                        }
+                        crate::metrics::BucketState::Sorting => {
+                            ("████    ", "Sorting", Color::Yellow)
+                        }
+                        crate::metrics::BucketState::Merging => {
+                            ("█████   ", "Merging", Color::Yellow)
+                        }
+                        crate::metrics::BucketState::AntiJoining => {
+                            ("██████  ", "Anti-join", Color::Yellow)
+                        }
+                        crate::metrics::BucketState::Compacting => {
+                            ("███████ ", "Compact", Color::Cyan)
+                        }
+                        crate::metrics::BucketState::Pending => {
+                            ("        ", "Pending", Color::DarkGray)
+                        }
                     };
-                    
+
                     let work_info = if b.new_work > 0 {
                         format!(" (+{} work)", format_number(b.new_work))
                     } else if matches!(b.state, crate::metrics::BucketState::Complete) {
@@ -742,10 +769,13 @@ impl Tui {
                     } else {
                         String::new()
                     };
-                    
+
                     Line::from(vec![
                         Span::styled(format!("[{}] ", progress_bar), Style::default().fg(color)),
-                        Span::styled(format!("B{}: ", b.bucket_id), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("B{}: ", b.bucket_id),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                         Span::styled(format!("{:<11}", state_text), Style::default().fg(color)),
                         Span::raw(work_info),
                     ])
@@ -759,9 +789,9 @@ impl Tui {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(2),  // Context lines
-                    Constraint::Length(3),  // Landing section
-                    Constraint::Length(2),  // Health section
+                    Constraint::Length(2), // Context lines
+                    Constraint::Length(3), // Landing section
+                    Constraint::Length(2), // Health section
                 ])
                 .split(inner);
 
@@ -778,18 +808,20 @@ impl Tui {
                     format_number(seen as usize),
                     format_bytes(snapshot.global.run_budget_bytes),
                     snapshot.global.fan_in
-                ))
+                )),
             ];
             f.render_widget(Paragraph::new(context_lines), chunks[0]);
 
             // Section 2: Landing Activity (most dynamic - changes every 100 orthos)
             if !snapshot.bucket_metrics.is_empty() {
-                let max_landing = snapshot.bucket_metrics.iter()
+                let max_landing = snapshot
+                    .bucket_metrics
+                    .iter()
                     .map(|b| b.landing_size)
                     .max()
                     .unwrap_or(1)
                     .max(1);
-                
+
                 // Build landing bars for buckets 0-3
                 let mut line1_spans = vec![Span::raw("Landing: ")];
                 for b in snapshot.bucket_metrics.iter().take(4) {
@@ -811,11 +843,11 @@ impl Tui {
                     };
                     line1_spans.push(Span::styled(
                         format!("B{}:{:<4} ", b.bucket_id, bar),
-                        Style::default().fg(color)
+                        Style::default().fg(color),
                     ));
                     line1_spans.push(Span::raw(format!("{} ", format_number(b.landing_size))));
                 }
-                
+
                 // Build landing bars for buckets 4-7
                 let mut line2_spans = vec![Span::raw("         ")];
                 for b in snapshot.bucket_metrics.iter().skip(4).take(4) {
@@ -837,34 +869,31 @@ impl Tui {
                     };
                     line2_spans.push(Span::styled(
                         format!("B{}:{:<4} ", b.bucket_id, bar),
-                        Style::default().fg(color)
+                        Style::default().fg(color),
                     ));
                     line2_spans.push(Span::raw(format!("{} ", format_number(b.landing_size))));
                 }
-                
-                let landing_lines = vec![
-                    Line::from(line1_spans),
-                    Line::from(line2_spans),
-                ];
+
+                let landing_lines = vec![Line::from(line1_spans), Line::from(line2_spans)];
                 f.render_widget(Paragraph::new(landing_lines), chunks[1]);
-                
+
                 // Section 3: Compaction Health (updated at generation boundaries)
                 let mut health_spans = vec![Span::raw("Health:  ")];
                 for b in snapshot.bucket_metrics.iter() {
                     let (indicator, color) = if b.run_count > 64 {
-                        ("⚡", Color::Red)     // Will compact next transition
+                        ("⚡", Color::Red) // Will compact next transition
                     } else if b.run_count > 10 {
-                        ("‼", Color::Red)      // Heavily fragmented
+                        ("‼", Color::Red) // Heavily fragmented
                     } else if b.run_count > 5 {
-                        ("!", Color::Yellow)   // Getting fragmented
+                        ("!", Color::Yellow) // Getting fragmented
                     } else {
-                        ("✓", Color::Green)    // Healthy
+                        ("✓", Color::Green) // Healthy
                     };
                     health_spans.push(Span::raw(format!("B{}[{}]", b.bucket_id, b.run_count)));
                     health_spans.push(Span::styled(indicator, Style::default().fg(color)));
                     health_spans.push(Span::raw(" "));
                 }
-                
+
                 let health_line = Line::from(health_spans);
                 f.render_widget(Paragraph::new(vec![health_line]), chunks[2]);
             } else {

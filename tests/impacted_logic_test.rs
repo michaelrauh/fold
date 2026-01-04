@@ -1,6 +1,6 @@
 use fold::{
     interner::Interner,
-    ortho::{payload_to_usize, Ortho},
+    ortho::{Ortho, payload_to_usize},
 };
 
 /// Test that demonstrates the bug: is_ortho_impacted_fast uses payload instead of requirements
@@ -36,9 +36,9 @@ fn test_impacted_should_check_requirements_not_payload() {
         .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
         .collect();
 
-    // The current buggy implementation would check if the entire payload [0,1,2] 
+    // The current buggy implementation would check if the entire payload [0,1,2]
     // matches an impacted prefix. But it should check if ANY requirement prefix matches.
-    
+
     // Map interner_a vocabulary to merged vocabulary
     let vocab_a = interner_a.vocabulary();
     let vocab_merged = merged.vocabulary();
@@ -47,14 +47,17 @@ fn test_impacted_should_check_requirements_not_payload() {
 
     // Check if requirements contain the impacted prefix
     let impacted_key = vec![a_idx, b_idx];
-    let has_impacted_requirement = requirements_usize.iter().any(|req| {
-        impacted_a.contains(&impacted_key) && req == &impacted_key
-    });
+    let has_impacted_requirement = requirements_usize
+        .iter()
+        .any(|req| impacted_a.contains(&impacted_key) && req == &impacted_key);
 
     // This ortho SHOULD be marked as impacted because one of its requirement prefixes
     // [a, b] matches an impacted key
     assert!(
-        has_impacted_requirement || impacted_a.iter().any(|imp| requirements_usize.contains(imp)),
+        has_impacted_requirement
+            || impacted_a
+                .iter()
+                .any(|imp| requirements_usize.contains(imp)),
         "Ortho should be impacted because its requirements include the changed prefix [a,b]"
     );
 }
@@ -107,7 +110,7 @@ fn test_impacted_keys_must_be_in_merged_space_for_smaller_archive() {
 
     // The impacted_a keys are already in MERGED space (returned by merged.impacted_keys)
     // So we can directly compare remapped requirements against impacted_a
-    
+
     // This should work correctly - both are in merged space
     let is_impacted = remapped_requirements_usize
         .iter()
@@ -140,10 +143,22 @@ fn test_impacted_must_compare_merged_vs_original_not_a_vs_b() {
     // wrong_impacted_a tells us "keys in A that differ from B" (in A's vocab space)
     // correct_impacted_a tells us "keys in merged that changed from A's perspective" (in merged vocab space)
 
-    println!("Wrong approach - A.impacted_keys(B): {:?}", wrong_impacted_a);
-    println!("Wrong approach - B.impacted_keys(A): {:?}", wrong_impacted_b);
-    println!("Correct approach - Merged.impacted_keys(A): {:?}", correct_impacted_a);
-    println!("Correct approach - Merged.impacted_keys(B): {:?}", correct_impacted_b);
+    println!(
+        "Wrong approach - A.impacted_keys(B): {:?}",
+        wrong_impacted_a
+    );
+    println!(
+        "Wrong approach - B.impacted_keys(A): {:?}",
+        wrong_impacted_b
+    );
+    println!(
+        "Correct approach - Merged.impacted_keys(A): {:?}",
+        correct_impacted_a
+    );
+    println!(
+        "Correct approach - Merged.impacted_keys(B): {:?}",
+        correct_impacted_b
+    );
 
     // The correct approach gives us keys in the merged vocabulary space,
     // which is what we need to check against remapped orthos
@@ -175,7 +190,7 @@ fn test_complete_impacted_ortho_scenario() {
 
     // Determine which is smaller
     let a_is_smaller = interner_a.vocab_size() <= interner_b.vocab_size();
-    
+
     // Merge
     let merged = if a_is_smaller {
         interner_b.merge(&interner_a)
@@ -227,9 +242,15 @@ fn test_complete_impacted_ortho_scenario() {
         .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect::<Vec<_>>())
         .any(|req| impacted_a.contains(&req));
 
-    println!("Ortho A1 requirements: {:?}", final_ortho_a1.get_requirement_phrases());
+    println!(
+        "Ortho A1 requirements: {:?}",
+        final_ortho_a1.get_requirement_phrases()
+    );
     println!("Ortho A1 impacted: {}", ortho_a1_impacted);
-    println!("Ortho A2 requirements: {:?}", final_ortho_a2.get_requirement_phrases());
+    println!(
+        "Ortho A2 requirements: {:?}",
+        final_ortho_a2.get_requirement_phrases()
+    );
     println!("Ortho A2 impacted: {}", ortho_a2_impacted);
 
     // Both should be impacted since both had their prefixes extended

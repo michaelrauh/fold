@@ -1,5 +1,6 @@
 pub mod error;
 pub mod file_handler;
+pub mod generation_runner;
 pub mod generation_store;
 pub mod interner;
 pub mod metrics;
