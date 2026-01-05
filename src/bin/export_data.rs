@@ -27,6 +27,7 @@ struct IndexEntry {
     completion_count: u32,
     counts_by_word_bucket: Vec<u32>,
     chunk: String,
+    max_descendant_len: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -137,6 +138,26 @@ fn export_interner_chunked(interner: &Interner, text: &str, out_dir: &Path) -> a
         cb.cmp(&ca)
     });
 
+    // Precompute, for every prefix, the maximum descendant key length (including itself).
+    let mut max_desc_len: HashMap<Vec<usize>, usize> = HashMap::new();
+    for (prefix, _) in prefixes.iter() {
+        let len = prefix.len();
+        // include self and all proper prefixes
+        for i in 0..=len {
+            let sub = prefix[..i].to_vec();
+            match max_desc_len.get_mut(&sub) {
+                Some(existing) => {
+                    if len > *existing {
+                        *existing = len;
+                    }
+                }
+                None => {
+                    max_desc_len.insert(sub, len);
+                }
+            }
+        }
+    }
+
     let bucket_size_words: usize = 500;
     let bucket_count = if total_words == 0 {
         0
@@ -208,6 +229,7 @@ fn export_interner_chunked(interner: &Interner, text: &str, out_dir: &Path) -> a
             completion_count,
             counts_by_word_bucket: bucket_counts.clone(),
             chunk: chunk_name.clone(),
+            max_descendant_len: *max_desc_len.get(prefix.as_slice()).unwrap_or(&prefix.len()),
         });
         per_key_bucket_counts.push(bucket_counts);
 

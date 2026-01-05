@@ -32,6 +32,20 @@ Linear plan
 6) Comprehensive Lepiter docs:
    - End-to-end pages: data formats/paths, interner views, ortho explorer, cross-links, examples.
 
+Ortho expansions (all children)
+-------------------------------
+- Export change: in `export_data.rs` emit one entry per child (loop all `ortho.add(...)` results) so `candidates` is a flat list of {word, min_input, child_id} for every expansion, not just the first.
+- GT change: existing Ortho view already lists `candidates`; no code change needed unless you want to rename the header (“Expansions”) or add grouping/sorting. Each row will show duplicated words with distinct child_ids.
+
+Pruning exploration (prefix → long key reachability)
+----------------------------------------------------
+- Export addition: for each prefix/key, compute `max_descendant_len` (longest key that has this prefix; include itself) and optionally a small histogram of descendant lengths.
+- GT: add a “min descendant length” slider to the interner view; show only keys with `max_descendant_len >= slider`, and summarize surviving keys/completions. Optionally annotate required keys in Ortho with whether they survive the threshold.
+
+Pruning Exploration (branching factor)
+----------------------------------------------------
+(flesh this out more)
+
 Extract generation loop for reuse (export & tooling)
 ----------------------------------------------------
 1) Map dependencies: list what the current generation loop in `main.rs` captures (Interner, GenerationStore, Metrics handle, Role/config, mem_claim, file_handler helpers, ingestion/merge metadata, best_ortho/best_score, optimal_dirty).
