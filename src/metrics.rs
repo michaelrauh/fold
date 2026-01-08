@@ -95,6 +95,8 @@ pub struct OperationStatus {
     pub text_preview: String,
     pub word_count: usize,
     pub new_orthos: usize,
+    pub pruned_completions: usize,
+    pub expanded_completions: usize,
 }
 
 impl Default for OperationStatus {
@@ -112,6 +114,8 @@ impl Default for OperationStatus {
             text_preview: String::new(),
             word_count: 0,
             new_orthos: 0,
+            pruned_completions: 0,
+            expanded_completions: 0,
         }
     }
 }
@@ -371,6 +375,24 @@ impl Metrics {
     pub fn increment_new_orthos(&self, count: usize) {
         let mut inner = self.inner.lock().unwrap();
         inner.operation.new_orthos = inner.operation.new_orthos.saturating_add(count);
+    }
+
+    pub fn reset_prune_counts(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.pruned_completions = 0;
+        inner.operation.expanded_completions = 0;
+    }
+
+    pub fn increment_pruned_completions(&self, count: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.pruned_completions =
+            inner.operation.pruned_completions.saturating_add(count);
+    }
+
+    pub fn increment_expanded_completions(&self, count: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.expanded_completions =
+            inner.operation.expanded_completions.saturating_add(count);
     }
 
     pub fn record_optimal_volume(&self, volume: usize) {

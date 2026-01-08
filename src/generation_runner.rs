@@ -1,4 +1,5 @@
 use crate::{
+    completion_pruning::bound_completion,
     error::FoldError,
     file_handler::StateConfig,
     generation_store::{Config, GenerationStore, ProgressCallback, Role},
@@ -70,6 +71,7 @@ where
     }
 
     metrics.set_operation_status("Processing orthos".to_string());
+    metrics.reset_prune_counts();
 
     let mut sys = sysinfo::System::new();
     let mut generation = 0u64;
@@ -255,6 +257,11 @@ where
 
             // Generate child orthos and record results
             for completion in completions {
+                if bound_completion(&ortho, completion, interner, best_score) {
+                    metrics.increment_pruned_completions(1);
+                    continue;
+                }
+                metrics.increment_expanded_completions(1);
                 let completion_val =
                     PayloadVal::try_from(completion).expect("completion overflowed u32");
                 let children = ortho.add(completion_val);

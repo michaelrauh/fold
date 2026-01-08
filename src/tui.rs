@@ -120,7 +120,7 @@ impl Tui {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
+                Constraint::Length(7),
                 Constraint::Min(15),
                 Constraint::Length(7),
             ])
@@ -165,6 +165,14 @@ impl Tui {
             snapshot.global.interner_version,
             format_number(snapshot.global.vocab_size)
         );
+        let pruned = snapshot.operation.pruned_completions;
+        let expanded = snapshot.operation.expanded_completions;
+        let ratio = if (pruned + expanded) == 0 {
+            0.0
+        } else {
+            (pruned as f64) / ((pruned + expanded) as f64)
+        };
+
         let line3 = format!(
             "Chunks: {} │ Processed: {} │ Remaining: {} │ Jobs: {} │ New orthos: {}",
             snapshot.global.total_chunks,
@@ -181,9 +189,12 @@ impl Tui {
             format_number(snapshot.global.seen_len_accepted as usize)
         );
         let line5 = format!(
-            "Run budget: {} │ Fan-in: {}",
+            "Run budget: {} │ Fan-in: {} │ Pruned: {} │ Expanded: {} │ Prune%: {:.1}%",
             format_bytes(snapshot.global.run_budget_bytes),
-            snapshot.global.fan_in
+            snapshot.global.fan_in,
+            format_number(pruned),
+            format_number(expanded),
+            ratio * 100.0
         );
         let header_lines = vec![
             Line::from(truncate_string(&line1, max_width)),

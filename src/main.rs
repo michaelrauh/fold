@@ -1,4 +1,5 @@
 use fold::{
+    completion_pruning::{bound_completion, bound_existing_ortho},
     FoldError,
     file_handler::{self, MemClaimGuard, StateConfig},
     generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
@@ -564,6 +565,7 @@ fn merge_archives(
         file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)?;
 
     metrics.set_operation_status("Loading interners".to_string());
+    metrics.reset_prune_counts();
 
     // Load both interners
     let (interner_a, interner_b) = ingestion.load_interners()?;
@@ -722,10 +724,26 @@ fn merge_archives(
             // Record to landing zone (will be deduped during generation end)
             store.record_result(&ortho)?;
 
+            let candidate_score = ortho.score();
+            if candidate_score > best_score {
+                best_ortho = ortho.clone();
+                best_score = candidate_score;
+            }
+            if candidate_score > global_score {
+                global_score = candidate_score;
+            }
+
             // If impacted, also seed to work queue
             if is_ortho_impacted_fast(&ortho, larger_impacted_ref) {
-                store.push_segments(vec![ortho])?;
-                impacted_from_larger += 1;
+                if !bound_existing_ortho(
+                    &ortho,
+                    &merged_interner,
+                    best_score,
+                    Some(larger_impacted_ref),
+                ) {
+                    store.push_segments(vec![ortho])?;
+                    impacted_from_larger += 1;
+                }
             }
 
             if total_from_larger % 10000 == 0 {
@@ -764,10 +782,26 @@ fn merge_archives(
                 // Record remapped ortho to landing zone
                 store.record_result(&remapped)?;
 
+                let candidate_score = remapped.score();
+                if candidate_score > best_score {
+                    best_ortho = remapped.clone();
+                    best_score = candidate_score;
+                }
+                if candidate_score > global_score {
+                    global_score = candidate_score;
+                }
+
                 // If impacted, also seed to work queue
                 if is_ortho_impacted_fast(&remapped, smaller_impacted_ref) {
-                    store.push_segments(vec![remapped])?;
-                    impacted_from_smaller += 1;
+                    if !bound_existing_ortho(
+                        &remapped,
+                        &merged_interner,
+                        best_score,
+                        Some(smaller_impacted_ref),
+                    ) {
+                        store.push_segments(vec![remapped])?;
+                        impacted_from_smaller += 1;
+                    }
                 }
             }
 
@@ -1049,6 +1083,11 @@ fn merge_archives(
 
             // Generate children
             for completion in completions {
+                if bound_completion(&ortho, completion, &merged_interner, best_score) {
+                    metrics.increment_pruned_completions(1);
+                    continue;
+                }
+                metrics.increment_expanded_completions(1);
                 let completion_val =
                     PayloadVal::try_from(completion).expect("completion overflowed u32");
                 let children = ortho.add(completion_val);
