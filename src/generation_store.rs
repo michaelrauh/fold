@@ -1,4 +1,8 @@
-use crate::ortho::{Ortho, OrthoId};
+use crate::{
+    completion_pruning::bound_existing_ortho,
+    interner::Interner,
+    ortho::{Ortho, OrthoId},
+};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -982,6 +986,66 @@ impl GenerationStore {
         (0..self.bucket_count)
             .map(|bucket| (bucket, self.history_runs[bucket].clone()))
             .collect()
+    }
+
+    /// Prune history runs using the optimistic bound; returns (kept, pruned) counts.
+    /// Uses impacted_prefixes (if provided) to tighten the bound for impacted merges.
+    pub fn prune_history_with_bound(
+        &mut self,
+        interner: &Interner,
+        best_score: (usize, usize),
+        impacted_prefixes: Option<&[Vec<usize>]>,
+        read_buf_bytes: usize,
+    ) -> io::Result<(u64, u64)> {
+        if best_score == (0, 0) {
+            return Ok((self.seen_len_accepted, 0));
+        }
+
+        let mut kept: u64 = 0;
+        let mut pruned: u64 = 0;
+
+        for bucket in 0..self.bucket_count {
+            let runs = std::mem::take(&mut self.history_runs[bucket]);
+            let mut new_runs: Vec<PathBuf> = Vec::with_capacity(runs.len());
+            for run_path in runs {
+                let run = Run::new(run_path.clone());
+                let mut reader = run.iter(read_buf_bytes)?;
+                let tmp_path = run_path.with_extension("pruned");
+                let tmp_parent = tmp_path
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.base_path.clone());
+                fs::create_dir_all(&tmp_parent)?;
+                let mut writer = BufWriter::new(File::create(&tmp_path)?);
+                let mut wrote_any = false;
+
+                while let Some(item) = reader.next() {
+                    let streamed = item?;
+                    let ortho = Ortho::from_bytes(streamed.bytes.as_ref()).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    if bound_existing_ortho(&ortho, interner, best_score, impacted_prefixes) {
+                        pruned = pruned.saturating_add(1);
+                        continue;
+                    }
+                    write_ortho_record(&mut writer, &ortho)?;
+                    kept = kept.saturating_add(1);
+                    wrote_any = true;
+                }
+                writer.flush()?;
+
+                if wrote_any {
+                    fs::rename(&tmp_path, &run_path)?;
+                    new_runs.push(run_path);
+                } else {
+                    let _ = fs::remove_file(&run_path);
+                    let _ = fs::remove_file(&tmp_path);
+                }
+            }
+            self.history_runs[bucket] = new_runs;
+        }
+
+        Ok((kept, pruned))
     }
 
     /// Add a history run for a bucket and update accepted count

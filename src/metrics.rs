@@ -97,6 +97,8 @@ pub struct OperationStatus {
     pub new_orthos: usize,
     pub pruned_completions: usize,
     pub expanded_completions: usize,
+    pub pruned_root_span: usize,
+    pub pruned_bound: usize,
 }
 
 impl Default for OperationStatus {
@@ -116,6 +118,8 @@ impl Default for OperationStatus {
             new_orthos: 0,
             pruned_completions: 0,
             expanded_completions: 0,
+            pruned_root_span: 0,
+            pruned_bound: 0,
         }
     }
 }
@@ -132,11 +136,15 @@ pub struct MergeStatus {
     pub seed_orthos_b: usize,
     pub impacted_queued_a: usize,
     pub impacted_queued_b: usize,
+    pub impacted_pruned_a: usize,
+    pub impacted_pruned_b: usize,
     pub new_orthos_from_merge: usize,
     pub text_preview_a: String,
     pub text_preview_b: String,
     pub word_count_a: usize,
     pub word_count_b: usize,
+    pub compaction_kept: usize,
+    pub compaction_pruned: usize,
 }
 
 impl Default for MergeStatus {
@@ -152,11 +160,15 @@ impl Default for MergeStatus {
             seed_orthos_b: 0,
             impacted_queued_a: 0,
             impacted_queued_b: 0,
+            impacted_pruned_a: 0,
+            impacted_pruned_b: 0,
             new_orthos_from_merge: 0,
             text_preview_a: String::new(),
             text_preview_b: String::new(),
             word_count_a: 0,
             word_count_b: 0,
+            compaction_kept: 0,
+            compaction_pruned: 0,
         }
     }
 }
@@ -222,6 +234,15 @@ pub struct Metrics {
     inner: Arc<Mutex<MetricsInner>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PruneSample {
+    pub generation: u64,
+    pub pruned: usize,
+    pub expanded: usize,
+    pub pruned_root_span: usize,
+    pub pruned_bound: usize,
+}
+
 struct MetricsInner {
     global: GlobalMetrics,
     operation: OperationStatus,
@@ -229,6 +250,7 @@ struct MetricsInner {
     largest_archive: LargestArchive,
     optimal_ortho: OptimalOrtho,
     generation_stats: Vec<GenerationStat>,
+    prune_history: VecDeque<PruneSample>,
 
     seen_history_samples: VecDeque<MetricSample>,
     optimal_volume_samples: VecDeque<MetricSample>,
@@ -254,6 +276,7 @@ impl Metrics {
                 largest_archive: LargestArchive::default(),
                 optimal_ortho: OptimalOrtho::default(),
                 generation_stats: Vec::new(),
+                prune_history: VecDeque::with_capacity(20),
                 seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
                 work_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
@@ -381,12 +404,59 @@ impl Metrics {
         let mut inner = self.inner.lock().unwrap();
         inner.operation.pruned_completions = 0;
         inner.operation.expanded_completions = 0;
+        inner.operation.pruned_root_span = 0;
+        inner.operation.pruned_bound = 0;
+    }
+
+    pub fn take_prune_counts(&self) -> (usize, usize, usize, usize) {
+        let mut inner = self.inner.lock().unwrap();
+        let pruned = inner.operation.pruned_completions;
+        let expanded = inner.operation.expanded_completions;
+        let pruned_root_span = inner.operation.pruned_root_span;
+        let pruned_bound = inner.operation.pruned_bound;
+        inner.operation.pruned_completions = 0;
+        inner.operation.expanded_completions = 0;
+        inner.operation.pruned_root_span = 0;
+        inner.operation.pruned_bound = 0;
+        (pruned, expanded, pruned_root_span, pruned_bound)
+    }
+
+    pub fn record_prune_sample(
+        &self,
+        generation: u64,
+        pruned: usize,
+        expanded: usize,
+        pruned_root_span: usize,
+        pruned_bound: usize,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.prune_history.push_back(PruneSample {
+            generation,
+            pruned,
+            expanded,
+            pruned_root_span,
+            pruned_bound,
+        });
+        if inner.prune_history.len() > 12 {
+            inner.prune_history.pop_front();
+        }
     }
 
     pub fn increment_pruned_completions(&self, count: usize) {
         let mut inner = self.inner.lock().unwrap();
         inner.operation.pruned_completions =
             inner.operation.pruned_completions.saturating_add(count);
+    }
+
+    pub fn increment_pruned_root_span(&self, count: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.pruned_root_span =
+            inner.operation.pruned_root_span.saturating_add(count);
+    }
+
+    pub fn increment_pruned_bound(&self, count: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.pruned_bound = inner.operation.pruned_bound.saturating_add(count);
     }
 
     pub fn increment_expanded_completions(&self, count: usize) {
@@ -538,6 +608,7 @@ impl Metrics {
             merge: inner.merge.clone(),
             largest_archive: inner.largest_archive.clone(),
             optimal_ortho: inner.optimal_ortho.clone(),
+            prune_history: inner.prune_history.iter().cloned().collect(),
             seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
             optimal_volume_samples: inner.optimal_volume_samples.iter().cloned().collect(),
             work_len_samples: inner.work_len_samples.iter().cloned().collect(),
@@ -582,6 +653,7 @@ pub struct MetricsSnapshot {
     pub largest_archive: LargestArchive,
     pub optimal_ortho: OptimalOrtho,
     pub generation_stats: Vec<GenerationStat>,
+    pub prune_history: Vec<PruneSample>,
     pub seen_history_samples: Vec<MetricSample>,
     pub optimal_volume_samples: Vec<MetricSample>,
     pub work_len_samples: Vec<MetricSample>,

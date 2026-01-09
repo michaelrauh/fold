@@ -7,7 +7,7 @@ use crate::{
     metrics::{GenerationStat, Metrics},
     ortho::{Ortho, PayloadVal, payload_to_usize},
 };
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 
 pub const COMPLETION_CHUNK_SIZE: usize = 1_000;
@@ -49,6 +49,23 @@ where
     let mut global_score = metrics.optimal_score();
     let mut optimal_dirty = false;
     let mut total_processed = 0u64;
+    let mut update_optimal_metrics = |ortho: &Ortho| {
+        let (volume, fullness) = ortho.score();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        metrics.update_optimal_ortho(|opt| {
+            opt.volume = volume;
+            opt.dims = ortho.dims().clone();
+            opt.fullness = fullness;
+            opt.capacity = ortho.payload().len();
+            opt.payload = ortho.payload().clone();
+            opt.vocab = interner.vocabulary().to_vec();
+            opt.last_update_time = now;
+        });
+        metrics.record_optimal_volume(volume);
+    };
 
     // Push seed to work queue
     store.push_segments(vec![seed_ortho])?;
@@ -132,6 +149,7 @@ where
                     best_ortho = cache_ortho;
                     best_score = cache_score;
                     optimal_dirty = true;
+                    update_optimal_metrics(&best_ortho);
                 }
             }
         }
@@ -141,6 +159,7 @@ where
             generation, work_len
         ));
 
+        metrics.reset_prune_counts();
         let mut gen_processed = 0u64;
 
         let gen_start = Instant::now();
@@ -259,6 +278,12 @@ where
             for completion in completions {
                 if bound_completion(&ortho, completion, interner, best_score) {
                     metrics.increment_pruned_completions(1);
+                    if required.is_empty() {
+                        // Root span prune
+                        metrics.increment_pruned_root_span(1);
+                    } else {
+                        metrics.increment_pruned_bound(1);
+                    }
                     continue;
                 }
                 metrics.increment_expanded_completions(1);
@@ -270,6 +295,7 @@ where
                     if candidate_score > best_score {
                         best_ortho = child.clone();
                         best_score = candidate_score;
+                        update_optimal_metrics(&best_ortho);
                     }
                     if candidate_score > global_score {
                         global_score = candidate_score;
@@ -333,6 +359,8 @@ where
             new_work,
             store.seen_len_accepted()
         ));
+        let (pruned, expanded, pruned_root_span, pruned_bound) = metrics.take_prune_counts();
+        metrics.record_prune_sample(generation, pruned, expanded, pruned_root_span, pruned_bound);
 
         generation += 1;
         if new_work == 0 {

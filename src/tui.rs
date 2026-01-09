@@ -222,11 +222,12 @@ impl Tui {
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
-                Constraint::Length(6),
-                Constraint::Length(10),
-                Constraint::Length(7),
-                Constraint::Length(4),
+                Constraint::Percentage(15),
+                Constraint::Percentage(12),
+                Constraint::Percentage(18),
+                Constraint::Percentage(12),
+                Constraint::Percentage(12),
+                Constraint::Percentage(10),
                 Constraint::Min(5),
             ])
             .split(area);
@@ -235,8 +236,9 @@ impl Tui {
         self.render_text_preview(f, left_chunks[1], snapshot);
         self.render_merge_progress(f, left_chunks[2], snapshot);
         self.render_optimal_ortho(f, left_chunks[3], snapshot);
-        self.render_largest_archive(f, left_chunks[4], snapshot);
-        self.render_provenance_tree(f, left_chunks[5], snapshot);
+        self.render_pruning_info(f, left_chunks[4], snapshot);
+        self.render_largest_archive(f, left_chunks[5], snapshot);
+        self.render_provenance_tree(f, left_chunks[6], snapshot);
     }
 
     fn render_current_operation(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -517,6 +519,76 @@ impl Tui {
         let block = Block::default()
             .borders(Borders::ALL)
             .title("Optimal Ortho");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
+
+    fn render_pruning_info(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let max_width = area.width.saturating_sub(2) as usize;
+        let pruned = snapshot.operation.pruned_completions;
+        let expanded = snapshot.operation.expanded_completions;
+        let ratio = if pruned + expanded == 0 {
+            0.0
+        } else {
+            pruned as f64 / (pruned + expanded) as f64
+        };
+        let current_line = format!(
+            "Current: pruned {} / expanded {} ({:.1}%)",
+            format_number(pruned),
+            format_number(expanded),
+            ratio * 100.0
+        );
+
+        let history = snapshot
+            .prune_history
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(|s| {
+                let r = if s.pruned + s.expanded == 0 {
+                    0.0
+                } else {
+                    s.pruned as f64 / (s.pruned + s.expanded) as f64
+                };
+                format!("G{} {:.0}%", s.generation, r * 100.0)
+            })
+            .collect::<Vec<_>>()
+            .join(" │ ");
+        let history_line = if history.is_empty() {
+            "History: n/a".to_string()
+        } else {
+            format!("History: {}", truncate_string(&history, max_width.saturating_sub(9)))
+        };
+
+        let comp_kept = snapshot.merge.compaction_kept;
+        let comp_pruned = snapshot.merge.compaction_pruned;
+        let comp_line = if comp_kept + comp_pruned == 0 {
+            "Compaction: n/a".to_string()
+        } else {
+            let pct = if comp_kept + comp_pruned == 0 {
+                0.0
+            } else {
+                comp_pruned as f64 / (comp_kept + comp_pruned) as f64
+            };
+            format!(
+                "Compaction: kept {} pruned {} ({:.1}%)",
+                format_number(comp_kept),
+                format_number(comp_pruned),
+                pct * 100.0
+            )
+        };
+
+        let lines = vec![
+            Line::from(truncate_string(&current_line, max_width)),
+            Line::from(history_line),
+            Line::from(truncate_string(&comp_line, max_width)),
+        ];
+
+        let block = Block::default().borders(Borders::ALL).title("Pruning");
         let inner = block.inner(area);
         f.render_widget(block, area);
 

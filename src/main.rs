@@ -616,6 +616,10 @@ fn merge_archives(
         m.text_preview_b = ingestion.text_preview_b.clone();
         m.word_count_a = ingestion.word_count_a;
         m.word_count_b = ingestion.word_count_b;
+        m.compaction_kept = 0;
+        m.compaction_pruned = 0;
+        m.impacted_pruned_a = 0;
+        m.impacted_pruned_b = 0;
     });
     metrics.reset_new_orthos();
 
@@ -689,6 +693,13 @@ fn merge_archives(
 
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
+    // Load per-archive optimal scores for symmetric pruning
+    let load_opt_score = |path: &str| -> Option<(usize, usize)> {
+        file_handler::load_optimal_ortho(path).ok().map(|o| o.score())
+    };
+    let opt_score_a = load_opt_score(&results_a_path).unwrap_or((0, 0));
+    let opt_score_b = load_opt_score(&results_b_path).unwrap_or((0, 0));
+    let max_opt_score = std::cmp::max(opt_score_a, opt_score_b);
 
     // Set up paths and impacted keys for each archive
     // Note: larger archive orthos don't need remapping, their impacted keys are already in merged space
@@ -735,14 +746,25 @@ fn merge_archives(
 
             // If impacted, also seed to work queue
             if is_ortho_impacted_fast(&ortho, larger_impacted_ref) {
+                let prune_score = std::cmp::max(best_score, max_opt_score);
                 if !bound_existing_ortho(
                     &ortho,
                     &merged_interner,
-                    best_score,
+                    prune_score,
                     Some(larger_impacted_ref),
                 ) {
                     store.push_segments(vec![ortho])?;
                     impacted_from_larger += 1;
+                } else {
+                    metrics.update_merge(|m| {
+                        if a_is_smaller {
+                            m.impacted_pruned_b =
+                                m.impacted_pruned_b.saturating_add(1);
+                        } else {
+                            m.impacted_pruned_a =
+                                m.impacted_pruned_a.saturating_add(1);
+                        }
+                    });
                 }
             }
 
@@ -793,14 +815,25 @@ fn merge_archives(
 
                 // If impacted, also seed to work queue
                 if is_ortho_impacted_fast(&remapped, smaller_impacted_ref) {
+                    let prune_score = std::cmp::max(best_score, max_opt_score);
                     if !bound_existing_ortho(
                         &remapped,
                         &merged_interner,
-                        best_score,
+                        prune_score,
                         Some(smaller_impacted_ref),
                     ) {
                         store.push_segments(vec![remapped])?;
                         impacted_from_smaller += 1;
+                    } else {
+                        metrics.update_merge(|m| {
+                            if a_is_smaller {
+                                m.impacted_pruned_a =
+                                    m.impacted_pruned_a.saturating_add(1);
+                            } else {
+                                m.impacted_pruned_b =
+                                    m.impacted_pruned_b.saturating_add(1);
+                            }
+                        });
                     }
                 }
             }
@@ -1261,6 +1294,7 @@ fn merge_archives(
         }
     }
 
+    let mut compacted_counts: Option<(u64, u64)> = None;
     metrics.add_log(format!(
         "Merge completed {} generations, {} total orthos",
         generation,
@@ -1282,9 +1316,29 @@ fn merge_archives(
             opt.vocab = merged_interner.vocabulary().to_vec();
             opt.last_update_time = now;
         });
+
+        // Best changed during merge; run a pruning compaction pass over history before archiving.
+        metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
+        let (kept, pruned) = store.prune_history_with_bound(
+            &merged_interner,
+            best_score,
+            None,
+            cfg.read_buf_bytes,
+        )?;
+        compacted_counts = Some((kept, pruned));
+        metrics.update_merge(|m| {
+            m.compaction_kept = kept as usize;
+            m.compaction_pruned = pruned as usize;
+        });
+        metrics.add_log(format!(
+            "Pruning compaction kept {} orthos, pruned {}",
+            kept, pruned
+        ));
     }
 
-    let total_orthos = store.seen_len_accepted() as usize;
+    let total_orthos = compacted_counts
+        .map(|(kept, _)| kept as usize)
+        .unwrap_or_else(|| store.seen_len_accepted() as usize);
     metrics.add_log(format!("Archiving merge: {} orthos", total_orthos));
     metrics.increment_new_orthos(total_orthos);
 
@@ -1778,6 +1832,47 @@ fn write_fold_history(
                 stat.transition_secs,
                 stat.accepted,
                 stat.new_work
+            ));
+        }
+    }
+
+    if !snapshot.prune_history.is_empty() {
+        summary.push_str("pruning:\n");
+        for sample in snapshot.prune_history.iter() {
+            let total = sample.pruned + sample.expanded;
+            let ratio = if total == 0 {
+                0.0
+            } else {
+                (sample.pruned as f64) / (total as f64)
+            };
+            summary.push_str(&format!(
+                "  gen {}: pruned={} expanded={} prune_pct={:.1}% root_span={} bound={}\n",
+                sample.generation,
+                sample.pruned,
+                sample.expanded,
+                ratio * 100.0,
+                sample.pruned_root_span,
+                sample.pruned_bound
+            ));
+        }
+        if snapshot.merge.compaction_kept + snapshot.merge.compaction_pruned > 0 {
+            let total = snapshot.merge.compaction_kept + snapshot.merge.compaction_pruned;
+            let ratio = if total == 0 {
+                0.0
+            } else {
+                snapshot.merge.compaction_pruned as f64 / total as f64
+            };
+            summary.push_str(&format!(
+                "  compaction: kept={} pruned={} prune_pct={:.1}%\n",
+                snapshot.merge.compaction_kept,
+                snapshot.merge.compaction_pruned,
+                ratio * 100.0
+            ));
+        }
+        if snapshot.merge.impacted_pruned_a + snapshot.merge.impacted_pruned_b > 0 {
+            summary.push_str(&format!(
+                "  impacted_pruned: A={} B={}\n",
+                snapshot.merge.impacted_pruned_a, snapshot.merge.impacted_pruned_b
             ));
         }
     }
