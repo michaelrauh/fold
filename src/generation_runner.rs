@@ -8,7 +8,7 @@ use crate::{
     ortho::{Ortho, PayloadVal, payload_to_usize},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{ProcessesToUpdate, System, get_current_pid};
+use sysinfo::{Disks, ProcessesToUpdate, System, get_current_pid};
 
 pub const COMPLETION_CHUNK_SIZE: usize = 1_000;
 pub const FANOUT_LOG_THRESHOLD: usize = COMPLETION_CHUNK_SIZE;
@@ -49,7 +49,7 @@ where
     let mut global_score = metrics.optimal_score();
     let mut optimal_dirty = false;
     let mut total_processed = 0u64;
-    let mut update_optimal_metrics = |ortho: &Ortho| {
+    let update_optimal_metrics = |ortho: &Ortho| {
         let (volume, fullness) = ortho.score();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -91,6 +91,9 @@ where
     metrics.reset_prune_counts();
 
     let mut sys = sysinfo::System::new();
+    let mut disks = Disks::new_with_refreshed_list();
+    let disk_base = state_config
+        .map(|cfg| cfg.base_dir.canonicalize().unwrap_or_else(|_| cfg.base_dir.clone()));
     let mut generation = 0u64;
     let mut generation_stats: Vec<GenerationStat> = Vec::new();
 
@@ -248,6 +251,25 @@ where
                     g.system_memory_percent = percent;
                     g.distinct_jobs_count = jobs_count;
                 });
+
+                // Disk usage for base dir, if known
+                if let Some(base_dir) = &disk_base {
+                    disks.refresh_list();
+                    disks.refresh();
+                    for disk in disks.iter() {
+                        if base_dir.starts_with(disk.mount_point()) {
+                            metrics.set_disk_usage(disk.total_space(), disk.available_space());
+                            break;
+                        }
+                    }
+                }
+
+                // Compression stats
+                let comp = store.compression_stats();
+                metrics.set_compression_bytes(
+                    comp.uncompressed_bytes,
+                    comp.compressed_bytes,
+                );
 
                 // Housekeeping hook (heartbeats, mem claim, leader lock)
                 housekeeping()?;

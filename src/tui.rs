@@ -120,7 +120,7 @@ impl Tui {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7),
+                Constraint::Length(8),
                 Constraint::Min(15),
                 Constraint::Length(7),
             ])
@@ -172,6 +172,36 @@ impl Tui {
         } else {
             (pruned as f64) / ((pruned + expanded) as f64)
         };
+        let disk_line = if snapshot.global.disk_total_bytes > 0 {
+            let total = snapshot.global.disk_total_bytes;
+            let free = snapshot.global.disk_available_bytes;
+            let pct = if total > 0 {
+                (free as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            format!(
+                "Disk: {} free / {} ({:.0}%)",
+                format_bytes(free as usize),
+                format_bytes(total as usize),
+                pct
+            )
+        } else {
+            "Disk: n/a".to_string()
+        };
+        let comp_line = if snapshot.global.compression_uncompressed_bytes > 0 {
+            let unc = snapshot.global.compression_uncompressed_bytes;
+            let comp = snapshot.global.compression_compressed_bytes;
+            let ratio = if comp > 0 { unc as f64 / comp as f64 } else { 0.0 };
+            let saved = unc.saturating_sub(comp);
+            format!(
+                "Compression: {:.2}× (saved {})",
+                ratio,
+                format_bytes(saved as usize)
+            )
+        } else {
+            "Compression: n/a".to_string()
+        };
 
         let line3 = format!(
             "Chunks: {} │ Processed: {} │ Remaining: {} │ Jobs: {} │ New orthos: {}",
@@ -196,12 +226,14 @@ impl Tui {
             format_number(expanded),
             ratio * 100.0
         );
+        let line6 = format!("{} │ {}", disk_line, comp_line);
         let header_lines = vec![
             Line::from(truncate_string(&line1, max_width)),
             Line::from(truncate_string(&line2, max_width)),
             Line::from(truncate_string(&line3, max_width)),
             Line::from(truncate_string(&line4, max_width)),
             Line::from(truncate_string(&line5, max_width)),
+            Line::from(truncate_string(&line6, max_width)),
         ];
 
         let header = Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL));

@@ -499,6 +499,23 @@ fn process_txt_file(
             opt.vocab = interner.vocabulary().to_vec();
             opt.last_update_time = now;
         });
+
+        // Prune history runs against the improved best before archiving.
+        metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
+        let (kept, pruned) = store.prune_history_with_bound(
+            &interner,
+            run_result.best_score,
+            None,
+            cfg.read_buf_bytes,
+        )?;
+        metrics.add_log(format!(
+            "Pruning compaction kept {} orthos, pruned {}",
+            kept, pruned
+        ));
+        metrics.update_merge(|m| {
+            m.compaction_kept = kept as usize;
+            m.compaction_pruned = pruned as usize;
+        });
     }
 
     let total_orthos = store.seen_len_accepted() as usize;

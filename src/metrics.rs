@@ -44,6 +44,10 @@ pub struct GlobalMetrics {
     pub distinct_jobs_count: usize,
     pub ram_bytes: usize,
     pub process_rss_bytes: usize,
+    pub disk_total_bytes: u64,
+    pub disk_available_bytes: u64,
+    pub compression_uncompressed_bytes: u64,
+    pub compression_compressed_bytes: u64,
     // Generational store fields
     pub generation: u64,
     pub phase: String,
@@ -75,6 +79,10 @@ impl Default for GlobalMetrics {
             distinct_jobs_count: 0,
             ram_bytes: 0,
             process_rss_bytes: 0,
+            disk_total_bytes: 0,
+            disk_available_bytes: 0,
+            compression_uncompressed_bytes: 0,
+            compression_compressed_bytes: 0,
             generation: 0,
             phase: "Idle".to_string(),
             work_len: 0,
@@ -406,6 +414,18 @@ impl Metrics {
         inner.operation.expanded_completions = 0;
         inner.operation.pruned_root_span = 0;
         inner.operation.pruned_bound = 0;
+    }
+
+    pub fn set_disk_usage(&self, total_bytes: u64, available_bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.disk_total_bytes = total_bytes;
+        inner.global.disk_available_bytes = available_bytes;
+    }
+
+    pub fn set_compression_bytes(&self, uncompressed: u64, compressed: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.compression_uncompressed_bytes = uncompressed;
+        inner.global.compression_compressed_bytes = compressed;
     }
 
     pub fn take_prune_counts(&self) -> (usize, usize, usize, usize) {

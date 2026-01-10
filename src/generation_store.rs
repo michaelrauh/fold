@@ -10,6 +10,8 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::PathBuf;
 use sysinfo::System;
+use zstd::stream::read::Decoder as ZstdDecoder;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 /// Role of the worker in the system
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +252,7 @@ pub struct GenerationStore {
     seen_len_accepted: u64,          // Monotonic count of accepted items across all generations
     #[allow(dead_code)]
     history_cache: std::collections::HashMap<PathBuf, Vec<u8>>, // Cached history run contents (future optimization)
+    compression_stats: CompressionStats,
 }
 
 /// Placeholder for unsorted drained data
@@ -292,7 +295,7 @@ impl Run {
 }
 
 struct OrthoRunIterator {
-    reader: BufReader<File>,
+    reader: Box<dyn Read>,
     buffer: Vec<u8>,
     offset: usize,
     read_buf_bytes: usize,
@@ -407,9 +410,12 @@ impl OrthoStreamReader {
     fn new(path: &PathBuf, read_buf_bytes: usize) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::with_capacity(read_buf_bytes, file);
+        let decoder = ZstdDecoder::new(reader)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let boxed_reader: Box<dyn Read> = Box::new(decoder);
         Ok(Self {
             inner: OrthoRunIterator {
-                reader,
+                reader: boxed_reader,
                 buffer: Vec::with_capacity(read_buf_bytes),
                 offset: 0,
                 read_buf_bytes,
@@ -448,6 +454,19 @@ fn archived_eq(a: &StreamedOrtho, b: &StreamedOrtho) -> bool {
 
 const ORTHO_RECORD_HEADER_SIZE: usize = mem::size_of::<u64>() * 2;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompressionStats {
+    pub uncompressed_bytes: u64,
+    pub compressed_bytes: u64,
+}
+
+impl CompressionStats {
+    fn record(&mut self, uncompressed: u64, compressed: u64) {
+        self.uncompressed_bytes = self.uncompressed_bytes.saturating_add(uncompressed);
+        self.compressed_bytes = self.compressed_bytes.saturating_add(compressed);
+    }
+}
+
 fn estimate_decoded_size(ortho: &Ortho) -> usize {
     // Rough estimate: struct size + vec metadata + element storage based on capacity.
     let dims_cap = ortho.dims().capacity();
@@ -460,7 +479,11 @@ fn estimate_decoded_size(ortho: &Ortho) -> usize {
         + payload_cap.saturating_mul(mem::size_of::<Option<crate::ortho::PayloadVal>>())
 }
 
-fn write_ortho_record<W: Write>(writer: &mut W, ortho: &Ortho) -> io::Result<usize> {
+fn write_ortho_record<W: Write>(
+    writer: &mut W,
+    ortho: &Ortho,
+    stats: Option<&mut CompressionStats>,
+) -> io::Result<usize> {
     let encoded = ortho
         .to_bytes()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -471,6 +494,8 @@ fn write_ortho_record<W: Write>(writer: &mut W, ortho: &Ortho) -> io::Result<usi
     writer.write_all(&encoded_len.to_le_bytes())?;
     writer.write_all(&encoded)?;
 
+    let _ = stats;
+
     Ok(ORTHO_RECORD_HEADER_SIZE + encoded.len())
 }
 
@@ -478,6 +503,7 @@ fn write_ortho_record_bytes<W: Write>(
     writer: &mut W,
     bytes: &[u8],
     decoded_size_est: usize,
+    stats: Option<&mut CompressionStats>,
 ) -> io::Result<usize> {
     let decoded_est = decoded_size_est as u64;
     let encoded_len = bytes.len() as u64;
@@ -486,7 +512,28 @@ fn write_ortho_record_bytes<W: Write>(
     writer.write_all(&encoded_len.to_le_bytes())?;
     writer.write_all(bytes)?;
 
+    let _ = stats;
+
     Ok(ORTHO_RECORD_HEADER_SIZE + bytes.len())
+}
+
+fn compress_file(path: &PathBuf, level: i32) -> io::Result<(u64, u64)> {
+    let uncompressed = fs::metadata(path)?.len();
+    let tmp_path = path.with_extension("zsttmp");
+    let input = File::open(path)?;
+    let output = File::create(&tmp_path)?;
+    let mut encoder = ZstdEncoder::new(output, level)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut reader = BufReader::new(input);
+    io::copy(&mut reader, &mut encoder)?;
+    let mut output = encoder
+        .finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    output.flush()?;
+    let compressed = fs::metadata(&tmp_path)?.len();
+    fs::remove_file(path)?;
+    fs::rename(&tmp_path, path)?;
+    Ok((uncompressed, compressed))
 }
 
 /// Sorted and deduplicated run of orthos
@@ -624,6 +671,7 @@ impl GenerationStore {
             history_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
             history_cache: std::collections::HashMap::new(),
+            compression_stats: CompressionStats::default(),
         })
     }
 
@@ -697,6 +745,7 @@ impl GenerationStore {
             history_runs: (0..8).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
             history_cache: std::collections::HashMap::new(),
+            compression_stats: CompressionStats::default(),
         }
     }
 
@@ -733,13 +782,13 @@ impl GenerationStore {
         if self.bucket_writers[bucket].is_none() {
             let path = self.active_log_path(bucket);
             let file = OpenOptions::new().create(true).append(true).open(path)?;
-            self.bucket_writers[bucket] =
-                Some(BufWriter::with_capacity(self.bufwriter_capacity, file));
+            let buf = BufWriter::with_capacity(self.bufwriter_capacity, file);
+            self.bucket_writers[bucket] = Some(buf);
         }
 
         // Write ortho using rkyv
         let writer = self.bucket_writers[bucket].as_mut().unwrap();
-        let encoded_len = write_ortho_record(writer, ortho)?;
+        let encoded_len = write_ortho_record(writer, ortho, None)?;
         self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
 
         // Track buffer size and flush if over threshold
@@ -756,7 +805,8 @@ impl GenerationStore {
     pub fn drain_bucket(&mut self, bucket: usize) -> io::Result<RawStream> {
         // Flush and close any active writer for this bucket
         if let Some(writer) = self.bucket_writers[bucket].take() {
-            drop(writer); // Explicit drop to flush and close
+            let mut writer = writer;
+            writer.flush()?;
         }
 
         let active_path = self.active_log_path(bucket);
@@ -772,6 +822,10 @@ impl GenerationStore {
         let drain_path = self.drain_log_path(bucket, drain_id);
 
         fs::rename(&active_path, &drain_path)?;
+        if drain_path.exists() {
+            let (unc, comp) = compress_file(&drain_path, 3)?;
+            self.compression_stats.record(unc, comp);
+        }
         // Landing for this bucket has been drained; reset counters.
         self.landing_counts[bucket] = 0;
         self.landing_buffer_sizes[bucket] = 0;
@@ -988,6 +1042,14 @@ impl GenerationStore {
             .collect()
     }
 
+    pub fn compression_stats(&self) -> CompressionStats {
+        self.compression_stats
+    }
+
+    pub fn base_path(&self) -> &PathBuf {
+        &self.base_path
+    }
+
     /// Prune history runs using the optimistic bound; returns (kept, pruned) counts.
     /// Uses impacted_prefixes (if provided) to tighten the bound for impacted merges.
     pub fn prune_history_with_bound(
@@ -1028,11 +1090,15 @@ impl GenerationStore {
                         pruned = pruned.saturating_add(1);
                         continue;
                     }
-                    write_ortho_record(&mut writer, &ortho)?;
+                    write_ortho_record(&mut writer, &ortho, Some(&mut self.compression_stats))?;
                     kept = kept.saturating_add(1);
                     wrote_any = true;
                 }
                 writer.flush()?;
+                if wrote_any {
+                    let (unc, comp) = compress_file(&tmp_path, 3)?;
+                    self.compression_stats.record(unc, comp);
+                }
 
                 if wrote_any {
                     fs::rename(&tmp_path, &run_path)?;
@@ -1266,7 +1332,13 @@ impl GenerationStore {
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:sorting", bucket));
             }
-            let runs = compact_landing(bucket, raw, cfg, &self.base_path)?;
+            let runs = compact_landing(
+                bucket,
+                raw,
+                cfg,
+                &self.base_path,
+                Some(&mut self.compression_stats),
+            )?;
 
             if runs.is_empty() {
                 // No runs generated, skip
@@ -1293,7 +1365,8 @@ impl GenerationStore {
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:merging", bucket));
             }
-            let unique_run = merge_unique(runs, cfg, &self.base_path)?;
+            let unique_run =
+                merge_unique(runs, cfg, &self.base_path, Some(&mut self.compression_stats))?;
 
             // Phase: Anti-join against history
             if let Some(cb) = &progress {
@@ -1305,6 +1378,7 @@ impl GenerationStore {
                 history_iter,
                 &self.base_path,
                 cfg.read_buf_bytes,
+                Some(&mut self.compression_stats),
             )?;
 
             total_accepted += accepted;
@@ -1399,7 +1473,8 @@ impl GenerationStore {
             .collect();
 
         // Merge them into a single unique run
-        let merged = merge_unique(runs_to_merge, cfg, &self.base_path)?;
+        let merged =
+            merge_unique(runs_to_merge, cfg, &self.base_path, Some(&mut self.compression_stats))?;
 
         // Move merged run to history with next available ID
         let history_dir = self
@@ -1431,6 +1506,7 @@ pub fn compact_landing(
     raw: RawStream,
     cfg: &Config,
     base_path: &PathBuf,
+    mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<Vec<Run>> {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     static RUN_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1458,7 +1534,7 @@ pub fn compact_landing(
                     .join("runs")
                     .join(format!("b={:02}-run-{}.dat", bucket, run_id));
 
-                write_streamed_run(&arena, &run_path)?;
+                write_streamed_run(&arena, &run_path, stats.as_deref_mut())?;
                 runs.push(Run::new(run_path));
 
                 arena.clear();
@@ -1478,7 +1554,7 @@ pub fn compact_landing(
             .join("runs")
             .join(format!("b={:02}-run-{}.dat", bucket, run_id));
 
-        write_streamed_run(&arena, &run_path)?;
+        write_streamed_run(&arena, &run_path, stats.as_deref_mut())?;
         runs.push(Run::new(run_path));
     }
 
@@ -1490,7 +1566,11 @@ pub fn compact_landing(
     Ok(runs)
 }
 
-fn write_streamed_run(arena: &[StreamedOrtho], path: &PathBuf) -> io::Result<()> {
+fn write_streamed_run(
+    arena: &[StreamedOrtho],
+    path: &PathBuf,
+    mut stats: Option<&mut CompressionStats>,
+) -> io::Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1498,9 +1578,18 @@ fn write_streamed_run(arena: &[StreamedOrtho], path: &PathBuf) -> io::Result<()>
 
     let mut writer = BufWriter::with_capacity(64 * 1024, File::create(path)?);
     for streamed in arena {
-        write_ortho_record_bytes(&mut writer, &streamed.bytes, streamed.decoded_size_est)?;
+        write_ortho_record_bytes(
+            &mut writer,
+            &streamed.bytes,
+            streamed.decoded_size_est,
+            stats.as_deref_mut(),
+        )?;
     }
     writer.flush()?;
+    let (unc, comp) = compress_file(path, 3)?;
+    if let Some(s) = stats.as_deref_mut() {
+        s.record(unc, comp);
+    }
     Ok(())
 }
 
@@ -1512,6 +1601,7 @@ pub fn merge_unique(
     mut runs: Vec<Run>,
     cfg: &Config,
     base_path: &PathBuf,
+    mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<UniqueRun> {
     use std::collections::BinaryHeap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1536,7 +1626,7 @@ pub fn merge_unique(
         let mut next_pass_runs = Vec::new();
 
         for chunk in runs.chunks(cfg.fan_in) {
-            let merged = merge_ortho_chunk(chunk, cfg, base_path)?;
+            let merged = merge_ortho_chunk(chunk, cfg, base_path, stats.as_deref_mut())?;
             cleanup_runs(chunk);
             next_pass_runs.push(merged);
         }
@@ -1602,7 +1692,12 @@ pub fn merge_unique(
             .map(|last| last.id == item.id && archived_eq(last, &streamed))
             .unwrap_or(false);
         if !is_duplicate {
-            write_ortho_record_bytes(&mut writer, &streamed.bytes, streamed.decoded_size_est)?;
+            write_ortho_record_bytes(
+                &mut writer,
+                &streamed.bytes,
+                streamed.decoded_size_est,
+                stats.as_deref_mut(),
+            )?;
             last_written = Some(streamed);
         } else {
             // Keep last_written so adjacent duplicates continue to collapse correctly
@@ -1622,13 +1717,22 @@ pub fn merge_unique(
     }
 
     writer.flush()?;
+    let (unc, comp) = compress_file(&unique_path, 3)?;
+    if let Some(s) = stats.as_deref_mut() {
+        s.record(unc, comp);
+    }
     cleanup_runs(&runs);
 
     Ok(UniqueRun::new(unique_path))
 }
 
 /// Helper to merge a chunk of ortho runs (for multi-pass)
-fn merge_ortho_chunk(runs: &[Run], cfg: &Config, base_path: &PathBuf) -> io::Result<Run> {
+fn merge_ortho_chunk(
+    runs: &[Run],
+    cfg: &Config,
+    base_path: &PathBuf,
+    mut stats: Option<&mut CompressionStats>,
+) -> io::Result<Run> {
     use std::collections::BinaryHeap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1679,7 +1783,12 @@ fn merge_ortho_chunk(runs: &[Run], cfg: &Config, base_path: &PathBuf) -> io::Res
     // No deduplication in intermediate passes - just merge
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
-        write_ortho_record_bytes(&mut writer, &streamed.bytes, streamed.decoded_size_est)?;
+        write_ortho_record_bytes(
+            &mut writer,
+            &streamed.bytes,
+            streamed.decoded_size_est,
+            stats.as_deref_mut(),
+        )?;
 
         if let Some(result) = iterators[item.run_idx].next() {
             let streamed = result?;
@@ -1693,6 +1802,10 @@ fn merge_ortho_chunk(runs: &[Run], cfg: &Config, base_path: &PathBuf) -> io::Res
     }
 
     writer.flush()?;
+    let (unc, comp) = compress_file(&chunk_path, 3)?;
+    if let Some(s) = stats.as_deref_mut() {
+        s.record(unc, comp);
+    }
     Ok(Run::new(chunk_path))
 }
 
@@ -1712,6 +1825,7 @@ pub fn anti_join_orthos(
     mut history: impl Iterator<Item = io::Result<StreamedOrtho>>,
     base_path: &PathBuf,
     read_buf_bytes: usize,
+    mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<(Run, Run, u64)> {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1741,8 +1855,18 @@ pub fn anti_join_orthos(
             (None, _) => break,
             (Some(g), None) => {
                 // No more history - all remaining gen values are new
-                write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est)?;
-                write_ortho_record_bytes(&mut new_work_writer, &g.bytes, g.decoded_size_est)?;
+                write_ortho_record_bytes(
+                    &mut seen_writer,
+                    &g.bytes,
+                    g.decoded_size_est,
+                    stats.as_deref_mut(),
+                )?;
+                write_ortho_record_bytes(
+                    &mut new_work_writer,
+                    &g.bytes,
+                    g.decoded_size_est,
+                    stats.as_deref_mut(),
+                )?;
                 accepted_count += 1;
                 gen_val = gen_iter.next().transpose()?;
             }
@@ -1753,11 +1877,17 @@ pub fn anti_join_orthos(
                 match g_id.cmp(&h_id) {
                     std::cmp::Ordering::Less => {
                         // g < h: g is new (not in history)
-                        write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est)?;
+                        write_ortho_record_bytes(
+                            &mut seen_writer,
+                            &g.bytes,
+                            g.decoded_size_est,
+                            stats.as_deref_mut(),
+                        )?;
                         write_ortho_record_bytes(
                             &mut new_work_writer,
                             &g.bytes,
                             g.decoded_size_est,
+                            stats.as_deref_mut(),
                         )?;
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
@@ -1770,6 +1900,7 @@ pub fn anti_join_orthos(
                                 &mut seen_writer,
                                 &g.bytes,
                                 g.decoded_size_est,
+                                stats.as_deref_mut(),
                             )?;
                         } else {
                             // ID collision with different structure - treat as new
@@ -1778,11 +1909,13 @@ pub fn anti_join_orthos(
                                 &mut seen_writer,
                                 &g.bytes,
                                 g.decoded_size_est,
+                                stats.as_deref_mut(),
                             )?;
                             write_ortho_record_bytes(
                                 &mut new_work_writer,
                                 &g.bytes,
                                 g.decoded_size_est,
+                                stats.as_deref_mut(),
                             )?;
                             accepted_count += 1;
                         }
@@ -1800,6 +1933,15 @@ pub fn anti_join_orthos(
 
     seen_writer.flush()?;
     new_work_writer.flush()?;
+    if let Some(s) = stats.as_deref_mut() {
+        let (unc, comp) = compress_file(&seen_run_path, 3)?;
+        s.record(unc, comp);
+        let (unc2, comp2) = compress_file(&new_work_path, 3)?;
+        s.record(unc2, comp2);
+    } else {
+        let _ = compress_file(&seen_run_path, 3)?;
+        let _ = compress_file(&new_work_path, 3)?;
+    }
     Ok((
         Run::new(new_work_path),
         Run::new(seen_run_path),
@@ -1860,10 +2002,12 @@ mod tests {
         let drain_path = landing_dir.join("drain-0.log");
 
         // Write orthos to drain file using the same record format as production
-        let mut file = BufWriter::new(File::create(&drain_path).unwrap());
+        let writer = BufWriter::new(File::create(&drain_path).unwrap());
+        let mut encoder = ZstdEncoder::new(writer, 3).unwrap();
         for ortho in &orthos {
-            write_ortho_record(&mut file, ortho).unwrap();
+            write_ortho_record(&mut encoder, ortho, None).unwrap();
         }
+        let mut file = encoder.finish().unwrap();
         file.flush().unwrap();
 
         let raw = RawStream::new(vec![drain_path]);
@@ -1874,7 +2018,8 @@ mod tests {
         // Create runs directory
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
-        let runs = compact_landing(bucket, raw, &cfg, &base_path).unwrap();
+        let mut stats = CompressionStats::default();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
 
         assert_eq!(runs.len(), 1);
 
@@ -1913,10 +2058,12 @@ mod tests {
         let drain_path = landing_dir.join("drain-0.log");
 
         // Write orthos to drain file using the same record format as production
-        let mut file = BufWriter::new(File::create(&drain_path).unwrap());
+        let writer = BufWriter::new(File::create(&drain_path).unwrap());
+        let mut encoder = ZstdEncoder::new(writer, 3).unwrap();
         for ortho in &orthos {
-            write_ortho_record(&mut file, ortho).unwrap();
+            write_ortho_record(&mut encoder, ortho, None).unwrap();
         }
+        let mut file = encoder.finish().unwrap();
         file.flush().unwrap();
 
         let raw = RawStream::new(vec![drain_path]);
@@ -1927,7 +2074,8 @@ mod tests {
         // Create runs directory
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
-        let runs = compact_landing(bucket, raw, &cfg, &base_path).unwrap();
+        let mut stats = CompressionStats::default();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
 
         // Should produce multiple runs due to small budget
         assert!(runs.len() >= 1);
@@ -1983,10 +2131,12 @@ mod tests {
         let drain_path = landing_dir.join("drain-0.log");
 
         // Write orthos to drain file using the same record format as production
-        let mut file = BufWriter::new(File::create(&drain_path).unwrap());
+        let writer = BufWriter::new(File::create(&drain_path).unwrap());
+        let mut encoder = ZstdEncoder::new(writer, 3).unwrap();
         for ortho in &orthos {
-            write_ortho_record(&mut file, ortho).unwrap();
+            write_ortho_record(&mut encoder, ortho, None).unwrap();
         }
+        let mut file = encoder.finish().unwrap();
         file.flush().unwrap();
 
         let raw = RawStream::new(vec![drain_path]);
@@ -1997,7 +2147,8 @@ mod tests {
         // Create runs directory
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
-        let runs = compact_landing(bucket, raw, &cfg, &base_path).unwrap();
+        let mut stats = CompressionStats::default();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
 
         // Collect and verify count
         let mut total = 0;
@@ -2067,17 +2218,20 @@ mod tests {
 
         // History: ortho1, ortho3
         let history_path = base_path.join("runs").join("history.dat");
-        let mut history_file = BufWriter::new(File::create(&history_path).unwrap());
+        let history_raw = BufWriter::new(File::create(&history_path).unwrap());
+        let mut history_file = ZstdEncoder::new(history_raw, 3).unwrap();
         let mut history_items = vec![ortho1.clone(), ortho3.clone()];
         history_items.sort_by_key(|o| o.id());
         for ortho in &history_items {
-            write_ortho_record(&mut history_file, ortho).unwrap();
+            write_ortho_record(&mut history_file, ortho, None).unwrap();
         }
+        let mut history_file = history_file.finish().unwrap();
         history_file.flush().unwrap();
 
         // Gen: ortho2, ortho3, ortho4, ortho5
         let gen_path = base_path.join("runs").join("gen.dat");
-        let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
+        let gen_raw = BufWriter::new(File::create(&gen_path).unwrap());
+        let mut gen_file = ZstdEncoder::new(gen_raw, 3).unwrap();
         let mut gen_items = vec![
             ortho2.clone(),
             ortho3.clone(),
@@ -2086,8 +2240,9 @@ mod tests {
         ];
         gen_items.sort_by_key(|o| o.id());
         for ortho in &gen_items {
-            write_ortho_record(&mut gen_file, ortho).unwrap();
+            write_ortho_record(&mut gen_file, ortho, None).unwrap();
         }
+        let mut gen_file = gen_file.finish().unwrap();
         gen_file.flush().unwrap();
 
         let unique_gen = UniqueRun::new(gen_path);
@@ -2095,7 +2250,7 @@ mod tests {
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
         let (work_run, _seen_run, accepted) =
-            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024).unwrap();
+            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
 
         // ortho3 is already in history, so only ortho2, ortho4, ortho5 should be in work
         let mut work = collect_run(&work_run, 64 * 1024);
@@ -2119,17 +2274,19 @@ mod tests {
 
         // Gen: ortho1, ortho2
         let gen_path = base_path.join("runs").join("gen.dat");
-        let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
+        let gen_raw = BufWriter::new(File::create(&gen_path).unwrap());
+        let mut gen_file = ZstdEncoder::new(gen_raw, 3).unwrap();
         for ortho in [&ortho1, &ortho2] {
-            write_ortho_record(&mut gen_file, ortho).unwrap();
+            write_ortho_record(&mut gen_file, ortho, None).unwrap();
         }
+        let mut gen_file = gen_file.finish().unwrap();
         gen_file.flush().unwrap();
 
         let unique_gen = UniqueRun::new(gen_path);
         let history_iter = std::iter::empty::<io::Result<StreamedOrtho>>();
 
         let (work_run, _seen_run, accepted) =
-            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024).unwrap();
+            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
 
         let mut work = collect_run(&work_run, 64 * 1024);
         work.sort_by_key(|o| o.id());
@@ -2152,16 +2309,20 @@ mod tests {
 
         // History: ortho1, ortho2
         let history_path = base_path.join("runs").join("history.dat");
-        let mut history_file = BufWriter::new(File::create(&history_path).unwrap());
+        let history_raw = BufWriter::new(File::create(&history_path).unwrap());
+        let mut history_file = ZstdEncoder::new(history_raw, 3).unwrap();
         for ortho in [&ortho1, &ortho2] {
-            write_ortho_record(&mut history_file, ortho).unwrap();
+            write_ortho_record(&mut history_file, ortho, None).unwrap();
         }
+        let mut history_file = history_file.finish().unwrap();
         history_file.flush().unwrap();
 
         // Gen: ortho1 (subset)
         let gen_path = base_path.join("runs").join("gen.dat");
-        let mut gen_file = BufWriter::new(File::create(&gen_path).unwrap());
-        write_ortho_record(&mut gen_file, &ortho1).unwrap();
+        let gen_raw = BufWriter::new(File::create(&gen_path).unwrap());
+        let mut gen_file = ZstdEncoder::new(gen_raw, 3).unwrap();
+        write_ortho_record(&mut gen_file, &ortho1, None).unwrap();
+        let mut gen_file = gen_file.finish().unwrap();
         gen_file.flush().unwrap();
 
         let unique_gen = UniqueRun::new(gen_path);
@@ -2169,7 +2330,7 @@ mod tests {
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
         let (work_run, _seen_run, accepted) =
-            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024).unwrap();
+            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
 
         let work = collect_run(&work_run, 64 * 1024);
         assert_eq!(work.len(), 0);

@@ -66,6 +66,7 @@ Metric ideas for clarity
 - Depth-weighted pruning: weight pruned counts by generation/depth so high-up prunes are visible.
 - Show per-gen prune ratio: surface pruned/expanded per generation alongside absolute counts.
 - Track “work saved”: estimate avoided expansions from prunes (e.g., sum of axis products) to quantify impact beyond counts.
+- Track space: runs are zstd(3)-compressed; surface disk free/total and compression ratio in the TUI to monitor space pressure during large ingests/merges.
 
 Implementation tasks (for another LLM; vertical slices with done checks)
 - [x] Interner depth stats  
@@ -88,4 +89,5 @@ Notes / watchouts
 - IDDFS/LIFO tuning: merge ingest is already close to LIFO; revisit full generation caps / strict IDDFS only if fanout/pruning metrics indicate need.
 - Prune-driven cleanup: consider dropping archival results that become irrelevant under new pruning/optimal scores when scanning impacted prefixes; non-impacted orthos might never matter once a stronger optimal is found.
 - Compaction pass (when best improves): after merge generations, if the best score changed, stream history runs bucket-by-bucket and re-write only orthos whose optimistic bound beats the new best. Use a temp file per run and rename after filtering so disk never more than ~1× a single run. Keep the current optimal even on ties; skip if best_score is zero.
+- Single-ingest compaction: even without merge, if best improves during generation, run the same pruning compaction over existing history before archiving the ingest, using the improved best as the bound.
 - Symmetric pre-prune: before/while merging, load each archive’s optimal score; prune impacted seeds using the higher of the two best scores so the weaker side is filtered by the stronger best. If the bests tie, no extra pruning beyond normal bounds. Optionally pre-compact only the weaker side with the higher best to avoid rewriting the stronger archive.
