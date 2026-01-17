@@ -3,6 +3,8 @@ use fold::generation_runner::run_generation_loop;
 use fold::generation_store::{Config, GenerationStore, Role};
 use fold::interner::Interner;
 use fold::metrics::Metrics;
+use fold::offload_config::OffloadConfig;
+use fold::offload_runtime::configure_offload_runtime;
 use fold::ortho::{Ortho, OrthoId};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -345,6 +347,9 @@ fn export_ortho_archive(
     }
     let mut store = GenerationStore::new_with_config(work_dir.clone(), 8)?;
     store.configure(&cfg);
+    let offload_cfg = OffloadConfig::from_env();
+    let _offload_guard = configure_offload_runtime(&work_dir, &offload_cfg)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let metrics = Metrics::new();
     let mut noop_housekeeping = || -> Result<(), FoldError> { Ok(()) };

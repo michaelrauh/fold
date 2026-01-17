@@ -4,7 +4,10 @@ use fold::{
     file_handler::{self, MemClaimGuard, StateConfig},
     generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
     generation_store::{Config, GenerationStore, Role},
+    generation_store,
     interner::Interner,
+    offload_config::OffloadConfig,
+    offload_runtime::configure_offload_runtime,
     metrics::{GenerationStat, Metrics},
     ortho::{Ortho, PayloadVal, payload_to_usize},
     tui::Tui,
@@ -361,8 +364,11 @@ fn process_txt_file(
         .parent()
         .unwrap()
         .to_path_buf();
-    let mut store = GenerationStore::new_with_config(store_path, 8)?;
+    let mut store = GenerationStore::new_with_config(store_path.clone(), 8)?;
     store.configure(&cfg);
+    let offload_cfg = OffloadConfig::from_env();
+    let _offload_guard =
+        configure_offload_runtime(&store_path, &offload_cfg).map_err(FoldError::Io)?;
 
     metrics.add_log(format!(
         "[{} init] generation_store configured: run_budget={} MB, work_cache={} orthos, bufwriter={} KB, segment_size={} orthos",
@@ -540,6 +546,12 @@ fn process_txt_file(
     )?;
 
     metrics.add_log(format!("Archive saved: {}", archive_path.display()));
+    if let Some(offload_bytes) = offload_archive_dir(&archive_path, &metrics)? {
+        metrics.add_log(format!(
+            "Archive offloaded ({} bytes); removed local copy",
+            offload_bytes
+        ));
+    }
 
     // Update largest archive
     metrics.update_largest_archive(|la| {
@@ -1579,6 +1591,35 @@ fn move_history_runs_to_archive(
     Ok(())
 }
 
+fn offload_archive_dir(path: &Path, metrics: &Metrics) -> Result<Option<u64>, FoldError> {
+    let mut uploaded_bytes = 0u64;
+
+    fn walk_and_offload(path: &Path, uploaded: &mut u64) -> Result<bool, FoldError> {
+        let mut offloaded_any = false;
+        if path.is_dir() {
+            for entry in fs::read_dir(path).map_err(FoldError::Io)? {
+                let entry = entry.map_err(FoldError::Io)?;
+                let p = entry.path();
+                offloaded_any |= walk_and_offload(&p, uploaded)?;
+            }
+        } else if path.is_file() {
+            let size = fs::metadata(path).map_err(FoldError::Io)?.len();
+            if generation_store::offload_path_if_configured(path).map_err(FoldError::Io)? {
+                offloaded_any = true;
+                *uploaded = uploaded.saturating_add(size);
+            }
+        }
+        Ok(offloaded_any)
+    }
+
+    if walk_and_offload(path, &mut uploaded_bytes)? {
+        fs::remove_dir_all(path).map_err(FoldError::Io)?;
+        metrics.record_landing_buffer_count(0); // reuse metric for quick visibility
+        return Ok(Some(uploaded_bytes));
+    }
+    Ok(None)
+}
+
 fn write_archive_artifacts(
     archive_path: &PathBuf,
     interner: &Interner,
@@ -2003,6 +2044,8 @@ fn directory_size(path: &Path) -> Result<u64, FoldError> {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+    use fold::generation_store::{RunOffloader, set_run_offloader};
+    use tempfile::TempDir;
 
     #[test]
     fn test_score() {
@@ -2129,5 +2172,54 @@ mod tests {
             snapshot.merge.impacted_queued_a,
             snapshot.merge.impacted_queued_b
         );
+    }
+
+    struct ArchiveOffloader {
+        dest: std::path::PathBuf,
+        uploads: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl RunOffloader for ArchiveOffloader {
+        fn offload(&self, path: &std::path::Path) -> std::io::Result<bool> {
+            fs::create_dir_all(&self.dest)?;
+            let dest = self.dest.join(
+                path.file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("artifact")),
+            );
+            fs::copy(path, &dest)?;
+            *self.uploads.lock().unwrap() += 1;
+            Ok(true)
+        }
+    }
+
+    struct OffloaderGuard;
+    impl Drop for OffloaderGuard {
+        fn drop(&mut self) {
+            set_run_offloader(None);
+        }
+    }
+
+    #[test]
+    fn archive_offload_removes_local_copy() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().to_path_buf();
+        let archive_dir = base.join("archive_test.bin");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let artifact = archive_dir.join("interner.bin");
+        fs::write(&artifact, b"data").unwrap();
+
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let offloader = std::sync::Arc::new(ArchiveOffloader {
+            dest: base.join("offloaded"),
+            uploads: uploads.clone(),
+        });
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+
+        let metrics = Metrics::new();
+        let result = offload_archive_dir(&archive_dir, &metrics).unwrap();
+        assert!(result.is_some());
+        assert!(!archive_dir.exists());
+        assert!(*uploads.lock().unwrap() >= 1);
     }
 }

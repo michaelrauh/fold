@@ -3,6 +3,7 @@ use crate::{
     error::FoldError,
     file_handler::StateConfig,
     generation_store::{Config, GenerationStore, ProgressCallback, Role},
+    offload_config::OffloadConfig,
     interner::Interner,
     metrics::{GenerationStat, Metrics},
     ortho::{Ortho, PayloadVal, payload_to_usize},
@@ -12,6 +13,60 @@ use sysinfo::{Disks, ProcessesToUpdate, System, get_current_pid};
 
 pub const COMPLETION_CHUNK_SIZE: usize = 1_000;
 pub const FANOUT_LOG_THRESHOLD: usize = COMPLETION_CHUNK_SIZE;
+const EST_BYTES_PER_ORTHO: u64 = 200;
+
+struct PressureWatchdog {
+    landing_bytes_high_water: Option<u64>,
+    disk_free_low_water: Option<u64>,
+    enabled: bool,
+}
+
+impl PressureWatchdog {
+    fn from_config(cfg: OffloadConfig) -> Self {
+        Self {
+            landing_bytes_high_water: cfg.landing_bytes_high_water,
+            disk_free_low_water: cfg.disk_free_low_water,
+            enabled: cfg.enabled,
+        }
+    }
+
+    fn should_trigger(&self, landing_bytes: u64, disk_free: Option<u64>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let landing_trigger = self
+            .landing_bytes_high_water
+            .map(|t| landing_bytes >= t)
+            .unwrap_or(false);
+        let disk_trigger = self
+            .disk_free_low_water
+            .and_then(|t| disk_free.map(|free| free <= t))
+            .unwrap_or(false);
+        landing_trigger || disk_trigger
+    }
+
+    fn maybe_handle(
+        &self,
+        store: &mut GenerationStore,
+        cfg: &Config,
+        disk_free: Option<u64>,
+        metrics: &Metrics,
+    ) -> Result<bool, FoldError> {
+        let landing_est_bytes =
+            (store.total_landing_size() as u64).saturating_mul(EST_BYTES_PER_ORTHO);
+        if !self.should_trigger(landing_est_bytes, disk_free) {
+            return Ok(false);
+        }
+        metrics.add_log(format!(
+            "Pressure watchdog: landing_est_bytes={}, disk_free={:?}",
+            landing_est_bytes, disk_free
+        ));
+        metrics.record_pressure_trigger();
+        store.pressure_compact_and_offload(cfg)?;
+        metrics.record_landing_buffer_count(store.total_landing_size());
+        Ok(true)
+    }
+}
 
 pub struct GenerationRunResult {
     pub best_ortho: Ortho,
@@ -96,6 +151,10 @@ where
         .map(|cfg| cfg.base_dir.canonicalize().unwrap_or_else(|_| cfg.base_dir.clone()));
     let mut generation = 0u64;
     let mut generation_stats: Vec<GenerationStat> = Vec::new();
+    let offload_cfg = OffloadConfig::from_env();
+    let pressure_watchdog = PressureWatchdog::from_config(offload_cfg);
+    let mut last_disk_available: Option<u64> = None;
+    crate::generation_store::set_offload_metrics_handle(Some(metrics.clone_handle()));
 
     // Tracking for throughput calculation
     let mut last_report_time = Instant::now();
@@ -256,11 +315,19 @@ where
                 if let Some(base_dir) = &disk_base {
                     disks.refresh_list();
                     disks.refresh();
+                    let mut best: Option<(u64, u64, usize)> = None;
                     for disk in disks.iter() {
-                        if base_dir.starts_with(disk.mount_point()) {
-                            metrics.set_disk_usage(disk.total_space(), disk.available_space());
-                            break;
+                        let mount = disk.mount_point();
+                        if base_dir.starts_with(mount) {
+                            let score = mount.as_os_str().to_string_lossy().len();
+                            if best.map_or(true, |(_, _, best_len)| score > best_len) {
+                                best = Some((disk.total_space(), disk.available_space(), score));
+                            }
                         }
+                    }
+                    if let Some((total, available, _)) = best {
+                        metrics.set_disk_usage(total, available);
+                        last_disk_available = Some(available);
                     }
                 }
 
@@ -273,6 +340,10 @@ where
 
                 // Housekeeping hook (heartbeats, mem claim, leader lock)
                 housekeeping()?;
+
+                // Pressure watchdog: drain/compact/offload under landing/disk pressure.
+                let _ = pressure_watchdog
+                    .maybe_handle(store, cfg, last_disk_available, metrics)?;
             }
 
             // Get requirements from ortho
@@ -391,6 +462,8 @@ where
         }
     }
 
+    crate::generation_store::set_offload_metrics_handle(None);
+
     Ok(GenerationRunResult {
         best_ortho,
         best_score,
@@ -443,4 +516,67 @@ fn current_process_rss_bytes(sys: &mut System) -> usize {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod pressure_watchdog_tests {
+    use super::*;
+    use crate::generation_store::{set_run_offloader, RunOffloader};
+    use std::io;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    struct RecordingOffloader {
+        uploads: Arc<Mutex<usize>>,
+    }
+
+    impl RunOffloader for RecordingOffloader {
+        fn offload(&self, _path: &Path) -> io::Result<bool> {
+            *self.uploads.lock().unwrap() += 1;
+            Ok(true)
+        }
+    }
+
+    struct OffloaderGuard;
+    impl Drop for OffloaderGuard {
+        fn drop(&mut self) {
+            set_run_offloader(None);
+        }
+    }
+
+    #[test]
+    fn pressure_watchdog_drains_and_offloads() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let uploads: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let offloader = Arc::new(RecordingOffloader {
+            uploads: uploads.clone(),
+        });
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 2).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        // Add a couple of orthos to create landing data
+        let ortho = Ortho::new();
+        store.record_result(&ortho).unwrap();
+        store.record_result(&ortho).unwrap();
+        store.flush_all().unwrap();
+
+        let watchdog = PressureWatchdog::from_config(OffloadConfig {
+            enabled: true,
+            landing_bytes_high_water: Some(1),
+            disk_free_low_water: None,
+            ..OffloadConfig::with_base_dir(base_path.clone())
+        });
+        let metrics = Metrics::new();
+        let triggered = watchdog
+            .maybe_handle(&mut store, &cfg, Some(u64::MAX), &metrics)
+            .unwrap();
+        assert!(triggered);
+        assert_eq!(store.total_landing_size(), 0);
+    }
 }

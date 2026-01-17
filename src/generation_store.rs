@@ -8,7 +8,9 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread_local;
 use sysinfo::System;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -277,6 +279,173 @@ pub struct Run {
     path: PathBuf,
 }
 
+/// Hook for offloading finalized run files (e.g., to object storage).
+pub trait RunOffloader: Send + Sync {
+    /// Returns true if the file was successfully offloaded and can be removed locally.
+    fn offload(&self, path: &Path) -> io::Result<bool>;
+}
+
+thread_local! {
+    static RUN_OFFLOADER: RefCell<Option<Arc<dyn RunOffloader>>> = RefCell::new(None);
+}
+struct RunDownloaderCtx {
+    base_path: PathBuf,
+    downloader: Arc<dyn RunDownloader>,
+}
+thread_local! {
+    static RUN_DOWNLOADER: RefCell<Option<RunDownloaderCtx>> = RefCell::new(None);
+}
+thread_local! {
+    static METRICS_HANDLE: RefCell<Option<crate::metrics::Metrics>> = RefCell::new(None);
+}
+
+/// Set or clear the global run offloader hook (used by pressure-mode/offload tests).
+pub fn set_run_offloader(offloader: Option<Arc<dyn RunOffloader>>) {
+    RUN_OFFLOADER.with(|slot| *slot.borrow_mut() = offloader);
+}
+
+/// Downloader invoked when a run file is missing locally. Implementations should download into a
+/// cache and return the path to the cached file.
+pub trait RunDownloader: Send + Sync {
+    fn cache_lookup(&self, key: &str) -> Option<PathBuf>;
+    fn download_to_cache(&self, key: &str) -> io::Result<PathBuf>;
+}
+
+/// Set or clear the global run downloader hook (used to hydrate missing runs).
+pub fn set_run_downloader(ctx: Option<(PathBuf, Arc<dyn RunDownloader>)>) {
+    RUN_DOWNLOADER.with(|slot| {
+        *slot.borrow_mut() = ctx.map(|(base_path, downloader)| RunDownloaderCtx {
+            base_path,
+            downloader,
+        })
+    });
+}
+
+/// Set or clear a metrics handle for offload/download counters.
+pub fn set_offload_metrics_handle(handle: Option<crate::metrics::Metrics>) {
+    METRICS_HANDLE.with(|slot| *slot.borrow_mut() = handle);
+}
+
+fn current_offloader() -> Option<Arc<dyn RunOffloader>> {
+    RUN_OFFLOADER.with(|slot| slot.borrow().clone())
+}
+
+fn current_downloader() -> Option<RunDownloaderCtx> {
+    RUN_DOWNLOADER.with(|slot| {
+        slot.borrow().as_ref().map(|ctx| RunDownloaderCtx {
+            base_path: ctx.base_path.clone(),
+            downloader: Arc::clone(&ctx.downloader),
+        })
+    })
+}
+
+fn metrics_handle() -> Option<crate::metrics::Metrics> {
+    METRICS_HANDLE.with(|slot| slot.borrow().clone())
+}
+
+/// Offload a path if a RunOffloader is configured. Returns true if offloaded.
+pub fn offload_path_if_configured(path: &Path) -> io::Result<bool> {
+    if let Some(offloader) = current_offloader() {
+        offloader.offload(path)
+    } else {
+        Ok(false)
+    }
+}
+
+fn maybe_offload_and_delete(path: &Path) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let size = metadata.len();
+            match offload_path_if_configured(path) {
+                Ok(true) => {
+                    if let Some(m) = metrics_handle() {
+                        m.record_offload(1, size);
+                    }
+                    let _ = fs::remove_file(path);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    if let Some(m) = metrics_handle() {
+                        m.add_log(format!("Offload failed for {:?}: {}", path, e));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(_) => {
+            if offload_path_if_configured(path)? {
+                let _ = fs::remove_file(path);
+            }
+        }
+    };
+    Ok(())
+}
+
+fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
+    // Prefer a relative path under base_path; handle deleted/nonexistent files gracefully.
+    let key_path = path
+        .strip_prefix(base_path)
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let base_canon = base_path
+                .canonicalize()
+                .unwrap_or_else(|_| base_path.to_path_buf());
+            let path_canon = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf());
+            path_canon
+                .strip_prefix(&base_canon)
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|_| {
+            path.file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf())
+        });
+    let key = key_path
+        .iter()
+        .map(|p| p.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(key)
+}
+
+fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let Some(ctx) = current_downloader() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("run file missing and no downloader configured: {:?}", path),
+        ));
+    };
+    let key = run_object_key(&ctx.base_path, path)?;
+    if let Some(hit) = ctx.downloader.cache_lookup(&key) {
+        if let Some(m) = metrics_handle() {
+            m.record_cache_hit();
+        }
+        return Ok(hit);
+    }
+    if let Some(m) = metrics_handle() {
+        m.record_cache_miss();
+    }
+    let cached = ctx.downloader.download_to_cache(&key)?;
+    if let Some(m) = metrics_handle() {
+        if let Ok(bytes) = fs::metadata(&cached) {
+            m.record_download(1, bytes.len() as u64);
+        } else {
+            m.record_download(1, 0);
+        }
+    }
+    Ok(cached)
+}
+
+#[cfg(test)]
+pub fn test_maybe_offload_and_delete(path: &Path) -> io::Result<()> {
+    maybe_offload_and_delete(path)
+}
+
 impl Run {
     /// Create a new Run from a file path
     pub fn new(path: PathBuf) -> Self {
@@ -290,7 +459,8 @@ impl Run {
 
     /// Iterate over orthos in this run with bounded buffering
     pub fn iter(&self, read_buf_bytes: usize) -> io::Result<OrthoStreamReader> {
-        OrthoStreamReader::new(&self.path, read_buf_bytes)
+        let path = resolve_run_path(&self.path)?;
+        OrthoStreamReader::new(&path, read_buf_bytes)
     }
 }
 
@@ -407,7 +577,7 @@ pub struct OrthoStreamReader {
 }
 
 impl OrthoStreamReader {
-    fn new(path: &PathBuf, read_buf_bytes: usize) -> io::Result<Self> {
+    fn new(path: &Path, read_buf_bytes: usize) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::with_capacity(read_buf_bytes, file);
         let decoder = ZstdDecoder::new(reader)
@@ -555,7 +725,8 @@ impl UniqueRun {
 
     /// Iterate over orthos in this unique run with bounded buffering
     pub fn iter(&self, read_buf_bytes: usize) -> io::Result<OrthoStreamReader> {
-        OrthoStreamReader::new(&self.path, read_buf_bytes)
+        let path = resolve_run_path(&self.path)?;
+        OrthoStreamReader::new(&path, read_buf_bytes)
     }
 }
 
@@ -587,8 +758,8 @@ impl HistoryIterator {
             return Ok(());
         }
 
-        let reader =
-            OrthoStreamReader::new(&self.run_files[self.current_run_index], self.read_buf_bytes)?;
+        let run_path = resolve_run_path(&self.run_files[self.current_run_index])?;
+        let reader = OrthoStreamReader::new(&run_path, self.read_buf_bytes)?;
         self.current_run_iter = Some(reader);
         self.current_run_index += 1;
 
@@ -1050,6 +1221,10 @@ impl GenerationStore {
         &self.base_path
     }
 
+    pub fn bucket_count(&self) -> usize {
+        self.bucket_count
+    }
+
     /// Prune history runs using the optimistic bound; returns (kept, pruned) counts.
     /// Uses impacted_prefixes (if provided) to tighten the bound for impacted merges.
     pub fn prune_history_with_bound(
@@ -1102,6 +1277,7 @@ impl GenerationStore {
 
                 if wrote_any {
                     fs::rename(&tmp_path, &run_path)?;
+                    maybe_offload_and_delete(&run_path)?;
                     new_runs.push(run_path);
                 } else {
                     let _ = fs::remove_file(&run_path);
@@ -1129,6 +1305,7 @@ impl GenerationStore {
 
         // Move the run file to history
         fs::rename(run.path(), &dest_path)?;
+        maybe_offload_and_delete(&dest_path)?;
 
         // Track the history run
         self.history_runs[bucket].push(dest_path);
@@ -1203,6 +1380,26 @@ impl GenerationStore {
                 }
             })
             .collect()
+    }
+
+    /// Emergency path: drain all buckets, compact landing, and offload/delete resulting runs.
+    /// Returns the number of buckets drained.
+    pub fn pressure_compact_and_offload(&mut self, cfg: &Config) -> io::Result<usize> {
+        self.flush_all()?;
+        let mut drained = 0usize;
+        for bucket in 0..self.bucket_count {
+            let raw = self.drain_bucket(bucket)?;
+            if raw.files().is_empty() {
+                continue;
+            }
+            drained += 1;
+            let runs = compact_landing(bucket, raw, cfg, &self.base_path, Some(&mut self.compression_stats))?;
+            for run in runs {
+                // Offloader hook will remove if configured; propagate failures so caller can pause.
+                maybe_offload_and_delete(run.path())?;
+            }
+        }
+        Ok(drained)
     }
 
     fn update_cached_best(&self, candidate: &Ortho) {
@@ -1590,6 +1787,7 @@ fn write_streamed_run(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
+    maybe_offload_and_delete(path)?;
     Ok(())
 }
 
@@ -1721,6 +1919,7 @@ pub fn merge_unique(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
+    maybe_offload_and_delete(&unique_path)?;
     cleanup_runs(&runs);
 
     Ok(UniqueRun::new(unique_path))
@@ -1806,6 +2005,7 @@ fn merge_ortho_chunk(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
+    maybe_offload_and_delete(&chunk_path)?;
     Ok(Run::new(chunk_path))
 }
 
@@ -1942,6 +2142,8 @@ pub fn anti_join_orthos(
         let _ = compress_file(&seen_run_path, 3)?;
         let _ = compress_file(&new_work_path, 3)?;
     }
+    maybe_offload_and_delete(&seen_run_path)?;
+    maybe_offload_and_delete(&new_work_path)?;
     Ok((
         Run::new(new_work_path),
         Run::new(seen_run_path),
@@ -1970,6 +2172,12 @@ impl Default for GenerationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::offload_cache::OffloadCache;
+    use crate::offloader::{MockObjectStore, OffloadClient};
+    use crate::metrics::Metrics;
+    use crate::generation_store::set_offload_metrics_handle;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn collect_run(run: &Run, read_buf_bytes: usize) -> Vec<Ortho> {
@@ -2103,6 +2311,294 @@ mod tests {
                 prev_id = Some(id);
             }
         }
+    }
+
+    struct RecordingOffloader {
+        dest_dir: PathBuf,
+        uploads: Arc<Mutex<Vec<PathBuf>>>,
+        base_path: PathBuf,
+    }
+
+    impl RecordingOffloader {
+        fn new(dest_dir: PathBuf, uploads: Arc<Mutex<Vec<PathBuf>>>, base_path: PathBuf) -> Self {
+            Self {
+                dest_dir,
+                uploads,
+                base_path,
+            }
+        }
+    }
+
+    impl RunOffloader for RecordingOffloader {
+        fn offload(&self, path: &Path) -> io::Result<bool> {
+            if !path.starts_with(&self.base_path) {
+                return Ok(false);
+            }
+            fs::create_dir_all(&self.dest_dir)?;
+            let name = path
+                .file_name()
+                .map(|f| f.to_owned())
+                .unwrap_or_else(|| std::ffi::OsString::from("run.dat"));
+            let dest = self.dest_dir.join(name);
+            fs::copy(path, &dest)?;
+            self.uploads.lock().unwrap().push(dest);
+            Ok(true)
+        }
+    }
+
+    struct OffloaderGuard;
+    impl Drop for OffloaderGuard {
+        fn drop(&mut self) {
+            set_run_offloader(None);
+        }
+    }
+
+    #[test]
+    fn compact_landing_offloads_and_deletes_runs() {
+        use crate::ortho::Ortho;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let offload_dir = base_path.join("offloaded");
+        let uploads: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let offloader =
+            Arc::new(RecordingOffloader::new(offload_dir.clone(), uploads.clone(), base_path.clone()));
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+        let metrics = Metrics::new();
+        set_offload_metrics_handle(Some(metrics.clone_handle()));
+
+        let orthos = vec![
+            Ortho::new(),
+            Ortho::new().add(1)[0].clone(),
+            Ortho::new().add(2)[0].clone(),
+        ];
+
+        let bucket = 0;
+        let landing_dir = base_path.join("landing").join(format!("b={:02}", bucket));
+        fs::create_dir_all(&landing_dir).unwrap();
+        let drain_path = landing_dir.join("drain-0.log");
+
+        let writer = BufWriter::new(File::create(&drain_path).unwrap());
+        let mut encoder = ZstdEncoder::new(writer, 3).unwrap();
+        for ortho in &orthos {
+            write_ortho_record(&mut encoder, ortho, None).unwrap();
+        }
+        let mut file = encoder.finish().unwrap();
+        file.flush().unwrap();
+
+        let raw = RawStream::new(vec![drain_path]);
+        let cfg = Config::test_config(1024 * 1024, 8);
+        fs::create_dir_all(base_path.join("runs")).unwrap();
+
+        let mut stats = CompressionStats::default();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
+
+        // Offloader should have copied and runs should be deleted locally.
+        let uploaded = uploads.lock().unwrap();
+        assert!(
+            uploaded.len() >= runs.len(),
+            "expected at least {} uploads, saw {}",
+            runs.len(),
+            uploaded.len()
+        );
+        for run in &runs {
+            assert!(!run.path().exists());
+        }
+        for dest in uploaded.iter() {
+            assert!(dest.exists());
+        }
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.global.offloaded_files >= 1);
+        set_offload_metrics_handle(None);
+    }
+
+    struct CachedDownloader {
+        client: OffloadClient,
+        cache: Mutex<OffloadCache>,
+        temp_root: PathBuf,
+    }
+
+    impl RunDownloader for CachedDownloader {
+        fn cache_lookup(&self, key: &str) -> Option<PathBuf> {
+            self.cache.lock().unwrap().get(key)
+        }
+
+        fn download_to_cache(&self, key: &str) -> io::Result<PathBuf> {
+            let tmp_dir = self.temp_root.join("tmp_downloads");
+            fs::create_dir_all(&tmp_dir)?;
+            let tmp_path = tmp_dir.join(key.replace('/', "_"));
+            self.client
+                .download_file(key, &tmp_path)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let mut cache = self.cache.lock().unwrap();
+            let cached = cache
+                .insert_copy(key, &tmp_path)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let _ = fs::remove_file(&tmp_path);
+            Ok(cached)
+        }
+    }
+
+    struct DownloaderGuard;
+    impl Drop for DownloaderGuard {
+        fn drop(&mut self) {
+            set_run_downloader(None);
+        }
+    }
+
+    struct UploadThenFailOffloader {
+        client: OffloadClient,
+        base_path: PathBuf,
+    }
+
+    impl RunOffloader for UploadThenFailOffloader {
+        fn offload(&self, path: &Path) -> io::Result<bool> {
+            let key = run_object_key(&self.base_path, path)?;
+            let rel = Path::new(&key);
+            self.client
+                .upload_file(path, rel)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "forced offload failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn iter_downloads_missing_run_from_cache() {
+        use crate::ortho::Ortho;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        fs::create_dir_all(base_path.join("runs")).unwrap();
+
+        // Create a run file with a few orthos.
+        let run_path = base_path.join("runs").join("b=00-run-0.dat");
+        let writer = BufWriter::new(File::create(&run_path).unwrap());
+        let mut encoder = ZstdEncoder::new(writer, 3).unwrap();
+        let orthos = vec![
+            Ortho::new(),
+            Ortho::new().add(1)[0].clone(),
+            Ortho::new().add(2)[0].clone(),
+        ];
+        for ortho in &orthos {
+            write_ortho_record(&mut encoder, ortho, None).unwrap();
+        }
+        let mut file = encoder.finish().unwrap();
+        file.flush().unwrap();
+
+        // Upload to mock object store using the relative key.
+        let store = Arc::new(MockObjectStore::new());
+        let client = OffloadClient::new(Arc::clone(&store), "bucket", "")
+            .with_retry(1, Duration::from_millis(1));
+        client
+            .upload_file(&run_path, Path::new("runs/b=00-run-0.dat"))
+            .unwrap();
+
+        // Delete the local run to force download path.
+        fs::remove_file(&run_path).unwrap();
+
+        // Configure downloader with cache.
+        let cache_dir = base_path.join("offload_cache");
+        let cache = OffloadCache::new(cache_dir.clone(), 1024 * 1024).unwrap();
+        let downloader = Arc::new(CachedDownloader {
+            client,
+            cache: Mutex::new(cache),
+            temp_root: base_path.clone(),
+        });
+        let _guard = DownloaderGuard;
+        set_run_downloader(Some((base_path.clone(), downloader)));
+        let metrics = Metrics::new();
+        set_offload_metrics_handle(Some(metrics.clone_handle()));
+
+        // Iterating the run should download from mock store into cache.
+        let run = Run::new(run_path.clone());
+        let collected = collect_run(&run, 64 * 1024);
+        assert_eq!(collected.len(), orthos.len());
+        for (a, b) in collected.iter().zip(orthos.iter()) {
+            assert_eq!(a.id(), b.id());
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.global.cache_misses, 1);
+        assert_eq!(snapshot.global.downloaded_files, 1);
+        assert!(snapshot.global.downloaded_bytes > 0);
+        set_offload_metrics_handle(None);
+    }
+
+    #[test]
+    fn offload_failure_retains_local_and_downloads_on_restart() {
+        use crate::ortho::Ortho;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        fs::create_dir_all(base_path.join("runs")).unwrap();
+
+        let run_path = base_path.join("runs").join("b=00-run-0.dat");
+        let writer = BufWriter::new(File::create(&run_path).unwrap());
+        let mut encoder = ZstdEncoder::new(writer, 3).unwrap();
+        let orthos = vec![Ortho::new(), Ortho::new().add(1)[0].clone()];
+        for ortho in &orthos {
+            write_ortho_record(&mut encoder, ortho, None).unwrap();
+        }
+        let mut file = encoder.finish().unwrap();
+        file.flush().unwrap();
+
+        let store = Arc::new(MockObjectStore::new());
+        let offload_client = OffloadClient::new(Arc::clone(&store), "bucket", "")
+            .with_retry(1, Duration::from_millis(1));
+        let download_client = OffloadClient::new(Arc::clone(&store), "bucket", "")
+            .with_retry(1, Duration::from_millis(1));
+        let key = run_object_key(&base_path, &run_path).unwrap();
+
+        let offloader = Arc::new(UploadThenFailOffloader {
+            client: offload_client,
+            base_path: base_path.clone(),
+        });
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+        let metrics = Metrics::new();
+        set_offload_metrics_handle(Some(metrics.clone_handle()));
+
+        let result = test_maybe_offload_and_delete(&run_path);
+        assert!(result.is_err(), "expected offload failure");
+        assert!(run_path.exists(), "run should remain after failure");
+        assert!(
+            store.get_bytes("bucket", &key).is_some(),
+            "object should be present in mock store"
+        );
+
+        let logs = metrics.snapshot().logs;
+        assert!(
+            logs.iter()
+                .any(|l| l.message.contains("Offload failed")),
+            "expected offload failure log entry"
+        );
+
+        // Simulate restart: clear hooks, drop local copy, and ensure downloads succeed.
+        set_run_offloader(None);
+        set_offload_metrics_handle(None);
+        fs::remove_file(&run_path).unwrap();
+
+        let cache_dir = base_path.join("offload_cache");
+        let cache = OffloadCache::new(cache_dir, 1024 * 1024).unwrap();
+        let downloader = Arc::new(CachedDownloader {
+            client: download_client,
+            cache: Mutex::new(cache),
+            temp_root: base_path.clone(),
+        });
+        let _dl_guard = DownloaderGuard;
+        set_run_downloader(Some((base_path.clone(), downloader)));
+
+        let run = Run::new(run_path.clone());
+        let collected = collect_run(&run, 64 * 1024);
+        assert_eq!(collected.len(), orthos.len());
+        for (a, b) in collected.iter().zip(orthos.iter()) {
+            assert_eq!(a.id(), b.id());
+        }
+        set_run_downloader(None);
     }
 
     #[test]

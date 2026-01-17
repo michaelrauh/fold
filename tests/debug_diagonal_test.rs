@@ -20,11 +20,19 @@ fn test_diagonal_calculation_2x2() {
 
     // Position 0 [0,0]: distance 0 - no earlier positions at distance 0
     let (_prefixes, diagonals) = spatial::get_requirements(0, &dims, None);
-    assert_eq!(diagonals, vec![], "Position 0 should have no diagonals");
+    assert_eq!(
+        diagonals,
+        Vec::<usize>::new(),
+        "Position 0 should have no diagonals"
+    );
 
     // Position 1 [0,1]: distance 1 - no earlier positions at distance 1
     let (_prefixes, diagonals) = spatial::get_requirements(1, &dims, None);
-    assert_eq!(diagonals, vec![], "Position 1 should have no diagonals");
+    assert_eq!(
+        diagonals,
+        Vec::<usize>::new(),
+        "Position 1 should have no diagonals"
+    );
 
     // Position 2 [1,0]: distance 1 - position 1 [0,1] is also at distance 1 and comes before
     let (_prefixes, diagonals) = spatial::get_requirements(2, &dims, None);
@@ -36,7 +44,11 @@ fn test_diagonal_calculation_2x2() {
 
     // Position 3 [1,1]: distance 2 - no earlier positions at distance 2
     let (_prefixes, diagonals) = spatial::get_requirements(3, &dims, None);
-    assert_eq!(diagonals, vec![], "Position 3 should have no diagonals");
+    assert_eq!(
+        diagonals,
+        Vec::<usize>::new(),
+        "Position 3 should have no diagonals"
+    );
 }
 
 #[test]

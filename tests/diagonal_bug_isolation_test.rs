@@ -30,7 +30,7 @@ fn test_3x3_position_6_diagonals() {
 
     assert_eq!(
         diagonals,
-        vec![],
+        Vec::<usize>::new(),
         "Position 6 should have no diagonal positions"
     );
 

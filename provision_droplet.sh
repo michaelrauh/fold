@@ -6,6 +6,14 @@ set -euo pipefail
 # key fingerprint or ID available to --ssh-keys.
 
 # --- Config (override via env) ---
+# Load .env if present (gitignored)
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 DROPLET_NAME="${DROPLET_NAME:-fold-16gb}"
 REGION="${REGION:-nyc3}"
 SIZE="${SIZE:-s-4vcpu-16gb}"
@@ -19,6 +27,12 @@ SANITIZED_VOLUME_NAME="${VOLUME_NAME// /_}"
 VOLUME_DEVICE="${VOLUME_DEVICE:-/dev/disk/by-id/scsi-0DO_Volume_${SANITIZED_VOLUME_NAME}}"
 VOLUME_FS_TYPE="${VOLUME_FS_TYPE:-ext4}"
 REMOTE_APP_DIR="${REMOTE_APP_DIR:-$MOUNT_POINT/fold}"
+# Spaces config (optional: set to enable offload on provisioned droplets)
+SPACES_BUCKET="${SPACES_BUCKET:-fold-offload}"
+SPACES_REGION="${SPACES_REGION:-nyc3}"
+SPACES_ENDPOINT="${SPACES_ENDPOINT:-https://$SPACES_REGION.digitaloceanspaces.com}"
+SPACES_ACCESS_KEY="${SPACES_ACCESS_KEY:-}"
+SPACES_SECRET_KEY="${SPACES_SECRET_KEY:-}"
 
 # Code sync: set SYNC_MODE=local to rsync the working tree; SYNC_MODE=github to clone/pull.
 SYNC_MODE="${SYNC_MODE:-local}"                # local|github
@@ -102,7 +116,7 @@ apt_with_retry() {
 wait_for_dpkg
 apt_with_retry apt-get update -y
 apt_with_retry apt-get install -y git tmux build-essential pkg-config libssl-dev curl ca-certificates e2fsprogs \
-  linux-tools-common "linux-tools-$(uname -r)" "linux-cloud-tools-$(uname -r)"
+  linux-tools-common "linux-tools-$(uname -r)" "linux-cloud-tools-$(uname -r)" awscli
 if [ ! -d "$HOME/.cargo" ]; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
@@ -112,6 +126,26 @@ EOF
 ensure_remote_dir() {
   local ip="$1"
   ssh "root@$ip" "mkdir -p \"$REMOTE_APP_DIR\""
+}
+
+create_spaces_bucket() {
+  local ip="$1"
+  if [ -z "$SPACES_ACCESS_KEY" ] || [ -z "$SPACES_SECRET_KEY" ]; then
+    echo "Spaces creds not provided; skipping bucket create"
+    return
+  fi
+  ssh "root@$ip" <<EOF
+set -euo pipefail
+export AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY"
+export AWS_DEFAULT_REGION="$SPACES_REGION"
+if aws --endpoint-url "$SPACES_ENDPOINT" s3api head-bucket --bucket "$SPACES_BUCKET" >/dev/null 2>&1; then
+  echo "Spaces bucket $SPACES_BUCKET already exists."
+else
+  echo "Creating Spaces bucket $SPACES_BUCKET..."
+  aws --endpoint-url "$SPACES_ENDPOINT" s3api create-bucket --bucket "$SPACES_BUCKET" >/dev/null
+fi
+EOF
 }
 
 sync_code() {
@@ -241,6 +275,7 @@ main() {
   ensure_remote_dir "$ip"
   sync_code "$ip"
   sync_text "$ip"
+  create_spaces_bucket "$ip"
 
   echo
   echo "Droplet ready at: $ip"

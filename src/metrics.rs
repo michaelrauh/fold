@@ -55,6 +55,14 @@ pub struct GlobalMetrics {
     pub seen_len_accepted: u64,
     pub run_budget_bytes: usize,
     pub fan_in: usize,
+    // Offload/caching
+    pub offloaded_files: u64,
+    pub offloaded_bytes: u64,
+    pub downloaded_files: u64,
+    pub downloaded_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub pressure_triggers: u64,
 }
 
 impl Default for GlobalMetrics {
@@ -89,6 +97,13 @@ impl Default for GlobalMetrics {
             seen_len_accepted: 0,
             run_budget_bytes: 0,
             fan_in: 0,
+            offloaded_files: 0,
+            offloaded_bytes: 0,
+            downloaded_files: 0,
+            downloaded_bytes: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            pressure_triggers: 0,
         }
     }
 }
@@ -238,6 +253,7 @@ pub struct LogEntry {
     pub message: String,
 }
 
+#[derive(Clone)]
 pub struct Metrics {
     inner: Arc<Mutex<MetricsInner>>,
 }
@@ -414,6 +430,33 @@ impl Metrics {
         inner.operation.expanded_completions = 0;
         inner.operation.pruned_root_span = 0;
         inner.operation.pruned_bound = 0;
+    }
+
+    pub fn record_offload(&self, files: u64, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.offloaded_files = inner.global.offloaded_files.saturating_add(files);
+        inner.global.offloaded_bytes = inner.global.offloaded_bytes.saturating_add(bytes);
+    }
+
+    pub fn record_download(&self, files: u64, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.downloaded_files = inner.global.downloaded_files.saturating_add(files);
+        inner.global.downloaded_bytes = inner.global.downloaded_bytes.saturating_add(bytes);
+    }
+
+    pub fn record_cache_hit(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.cache_hits = inner.global.cache_hits.saturating_add(1);
+    }
+
+    pub fn record_cache_miss(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.cache_misses = inner.global.cache_misses.saturating_add(1);
+    }
+
+    pub fn record_pressure_trigger(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.pressure_triggers = inner.global.pressure_triggers.saturating_add(1);
     }
 
     pub fn set_disk_usage(&self, total_bytes: u64, available_bytes: u64) {

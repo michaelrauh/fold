@@ -120,7 +120,7 @@ impl Tui {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Min(15),
                 Constraint::Length(7),
             ])
@@ -227,6 +227,16 @@ impl Tui {
             ratio * 100.0
         );
         let line6 = format!("{} │ {}", disk_line, comp_line);
+        let line7 = format!(
+            "Offload: {} files {} │ Download: {} files {} │ Cache: hit {} miss {} │ Pressure: {}",
+            format_number(snapshot.global.offloaded_files as usize),
+            format_bytes(snapshot.global.offloaded_bytes as usize),
+            format_number(snapshot.global.downloaded_files as usize),
+            format_bytes(snapshot.global.downloaded_bytes as usize),
+            format_number(snapshot.global.cache_hits as usize),
+            format_number(snapshot.global.cache_misses as usize),
+            format_number(snapshot.global.pressure_triggers as usize)
+        );
         let header_lines = vec![
             Line::from(truncate_string(&line1, max_width)),
             Line::from(truncate_string(&line2, max_width)),
@@ -234,6 +244,7 @@ impl Tui {
             Line::from(truncate_string(&line4, max_width)),
             Line::from(truncate_string(&line5, max_width)),
             Line::from(truncate_string(&line6, max_width)),
+            Line::from(truncate_string(&line7, max_width)),
         ];
 
         let header = Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL));

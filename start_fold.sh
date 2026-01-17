@@ -3,6 +3,13 @@ set -euo pipefail
 
 # Start two fold instances in tmux after staging fresh input and building with DWARF info for perf.
 
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -11,6 +18,8 @@ TMUX_SOCKET="${TMUX_SOCKET:-/tmp/fold_tmux.sock}"
 STATE_DIR="$SCRIPT_DIR/fold_state"
 APP_BIN="$SCRIPT_DIR/target/release/fold"
 CARGO_ENV="$HOME/.cargo/env"
+# Pass through offload env if provided (no defaults here to avoid changing workflow).
+FOLD_OFFLOAD_ENABLED="${FOLD_OFFLOAD_ENABLED:-}"
 
 # Default to debuginfo + frame pointers for better perf attribution; allow override via env.
 RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2}"
@@ -48,6 +57,50 @@ rm -rf "$STATE_DIR"
 
 echo "Staging e.txt into fold_state/input..."
 ./stage.sh "$SCRIPT_DIR/e.txt"
+
+# Export offload env if set so the app can pick up Spaces/local store config.
+# Auto-map legacy SPACES_* vars into FOLD_OFFLOAD_* if the latter are unset.
+if [ -z "${FOLD_OFFLOAD_SPACES_BUCKET:-}" ] && [ -n "${SPACES_BUCKET:-}" ]; then
+  FOLD_OFFLOAD_SPACES_BUCKET="$SPACES_BUCKET"
+fi
+if [ -z "${FOLD_OFFLOAD_SPACES_REGION:-}" ] && [ -n "${SPACES_REGION:-}" ]; then
+  FOLD_OFFLOAD_SPACES_REGION="$SPACES_REGION"
+fi
+if [ -z "${FOLD_OFFLOAD_SPACES_ENDPOINT:-}" ] && [ -n "${SPACES_ENDPOINT:-}" ]; then
+  FOLD_OFFLOAD_SPACES_ENDPOINT="$SPACES_ENDPOINT"
+fi
+if [ -z "${FOLD_OFFLOAD_SPACES_PREFIX:-}" ]; then
+  FOLD_OFFLOAD_SPACES_PREFIX="runs"
+fi
+if [ -z "${FOLD_OFFLOAD_SPACES_ACCESS_KEY:-}" ] && [ -n "${SPACES_ACCESS_KEY:-}" ]; then
+  FOLD_OFFLOAD_SPACES_ACCESS_KEY="$SPACES_ACCESS_KEY"
+fi
+if [ -z "${FOLD_OFFLOAD_SPACES_SECRET_KEY:-}" ] && [ -n "${SPACES_SECRET_KEY:-}" ]; then
+  FOLD_OFFLOAD_SPACES_SECRET_KEY="$SPACES_SECRET_KEY"
+fi
+if [ -z "${FOLD_OFFLOAD_CACHE_DIR:-}" ]; then
+  FOLD_OFFLOAD_CACHE_DIR="$STATE_DIR/offload_cache"
+fi
+if [ -n "${FOLD_OFFLOAD_MIN_FILE_BYTES:-}" ]; then export FOLD_OFFLOAD_MIN_FILE_BYTES; fi
+if [ -n "${FOLD_OFFLOAD_BATCH_BYTES:-}" ]; then export FOLD_OFFLOAD_BATCH_BYTES; fi
+
+if [ -z "${FOLD_OFFLOAD_ENABLED:-}" ] && [ -n "${FOLD_OFFLOAD_SPACES_ACCESS_KEY:-}" ] && [ -n "${FOLD_OFFLOAD_SPACES_SECRET_KEY:-}" ]; then
+  FOLD_OFFLOAD_ENABLED=1
+fi
+
+if [ -n "${FOLD_OFFLOAD_ENABLED:-}" ]; then export FOLD_OFFLOAD_ENABLED; fi
+if [ -n "${FOLD_OFFLOAD_SPACES_ENDPOINT:-}" ]; then export FOLD_OFFLOAD_SPACES_ENDPOINT; fi
+if [ -n "${FOLD_OFFLOAD_SPACES_REGION:-}" ]; then export FOLD_OFFLOAD_SPACES_REGION; fi
+if [ -n "${FOLD_OFFLOAD_SPACES_BUCKET:-}" ]; then export FOLD_OFFLOAD_SPACES_BUCKET; fi
+if [ -n "${FOLD_OFFLOAD_SPACES_PREFIX:-}" ]; then export FOLD_OFFLOAD_SPACES_PREFIX; fi
+if [ -n "${FOLD_OFFLOAD_SPACES_ACCESS_KEY:-}" ]; then export FOLD_OFFLOAD_SPACES_ACCESS_KEY; fi
+if [ -n "${FOLD_OFFLOAD_SPACES_SECRET_KEY:-}" ]; then export FOLD_OFFLOAD_SPACES_SECRET_KEY; fi
+if [ -n "${FOLD_OFFLOAD_CACHE_DIR:-}" ]; then export FOLD_OFFLOAD_CACHE_DIR; fi
+if [ -n "${FOLD_OFFLOAD_CACHE_BYTES_CAP:-}" ]; then export FOLD_OFFLOAD_CACHE_BYTES_CAP; fi
+if [ -n "${FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER:-}" ]; then export FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER; fi
+if [ -n "${FOLD_OFFLOAD_DISK_FREE_LOW_WATER:-}" ]; then export FOLD_OFFLOAD_DISK_FREE_LOW_WATER; fi
+if [ -n "${FOLD_OFFLOAD_LOCAL_STORE_DIR:-}" ]; then export FOLD_OFFLOAD_LOCAL_STORE_DIR; fi
+if [ -n "${FOLD_OFFLOAD_IN_MEMORY_STORE:-}" ]; then export FOLD_OFFLOAD_IN_MEMORY_STORE; fi
 
 # Ensure no stale sessions/servers (both default and custom socket).
 tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
