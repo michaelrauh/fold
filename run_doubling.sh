@@ -16,38 +16,47 @@ if [[ "$TOTAL_LINES" -eq 0 ]]; then
   exit 1
 fi
 
-# Fixed line counts for ~5k and ~10k words in e.txt (approx)
-START_LINES=507
-END_LINES=1026
-SAMPLES=10  # inclusive count
-
-samples=()
-if [[ "$START_LINES" -le "$END_LINES" && "$END_LINES" -le "$TOTAL_LINES" ]]; then
-  step=$(( (END_LINES - START_LINES) / (SAMPLES - 1) ))
-  for ((i=0; i<SAMPLES; i++)); do
-    n=$((START_LINES + i * step))
-    samples+=("$n")
-  done
-else
-  echo "Start/end lines exceed file; falling back to start/end only" >&2
-  samples=("$START_LINES" "$END_LINES")
+# Pure doubling over words: 1, 2, 4, ... up to the full word count.
+TOTAL_WORDS=$(wc -w < "$SRC_FILE")
+if [[ "$TOTAL_WORDS" -eq 0 ]]; then
+  echo "Source file has zero words" >&2
+  exit 1
 fi
 
-# Sort and dedupe
-IFS=$'\n' read -r -d '' -a samples < <(printf "%s\n" "${samples[@]}" | sort -n -u && printf '\0')
+# Build the sequence first so we can log/verify each step.
+counts=()
+w=1
+while [[ "$w" -lt "$TOTAL_WORDS" ]]; do
+  counts+=("$w")
+  w=$((w * 2))
+done
+counts+=("$TOTAL_WORDS")
 
-for n in "${samples[@]}"; do
-  echo "=== Running with n=$n (of $TOTAL_LINES lines) ==="
+for words in "${counts[@]}"; do
+  echo "=== Running with $words words (of $TOTAL_WORDS) ==="
   rm -rf ./fold_state
   mkdir -p ./fold_state/input
-  head -n "$n" "$SRC_FILE" > ./fold_state/input/small.txt
+
+  python3 - "$SRC_FILE" "$words" <<'PY'
+import sys, pathlib
+src = pathlib.Path(sys.argv[1]).read_text()
+limit = int(sys.argv[2])
+tokens = src.split()
+subset = " ".join(tokens[:limit])
+pathlib.Path("./fold_state/input/small.txt").write_text(subset)
+PY
+
+  actual_words=$(wc -w < ./fold_state/input/small.txt)
+  if [[ "$actual_words" -ne "$words" ]]; then
+    echo "Warning: expected $words words, wrote $actual_words" >&2
+  fi
 
   if ! cargo run --release; then
-    echo "cargo run failed at n=$n" >&2
+    echo "cargo run failed at $words words" >&2
     exit 1
   fi
 
   rm -rf ./fold_state
 done
 
-echo "Completed runs up to $TOTAL_LINES lines."
+echo "Completed doubling runs up to $TOTAL_WORDS words."
