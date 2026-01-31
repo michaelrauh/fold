@@ -4,6 +4,13 @@ set -euo pipefail
 # Iterate input sizes by doubling (1, 2, 4, 8, ...) and run `cargo run --release`
 # for each size, resetting fold_state between runs.
 
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 SRC_FILE="${1:-e.txt}"
 if [[ ! -f "$SRC_FILE" ]]; then
   echo "Source file '$SRC_FILE' not found" >&2

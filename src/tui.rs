@@ -19,9 +19,10 @@ use ratatui::{
     },
 };
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct TerminalGuard;
 
@@ -44,15 +45,23 @@ pub struct Tui {
     should_quit: Arc<AtomicBool>,
     log_scroll: usize,
     ortho_scroll: usize,
+    snapshot_path: Option<PathBuf>,
+    last_snapshot_write: Instant,
 }
 
 impl Tui {
-    pub fn new(metrics: Metrics, should_quit: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        metrics: Metrics,
+        should_quit: Arc<AtomicBool>,
+        snapshot_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             metrics,
             should_quit,
             log_scroll: 0,
             ortho_scroll: 0,
+            snapshot_path,
+            last_snapshot_write: Instant::now(),
         }
     }
 
@@ -82,6 +91,7 @@ impl Tui {
             }
 
             terminal.draw(|f| self.render(f))?;
+            self.maybe_persist_snapshot()?;
 
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
@@ -111,6 +121,28 @@ impl Tui {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn maybe_persist_snapshot(&mut self) -> io::Result<()> {
+        let Some(path) = &self.snapshot_path else {
+            return Ok(());
+        };
+
+        const SNAPSHOT_INTERVAL_SECS: u64 = 3;
+        if self.last_snapshot_write.elapsed() < Duration::from_secs(SNAPSHOT_INTERVAL_SECS) {
+            return Ok(());
+        }
+
+        let snapshot = self.metrics.snapshot();
+        let contents = format_snapshot(&snapshot);
+        if let Err(err) = std::fs::write(path, contents) {
+            self.metrics
+                .add_log(format!("TUI snapshot write failed: {}", err));
+            // Do not fail the loop on snapshot write issues.
+            return Ok(());
+        }
+        self.last_snapshot_write = Instant::now();
         Ok(())
     }
 
@@ -192,7 +224,11 @@ impl Tui {
         let comp_line = if snapshot.global.compression_uncompressed_bytes > 0 {
             let unc = snapshot.global.compression_uncompressed_bytes;
             let comp = snapshot.global.compression_compressed_bytes;
-            let ratio = if comp > 0 { unc as f64 / comp as f64 } else { 0.0 };
+            let ratio = if comp > 0 {
+                unc as f64 / comp as f64
+            } else {
+                0.0
+            };
             let saved = unc.saturating_sub(comp);
             format!(
                 "Compression: {:.2}× (saved {})",
@@ -604,7 +640,10 @@ impl Tui {
         let history_line = if history.is_empty() {
             "History: n/a".to_string()
         } else {
-            format!("History: {}", truncate_string(&history, max_width.saturating_sub(9)))
+            format!(
+                "History: {}",
+                truncate_string(&history, max_width.saturating_sub(9))
+            )
         };
 
         let comp_kept = snapshot.merge.compaction_kept;
@@ -1585,6 +1624,125 @@ fn count_leaves(node: &TreeNode) -> usize {
         TreeNode::Leaf(_) => 1,
         TreeNode::Branch(left, right) => count_leaves(left) + count_leaves(right),
     }
+}
+
+fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
+    let mut lines = Vec::new();
+    let role_label = if snapshot.global.role.is_empty() {
+        "unknown".to_string()
+    } else {
+        snapshot.global.role.clone()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let elapsed = now.saturating_sub(snapshot.global.start_time);
+
+    lines.push(format!(
+        "FOLD TUI Snapshot @ {}s since start",
+        format_elapsed(elapsed)
+    ));
+    lines.push(format!(
+        "Role: {} | Mode: {} | Phase: {} | Generation: {}",
+        role_label, snapshot.global.mode, snapshot.global.phase, snapshot.global.generation
+    ));
+    lines.push(format!(
+        "Work: {} | Accepted: {} | Fan-in: {} | Run budget: {}",
+        format_number(snapshot.global.work_len as usize),
+        format_number(snapshot.global.seen_len_accepted as usize),
+        snapshot.global.fan_in,
+        format_bytes(snapshot.global.run_budget_bytes)
+    ));
+
+    let disk_line = if snapshot.global.disk_total_bytes > 0 {
+        let total = snapshot.global.disk_total_bytes;
+        let free = snapshot.global.disk_available_bytes;
+        let used = total.saturating_sub(free);
+        let pct_used = if total > 0 {
+            (used as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "Disk: used {} ({:.0}%) | free {} of {}",
+            format_bytes(used as usize),
+            pct_used,
+            format_bytes(free as usize),
+            format_bytes(total as usize)
+        )
+    } else {
+        "Disk: n/a".to_string()
+    };
+    lines.push(disk_line);
+
+    lines.push(format!(
+        "RAM: total {} ({}%) | proc {}",
+        format_bytes(snapshot.global.ram_bytes),
+        snapshot.global.system_memory_percent,
+        format_bytes(snapshot.global.process_rss_bytes)
+    ));
+
+    let progress = if snapshot.operation.progress_total > 0 {
+        let ratio =
+            snapshot.operation.progress_current as f64 / snapshot.operation.progress_total as f64;
+        format!(
+            "{} / {} ({:.0}%)",
+            format_number(snapshot.operation.progress_current),
+            format_number(snapshot.operation.progress_total),
+            (ratio * 100.0).clamp(0.0, 100.0)
+        )
+    } else {
+        "n/a".to_string()
+    };
+    lines.push(format!(
+        "Current: {} | Status: {} | New orthos: {} | Progress: {}",
+        snapshot.operation.current_file,
+        snapshot.operation.status,
+        format_number(snapshot.operation.new_orthos),
+        progress
+    ));
+
+    let offload_line = format!(
+        "Offload: {} files {} | Download: {} files {} | Cache hit/miss: {}/{} | Pressure triggers: {}",
+        format_number(snapshot.global.offloaded_files as usize),
+        format_bytes(snapshot.global.offloaded_bytes as usize),
+        format_number(snapshot.global.downloaded_files as usize),
+        format_bytes(snapshot.global.downloaded_bytes as usize),
+        format_number(snapshot.global.cache_hits as usize),
+        format_number(snapshot.global.cache_misses as usize),
+        format_number(snapshot.global.pressure_triggers as usize)
+    );
+    lines.push(offload_line);
+
+    if snapshot.global.compression_uncompressed_bytes > 0 {
+        let unc = snapshot.global.compression_uncompressed_bytes;
+        let comp = snapshot.global.compression_compressed_bytes;
+        let ratio = if comp > 0 {
+            unc as f64 / comp as f64
+        } else {
+            0.0
+        };
+        let saved = unc.saturating_sub(comp);
+        lines.push(format!(
+            "Compression: {:.2}x (saved {})",
+            ratio,
+            format_bytes(saved as usize)
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Logs (last 50):".to_string());
+    let log_lines = snapshot.logs.iter().rev().take(50).rev();
+    for log in log_lines {
+        lines.push(format!(
+            "- [{}] {}",
+            format_timestamp(log.timestamp),
+            log.message
+        ));
+    }
+
+    lines.join("\n")
 }
 
 fn sample_data(samples: &[MetricSample], max_points: usize) -> Vec<MetricSample> {

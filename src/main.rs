@@ -1,14 +1,14 @@
 use fold::{
-    completion_pruning::{bound_completion, bound_existing_ortho},
     FoldError,
+    completion_pruning::{bound_completion, bound_existing_ortho},
     file_handler::{self, MemClaimGuard, StateConfig},
     generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
-    generation_store::{Config, GenerationStore, Role},
     generation_store,
+    generation_store::{Config, GenerationStore, Role},
     interner::Interner,
+    metrics::{GenerationStat, Metrics},
     offload_config::OffloadConfig,
     offload_runtime::configure_offload_runtime,
-    metrics::{GenerationStat, Metrics},
     ortho::{Ortho, PayloadVal, payload_to_usize},
     tui::Tui,
 };
@@ -47,6 +47,7 @@ fn main() -> Result<(), FoldError> {
     fs::create_dir_all(&log_dir)?;
     metrics.add_log("Log initialized".to_string());
     let should_quit = Arc::new(AtomicBool::new(false));
+    let tui_snapshot_path = log_dir.join("tui_state.log");
 
     let tui_enabled = std::env::var("FOLD_DISABLE_TUI").is_err() && std::io::stdout().is_terminal();
 
@@ -54,9 +55,10 @@ fn main() -> Result<(), FoldError> {
     let tui_handle = if tui_enabled {
         let metrics_clone = metrics.clone_handle();
         let should_quit_clone = Arc::clone(&should_quit);
+        let snapshot_path = tui_snapshot_path.clone();
         Some(thread::spawn(move || {
             let result = std::panic::catch_unwind(move || {
-                let mut tui = Tui::new(metrics_clone, should_quit_clone);
+                let mut tui = Tui::new(metrics_clone, should_quit_clone, Some(snapshot_path));
                 tui.run()
             });
             match result {
@@ -724,7 +726,9 @@ fn merge_archives(
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
     // Load per-archive optimal scores for symmetric pruning
     let load_opt_score = |path: &str| -> Option<(usize, usize)> {
-        file_handler::load_optimal_ortho(path).ok().map(|o| o.score())
+        file_handler::load_optimal_ortho(path)
+            .ok()
+            .map(|o| o.score())
     };
     let opt_score_a = load_opt_score(&results_a_path).unwrap_or((0, 0));
     let opt_score_b = load_opt_score(&results_b_path).unwrap_or((0, 0));
@@ -787,11 +791,9 @@ fn merge_archives(
                 } else {
                     metrics.update_merge(|m| {
                         if a_is_smaller {
-                            m.impacted_pruned_b =
-                                m.impacted_pruned_b.saturating_add(1);
+                            m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
                         } else {
-                            m.impacted_pruned_a =
-                                m.impacted_pruned_a.saturating_add(1);
+                            m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
                         }
                     });
                 }
@@ -856,11 +858,9 @@ fn merge_archives(
                     } else {
                         metrics.update_merge(|m| {
                             if a_is_smaller {
-                                m.impacted_pruned_a =
-                                    m.impacted_pruned_a.saturating_add(1);
+                                m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
                             } else {
-                                m.impacted_pruned_b =
-                                    m.impacted_pruned_b.saturating_add(1);
+                                m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
                             }
                         });
                     }
@@ -2043,8 +2043,8 @@ fn directory_size(path: &Path) -> Result<u64, FoldError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::ErrorKind;
     use fold::generation_store::{RunOffloader, set_run_offloader};
+    use std::io::ErrorKind;
     use tempfile::TempDir;
 
     #[test]

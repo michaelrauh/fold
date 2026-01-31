@@ -1,4 +1,4 @@
-use crate::{interner::Interner, ortho::payload_to_usize, ortho::Ortho};
+use crate::{interner::Interner, ortho::Ortho, ortho::payload_to_usize};
 
 /// Returns true if the candidate should be pruned (optimistic bound cannot beat best_score).
 pub fn bound_completion(
@@ -71,7 +71,10 @@ pub fn bound_existing_ortho(
                 totals.push(max_desc_len);
             }
             None => {
-                panic!("[bound][panic] missing prefix stats for impacted prefix {:?}", prefix_usize);
+                panic!(
+                    "[bound][panic] missing prefix stats for impacted prefix {:?}",
+                    prefix_usize
+                );
             }
         }
     }
@@ -113,7 +116,11 @@ pub fn bound_existing_ortho(
 /// Compute an upper-bound (volume, fullness) given per-prefix max lengths, dim count, and a volume floor.
 /// Volume upper is the saturated product of (axis total - 1) across provided axes (capped at dim_count),
 /// maxed with current excess volume; fullness upper = volume upper.
-pub fn upper_bound_score(axis_totals: &[usize], min_volume: usize, dim_count: usize) -> (usize, usize) {
+pub fn upper_bound_score(
+    axis_totals: &[usize],
+    min_volume: usize,
+    dim_count: usize,
+) -> (usize, usize) {
     let mut volume_upper: usize = 1;
     for t in axis_totals.iter().take(dim_count) {
         volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
@@ -178,9 +185,7 @@ mod tests {
         let z_idx = vocab_index(&interner, "z");
 
         // After placing x in the first slot, required prefixes include [x].
-        let ortho = Ortho::new()
-            .add(PayloadVal::try_from(x_idx).unwrap())[0]
-            .clone();
+        let ortho = Ortho::new().add(PayloadVal::try_from(x_idx).unwrap())[0].clone();
 
         // Compute potentials to pick a separating best_score.
         let required_usize: Vec<Vec<usize>> = ortho
@@ -218,7 +223,10 @@ mod tests {
         let prunes_y = bound_completion(&ortho, y_idx, &interner, best_score);
         let prunes_z = bound_completion(&ortho, z_idx, &interner, best_score);
 
-        assert!(prunes_y, "shallow completion y should be pruned at first slot");
+        assert!(
+            prunes_y,
+            "shallow completion y should be pruned at first slot"
+        );
         assert!(!prunes_z, "deeper completion z should remain");
     }
 

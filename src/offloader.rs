@@ -1,3 +1,6 @@
+use s3::Bucket;
+use s3::creds::Credentials;
+use s3::region::Region;
 use std::{
     collections::HashMap,
     fs,
@@ -8,9 +11,6 @@ use std::{
     thread,
     time::Duration,
 };
-use s3::creds::Credentials;
-use s3::Bucket;
-use s3::region::Region;
 
 /// Errors that can occur during offload/download.
 #[derive(Debug)]
@@ -107,7 +107,9 @@ impl OffloadClient {
     /// Upload a file to the configured bucket/prefix. Returns the object key used.
     pub fn upload_file(&self, local_path: &Path, relative: &Path) -> Result<String, OffloadError> {
         let key = self.object_key(relative);
-        self.retry("put", &key, || self.store.put(&self.bucket, &key, local_path))?;
+        self.retry("put", &key, || {
+            self.store.put(&self.bucket, &key, local_path)
+        })?;
         Ok(key)
     }
 
@@ -280,7 +282,7 @@ impl SpacesObjectStore {
             _ => {
                 return Err(OffloadError::Other(
                     "missing region/endpoint for Spaces client".to_string(),
-                ))
+                ));
             }
         };
         let credentials = Credentials::new(Some(access_key), Some(secret_key), None, None, None)
@@ -380,11 +382,7 @@ mod tests {
 
     #[test]
     fn object_key_preserves_relative_path_under_prefix() {
-        let client = OffloadClient::new(
-            Arc::new(MockObjectStore::new()),
-            "bucket",
-            "prefix/sub",
-        );
+        let client = OffloadClient::new(Arc::new(MockObjectStore::new()), "bucket", "prefix/sub");
         let rel = PathBuf::from("a/b/run.bin");
         let key = client.object_key(&rel);
         assert_eq!(key, "prefix/sub/a/b/run.bin");
@@ -408,6 +406,12 @@ mod tests {
         let bytes = std::fs::read(&download).unwrap();
         assert_eq!(bytes, b"hello");
 
-        assert!(root.join("bucket").join("prefix").join("runs").join("file.dat").exists());
+        assert!(
+            root.join("bucket")
+                .join("prefix")
+                .join("runs")
+                .join("file.dat")
+                .exists()
+        );
     }
 }

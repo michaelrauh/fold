@@ -74,7 +74,7 @@ impl StateConfig {
     }
 
     pub fn logs_dir(&self) -> PathBuf {
-        self.base_dir.join("logs")
+        PathBuf::from("fold_history").join("logs")
     }
 }
 

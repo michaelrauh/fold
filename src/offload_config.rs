@@ -75,10 +75,8 @@ impl OffloadConfig {
             env_string("FOLD_OFFLOAD_SPACES_ACCESS_KEY").or(cfg.spaces_access_key);
         cfg.spaces_secret_key =
             env_string("FOLD_OFFLOAD_SPACES_SECRET_KEY").or(cfg.spaces_secret_key);
-        cfg.min_offload_bytes =
-            env_u64("FOLD_OFFLOAD_MIN_FILE_BYTES").or(cfg.min_offload_bytes);
-        cfg.batch_offload_bytes =
-            env_u64("FOLD_OFFLOAD_BATCH_BYTES").or(cfg.batch_offload_bytes);
+        cfg.min_offload_bytes = env_u64("FOLD_OFFLOAD_MIN_FILE_BYTES").or(cfg.min_offload_bytes);
+        cfg.batch_offload_bytes = env_u64("FOLD_OFFLOAD_BATCH_BYTES").or(cfg.batch_offload_bytes);
         cfg.local_store_dir = env_string("FOLD_OFFLOAD_LOCAL_STORE_DIR")
             .map(PathBuf::from)
             .or(cfg.local_store_dir);
@@ -250,10 +248,7 @@ mod tests {
         let cfg = OffloadConfig::from_env_with_base(base_dir.path());
 
         assert!(cfg.enabled);
-        assert_eq!(
-            cfg.spaces_endpoint.as_deref(),
-            Some("https://example.com")
-        );
+        assert_eq!(cfg.spaces_endpoint.as_deref(), Some("https://example.com"));
         assert_eq!(cfg.spaces_region.as_deref(), Some("nyc3"));
         assert_eq!(cfg.spaces_bucket.as_deref(), Some("fold-bucket"));
         assert_eq!(cfg.spaces_prefix, "custom/prefix".to_string());

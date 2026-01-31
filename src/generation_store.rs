@@ -390,12 +390,8 @@ fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
             let base_canon = base_path
                 .canonicalize()
                 .unwrap_or_else(|_| base_path.to_path_buf());
-            let path_canon = path
-                .canonicalize()
-                .unwrap_or_else(|_| path.to_path_buf());
-            path_canon
-                .strip_prefix(&base_canon)
-                .map(PathBuf::from)
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            path_canon.strip_prefix(&base_canon).map(PathBuf::from)
         })
         .unwrap_or_else(|_| {
             path.file_name()
@@ -1258,9 +1254,8 @@ impl GenerationStore {
 
                 while let Some(item) = reader.next() {
                     let streamed = item?;
-                    let ortho = Ortho::from_bytes(streamed.bytes.as_ref()).map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    let ortho = Ortho::from_bytes(streamed.bytes.as_ref())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     if bound_existing_ortho(&ortho, interner, best_score, impacted_prefixes) {
                         pruned = pruned.saturating_add(1);
                         continue;
@@ -1393,7 +1388,13 @@ impl GenerationStore {
                 continue;
             }
             drained += 1;
-            let runs = compact_landing(bucket, raw, cfg, &self.base_path, Some(&mut self.compression_stats))?;
+            let runs = compact_landing(
+                bucket,
+                raw,
+                cfg,
+                &self.base_path,
+                Some(&mut self.compression_stats),
+            )?;
             for run in runs {
                 // Offloader hook will remove if configured; propagate failures so caller can pause.
                 maybe_offload_and_delete(run.path())?;
@@ -1562,8 +1563,12 @@ impl GenerationStore {
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:merging", bucket));
             }
-            let unique_run =
-                merge_unique(runs, cfg, &self.base_path, Some(&mut self.compression_stats))?;
+            let unique_run = merge_unique(
+                runs,
+                cfg,
+                &self.base_path,
+                Some(&mut self.compression_stats),
+            )?;
 
             // Phase: Anti-join against history
             if let Some(cb) = &progress {
@@ -1670,8 +1675,12 @@ impl GenerationStore {
             .collect();
 
         // Merge them into a single unique run
-        let merged =
-            merge_unique(runs_to_merge, cfg, &self.base_path, Some(&mut self.compression_stats))?;
+        let merged = merge_unique(
+            runs_to_merge,
+            cfg,
+            &self.base_path,
+            Some(&mut self.compression_stats),
+        )?;
 
         // Move merged run to history with next available ID
         let history_dir = self
@@ -2172,10 +2181,10 @@ impl Default for GenerationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation_store::set_offload_metrics_handle;
+    use crate::metrics::Metrics;
     use crate::offload_cache::OffloadCache;
     use crate::offloader::{MockObjectStore, OffloadClient};
-    use crate::metrics::Metrics;
-    use crate::generation_store::set_offload_metrics_handle;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -2361,8 +2370,11 @@ mod tests {
         let base_path = temp_dir.path().to_path_buf();
         let offload_dir = base_path.join("offloaded");
         let uploads: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-        let offloader =
-            Arc::new(RecordingOffloader::new(offload_dir.clone(), uploads.clone(), base_path.clone()));
+        let offloader = Arc::new(RecordingOffloader::new(
+            offload_dir.clone(),
+            uploads.clone(),
+            base_path.clone(),
+        ));
         let _guard = OffloaderGuard;
         set_run_offloader(Some(offloader));
         let metrics = Metrics::new();
@@ -2572,8 +2584,7 @@ mod tests {
 
         let logs = metrics.snapshot().logs;
         assert!(
-            logs.iter()
-                .any(|l| l.message.contains("Offload failed")),
+            logs.iter().any(|l| l.message.contains("Offload failed")),
             "expected offload failure log entry"
         );
 

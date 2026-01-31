@@ -1,6 +1,4 @@
-use crate::generation_store::{
-    RunDownloader, RunOffloader, set_run_downloader, set_run_offloader,
-};
+use crate::generation_store::{RunDownloader, RunOffloader, set_run_downloader, set_run_offloader};
 use crate::offload_cache::OffloadCache;
 use crate::offload_config::OffloadConfig;
 use crate::offloader::{
@@ -138,15 +136,12 @@ pub fn configure_offload_runtime(
         cfg.spaces_access_key.clone(),
         cfg.spaces_secret_key.clone(),
     ) {
-        let region = cfg.spaces_region.clone().or_else(|| Some("us-east-1".to_string()));
-        let store = SpacesObjectStore::new(
-            &bucket,
-            region,
-            Some(endpoint),
-            &access,
-            &secret,
-        )
-        .map_err(offload_err_to_io)?;
+        let region = cfg
+            .spaces_region
+            .clone()
+            .or_else(|| Some("us-east-1".to_string()));
+        let store = SpacesObjectStore::new(&bucket, region, Some(endpoint), &access, &secret)
+            .map_err(offload_err_to_io)?;
         OffloadClient::new(Arc::new(store), bucket, prefix)
     } else {
         // No supported store configured (missing endpoint/creds or storage selection).

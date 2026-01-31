@@ -513,8 +513,7 @@ impl Metrics {
 
     pub fn increment_pruned_root_span(&self, count: usize) {
         let mut inner = self.inner.lock().unwrap();
-        inner.operation.pruned_root_span =
-            inner.operation.pruned_root_span.saturating_add(count);
+        inner.operation.pruned_root_span = inner.operation.pruned_root_span.saturating_add(count);
     }
 
     pub fn increment_pruned_bound(&self, count: usize) {

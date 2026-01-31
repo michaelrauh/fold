@@ -3,9 +3,9 @@ use crate::{
     error::FoldError,
     file_handler::StateConfig,
     generation_store::{Config, GenerationStore, ProgressCallback, Role},
-    offload_config::OffloadConfig,
     interner::Interner,
     metrics::{GenerationStat, Metrics},
+    offload_config::OffloadConfig,
     ortho::{Ortho, PayloadVal, payload_to_usize},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -147,8 +147,11 @@ where
 
     let mut sys = sysinfo::System::new();
     let mut disks = Disks::new_with_refreshed_list();
-    let disk_base = state_config
-        .map(|cfg| cfg.base_dir.canonicalize().unwrap_or_else(|_| cfg.base_dir.clone()));
+    let disk_base = state_config.map(|cfg| {
+        cfg.base_dir
+            .canonicalize()
+            .unwrap_or_else(|_| cfg.base_dir.clone())
+    });
     let mut generation = 0u64;
     let mut generation_stats: Vec<GenerationStat> = Vec::new();
     let offload_cfg = OffloadConfig::from_env();
@@ -333,17 +336,13 @@ where
 
                 // Compression stats
                 let comp = store.compression_stats();
-                metrics.set_compression_bytes(
-                    comp.uncompressed_bytes,
-                    comp.compressed_bytes,
-                );
+                metrics.set_compression_bytes(comp.uncompressed_bytes, comp.compressed_bytes);
 
                 // Housekeeping hook (heartbeats, mem claim, leader lock)
                 housekeeping()?;
 
                 // Pressure watchdog: drain/compact/offload under landing/disk pressure.
-                let _ = pressure_watchdog
-                    .maybe_handle(store, cfg, last_disk_available, metrics)?;
+                let _ = pressure_watchdog.maybe_handle(store, cfg, last_disk_available, metrics)?;
             }
 
             // Get requirements from ortho
@@ -521,7 +520,7 @@ fn current_process_rss_bytes(sys: &mut System) -> usize {
 #[cfg(test)]
 mod pressure_watchdog_tests {
     use super::*;
-    use crate::generation_store::{set_run_offloader, RunOffloader};
+    use crate::generation_store::{RunOffloader, set_run_offloader};
     use std::io;
     use std::path::Path;
     use std::sync::{Arc, Mutex};

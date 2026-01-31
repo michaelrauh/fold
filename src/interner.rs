@@ -32,8 +32,11 @@ impl Interner {
             .iter()
             .map(|(k, v)| (k.clone(), v.ones().map(|x| x as u32).collect()))
             .collect();
-        let prefix_stats: Vec<(Vec<usize>, usize)> =
-            self.prefix_stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let prefix_stats: Vec<(Vec<usize>, usize)> = self
+            .prefix_stats
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         InternerSerializable {
             version: self.version,
             vocabulary: self.vocabulary.clone(),
@@ -152,10 +155,7 @@ impl Interner {
         vocabulary: &[String],
         vocab_len: usize,
         existing: Option<&Interner>,
-    ) -> (
-        HashMap<Vec<usize>, FixedBitSet>,
-        HashMap<Vec<usize>, usize>,
-    ) {
+    ) -> (HashMap<Vec<usize>, FixedBitSet>, HashMap<Vec<usize>, usize>) {
         let mut prefix_to_completions = match existing {
             Some(interner) => {
                 let mut new_map = interner.prefix_to_completions.clone();
@@ -228,25 +228,28 @@ impl Interner {
                 fbs.grow(vocab_len);
                 fbs
             });
-            prefix_stats.entry(vec![idx]).and_modify(|len| {
-                if *len < 1 {
-                    *len = 1;
-                }
-            }).or_insert(1);
+            prefix_stats
+                .entry(vec![idx])
+                .and_modify(|len| {
+                    if *len < 1 {
+                        *len = 1;
+                    }
+                })
+                .or_insert(1);
         }
         // Ensure every full phrase itself as terminal prefix with empty completions and stats
         for indices in &phrase_indices {
             if indices.is_empty() {
                 continue;
             }
-            prefix_to_completions.entry(indices.clone()).or_insert_with(|| {
-                let mut fbs = FixedBitSet::with_capacity(vocab_len);
-                fbs.grow(vocab_len);
-                fbs
-            });
-            prefix_stats
+            prefix_to_completions
                 .entry(indices.clone())
-                .or_insert(indices.len());
+                .or_insert_with(|| {
+                    let mut fbs = FixedBitSet::with_capacity(vocab_len);
+                    fbs.grow(vocab_len);
+                    fbs
+                });
+            prefix_stats.entry(indices.clone()).or_insert(indices.len());
         }
         (prefix_to_completions, prefix_stats)
     }

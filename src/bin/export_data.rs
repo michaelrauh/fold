@@ -348,8 +348,8 @@ fn export_ortho_archive(
     let mut store = GenerationStore::new_with_config(work_dir.clone(), 8)?;
     store.configure(&cfg);
     let offload_cfg = OffloadConfig::from_env();
-    let _offload_guard = configure_offload_runtime(&work_dir, &offload_cfg)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let _offload_guard =
+        configure_offload_runtime(&work_dir, &offload_cfg).map_err(|e| anyhow::anyhow!(e))?;
 
     let metrics = Metrics::new();
     let mut noop_housekeeping = || -> Result<(), FoldError> { Ok(()) };

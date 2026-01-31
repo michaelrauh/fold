@@ -26,14 +26,15 @@ fn pruning_skips_low_potential_completion_but_keeps_higher() {
     );
 
     // Ortho with a single token so required prefixes include [a]
-    let ortho = Ortho::new()
-        .add(PayloadVal::try_from(a_idx).unwrap())[0]
-        .clone();
+    let ortho = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0].clone();
 
     // Compute upper-bound potentials for each completion using axis totals.
     let potential_b = upper_bound_score(&[total_ab], ortho.volume(), ortho.dims().len());
     let potential_c = upper_bound_score(&[total_ac], ortho.volume(), ortho.dims().len());
-    assert!(potential_c > potential_b, "longer branch should have higher potential");
+    assert!(
+        potential_c > potential_b,
+        "longer branch should have higher potential"
+    );
 
     // Choose a best_score that prunes the short branch ([a b]) but not the longer one ([a c ...]).
     let best_score = if potential_c.0 > potential_b.0 {
@@ -75,15 +76,9 @@ fn impacted_seeding_prunes_hopeless_prefixes() {
     let b_idx = vocab_index(&interner, "b");
     let c_idx = vocab_index(&interner, "c");
 
-    let ortho_a = Ortho::new()
-        .add(PayloadVal::try_from(a_idx).unwrap())[0]
-        .clone();
-    let ortho_ab = ortho_a
-        .add(PayloadVal::try_from(b_idx).unwrap())[0]
-        .clone();
-    let ortho_ac = ortho_a
-        .add(PayloadVal::try_from(c_idx).unwrap())[0]
-        .clone();
+    let ortho_a = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0].clone();
+    let ortho_ab = ortho_a.add(PayloadVal::try_from(b_idx).unwrap())[0].clone();
+    let ortho_ac = ortho_a.add(PayloadVal::try_from(c_idx).unwrap())[0].clone();
 
     // Use the same best_score derived from potentials above logic.
     let best_score = {
