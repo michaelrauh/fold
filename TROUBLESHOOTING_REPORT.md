@@ -109,7 +109,7 @@ pub fn upper_bound_score(
     dim_count: usize,
 ) -> (usize, usize) {
     let mut volume_upper: usize = 1;
-    let mut capacity_upper: usize = 1;  // NEW: track max cells separately
+    let mut capacity_upper: usize = 1;  // Track total cell count (max fullness)
     
     for t in axis_totals.iter().take(dim_count) {
         volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
