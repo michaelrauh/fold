@@ -2,26 +2,55 @@
 
 ## Summary
 
-The `run_doubling` process on the droplet is ending far too early when processing the 8k word input (e.txt - "A Princess of Mars" by Edgar Rice Burroughs). This report identifies the root cause after comparing the current branch to main.
+The `run_doubling` process on the droplet is ending far too early when processing the 8k word input (e.txt - "A Princess of Mars" by Edgar Rice Burroughs). After clarification that the pruning is intentional, this report identifies a **bug in the upper bound calculation** that causes over-pruning, leading to premature termination after ~5 generations.
 
 ## Root Cause Identified
 
-**The current branch has introduced a new completion pruning feature (`completion_pruning.rs`) that aggressively prunes completions at the root level. This pruning is NOT present in the main branch.**
+**BUG: The `upper_bound_score` function in `completion_pruning.rs` incorrectly computes the fullness upper bound, causing valid search paths to be pruned prematurely.**
 
-### Key Difference
+### The Bug
 
-| Aspect | Main Branch | Current Branch |
-|--------|-------------|----------------|
-| Completion Pruning | **Not present** | **Present** |
-| Processing Model | Continuous BFS (work_queue until empty) | Generational processing with transitions |
-| Root Pruning | No root-level pruning | Prunes single-span completions |
-| Termination Condition | Queue empty and tracker buffer empty | `new_work == 0` after generation transition |
+In `src/completion_pruning.rs`, the `upper_bound_score` function returns:
 
-## Technical Analysis
+```rust
+pub fn upper_bound_score(
+    axis_totals: &[usize],
+    min_volume: usize,
+    dim_count: usize,
+) -> (usize, usize) {
+    let mut volume_upper: usize = 1;
+    for t in axis_totals.iter().take(dim_count) {
+        volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
+    }
+    volume_upper = volume_upper.max(min_volume);
+    (volume_upper, volume_upper)  // <-- BUG: fullness_upper should NOT equal volume_upper
+}
+```
 
-### The Problematic Pruning Logic
+**The problem:** Setting `fullness_upper = volume_upper` is mathematically incorrect.
 
-The new pruning is implemented in `src/completion_pruning.rs`, function `bound_completion()`:
+- **Volume** = product of (dim - 1) for each dimension
+- **Fullness** = count of filled cells (total capacity)
+
+For a 3×3 ortho:
+- Volume = (3-1) × (3-1) = **4**
+- Max Fullness = 3 × 3 = **9** (all cells can be filled)
+
+**Fullness can exceed volume!** The current code underestimates the fullness potential, causing over-pruning.
+
+### How This Causes Early Termination (~5 Generations)
+
+1. As processing continues, `best_score` increases (e.g., to `(4, 5)`)
+2. `upper_bound_score` returns `(volume_upper, volume_upper)`, e.g., `(4, 4)`
+3. The comparison `potential_score <= best_score` becomes `(4, 4) <= (4, 5)`
+4. Since `4 <= 5` when first elements are equal, this is **true** → we **PRUNE**
+5. But the path could have led to fullness 6, 7, 8, or 9!
+
+This explains why the search terminates after ~5 generations: by that point, `best_score.1` (fullness) has grown enough that the underestimated `fullness_upper` causes valid paths to be pruned.
+
+## NOTE: Root-Level Pruning is Intentional
+
+The root-level "single-span" pruning (lines 12-18) is **intentional** and correct:
 
 ```rust
 if required.is_empty() {
@@ -30,17 +59,24 @@ if required.is_empty() {
         .completions_for_prefix(&vec![completion])
         .expect("missing completions bitset for single-token prefix")
         .count_ones(..);
-    return completion_count <= 1;  // <-- PRUNE if only 1 continuation
+    return completion_count <= 1;  // Intentional: prunes dead-end single chains
 }
 ```
 
-This means:
-1. When processing the seed/root ortho (`required.is_empty()` is true)
-2. For each possible first token `completion`
-3. Look up how many continuations that token has
-4. **Prune the token if it only has 1 continuation**
+This prunes single-chain tokens at the root level, which is a valid optimization to avoid exploring dead paths. **This is NOT the bug.**
 
-### Why This Causes Early Termination
+## Technical Analysis
+
+### Key Difference from Main Branch
+
+| Aspect | Main Branch | Current Branch |
+|--------|-------------|----------------|
+| Completion Pruning | **Not present** | **Present (with bug)** |
+| `upper_bound_score` | N/A | Returns `(vol, vol)` - **underestimates fullness** |
+| Processing Model | Continuous BFS | Generational with anti-join |
+| Termination | Queue empty | `new_work == 0` after generation |
+
+### The Pruning Flow
 
 The pruning triggers in `src/generation_runner.rs` at lines 371-379:
 
@@ -48,124 +84,113 @@ The pruning triggers in `src/generation_runner.rs` at lines 371-379:
 for completion in completions {
     if bound_completion(&ortho, completion, interner, best_score) {
         metrics.increment_pruned_completions(1);
-        if required.is_empty() {
-            // Root span prune
-            metrics.increment_pruned_root_span(1);
-        } else {
-            metrics.increment_pruned_bound(1);
-        }
-        continue;  // <-- Skip this completion entirely
-    }
-    // ... rest of processing
-}
-```
-
-After the generation transition (`on_generation_end`), if all completions were pruned, `new_work == 0`, and the loop terminates:
-
-```rust
-if new_work == 0 {
-    metrics.add_log("No new work after transition; stopping generations".to_string());
-    break;
-}
-```
-
-### Why the 8k Input is Affected
-
-**Hypothesis (requires verification):** The text "A Princess of Mars" may have vocabulary characteristics where many words only have single continuations in the sentence structure. This could occur because:
-
-- Many unique word sequences where word A is always followed by word B (and B is never the start of another sequence)
-- These "single chain" tokens are all pruned at the root level
-- If *most* tokens in the vocabulary are single-chain, the system prunes almost everything
-
-This hypothesis is supported by the characteristics of the text:
-- Proper nouns (character names like "Dejah Thoris", place names like "Helium") that appear in fixed phrases
-- Technical or archaic vocabulary with limited usage patterns
-- Victorian-era prose style with specific patterns
-
-**To confirm this hypothesis**, check the TUI metrics or log output for `pruned_root_span` counts during processing. If most completions show high `pruned_root_span` values relative to `expanded_completions`, this confirms the root-level pruning is the culprit.
-
-### Main Branch Behavior (Why It Works)
-
-The main branch does NOT have this pruning. It processes **all** completions regardless of their continuation count:
-
-```rust
-// From main branch src/main.rs - no bound_completion call
-for chunk in completions.chunks(COMPLETION_CHUNK_SIZE) {
-    let mut batch_ids = Vec::new();
-    for completion in chunk {
-        let children = ortho.add(*completion);  // <-- ALL completions processed
         // ...
+        continue;  // Skip this completion
     }
+    // ... process completion
 }
+```
+
+Within `bound_completion()`, when `required` is NOT empty (generations > 0):
+
+```rust
+let potential_score = upper_bound_score(&totals, ortho.volume(), dim_count);
+potential_score <= best_score  // <-- BUG: fullness comparison is wrong
+```
+
+## Fix Required
+
+The `upper_bound_score` function should compute a proper upper bound for fullness:
+
+```rust
+pub fn upper_bound_score(
+    axis_totals: &[usize],
+    min_volume: usize,
+    dim_count: usize,
+) -> (usize, usize) {
+    let mut volume_upper: usize = 1;
+    let mut capacity_upper: usize = 1;  // NEW: track max cells separately
+    
+    for t in axis_totals.iter().take(dim_count) {
+        volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
+        capacity_upper = capacity_upper.saturating_mul(*t);  // Total cells = product of dims
+    }
+    volume_upper = volume_upper.max(min_volume);
+    
+    // Fullness can reach up to capacity (all cells filled)
+    (volume_upper, capacity_upper)
+}
+```
+
+Alternatively, use `usize::MAX` for fullness to never prune based on fullness:
+
+```rust
+(volume_upper, usize::MAX)
 ```
 
 ## Evidence
 
-1. **Diff shows new file**: `src/completion_pruning.rs` is entirely new (258+ lines added)
-2. **Diff shows usage**: `generation_runner.rs` imports and uses `bound_completion`
-3. **No equivalent in main**: `git show origin/main:src/main.rs | grep "bound"` returns only one unrelated hit
-4. **Test name suggests intent**: `test bound_prunes_deep_single_span_at_root` confirms this is intentional behavior
+1. **Bug in `upper_bound_score`**: Returns `(volume_upper, volume_upper)` but fullness can exceed volume
+2. **~5 generation cutoff**: Matches the pattern where `best_score.1` (fullness) grows enough to trigger bad pruning
+3. **Math verification**: For 3×3 ortho, volume=4 but max_fullness=9
+4. **Diff shows new file**: `src/completion_pruning.rs` is entirely new (258+ lines added)
 
 ## Reproduction Steps
 
 1. Use the 8k word input (e.txt)
 2. Run `./run_doubling.sh e.txt`
-3. Observe early termination with message "No new work after transition; stopping generations"
+3. Observe termination after ~5 generations
+4. Check logs for high `pruned_bound` counts (not `pruned_root_span`)
 
-## Potential Fixes
+## Recommended Fix
 
-### Option 1: Disable Root-Level Span Pruning (Conservative)
-
-Modify `bound_completion` to not prune at root level:
+**Option 1: Fix the fullness upper bound calculation (Recommended)**
 
 ```rust
-if required.is_empty() {
-    // Option 1: Remove root pruning entirely
-    return false;
+pub fn upper_bound_score(
+    axis_totals: &[usize],
+    min_volume: usize,
+    dim_count: usize,
+) -> (usize, usize) {
+    let mut volume_upper: usize = 1;
+    for t in axis_totals.iter().take(dim_count) {
+        volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
+    }
+    volume_upper = volume_upper.max(min_volume);
+    
+    // Use usize::MAX for fullness to prevent over-pruning on fullness
+    // (volume-based pruning is the primary bound)
+    (volume_upper, usize::MAX)
 }
 ```
 
-### Option 2: Relax the Threshold (Moderate)
+**Option 2: Compute proper capacity**
 
 ```rust
-if required.is_empty() {
-    // Allow tokens with very few continuations (not just single-chain)
-    let completion_count = interner
-        .completions_for_prefix(&vec![completion])
-        .expect("missing completions bitset for single-token prefix")
-        .count_ones(..);
-    return completion_count == 0;  // Only prune if NO continuations (dead end)
+let mut capacity_upper: usize = 1;
+for t in axis_totals.iter().take(dim_count) {
+    capacity_upper = capacity_upper.saturating_mul(*t);
 }
+(volume_upper, capacity_upper)
 ```
-
-### Option 3: Add Fallback (Safe)
-
-Add a fallback mechanism that detects when all completions are pruned and reverts to unpruned expansion for at least some candidates.
-
-### Option 4: Make Pruning Configurable
-
-Add an environment variable or config option to disable the aggressive root pruning for certain inputs.
-
-## Recommendation
-
-The root-level "single-span pruning" appears to be an optimization that makes assumptions about input characteristics that don't hold for all texts. 
-
-**Recommended action**: Disable or relax the root-level pruning constraint (Option 1 or 2). The pruning at deeper levels (when `best_score` is established) may still be valuable, but the root-level heuristic is too aggressive.
 
 ## Files Involved
 
-- `src/completion_pruning.rs` - New pruning module (root cause)
-- `src/generation_runner.rs` - Uses the pruning, handles termination
-- `src/generation_store.rs` - New generational model with `on_generation_end`
-- `src/main.rs` - Orchestrates the processing
+- `src/completion_pruning.rs` - Contains the buggy `upper_bound_score` function (line 119-130)
+- `src/generation_runner.rs` - Uses `bound_completion` for pruning decisions
+- `src/generation_store.rs` - Generational model with `on_generation_end`
 
 ## Conclusion
 
-The early termination is caused by the new completion pruning feature that rejects tokens with only single continuations. For the 8k "Princess of Mars" text, this pruning appears to be too aggressive, resulting in root-level completions being pruned, which causes the generation loop to terminate with "No new work after transition."
+The early termination after ~5 generations is caused by a **bug in the `upper_bound_score` function** that incorrectly sets `fullness_upper = volume_upper`. Since fullness (number of filled cells) can significantly exceed volume (product of dim-1), the upper bound underestimates the potential score, causing valid search paths to be pruned.
 
-**To verify this root cause:**
-1. Run the 8k input and monitor the `pruned_root_span` metric in the TUI or logs
-2. Compare to the `expanded_completions` metric
-3. If `pruned_root_span >> expanded_completions` (pruned much larger than expanded), this confirms the diagnosis
+**The fix is simple**: Change line 129 in `completion_pruning.rs` from:
+```rust
+(volume_upper, volume_upper)
+```
+to:
+```rust
+(volume_upper, usize::MAX)
+```
 
-The main branch does not have this issue because it lacks the completion pruning feature entirely, processing all completions regardless of their continuation characteristics.
+This ensures pruning is based only on volume bounds, not the incorrectly computed fullness bound. The root-level "single-span" pruning (lines 12-18) is intentional and correct - only the bound-based pruning (line 41) has the bug in its upper bound calculation.
