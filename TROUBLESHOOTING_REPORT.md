@@ -71,16 +71,18 @@ if new_work == 0 {
 
 ### Why the 8k Input is Affected
 
-The text "A Princess of Mars" likely has vocabulary characteristics where many words only have single continuations in the sentence structure. For example:
+**Hypothesis (requires verification):** The text "A Princess of Mars" may have vocabulary characteristics where many words only have single continuations in the sentence structure. This could occur because:
 
-- If the text has many unique word sequences where word A is always followed by word B (and B is never the start of another sequence)
+- Many unique word sequences where word A is always followed by word B (and B is never the start of another sequence)
 - These "single chain" tokens are all pruned at the root level
 - If *most* tokens in the vocabulary are single-chain, the system prunes almost everything
 
-This is especially likely with:
-- Proper nouns (character names, place names) that appear in fixed phrases
+This hypothesis is supported by the characteristics of the text:
+- Proper nouns (character names like "Dejah Thoris", place names like "Helium") that appear in fixed phrases
 - Technical or archaic vocabulary with limited usage patterns
-- Smaller text samples where vocabulary diversity is lower
+- Victorian-era prose style with specific patterns
+
+**To confirm this hypothesis**, check the TUI metrics or log output for `pruned_root_span` counts during processing. If most completions show high `pruned_root_span` values relative to `expanded_completions`, this confirms the root-level pruning is the culprit.
 
 ### Main Branch Behavior (Why It Works)
 
@@ -159,6 +161,11 @@ The root-level "single-span pruning" appears to be an optimization that makes as
 
 ## Conclusion
 
-The early termination is caused by the new completion pruning feature that rejects tokens with only single continuations. For the 8k "Princess of Mars" text, this pruning is too aggressive, resulting in all or most root-level completions being pruned, which causes the generation loop to terminate immediately with "No new work after transition."
+The early termination is caused by the new completion pruning feature that rejects tokens with only single continuations. For the 8k "Princess of Mars" text, this pruning appears to be too aggressive, resulting in root-level completions being pruned, which causes the generation loop to terminate with "No new work after transition."
+
+**To verify this root cause:**
+1. Run the 8k input and monitor the `pruned_root_span` metric in the TUI or logs
+2. Compare to the `expanded_completions` metric
+3. If `pruned_root_span >> expanded_completions` (pruned much larger than expanded), this confirms the diagnosis
 
 The main branch does not have this issue because it lacks the completion pruning feature entirely, processing all completions regardless of their continuation characteristics.
