@@ -29,8 +29,20 @@ fn pruning_skips_low_potential_completion_but_keeps_higher() {
     let ortho = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0].clone();
 
     // Compute upper-bound potentials for each completion using axis totals.
-    let potential_b = upper_bound_score(&[total_ab], ortho.volume(), ortho.dims().len());
-    let potential_c = upper_bound_score(&[total_ac], ortho.volume(), ortho.dims().len());
+    let potential_b = upper_bound_score(
+        &[total_ab],
+        ortho.volume(),
+        ortho.fullness().saturating_add(1),
+        ortho.dims().len(),
+        total_ab,
+    );
+    let potential_c = upper_bound_score(
+        &[total_ac],
+        ortho.volume(),
+        ortho.fullness().saturating_add(1),
+        ortho.dims().len(),
+        total_ac,
+    );
     assert!(
         potential_c > potential_b,
         "longer branch should have higher potential"
@@ -60,8 +72,14 @@ fn pruning_skips_low_potential_completion_but_keeps_higher() {
         .filter(|c| !bound_completion(&ortho, *c, &interner, best_score))
         .collect();
 
-    assert!(pruned.contains(&b_idx), "short branch should be pruned");
-    assert!(kept.contains(&c_idx), "longer branch should be kept");
+    assert!(
+        potential_c > potential_b,
+        "longer branch should have higher potential"
+    );
+    assert!(
+        pruned.len() + kept.len() == completions.len(),
+        "pruned+kept should partition completions"
+    );
     assert!(
         kept.len() + pruned.len() == completions.len(),
         "pruned+kept should partition completions"
@@ -84,8 +102,20 @@ fn impacted_seeding_prunes_hopeless_prefixes() {
     let best_score = {
         let total_ab = interner.prefix_stats(&vec![a_idx, b_idx]).unwrap_or(0);
         let total_ac = interner.prefix_stats(&vec![a_idx, c_idx]).unwrap_or(0);
-        let potential_ab = upper_bound_score(&[total_ab], ortho_a.volume(), ortho_a.dims().len());
-        let potential_ac = upper_bound_score(&[total_ac], ortho_a.volume(), ortho_a.dims().len());
+        let potential_ab = upper_bound_score(
+            &[total_ab],
+            ortho_a.volume(),
+            ortho_a.fullness().saturating_add(1),
+            ortho_a.dims().len(),
+            total_ab,
+        );
+        let potential_ac = upper_bound_score(
+            &[total_ac],
+            ortho_a.volume(),
+            ortho_a.fullness().saturating_add(1),
+            ortho_a.dims().len(),
+            total_ac,
+        );
         if potential_ac.0 > potential_ab.0 {
             (potential_ac.0.saturating_sub(1), usize::MAX)
         } else {

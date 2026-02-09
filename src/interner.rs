@@ -308,6 +308,11 @@ impl Interner {
         self.prefix_stats.get(prefix).copied()
     }
 
+    /// Maximum descriptor length across all prefixes (used for optimistic bounds when axis is missing).
+    pub fn max_prefix_len(&self) -> usize {
+        self.prefix_stats.values().copied().max().unwrap_or(0)
+    }
+
     pub fn max_suffix_depth(&self, prefix: &[usize]) -> Option<usize> {
         self.prefix_stats(prefix)
             .map(|max_desc_len| max_desc_len.saturating_sub(prefix.len()))
@@ -687,6 +692,36 @@ mod tests {
     }
 
     #[test]
+    fn commas_shrink_phrase_depth_drastically() {
+        // Without commas: one 7-word sentence → max_desc_len for [a] is 7
+        let no_commas = Interner::from_text("a b c d e f g");
+        let vocab_no_commas = no_commas.vocabulary();
+        let a_idx = vocab_no_commas.iter().position(|w| w == "a").unwrap();
+        assert_eq!(
+            no_commas.prefix_stats(&[a_idx]),
+            Some(7),
+            "continuous text should yield full length"
+        );
+
+        // With commas: split_into_sentences breaks on ',' so a/b/c/d become single-word sentences.
+        // They get stats=1 only; only the tail 'e f g' forms phrases.
+        let with_commas = Interner::from_text("a, b, c, d, e f g");
+        let vocab_with_commas = with_commas.vocabulary();
+        let a_idx_commas = vocab_with_commas.iter().position(|w| w == "a").unwrap();
+        let e_idx_commas = vocab_with_commas.iter().position(|w| w == "e").unwrap();
+        assert_eq!(
+            with_commas.prefix_stats(&[a_idx_commas]),
+            Some(1),
+            "comma splitting collapses depth for early tokens"
+        );
+        assert_eq!(
+            with_commas.prefix_stats(&[e_idx_commas]),
+            Some(3),
+            "tail chunk retains its own depth"
+        );
+    }
+
+    #[test]
     fn test_add_text_updates_prefix_stats() {
         let base = Interner::from_text("a b");
         let extended = base.add_text("a b c");
@@ -728,6 +763,24 @@ mod tests {
         let after = decoded.prefix_stats(&prefix).unwrap();
 
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn prefix_stats_takes_longest_phrase_for_prefix() {
+        // Prefix [a] appears in two phrases: short (a b) and long (a b c d).
+        let interner = Interner::from_text("a b. a b c d");
+        let vocab = interner.vocabulary();
+        let a_idx = vocab.iter().position(|w| w == "a").unwrap();
+        let b_idx = vocab.iter().position(|w| w == "b").unwrap();
+
+        let a_len = interner.prefix_stats(&[a_idx]).unwrap();
+        let ab_len = interner.prefix_stats(&[a_idx, b_idx]).unwrap();
+
+        assert_eq!(a_len, 4, "max_desc_len for [a] should use the longest phrase");
+        assert_eq!(
+            ab_len, 4,
+            "max_desc_len for [a b] should use the longest phrase containing it"
+        );
     }
 
     #[test]

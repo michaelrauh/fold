@@ -157,7 +157,37 @@ where
     let offload_cfg = OffloadConfig::from_env();
     let pressure_watchdog = PressureWatchdog::from_config(offload_cfg);
     let mut last_disk_available: Option<u64> = None;
+    let mut prev_new_work: Option<u64> = None;
     crate::generation_store::set_offload_metrics_handle(Some(metrics.clone_handle()));
+
+    // One-time snapshot: prefix_stats for single-token prefixes (to detect underestimation)
+    {
+        let single_prefix_lens: Vec<usize> = interner
+            .prefix_entries()
+            .filter_map(|(p, _)| {
+                if p.len() == 1 {
+                    interner.prefix_stats(p.as_slice())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !single_prefix_lens.is_empty() {
+            let mut sorted = single_prefix_lens.clone();
+            sorted.sort_unstable();
+            let len = sorted.len();
+            let median = sorted[len / 2];
+            let p90 = sorted[((len as f64 * 0.9).floor() as usize).min(len - 1)];
+            metrics.add_log(format!(
+                "prefix_stats single-token lens: min={}, median={}, p90={}, max={}, count={}",
+                sorted[0],
+                median,
+                p90,
+                sorted[len - 1],
+                len
+            ));
+        }
+    }
 
     // Tracking for throughput calculation
     let mut last_report_time = Instant::now();
@@ -180,6 +210,16 @@ where
             g.run_budget_bytes = cfg.run_budget_bytes;
             g.fan_in = cfg.fan_in;
         });
+        // Extra logging to debug early queue exhaustion
+        metrics.add_log(format!(
+            "Gen {} start: work_len={}, landing={}, best_score=({},{}), prev_new_work={}",
+            generation,
+            work_len,
+            store.total_landing_size(),
+            best_score.0,
+            best_score.1,
+            prev_new_work.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string())
+        ));
         // Set progress tracking for this generation
         metrics.update_operation(|op| {
             op.progress_total = work_len as usize;
@@ -226,6 +266,7 @@ where
 
         metrics.reset_prune_counts();
         let mut gen_processed = 0u64;
+        let mut pop_work_calls = 0u64;
 
         let gen_start = Instant::now();
         let accepted_before = store.seen_len_accepted();
@@ -233,6 +274,7 @@ where
 
         // Process all work in this generation
         while let Some(ortho) = store.pop_work()? {
+            pop_work_calls += 1;
             if should_quit() {
                 break;
             }
@@ -404,8 +446,8 @@ where
         }
 
         metrics.add_log(format!(
-            "Generation {}: processed {} orthos",
-            generation, gen_processed
+            "Generation {}: processed={}, pop_work_calls={}",
+            generation, gen_processed, pop_work_calls
         ));
 
         // End of generation: drain, compact, anti-join, push new work
@@ -446,11 +488,16 @@ where
         metrics.record_landing_buffer_count(store.total_landing_size());
 
         metrics.add_log(format!(
-            "Generation {} complete: {} new work items, {} total seen",
+            "Generation {} complete: processed={}, pop_work_calls={}, accepted_delta={}, new_work={}, work_len_after={}, total_seen={}",
             generation,
+            gen_processed,
+            pop_work_calls,
+            accepted_delta,
             new_work,
+            store.work_len(),
             store.seen_len_accepted()
         ));
+        prev_new_work = Some(new_work);
         let (pruned, expanded, pruned_root_span, pruned_bound) = metrics.take_prune_counts();
         metrics.record_prune_sample(generation, pruned, expanded, pruned_root_span, pruned_bound);
 

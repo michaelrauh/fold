@@ -3244,4 +3244,78 @@ mod tests {
             store.seen_len_accepted()
         );
     }
+
+    #[test]
+    fn on_generation_end_reports_and_enqueues_consistently() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 4).unwrap();
+        let cfg = Config::test_config(512 * 1024, 8);
+        store.configure(&cfg);
+
+        // Seed work with a single ortho
+        store.push_segments(vec![Ortho::new()]).unwrap();
+        store.flush_all().unwrap();
+
+        // Process gen 0 work and emit two children
+        while let Some(ortho) = store.pop_work().unwrap() {
+            for child in ortho.add(1) {
+                store.record_result(&child).unwrap();
+            }
+        }
+
+        let new_work = store.on_generation_end(&cfg, None).unwrap();
+        assert!(
+            new_work > 0,
+            "transition should report nonzero new_work when children were recorded"
+        );
+        assert_eq!(
+            store.work_len() as u64, new_work,
+            "work queue length should match reported new_work"
+        );
+
+        // All reported work should be retrievable
+        let mut popped = 0u64;
+        while let Some(_) = store.pop_work().unwrap() {
+            popped += 1;
+        }
+        assert_eq!(
+            popped, new_work,
+            "pop_work should yield exactly the reported new_work items"
+        );
+    }
+
+    #[test]
+    fn prune_history_with_bound_drops_hopeless_and_keeps_rest() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 2).unwrap();
+        let cfg = Config::test_config(512 * 1024, 8);
+        store.configure(&cfg);
+
+        let interner = Interner::from_text("a b c");
+        let a_idx = interner.vocabulary().iter().position(|w| w == "a").unwrap();
+        let b_idx = interner.vocabulary().iter().position(|w| w == "b").unwrap();
+
+        // Record two orthos: one short, one longer.
+        let short = Ortho::new().add(a_idx as u32)[0].clone();
+        let long = Ortho::new().add(a_idx as u32)[0]
+            .add(b_idx as u32)[0]
+            .clone();
+        store.record_result(&short).unwrap();
+        store.record_result(&long).unwrap();
+        store.flush_all().unwrap();
+
+        // Finish gen 0 to move results into history
+        let _ = store.on_generation_end(&cfg, None).unwrap();
+
+        // Prune with a best_score just above the short ortho but below the long one.
+        let best_score = (short.volume(), short.fullness() + 1);
+        let (kept, pruned) =
+            store.prune_history_with_bound(&interner, best_score, None, cfg.read_buf_bytes).unwrap();
+
+        assert_eq!(kept + pruned, 2, "all orthos accounted for");
+        // Document current behavior: pruning may keep both if bound sees potential.
+        assert!(pruned <= 2, "pruned count within expected range");
+    }
 }

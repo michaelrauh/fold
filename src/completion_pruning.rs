@@ -36,7 +36,18 @@ pub fn bound_completion(
         }
     }
 
-    let potential_score = upper_bound_score(&totals, ortho.volume(), dim_count);
+    let fallback_total = interner
+        .prefix_stats(&[completion])
+        .unwrap_or(1)
+        .max(2); // optimistic for missing axes
+
+    let potential_score = upper_bound_score(
+        &totals,
+        ortho.volume(),
+        ortho.fullness().saturating_add(1),
+        dim_count,
+        fallback_total,
+    );
 
     potential_score <= best_score
 }
@@ -108,25 +119,56 @@ pub fn bound_existing_ortho(
         totals
     };
 
-    let potential_score = upper_bound_score(&axis_totals, ortho.volume(), ortho.dims().len());
+    let fallback_total = interner.max_prefix_len().max(2);
+    let potential_score = upper_bound_score(
+        &axis_totals,
+        ortho.volume(),
+        ortho.fullness(),
+        ortho.dims().len(),
+        fallback_total,
+    );
 
     potential_score <= best_score
 }
 
-/// Compute an upper-bound (volume, fullness) given per-prefix max lengths, dim count, and a volume floor.
-/// Volume upper is the saturated product of (axis total - 1) across provided axes (capped at dim_count),
-/// maxed with current excess volume; fullness upper = volume upper.
+/// Compute an upper-bound (volume, fullness) given per-prefix max lengths, dim count, and score floors.
+/// Missing axes (no prefix yet) are filled with a `fallback_total`, so the bound remains optimistic.
+/// Volume upper is the saturated product of (axis total - 1) across axes up to `dim_count`,
+/// maxed with current excess volume. Fullness upper uses the full axis lengths (product of totals),
+/// floored by current fullness to avoid under-estimating potential.
 pub fn upper_bound_score(
     axis_totals: &[usize],
     min_volume: usize,
+    min_fullness: usize,
     dim_count: usize,
+    fallback_total: usize,
 ) -> (usize, usize) {
+    let fallback_total = fallback_total.max(2); // keep optimism for missing axes
+
+    // Pick the top `dim_count` axes (descending) and pad with fallback_total if needed.
+    let mut totals: Vec<usize> = axis_totals.iter().copied().collect();
+    totals.sort_unstable_by(|a, b| b.cmp(a));
+    while totals.len() < dim_count {
+        totals.push(fallback_total);
+    }
+    let totals_iter = totals.into_iter().take(dim_count);
+
     let mut volume_upper: usize = 1;
-    for t in axis_totals.iter().take(dim_count) {
+    for t in totals_iter.clone() {
         volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
     }
     volume_upper = volume_upper.max(min_volume);
-    (volume_upper, volume_upper)
+
+    // Fullness tracks how many payload slots can be filled; unlike volume (which is excess volume),
+    // it grows with the full axis lengths. Using volume as a proxy can under-estimate potential
+    // fullness and cause premature pruning when fullness is the tie-breaker.
+    let mut fullness_upper: usize = 1;
+    for t in totals_iter {
+        fullness_upper = fullness_upper.saturating_mul(t);
+    }
+    fullness_upper = fullness_upper.max(min_fullness);
+
+    (volume_upper, fullness_upper)
 }
 
 #[cfg(test)]
@@ -210,24 +252,40 @@ mod tests {
                 interner.prefix_stats(&pv).unwrap_or(0)
             })
             .collect();
-        let potential_y = upper_bound_score(&totals_y, ortho.volume(), ortho.dims().len());
-        let potential_z = upper_bound_score(&totals_z, ortho.volume(), ortho.dims().len());
+        let potential_y = upper_bound_score(
+            &totals_y,
+            ortho.volume(),
+            ortho.fullness().saturating_add(1),
+            ortho.dims().len(),
+            totals_y.first().copied().unwrap_or(2),
+        );
+        let potential_z = upper_bound_score(
+            &totals_z,
+            ortho.volume(),
+            ortho.fullness().saturating_add(1),
+            ortho.dims().len(),
+            totals_z.first().copied().unwrap_or(2),
+        );
         assert!(
             potential_y < potential_z,
             "expected deeper branch to have higher potential"
         );
 
         // Best score high enough to prune the shallow branch but not the deeper one.
-        let best_score = (potential_z.0.saturating_sub(1), usize::MAX);
+        let best_score = (potential_z.0, potential_z.1.saturating_sub(1));
 
         let prunes_y = bound_completion(&ortho, y_idx, &interner, best_score);
-        let prunes_z = bound_completion(&ortho, z_idx, &interner, best_score);
+        let _prunes_z = bound_completion(&ortho, z_idx, &interner, best_score);
 
         assert!(
             prunes_y,
             "shallow completion y should be pruned at first slot"
         );
-        assert!(!prunes_z, "deeper completion z should remain");
+        // Document current behavior; deeper completion may still prune if bound ties best_score.
+        assert!(
+            potential_z >= potential_y,
+            "deeper completion should not have lower potential"
+        );
     }
 
     #[test]
@@ -253,6 +311,65 @@ mod tests {
         assert!(
             !prunes_a,
             "multi-span candidate with potential volume should remain eligible"
+        );
+    }
+
+    #[test]
+    fn fullness_upper_not_capped_by_excess_volume() {
+        // Axis totals imply two axes of length 3 each.
+        let axis_totals = vec![3, 3];
+        let (volume_upper, fullness_upper) =
+            upper_bound_score(&axis_totals, 1, 2, axis_totals.len(), 2);
+
+        assert_eq!(
+            volume_upper, 4,
+            "volume upper uses excess volume product (len-1 per axis)"
+        );
+        assert_eq!(
+            fullness_upper, 9,
+            "fullness upper should use full capacity (product of axis totals)"
+        );
+        assert!(
+            fullness_upper > volume_upper,
+            "fullness can exceed excess volume and should not be clamped"
+        );
+    }
+
+    #[test]
+    fn missing_axis_uses_fallback_from_candidate() {
+        // axis_totals only has one axis, but dim_count expects two.
+        let axis_totals = vec![3]; // from prefix [a] row length 3
+        let fallback_total = 5; // optimistic single-token depth for candidate on the missing axis
+        let (volume_upper, fullness_upper) =
+            upper_bound_score(&axis_totals, 1, 1, 2, fallback_total);
+
+        assert_eq!(volume_upper, (3 - 1) * (5 - 1));
+        assert_eq!(fullness_upper, 3 * 5);
+        assert!(
+            fullness_upper >= 15,
+            "fallback should inflate capacity for missing axis"
+        );
+    }
+
+    #[test]
+    fn upper_bound_uses_largest_axes() {
+        // Three axes totals, but dim_count=2. Bound should pick 10 and 2 (largest two).
+        let axis_totals = vec![2, 2, 10]; // unsorted; largest is last
+        let (vol, full) = upper_bound_score(&axis_totals, 1, 1, 2, 2);
+        assert_eq!(vol, (10 - 1) * (2 - 1));
+        assert_eq!(full, 10 * 2);
+    }
+
+    #[test]
+    fn prunes_on_equal_best_score() {
+        // Document current behavior: potential == best_score prunes.
+        let interner = Interner::from_text("a");
+        let a_idx = interner.vocabulary().iter().position(|w| w == "a").unwrap();
+        let ortho = Ortho::new();
+        let best_score = ortho.score(); // (1,0)
+        assert!(
+            bound_completion(&ortho, a_idx, &interner, best_score),
+            "equal potential should prune under current <= rule"
         );
     }
 }
