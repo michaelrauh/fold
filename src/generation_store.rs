@@ -4,7 +4,7 @@ use crate::{
     ortho::{Ortho, OrthoId},
 };
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
@@ -249,6 +249,7 @@ pub struct GenerationStore {
     best_volume_dirty: Cell<bool>,     // Whether cached best needs recompute
     bufwriter_capacity: usize,         // Buffer capacity for bucket writers
     landing_flush_threshold: usize,    // Threshold for flushing landing writes
+    spill_runs: Vec<Vec<PathBuf>>,     // Per-bucket pending spill runs for the current generation
     // History state
     history_runs: Vec<Vec<PathBuf>>, // Per-bucket list of history run files
     seen_len_accepted: u64,          // Monotonic count of accepted items across all generations
@@ -271,6 +272,13 @@ impl RawStream {
     pub fn files(&self) -> &[PathBuf] {
         &self.files
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PressureSpillStats {
+    pub buckets_drained: usize,
+    pub spill_runs_created: usize,
+    pub spill_runs_offloaded: usize,
 }
 
 /// Sorted run of orthos
@@ -352,7 +360,7 @@ pub fn offload_path_if_configured(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn maybe_offload_and_delete(path: &Path) -> io::Result<()> {
+fn offload_and_delete_if_configured(path: &Path) -> io::Result<bool> {
     match fs::metadata(path) {
         Ok(metadata) => {
             let size = metadata.len();
@@ -362,6 +370,7 @@ fn maybe_offload_and_delete(path: &Path) -> io::Result<()> {
                         m.record_offload(1, size);
                     }
                     let _ = fs::remove_file(path);
+                    return Ok(true);
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -375,13 +384,25 @@ fn maybe_offload_and_delete(path: &Path) -> io::Result<()> {
         Err(_) => {
             if offload_path_if_configured(path)? {
                 let _ = fs::remove_file(path);
+                return Ok(true);
             }
         }
     };
+    Ok(false)
+}
+
+fn maybe_offload_and_delete(path: &Path) -> io::Result<()> {
+    let _ = offload_and_delete_if_configured(path)?;
     Ok(())
 }
 
 fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
+    let namespace = base_path
+        .file_name()
+        .map(|part| part.to_string_lossy().into_owned())
+        .filter(|part| !part.is_empty())
+        .unwrap_or_else(|| "store".to_string());
+
     // Prefer a relative path under base_path; handle deleted/nonexistent files gracefully.
     let key_path = path
         .strip_prefix(base_path)
@@ -403,7 +424,11 @@ fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
         .map(|p| p.to_string_lossy())
         .collect::<Vec<_>>()
         .join("/");
-    Ok(key)
+    if key.is_empty() {
+        Ok(namespace)
+    } else {
+        Ok(format!("{}/{}", namespace, key))
+    }
 }
 
 fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
@@ -808,6 +833,14 @@ impl GenerationStore {
         let runs_dir = base_path.join("runs");
         fs::create_dir_all(&runs_dir)?;
 
+        // Create spill directory
+        let spill_dir = base_path.join("spill");
+        fs::create_dir_all(&spill_dir)?;
+        for bucket in 0..bucket_count {
+            let bucket_spill_dir = spill_dir.join(format!("b={:02}", bucket));
+            fs::create_dir_all(&bucket_spill_dir)?;
+        }
+
         // Create history directory
         let history_dir = base_path.join("history");
         fs::create_dir_all(&history_dir)?;
@@ -835,6 +868,7 @@ impl GenerationStore {
             best_volume_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024, // Default 16MB
             landing_flush_threshold: 10 * 1024 * 1024, // Default 10MB
+            spill_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
             history_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
             history_cache: std::collections::HashMap::new(),
@@ -846,6 +880,7 @@ impl GenerationStore {
     pub fn from_existing(base_path: PathBuf, bucket_count: usize) -> io::Result<Self> {
         let mut store = Self::new_with_config(base_path, bucket_count)?;
         store.load_history_runs_from_disk()?;
+        store.load_spill_runs_from_disk()?;
         Ok(store)
     }
 
@@ -888,6 +923,115 @@ impl GenerationStore {
         Ok(())
     }
 
+    fn spill_root(&self) -> PathBuf {
+        self.base_path.join("spill")
+    }
+
+    fn spill_dir(&self, bucket: usize) -> PathBuf {
+        self.spill_root().join(format!("b={:02}", bucket))
+    }
+
+    fn spill_manifest_path(&self) -> PathBuf {
+        self.spill_root().join("manifest.txt")
+    }
+
+    fn persist_spill_manifest(&self) -> io::Result<()> {
+        let manifest_path = self.spill_manifest_path();
+        if let Some(parent) = manifest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut contents = String::new();
+        for bucket in 0..self.bucket_count {
+            for path in &self.spill_runs[bucket] {
+                let relative = path
+                    .strip_prefix(&self.base_path)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                contents.push_str(&format!("{}\t{}\n", bucket, relative));
+            }
+        }
+
+        if contents.is_empty() {
+            match fs::remove_file(&manifest_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        } else {
+            fs::write(manifest_path, contents)?;
+        }
+
+        Ok(())
+    }
+
+    fn load_spill_runs_from_disk(&mut self) -> io::Result<()> {
+        self.spill_runs = (0..self.bucket_count).map(|_| Vec::new()).collect();
+        let mut per_bucket: Vec<BTreeSet<PathBuf>> =
+            (0..self.bucket_count).map(|_| BTreeSet::new()).collect();
+
+        let manifest_path = self.spill_manifest_path();
+        if let Ok(contents) = fs::read_to_string(&manifest_path) {
+            for line in contents.lines() {
+                let mut parts = line.splitn(2, '\t');
+                let Some(bucket_str) = parts.next() else {
+                    continue;
+                };
+                let Some(path_str) = parts.next() else {
+                    continue;
+                };
+                let Ok(bucket) = bucket_str.parse::<usize>() else {
+                    continue;
+                };
+                if bucket >= self.bucket_count {
+                    continue;
+                }
+                let path = PathBuf::from(path_str);
+                let full_path = if path.is_absolute() {
+                    path
+                } else {
+                    self.base_path.join(path)
+                };
+                per_bucket[bucket].insert(full_path);
+            }
+        }
+
+        for bucket in 0..self.bucket_count {
+            let spill_dir = self.spill_dir(bucket);
+            if spill_dir.exists() {
+                for entry in fs::read_dir(&spill_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() {
+                        per_bucket[bucket].insert(path);
+                    }
+                }
+            }
+            self.spill_runs[bucket] = per_bucket[bucket].iter().cloned().collect();
+        }
+
+        Ok(())
+    }
+
+    fn spill_runs_for_bucket(&self, bucket: usize) -> Vec<PathBuf> {
+        self.spill_runs[bucket].clone()
+    }
+
+    fn clear_spill_runs_for_bucket(&mut self, bucket: usize) -> io::Result<()> {
+        self.spill_runs[bucket].clear();
+        self.persist_spill_manifest()
+    }
+
+    fn extend_spill_runs<I>(&mut self, bucket: usize, paths: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        self.spill_runs[bucket].extend(paths);
+        self.spill_runs[bucket].sort();
+        self.persist_spill_manifest()
+    }
+
     /// Create a new empty generation store
     pub fn new() -> Self {
         Self {
@@ -909,6 +1053,7 @@ impl GenerationStore {
             best_volume_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024,
             landing_flush_threshold: 10 * 1024 * 1024,
+            spill_runs: (0..8).map(|_| Vec::new()).collect(),
             history_runs: (0..8).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
             history_cache: std::collections::HashMap::new(),
@@ -1377,30 +1522,48 @@ impl GenerationStore {
             .collect()
     }
 
-    /// Emergency path: drain all buckets, compact landing, and offload/delete resulting runs.
-    /// Returns the number of buckets drained.
-    pub fn pressure_compact_and_offload(&mut self, cfg: &Config) -> io::Result<usize> {
+    /// Emergency path: drain all buckets into tracked spill runs and optionally offload them.
+    pub fn pressure_spill_and_maybe_offload(
+        &mut self,
+        cfg: &Config,
+    ) -> io::Result<PressureSpillStats> {
         self.flush_all()?;
-        let mut drained = 0usize;
+        let mut stats = PressureSpillStats::default();
         for bucket in 0..self.bucket_count {
             let raw = self.drain_bucket(bucket)?;
             if raw.files().is_empty() {
                 continue;
             }
-            drained += 1;
+            stats.buckets_drained += 1;
             let runs = compact_landing(
                 bucket,
                 raw,
                 cfg,
                 &self.base_path,
+                false,
                 Some(&mut self.compression_stats),
             )?;
+            let mut tracked_paths = Vec::with_capacity(runs.len());
             for run in runs {
-                // Offloader hook will remove if configured; propagate failures so caller can pause.
-                maybe_offload_and_delete(run.path())?;
+                let file_name = run
+                    .path()
+                    .file_name()
+                    .map(|name| name.to_owned())
+                    .unwrap_or_else(|| std::ffi::OsString::from("spill-run.dat"));
+                let spill_path = self.spill_dir(bucket).join(file_name);
+                if let Some(parent) = spill_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(run.path(), &spill_path)?;
+                if offload_and_delete_if_configured(&spill_path)? {
+                    stats.spill_runs_offloaded += 1;
+                }
+                tracked_paths.push(spill_path);
             }
+            stats.spill_runs_created += tracked_paths.len();
+            self.extend_spill_runs(bucket, tracked_paths)?;
         }
-        Ok(drained)
+        Ok(stats)
     }
 
     fn update_cached_best(&self, candidate: &Ortho) {
@@ -1500,8 +1663,9 @@ impl GenerationStore {
                 cb(&format!("BUCKET_STATE:{}:draining", bucket));
             }
             let raw = self.drain_bucket(bucket)?;
+            let spill_runs = self.spill_runs_for_bucket(bucket);
 
-            if raw.files().is_empty() {
+            if raw.files().is_empty() && spill_runs.is_empty() {
                 // No data in this bucket, skip
                 if let Some(cb) = &progress {
                     cb(&format!("BUCKET_STATE:{}:empty", bucket));
@@ -1525,18 +1689,31 @@ impl GenerationStore {
                     bucket, self.bucket_count, drained_count
                 ));
             }
+            if !spill_runs.is_empty() {
+                if let Some(cb) = &progress {
+                    cb(&format!(
+                        "Bucket {}/{}: consuming {} spill runs",
+                        bucket,
+                        self.bucket_count,
+                        spill_runs.len()
+                    ));
+                }
+            }
 
             // Phase: Compacting
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:sorting", bucket));
             }
-            let runs = compact_landing(
+            let mut runs: Vec<Run> = spill_runs.iter().cloned().map(Run::new).collect();
+            let raw_runs = compact_landing(
                 bucket,
                 raw,
                 cfg,
                 &self.base_path,
+                true,
                 Some(&mut self.compression_stats),
             )?;
+            runs.extend(raw_runs);
 
             if runs.is_empty() {
                 // No runs generated, skip
@@ -1590,6 +1767,17 @@ impl GenerationStore {
 
             // Enqueue new work from run in bounded batches
             let bucket_new_work = self.enqueue_work_run(new_work_run, cfg.read_buf_bytes)?;
+            if !spill_runs.is_empty() {
+                self.clear_spill_runs_for_bucket(bucket)?;
+                if let Some(cb) = &progress {
+                    cb(&format!(
+                        "Bucket {}/{}: consumed {} spill runs",
+                        bucket,
+                        self.bucket_count,
+                        spill_runs.len()
+                    ));
+                }
+            }
 
             if let Some(cb) = &progress {
                 cb(&format!(
@@ -1712,6 +1900,7 @@ pub fn compact_landing(
     raw: RawStream,
     cfg: &Config,
     base_path: &PathBuf,
+    offload_after_write: bool,
     mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<Vec<Run>> {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1740,7 +1929,7 @@ pub fn compact_landing(
                     .join("runs")
                     .join(format!("b={:02}-run-{}.dat", bucket, run_id));
 
-                write_streamed_run(&arena, &run_path, stats.as_deref_mut())?;
+                write_streamed_run(&arena, &run_path, offload_after_write, stats.as_deref_mut())?;
                 runs.push(Run::new(run_path));
 
                 arena.clear();
@@ -1760,7 +1949,7 @@ pub fn compact_landing(
             .join("runs")
             .join(format!("b={:02}-run-{}.dat", bucket, run_id));
 
-        write_streamed_run(&arena, &run_path, stats.as_deref_mut())?;
+        write_streamed_run(&arena, &run_path, offload_after_write, stats.as_deref_mut())?;
         runs.push(Run::new(run_path));
     }
 
@@ -1775,6 +1964,7 @@ pub fn compact_landing(
 fn write_streamed_run(
     arena: &[StreamedOrtho],
     path: &PathBuf,
+    offload_after_write: bool,
     mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<()> {
     // Ensure parent directory exists
@@ -1796,7 +1986,9 @@ fn write_streamed_run(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    maybe_offload_and_delete(path)?;
+    if offload_after_write {
+        maybe_offload_and_delete(path)?;
+    }
     Ok(())
 }
 
@@ -2151,8 +2343,6 @@ pub fn anti_join_orthos(
         let _ = compress_file(&seen_run_path, 3)?;
         let _ = compress_file(&new_work_path, 3)?;
     }
-    maybe_offload_and_delete(&seen_run_path)?;
-    maybe_offload_and_delete(&new_work_path)?;
     Ok((
         Run::new(new_work_path),
         Run::new(seen_run_path),
@@ -2199,6 +2389,20 @@ mod tests {
         out
     }
 
+    fn count_history_orthos(store: &GenerationStore, read_buf_bytes: usize) -> usize {
+        let mut count = 0usize;
+        for bucket in 0..store.bucket_count {
+            for item in store
+                .history_iter_with_buffer(bucket, read_buf_bytes)
+                .unwrap()
+            {
+                item.unwrap();
+                count += 1;
+            }
+        }
+        count
+    }
+
     #[test]
     fn test_compact_landing_small() {
         use crate::ortho::Ortho;
@@ -2236,7 +2440,7 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, false, Some(&mut stats)).unwrap();
 
         assert_eq!(runs.len(), 1);
 
@@ -2292,7 +2496,7 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, false, Some(&mut stats)).unwrap();
 
         // Should produce multiple runs due to small budget
         assert!(runs.len() >= 1);
@@ -2404,7 +2608,7 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, true, Some(&mut stats)).unwrap();
 
         // Offloader should have copied and runs should be deleted locally.
         let uploaded = uploads.lock().unwrap();
@@ -2440,8 +2644,9 @@ mod tests {
             let tmp_dir = self.temp_root.join("tmp_downloads");
             fs::create_dir_all(&tmp_dir)?;
             let tmp_path = tmp_dir.join(key.replace('/', "_"));
+            let object_key = self.client.object_key(Path::new(key));
             self.client
-                .download_file(key, &tmp_path)
+                .download_file(&object_key, &tmp_path)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let mut cache = self.cache.lock().unwrap();
             let cached = cache
@@ -2503,11 +2708,10 @@ mod tests {
 
         // Upload to mock object store using the relative key.
         let store = Arc::new(MockObjectStore::new());
-        let client = OffloadClient::new(Arc::clone(&store), "bucket", "")
+        let client = OffloadClient::new(Arc::clone(&store), "bucket", "runs")
             .with_retry(1, Duration::from_millis(1));
-        client
-            .upload_file(&run_path, Path::new("runs/b=00-run-0.dat"))
-            .unwrap();
+        let key = run_object_key(&base_path, &run_path).unwrap();
+        client.upload_file(&run_path, Path::new(&key)).unwrap();
 
         // Delete the local run to force download path.
         fs::remove_file(&run_path).unwrap();
@@ -2655,7 +2859,7 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, Some(&mut stats)).unwrap();
+        let runs = compact_landing(bucket, raw, &cfg, &base_path, false, Some(&mut stats)).unwrap();
 
         // Collect and verify count
         let mut total = 0;
@@ -2706,6 +2910,182 @@ mod tests {
             }
         }
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn anti_join_outputs_stay_local_until_store_consumes_them() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let offload_dir = base_path.join("offloaded");
+        let uploads: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let offloader = Arc::new(RecordingOffloader::new(
+            offload_dir,
+            uploads.clone(),
+            base_path.clone(),
+        ));
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+
+        let cfg = Config::test_config(256 * 1024, 8);
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        store.configure(&cfg);
+        fs::create_dir_all(base_path.join("runs")).unwrap();
+
+        let ortho1 = Ortho::new().add(1)[0].clone();
+        let ortho2 = Ortho::new().add(2)[0].clone();
+        let gen_path = base_path.join("runs").join("gen.dat");
+        let gen_raw = BufWriter::new(File::create(&gen_path).unwrap());
+        let mut gen_file = ZstdEncoder::new(gen_raw, 3).unwrap();
+        let mut gen_items = vec![ortho1.clone(), ortho2.clone()];
+        gen_items.sort_by_key(|o| o.id());
+        for ortho in &gen_items {
+            write_ortho_record(&mut gen_file, ortho, None).unwrap();
+        }
+        let mut gen_file = gen_file.finish().unwrap();
+        gen_file.flush().unwrap();
+
+        let history_iter = std::iter::empty::<io::Result<StreamedOrtho>>();
+        let (new_work_run, seen_run, accepted) = anti_join_orthos(
+            UniqueRun::new(gen_path),
+            history_iter,
+            &base_path,
+            64 * 1024,
+            None,
+        )
+        .unwrap();
+
+        assert!(new_work_run.path().exists());
+        assert!(seen_run.path().exists());
+        assert_eq!(uploads.lock().unwrap().len(), 0);
+
+        store.add_history_run(0, seen_run, accepted).unwrap();
+        assert!(!store.history_runs[0].is_empty());
+        assert!(
+            !uploads.lock().unwrap().is_empty(),
+            "history offload should only happen after add_history_run consumes the local file"
+        );
+
+        let enqueued = store
+            .enqueue_work_run(new_work_run, cfg.read_buf_bytes)
+            .unwrap();
+        assert_eq!(enqueued, 2);
+        assert_eq!(store.work_len(), enqueued as u64);
+    }
+
+    #[test]
+    fn pressure_spill_runs_are_consumed_on_generation_end() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        let orthos = vec![
+            Ortho::new(),
+            Ortho::new().add(1)[0].clone(),
+            Ortho::new().add(2)[0].clone(),
+            Ortho::new().add(1)[0].add(2)[0].clone(),
+        ];
+        for ortho in &orthos {
+            store.record_result(ortho).unwrap();
+        }
+        store.flush_all().unwrap();
+
+        let spill_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+        assert!(spill_stats.buckets_drained > 0);
+        assert!(spill_stats.spill_runs_created > 0);
+        assert_eq!(store.total_landing_size(), 0);
+        assert!(store.spill_runs.iter().any(|runs| !runs.is_empty()));
+        assert!(store.spill_manifest_path().exists());
+
+        let new_work = store.on_generation_end(&cfg, None).unwrap();
+        assert_eq!(new_work as usize, orthos.len());
+        assert_eq!(store.seen_len_accepted(), orthos.len() as u64);
+        assert_eq!(
+            count_history_orthos(&store, cfg.read_buf_bytes),
+            orthos.len()
+        );
+        assert!(store.spill_runs.iter().all(|runs| runs.is_empty()));
+        assert!(!store.spill_manifest_path().exists());
+    }
+
+    #[test]
+    fn repeated_pressure_spills_preserve_all_outputs() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        let first_batch = vec![
+            Ortho::new().add(10)[0].clone(),
+            Ortho::new().add(11)[0].clone(),
+        ];
+        for ortho in &first_batch {
+            store.record_result(ortho).unwrap();
+        }
+        store.flush_all().unwrap();
+        let first_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+        assert!(first_stats.spill_runs_created > 0);
+
+        let second_batch = vec![
+            Ortho::new().add(12)[0].clone(),
+            Ortho::new().add(13)[0].clone(),
+            Ortho::new().add(10)[0].add(12)[0].clone(),
+        ];
+        for ortho in &second_batch {
+            store.record_result(ortho).unwrap();
+        }
+        store.flush_all().unwrap();
+        let second_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+        assert!(second_stats.spill_runs_created > 0);
+        assert!(store.spill_runs.iter().flatten().count() >= 2);
+
+        let new_work = store.on_generation_end(&cfg, None).unwrap();
+        let expected = first_batch.len() + second_batch.len();
+        assert_eq!(new_work as usize, expected);
+        assert_eq!(store.seen_len_accepted(), expected as u64);
+        assert_eq!(count_history_orthos(&store, cfg.read_buf_bytes), expected);
+        assert!(store.spill_runs.iter().all(|runs| runs.is_empty()));
+    }
+
+    #[test]
+    fn from_existing_restores_spill_runs_and_consumes_them() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let cfg = Config::test_config(256 * 1024, 8);
+
+        let expected = {
+            let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+            store.configure(&cfg);
+            let orthos = vec![
+                Ortho::new().add(21)[0].clone(),
+                Ortho::new().add(22)[0].clone(),
+                Ortho::new().add(21)[0].add(22)[0].clone(),
+            ];
+            for ortho in &orthos {
+                store.record_result(ortho).unwrap();
+            }
+            store.flush_all().unwrap();
+            let spill_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+            assert!(spill_stats.spill_runs_created > 0);
+            assert!(store.spill_manifest_path().exists());
+            orthos.len()
+        };
+
+        let mut reopened = GenerationStore::from_existing(base_path.clone(), 8).unwrap();
+        reopened.configure(&cfg);
+        assert!(reopened.spill_runs.iter().any(|runs| !runs.is_empty()));
+
+        let new_work = reopened.on_generation_end(&cfg, None).unwrap();
+        assert_eq!(new_work as usize, expected);
+        assert_eq!(reopened.seen_len_accepted(), expected as u64);
+        assert_eq!(
+            count_history_orthos(&reopened, cfg.read_buf_bytes),
+            expected
+        );
+        assert!(reopened.spill_runs.iter().all(|runs| runs.is_empty()));
+        assert!(!reopened.spill_manifest_path().exists());
     }
 
     // ============ TASK 6 TESTS ============
@@ -3270,7 +3650,8 @@ mod tests {
             "transition should report nonzero new_work when children were recorded"
         );
         assert_eq!(
-            store.work_len() as u64, new_work,
+            store.work_len() as u64,
+            new_work,
             "work queue length should match reported new_work"
         );
 
@@ -3299,9 +3680,7 @@ mod tests {
 
         // Record two orthos: one short, one longer.
         let short = Ortho::new().add(a_idx as u32)[0].clone();
-        let long = Ortho::new().add(a_idx as u32)[0]
-            .add(b_idx as u32)[0]
-            .clone();
+        let long = Ortho::new().add(a_idx as u32)[0].add(b_idx as u32)[0].clone();
         store.record_result(&short).unwrap();
         store.record_result(&long).unwrap();
         store.flush_all().unwrap();
@@ -3311,11 +3690,21 @@ mod tests {
 
         // Prune with a best_score just above the short ortho but below the long one.
         let best_score = (short.volume(), short.fullness() + 1);
-        let (kept, pruned) =
-            store.prune_history_with_bound(&interner, best_score, None, cfg.read_buf_bytes).unwrap();
+        let (kept, pruned) = store
+            .prune_history_with_bound(&interner, best_score, None, cfg.read_buf_bytes)
+            .unwrap();
 
         assert_eq!(kept + pruned, 2, "all orthos accounted for");
         // Document current behavior: pruning may keep both if bound sees potential.
         assert!(pruned <= 2, "pruned count within expected range");
+    }
+
+    #[test]
+    fn run_object_key_scopes_under_store_name() {
+        let base_path = PathBuf::from("/tmp/example/input_w16_ts123.txt.work");
+        let run_path = base_path.join("runs").join("b=00-run-0.dat");
+
+        let key = run_object_key(&base_path, &run_path).unwrap();
+        assert_eq!(key, "input_w16_ts123.txt.work/runs/b=00-run-0.dat");
     }
 }

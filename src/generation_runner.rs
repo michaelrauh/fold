@@ -62,7 +62,11 @@ impl PressureWatchdog {
             landing_est_bytes, disk_free
         ));
         metrics.record_pressure_trigger();
-        store.pressure_compact_and_offload(cfg)?;
+        let stats = store.pressure_spill_and_maybe_offload(cfg)?;
+        metrics.add_log(format!(
+            "Pressure watchdog spill: buckets_drained={}, spill_runs_created={}, spill_runs_offloaded={}",
+            stats.buckets_drained, stats.spill_runs_created, stats.spill_runs_offloaded
+        ));
         metrics.record_landing_buffer_count(store.total_landing_size());
         Ok(true)
     }
@@ -218,7 +222,9 @@ where
             store.total_landing_size(),
             best_score.0,
             best_score.1,
-            prev_new_work.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string())
+            prev_new_work
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
         ));
         // Set progress tracking for this generation
         metrics.update_operation(|op| {

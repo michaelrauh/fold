@@ -36,10 +36,7 @@ pub fn bound_completion(
         }
     }
 
-    let fallback_total = interner
-        .prefix_stats(&[completion])
-        .unwrap_or(1)
-        .max(2); // optimistic for missing axes
+    let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2); // optimistic for missing axes
 
     let potential_score = upper_bound_score(
         &totals,

@@ -12,6 +12,7 @@ use fold::{
     ortho::{Ortho, PayloadVal, payload_to_usize},
     tui::Tui,
 };
+use std::any::Any;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,15 @@ fn role_as_str(role: Role) -> &'static str {
         Role::Leader => "leader",
         Role::Follower => "follower",
     }
+}
+
+enum RunFailure {
+    Error(FoldError),
+    Panic {
+        source: &'static str,
+        message: String,
+        payload: Box<dyn Any + Send>,
+    },
 }
 
 fn main() -> Result<(), FoldError> {
@@ -282,19 +292,175 @@ fn main() -> Result<(), FoldError> {
 
     cleanup_leader_lock(&config);
 
-    let result = match (main_result, tui_result) {
-        (Ok(Ok(())), Some(Ok(()))) | (Ok(Ok(())), None) => Ok(()),
-        (Ok(Ok(())), Some(Err(panic))) => std::panic::resume_unwind(panic),
-        (Ok(Err(e)), _) => Err(e),
-        (Err(panic), _) => std::panic::resume_unwind(panic),
+    let failure = match (main_result, tui_result) {
+        (Ok(Ok(())), Some(Ok(()))) | (Ok(Ok(())), None) => None,
+        (Ok(Ok(())), Some(Err(panic))) => Some(RunFailure::Panic {
+            source: "tui",
+            message: panic_payload_to_string(&*panic),
+            payload: panic,
+        }),
+        (Ok(Err(e)), _) => Some(RunFailure::Error(e)),
+        (Err(panic), _) => Some(RunFailure::Panic {
+            source: "main",
+            message: panic_payload_to_string(&*panic),
+            payload: panic,
+        }),
     };
 
-    if let Ok(()) = result {
+    if let Some(ref run_failure) = failure {
+        if let Err(write_err) = write_failure_artifact(&config, &metrics, run_failure) {
+            eprintln!("!!! FOLD FAILURE artifact write failed: {}", write_err);
+        }
+    } else {
         let runtime = program_start.elapsed();
         write_fold_history(&config, &metrics, runtime)?;
     }
 
-    result
+    match failure {
+        None => Ok(()),
+        Some(RunFailure::Error(err)) => Err(err),
+        Some(RunFailure::Panic { payload, .. }) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn env_var_or_empty(name: &str) -> String {
+    std::env::var(name).unwrap_or_default()
+}
+
+fn env_var_or_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn write_failure_artifact(
+    config: &StateConfig,
+    metrics: &Metrics,
+    failure: &RunFailure,
+) -> Result<PathBuf, FoldError> {
+    let snapshot = metrics.snapshot();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+        .as_secs();
+    let artifact_path = match std::env::var("FOLD_FATAL_LOG_PATH") {
+        Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+        _ => config.logs_dir().join(format!(
+            "fatal_{}_pid={}.log",
+            timestamp,
+            std::process::id()
+        )),
+    };
+
+    if let Some(parent) = artifact_path.parent() {
+        fs::create_dir_all(parent).map_err(FoldError::Io)?;
+    }
+
+    let current_file = if snapshot.operation.current_file.is_empty() {
+        env_var_or_empty("FOLD_RUN_STAGE_FILE")
+    } else {
+        snapshot.operation.current_file.clone()
+    };
+    let input_words = if snapshot.operation.word_count > 0 {
+        snapshot.operation.word_count
+    } else if snapshot.global.run_input_words > 0 {
+        snapshot.global.run_input_words
+    } else {
+        env_var_or_usize("FOLD_RUN_INPUT_WORDS").unwrap_or(0)
+    };
+    let source_file = env_var_or_empty("FOLD_RUN_SOURCE_FILE");
+    let run_id = env_var_or_empty("FOLD_RUN_ID");
+    let bundle_dir = env_var_or_empty("FOLD_RUN_BUNDLE_DIR");
+    let transcript_path = env_var_or_empty("FOLD_RUN_TRANSCRIPT_PATH");
+    let offload_cfg = OffloadConfig::from_env();
+    let (failure_kind, failure_source, failure_message) = match failure {
+        RunFailure::Error(err) => ("error", "app", err.to_string()),
+        RunFailure::Panic {
+            source, message, ..
+        } => ("panic", *source, message.clone()),
+    };
+
+    let mut artifact = String::new();
+    artifact.push_str("=== FOLD FATAL START ===\n");
+    artifact.push_str(&format!("timestamp: {}\n", timestamp));
+    artifact.push_str(&format!("run_id: {}\n", run_id));
+    artifact.push_str(&format!("kind: {}\n", failure_kind));
+    artifact.push_str(&format!("source: {}\n", failure_source));
+    artifact.push_str(&format!("message: {}\n", failure_message));
+    artifact.push_str(&format!("current_file: {}\n", current_file));
+    artifact.push_str(&format!("source_file: {}\n", source_file));
+    artifact.push_str(&format!("input_words: {}\n", input_words));
+    artifact.push_str(&format!("bundle_dir: {}\n", bundle_dir));
+    artifact.push_str(&format!("transcript_path: {}\n", transcript_path));
+    artifact.push_str(&format!("offload_prefix: {}\n", offload_cfg.spaces_prefix));
+    artifact.push_str(&format!("mode: {}\n", snapshot.global.mode));
+    artifact.push_str(&format!("role: {}\n", snapshot.global.role));
+    artifact.push_str(&format!("generation: {}\n", snapshot.global.generation));
+    artifact.push_str(&format!("phase: {}\n", snapshot.global.phase));
+    artifact.push_str(&format!("status: {}\n", snapshot.operation.status));
+    artifact.push_str(&format!(
+        "progress: {}/{}\n",
+        snapshot.operation.progress_current, snapshot.operation.progress_total
+    ));
+    artifact.push_str(&format!("work_len: {}\n", snapshot.global.work_len));
+    artifact.push_str(&format!(
+        "accepted: {}\n",
+        snapshot.global.seen_len_accepted
+    ));
+    artifact.push_str(&format!(
+        "offload: files={} bytes={}\n",
+        snapshot.global.offloaded_files, snapshot.global.offloaded_bytes
+    ));
+    artifact.push_str(&format!(
+        "download: files={} bytes={}\n",
+        snapshot.global.downloaded_files, snapshot.global.downloaded_bytes
+    ));
+    artifact.push_str(&format!(
+        "cache: hits={} misses={}\n",
+        snapshot.global.cache_hits, snapshot.global.cache_misses
+    ));
+    artifact.push_str(&format!(
+        "pressure_triggers: {}\n",
+        snapshot.global.pressure_triggers
+    ));
+
+    if !snapshot.logs.is_empty() {
+        artifact.push_str("recent_logs:\n");
+        let start = snapshot.logs.len().saturating_sub(20);
+        for entry in snapshot.logs.iter().skip(start) {
+            artifact.push_str(&format!("  - [{}] {}\n", entry.timestamp, entry.message));
+        }
+    }
+
+    artifact.push_str("=== FOLD FATAL END ===\n");
+    fs::write(&artifact_path, artifact).map_err(FoldError::Io)?;
+
+    eprintln!(
+        "!!! FOLD FAILURE kind={} current_file={} input_words={} artifact={}",
+        failure_kind,
+        if current_file.is_empty() {
+            "(unknown)"
+        } else {
+            current_file.as_str()
+        },
+        input_words,
+        artifact_path.display()
+    );
+    if !transcript_path.is_empty() {
+        eprintln!("!!! Transcript: {}", transcript_path);
+    }
+
+    Ok(artifact_path)
 }
 
 fn process_txt_file(
@@ -306,7 +472,8 @@ fn process_txt_file(
 ) -> Result<(), FoldError> {
     let run_start = Instant::now();
     // Ingest the text file
-    let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)?;
+    let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)
+        .map_err(mark_claim_race_if_applicable)?;
     let remaining_chunks = file_handler::count_all_chunks_with_config(config)?;
     metrics.reset_new_orthos();
 
@@ -593,7 +760,8 @@ fn merge_archives(
 
     // Ingest archives for merging
     let ingestion =
-        file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)?;
+        file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)
+            .map_err(mark_claim_race_if_applicable)?;
 
     metrics.set_operation_status("Loading interners".to_string());
     metrics.reset_prune_counts();
@@ -1822,17 +1990,25 @@ fn cleanup_leader_lock(config: &StateConfig) {
     }
 }
 
-// Treat common IO races (files already moved by another process) as recoverable.
-fn is_concurrent_claim_error(err: &FoldError) -> bool {
+fn is_claim_race_io(io_err: &std::io::Error) -> bool {
+    matches!(
+        io_err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+    ) || matches!(io_err.raw_os_error(), Some(39) | Some(66))
+}
+
+fn mark_claim_race_if_applicable(err: FoldError) -> FoldError {
     match err {
-        FoldError::Io(io_err) => {
-            matches!(
-                io_err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
-            ) || matches!(io_err.raw_os_error(), Some(39) | Some(66))
+        FoldError::Io(io_err) if is_claim_race_io(&io_err) => {
+            FoldError::ConcurrentClaim(io_err.to_string())
         }
-        _ => false,
+        other => other,
     }
+}
+
+// Only explicit claim-race errors are retryable.
+fn is_concurrent_claim_error(err: &FoldError) -> bool {
+    matches!(err, FoldError::ConcurrentClaim(_))
 }
 
 fn write_fold_history(
@@ -2059,17 +2235,29 @@ mod tests {
 
     #[test]
     fn concurrent_claim_errors_are_retryable() {
-        let not_found = FoldError::Io(std::io::Error::new(ErrorKind::NotFound, "missing"));
+        let not_found = mark_claim_race_if_applicable(FoldError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            "missing",
+        )));
         assert!(is_concurrent_claim_error(&not_found));
 
-        let already_exists = FoldError::Io(std::io::Error::new(ErrorKind::AlreadyExists, "exists"));
+        let raw_not_found = FoldError::Io(std::io::Error::new(ErrorKind::NotFound, "missing"));
+        assert!(!is_concurrent_claim_error(&raw_not_found));
+
+        let already_exists = mark_claim_race_if_applicable(FoldError::Io(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "exists",
+        )));
         assert!(is_concurrent_claim_error(&already_exists));
 
-        let dir_not_empty = FoldError::Io(std::io::Error::from_raw_os_error(39));
+        let dir_not_empty =
+            mark_claim_race_if_applicable(FoldError::Io(std::io::Error::from_raw_os_error(39)));
         assert!(is_concurrent_claim_error(&dir_not_empty));
 
-        let permission_denied =
-            FoldError::Io(std::io::Error::new(ErrorKind::PermissionDenied, "denied"));
+        let permission_denied = mark_claim_race_if_applicable(FoldError::Io(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "denied",
+        )));
         assert!(!is_concurrent_claim_error(&permission_denied));
     }
 

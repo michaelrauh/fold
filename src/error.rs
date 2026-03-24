@@ -5,6 +5,7 @@ pub enum FoldError {
     Serialization(String),
     Deserialization(String),
     Io(std::io::Error),
+    ConcurrentClaim(String),
     Interner(String),
     Other(String),
 }
@@ -15,6 +16,7 @@ impl fmt::Display for FoldError {
             FoldError::Serialization(e) => write!(f, "Serialization error: {}", e),
             FoldError::Deserialization(e) => write!(f, "Deserialization error: {}", e),
             FoldError::Io(e) => write!(f, "IO error: {}", e),
+            FoldError::ConcurrentClaim(e) => write!(f, "Concurrent claim: {}", e),
             FoldError::Interner(e) => write!(f, "Interner error: {}", e),
             FoldError::Other(e) => write!(f, "Error: {}", e),
         }

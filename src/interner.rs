@@ -776,7 +776,10 @@ mod tests {
         let a_len = interner.prefix_stats(&[a_idx]).unwrap();
         let ab_len = interner.prefix_stats(&[a_idx, b_idx]).unwrap();
 
-        assert_eq!(a_len, 4, "max_desc_len for [a] should use the longest phrase");
+        assert_eq!(
+            a_len, 4,
+            "max_desc_len for [a] should use the longest phrase"
+        );
         assert_eq!(
             ab_len, 4,
             "max_desc_len for [a b] should use the longest phrase containing it"

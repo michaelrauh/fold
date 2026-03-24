@@ -18,6 +18,11 @@ fn offload_err_to_io(err: OffloadError) -> io::Error {
 }
 
 fn object_key(base_path: &Path, path: &Path) -> io::Result<String> {
+    let namespace = base_path
+        .file_name()
+        .map(|part| part.to_string_lossy().into_owned())
+        .filter(|part| !part.is_empty())
+        .unwrap_or_else(|| "store".to_string());
     let rel = path
         .strip_prefix(base_path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path not under base_path"))?;
@@ -26,7 +31,11 @@ fn object_key(base_path: &Path, path: &Path) -> io::Result<String> {
         .map(|p| p.to_string_lossy())
         .collect::<Vec<_>>()
         .join("/");
-    Ok(key)
+    if key.is_empty() {
+        Ok(namespace)
+    } else {
+        Ok(format!("{}/{}", namespace, key))
+    }
 }
 
 struct ClientRunOffloader {
@@ -82,8 +91,9 @@ impl RunDownloader for ClientRunDownloader {
         let tmp_dir = self.temp_root.join("tmp_downloads");
         std::fs::create_dir_all(&tmp_dir)?;
         let tmp_path = tmp_dir.join(key.replace('/', "_"));
+        let object_key = self.client.object_key(Path::new(key));
         self.client
-            .download_file(key, &tmp_path)
+            .download_file(&object_key, &tmp_path)
             .map_err(offload_err_to_io)?;
         let mut cache = self.cache.lock().unwrap();
         let cached = cache
@@ -197,6 +207,8 @@ mod tests {
 
         let expected = local_store
             .join("local-offload")
+            .join("runs")
+            .join("base")
             .join("runs")
             .join("b=00-run-0.dat");
         assert!(expected.exists());
