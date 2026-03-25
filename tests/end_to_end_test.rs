@@ -48,9 +48,16 @@ fn test_end_to_end_tiny_input() {
 
     // Start fold in the background with a timeout
     println!("[test] Starting fold processor...");
+    let total_ram = fold::memory_safety::total_system_ram_bytes();
     let mut fold_process: Child = Command::new("./target/release/fold")
         .env("FOLD_STATE_DIR", state_dir.to_str().unwrap())
         .env("FOLD_DISABLE_TUI", "1") // Disable TUI for testing
+        .env("FOLD_MEMORY_LEADER_MAX_BYTES", total_ram.to_string())
+        .env(
+            "FOLD_MEMORY_FOLLOWER_MAX_BYTES",
+            (total_ram / 2).to_string(),
+        )
+        .env("FOLD_MEMORY_SYSTEM_RESERVE_BYTES", "0")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

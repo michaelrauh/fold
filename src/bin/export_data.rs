@@ -2,6 +2,8 @@ use fold::error::FoldError;
 use fold::generation_runner::run_generation_loop;
 use fold::generation_store::{Config, GenerationStore, Role};
 use fold::interner::Interner;
+use fold::memory_budget::MemoryBudget;
+use fold::memory_safety;
 use fold::metrics::Metrics;
 use fold::offload_config::OffloadConfig;
 use fold::offload_runtime::configure_offload_runtime;
@@ -339,8 +341,10 @@ fn export_ortho_archive(
         stride_words
     );
     // Prepare generation store using the same configuration logic as main (leader role).
-    let cfg = Config::compute_config(Role::Leader)
-        .ok_or_else(|| anyhow::anyhow!("insufficient memory for generation config"))?;
+    let total_ram_bytes = memory_safety::total_system_ram_bytes();
+    let memory_budget = MemoryBudget::for_role(Role::Leader, total_ram_bytes)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let cfg = Config::from_memory_budget(&memory_budget);
     let work_dir = out_dir.join(format!("work_{}", stride_words));
     if work_dir.exists() {
         fs::remove_dir_all(&work_dir)?;

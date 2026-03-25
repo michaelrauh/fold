@@ -1,3 +1,4 @@
+use crate::disk_safety;
 use crate::generation_store::{RunDownloader, RunOffloader, set_run_downloader, set_run_offloader};
 use crate::offload_cache::OffloadCache;
 use crate::offload_config::OffloadConfig;
@@ -41,32 +42,10 @@ fn object_key(base_path: &Path, path: &Path) -> io::Result<String> {
 struct ClientRunOffloader {
     client: OffloadClient,
     base_path: PathBuf,
-    min_bytes: Option<u64>,
-    batch_bytes: Option<u64>,
-    skipped: Mutex<(u64, bool)>, // (accumulated skipped bytes, min_unlocked)
 }
 
 impl RunOffloader for ClientRunOffloader {
     fn offload(&self, path: &Path) -> io::Result<bool> {
-        if let Some(min) = self.min_bytes {
-            if let Ok(meta) = std::fs::metadata(path) {
-                let size = meta.len();
-                let mut guard = self.skipped.lock().unwrap();
-                if !guard.1 && size < min {
-                    if let Some(batch) = self.batch_bytes {
-                        guard.0 = guard.0.saturating_add(size);
-                        if guard.0 >= batch {
-                            guard.0 = 0;
-                            guard.1 = true; // unlock min threshold after batch reached
-                        } else {
-                            return Ok(false);
-                        }
-                    } else {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
         let key = object_key(&self.base_path, path)?;
         let rel = Path::new(&key);
         self.client
@@ -111,6 +90,7 @@ impl Drop for OffloadRuntimeGuard {
     fn drop(&mut self) {
         set_run_offloader(None);
         set_run_downloader(None);
+        disk_safety::clear();
     }
 }
 
@@ -154,9 +134,9 @@ pub fn configure_offload_runtime(
             .map_err(offload_err_to_io)?;
         OffloadClient::new(Arc::new(store), bucket, prefix)
     } else {
-        // No supported store configured (missing endpoint/creds or storage selection).
-        eprintln!("Offload enabled but no store configured; skipping offload/download hooks");
-        return Ok(None);
+        return Err(io::Error::other(
+            "offload enabled but no usable object store is configured",
+        ));
     };
     let cache = OffloadCache::new(cfg.cache_dir.clone(), cfg.cache_bytes_cap)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -168,13 +148,11 @@ pub fn configure_offload_runtime(
     let offloader = ClientRunOffloader {
         client,
         base_path: base_path.to_path_buf(),
-        min_bytes: cfg.min_offload_bytes,
-        batch_bytes: cfg.batch_offload_bytes,
-        skipped: Mutex::new((0, false)),
     };
 
     set_run_offloader(Some(Arc::new(offloader)));
     set_run_downloader(Some((base_path.to_path_buf(), Arc::new(downloader))));
+    disk_safety::configure(base_path.to_path_buf(), cfg);
 
     Ok(Some(OffloadRuntimeGuard))
 }
@@ -213,5 +191,20 @@ mod tests {
             .join("b=00-run-0.dat");
         assert!(expected.exists());
         drop(guard);
+    }
+
+    #[test]
+    fn configure_enabled_offload_without_store_fails() {
+        let temp = tempdir().unwrap();
+        let base_path = temp.path().join("base");
+        std::fs::create_dir_all(&base_path).unwrap();
+
+        let mut cfg = OffloadConfig::with_base_dir(&base_path);
+        cfg.enabled = true;
+
+        let err = configure_offload_runtime(&base_path, &cfg)
+            .err()
+            .expect("offload config should fail without a store");
+        assert!(err.to_string().contains("no usable object store"));
     }
 }

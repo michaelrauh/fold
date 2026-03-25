@@ -152,7 +152,7 @@ impl Tui {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9),
+                Constraint::Length(10),
                 Constraint::Min(15),
                 Constraint::Length(7),
             ])
@@ -177,6 +177,7 @@ impl Tui {
 
         let ram_readable = format_bytes(snapshot.global.ram_bytes);
         let proc_ram_readable = format_bytes(snapshot.global.process_rss_bytes);
+        let proc_cap_readable = format_bytes(snapshot.global.process_rss_cap_bytes);
         let role_label = if snapshot.global.role.is_empty() {
             "unknown".to_string()
         } else {
@@ -184,12 +185,13 @@ impl Tui {
         };
 
         let line1 = format!(
-            "FOLD Dashboard [Role: {} │ Time: {} │ RAM Total: {} ({}%) │ RAM Proc: {}]",
+            "FOLD Dashboard [Role: {} │ Time: {} │ RAM Total: {} ({}%) │ RAM Proc: {} / {}]",
             role_label,
             elapsed_str,
             ram_readable,
             snapshot.global.system_memory_percent,
-            proc_ram_readable
+            proc_ram_readable,
+            proc_cap_readable
         );
         let line2 = format!(
             "Mode: {} │ Interner: v{} │ Vocab: {}",
@@ -255,15 +257,30 @@ impl Tui {
             format_number(snapshot.global.seen_len_accepted as usize)
         );
         let line5 = format!(
-            "Run budget: {} │ Fan-in: {} │ Pruned: {} │ Expanded: {} │ Prune%: {:.1}%",
-            format_bytes(snapshot.global.run_budget_bytes),
+            "Arena: {} │ Work cache: {} / {} │ Fan-in: {} │ Prune%: {:.1}%",
+            format_bytes(snapshot.global.compaction_arena_cap_bytes),
+            format_bytes(snapshot.global.work_cache_bytes),
+            format_bytes(snapshot.global.work_cache_cap_bytes),
             snapshot.global.fan_in,
-            format_number(pruned),
-            format_number(expanded),
             ratio * 100.0
         );
-        let line6 = format!("{} │ {}", disk_line, comp_line);
+        let line6 = format!(
+            "{} │ {} │ Segment batch: {} / {}",
+            disk_line,
+            comp_line,
+            format_bytes(snapshot.global.segment_batch_bytes),
+            format_bytes(snapshot.global.segment_batch_cap_bytes)
+        );
         let line7 = format!(
+            "Spill: created {} files {} │ pending {} files {} │ consumed {} files {}",
+            format_number(snapshot.global.spill_created_files as usize),
+            format_bytes(snapshot.global.spill_created_bytes as usize),
+            format_number(snapshot.global.spill_pending_files as usize),
+            format_bytes(snapshot.global.spill_pending_bytes as usize),
+            format_number(snapshot.global.spill_consumed_files as usize),
+            format_bytes(snapshot.global.spill_consumed_bytes as usize)
+        );
+        let line8 = format!(
             "Offload: {} files {} │ Download: {} files {} │ Cache: hit {} miss {} │ Pressure: {}",
             format_number(snapshot.global.offloaded_files as usize),
             format_bytes(snapshot.global.offloaded_bytes as usize),
@@ -281,6 +298,7 @@ impl Tui {
             Line::from(truncate_string(&line5, max_width)),
             Line::from(truncate_string(&line6, max_width)),
             Line::from(truncate_string(&line7, max_width)),
+            Line::from(truncate_string(&line8, max_width)),
         ];
 
         let header = Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL));
@@ -969,9 +987,9 @@ impl Tui {
                     format_number(work_len as usize)
                 )),
                 Line::from(format!(
-                    "Accepted: {} │ Budget: {} │ Fan-in: {}",
+                    "Accepted: {} │ Arena: {} │ Fan-in: {}",
                     format_number(seen as usize),
-                    format_bytes(snapshot.global.run_budget_bytes),
+                    format_bytes(snapshot.global.compaction_arena_cap_bytes),
                     snapshot.global.fan_in
                 )),
             ];
@@ -1648,11 +1666,11 @@ fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
         role_label, snapshot.global.mode, snapshot.global.phase, snapshot.global.generation
     ));
     lines.push(format!(
-        "Work: {} | Accepted: {} | Fan-in: {} | Run budget: {}",
+        "Work: {} | Accepted: {} | Fan-in: {} | Arena cap: {}",
         format_number(snapshot.global.work_len as usize),
         format_number(snapshot.global.seen_len_accepted as usize),
         snapshot.global.fan_in,
-        format_bytes(snapshot.global.run_budget_bytes)
+        format_bytes(snapshot.global.compaction_arena_cap_bytes)
     ));
 
     let disk_line = if snapshot.global.disk_total_bytes > 0 {
@@ -1677,10 +1695,18 @@ fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
     lines.push(disk_line);
 
     lines.push(format!(
-        "RAM: total {} ({}%) | proc {}",
+        "RAM: total {} ({}%) | proc {} / {}",
         format_bytes(snapshot.global.ram_bytes),
         snapshot.global.system_memory_percent,
-        format_bytes(snapshot.global.process_rss_bytes)
+        format_bytes(snapshot.global.process_rss_bytes),
+        format_bytes(snapshot.global.process_rss_cap_bytes)
+    ));
+    lines.push(format!(
+        "Work cache: {} / {} | Segment batch: {} / {}",
+        format_bytes(snapshot.global.work_cache_bytes),
+        format_bytes(snapshot.global.work_cache_cap_bytes),
+        format_bytes(snapshot.global.segment_batch_bytes),
+        format_bytes(snapshot.global.segment_batch_cap_bytes)
     ));
 
     let progress = if snapshot.operation.progress_total > 0 {
@@ -1701,6 +1727,16 @@ fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
         snapshot.operation.status,
         format_number(snapshot.operation.new_orthos),
         progress
+    ));
+
+    lines.push(format!(
+        "Spill: created {} files {} | pending {} files {} | consumed {} files {}",
+        format_number(snapshot.global.spill_created_files as usize),
+        format_bytes(snapshot.global.spill_created_bytes as usize),
+        format_number(snapshot.global.spill_pending_files as usize),
+        format_bytes(snapshot.global.spill_pending_bytes as usize),
+        format_number(snapshot.global.spill_consumed_files as usize),
+        format_bytes(snapshot.global.spill_consumed_bytes as usize)
     ));
 
     let offload_line = format!(

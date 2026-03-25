@@ -1,11 +1,13 @@
 use fold::{
     FoldError,
     completion_pruning::{bound_completion, bound_existing_ortho},
+    disk_safety,
     file_handler::{self, MemClaimGuard, StateConfig},
     generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
-    generation_store,
     generation_store::{Config, GenerationStore, Role},
     interner::Interner,
+    memory_budget::MemoryBudget,
+    memory_safety,
     metrics::{GenerationStat, Metrics},
     offload_config::OffloadConfig,
     offload_runtime::configure_offload_runtime,
@@ -20,7 +22,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
-use sysinfo::ProcessesToUpdate;
 
 // Helper to convert Role to string
 fn role_as_str(role: Role) -> &'static str {
@@ -418,6 +419,31 @@ fn write_failure_artifact(
         snapshot.global.seen_len_accepted
     ));
     artifact.push_str(&format!(
+        "memory: rss_bytes={} cap_bytes={}\n",
+        snapshot.global.process_rss_bytes, snapshot.global.process_rss_cap_bytes
+    ));
+    artifact.push_str(&format!(
+        "compaction: current_bytes={} cap_bytes={}\n",
+        snapshot.global.compaction_arena_bytes, snapshot.global.compaction_arena_cap_bytes
+    ));
+    artifact.push_str(&format!(
+        "work_cache: current_bytes={} cap_bytes={}\n",
+        snapshot.global.work_cache_bytes, snapshot.global.work_cache_cap_bytes
+    ));
+    artifact.push_str(&format!(
+        "segment_batch: current_bytes={} cap_bytes={}\n",
+        snapshot.global.segment_batch_bytes, snapshot.global.segment_batch_cap_bytes
+    ));
+    artifact.push_str(&format!(
+        "spill: created_files={} created_bytes={} pending_files={} pending_bytes={} consumed_files={} consumed_bytes={}\n",
+        snapshot.global.spill_created_files,
+        snapshot.global.spill_created_bytes,
+        snapshot.global.spill_pending_files,
+        snapshot.global.spill_pending_bytes,
+        snapshot.global.spill_consumed_files,
+        snapshot.global.spill_consumed_bytes
+    ));
+    artifact.push_str(&format!(
         "offload: files={} bytes={}\n",
         snapshot.global.offloaded_files, snapshot.global.offloaded_bytes
     ));
@@ -471,6 +497,12 @@ fn process_txt_file(
     should_quit: &AtomicBool,
 ) -> Result<(), FoldError> {
     let run_start = Instant::now();
+    let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
+    let _offload_guard =
+        configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
+    disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
+    log_offload_policy(metrics, &offload_cfg);
+
     // Ingest the text file
     let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)
         .map_err(mark_claim_race_if_applicable)?;
@@ -500,6 +532,15 @@ fn process_txt_file(
         g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
     });
 
+    let memory_budget = memory_budget_for_role(role)?;
+    let mem_claim = acquire_memory_claim_simple(role, config, &memory_budget)?;
+    let _memory_guard = memory_safety::ScopedProcessMemory::new(
+        mem_claim.granted_bytes(),
+        Some(metrics.clone_handle()),
+    );
+    let cfg = Config::from_memory_budget(&memory_budget);
+    apply_memory_budget_metrics(metrics, &cfg, &memory_budget);
+
     // Build interner from the text
     let interner = Interner::from_text(&ingestion.text);
 
@@ -513,21 +554,6 @@ fn process_txt_file(
         interner.vocabulary().len()
     ));
 
-    // Get memory configuration based on role and current RAM state
-    let Some(cfg) = Config::compute_config(role) else {
-        metrics.add_log(format!(
-            "Follower bailing: insufficient memory for minimum configuration"
-        ));
-        return Err(FoldError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Follower: insufficient memory",
-        )));
-    };
-
-    // Acquire memory claim for this file
-    let interner_bytes = interner.to_bytes()?.len();
-    let mem_claim = acquire_memory_claim_simple(role, config, metrics, interner_bytes)?;
-
     // Initialize GenerationStore for this file (work folder becomes gen store base)
     let store_path = PathBuf::from(ingestion.work_queue_path())
         .parent()
@@ -535,17 +561,16 @@ fn process_txt_file(
         .to_path_buf();
     let mut store = GenerationStore::new_with_config(store_path.clone(), 8)?;
     store.configure(&cfg);
-    let offload_cfg = OffloadConfig::from_env();
-    let _offload_guard =
-        configure_offload_runtime(&store_path, &offload_cfg).map_err(FoldError::Io)?;
 
     metrics.add_log(format!(
-        "[{} init] generation_store configured: run_budget={} MB, work_cache={} orthos, bufwriter={} KB, segment_size={} orthos",
+        "[{} init] generation_store configured: claim={} MB, arena={} MB, work_cache={} MB, segment_max={} MB, fan_in={}, read_buf={} KB",
         role_as_str(role),
+        memory_budget.process_claim_bytes / 1_048_576,
         cfg.run_budget_bytes / 1_048_576,
-        cfg.work_queue_cache_size,
-        cfg.bufwriter_capacity / 1024,
-        cfg.work_segment_size
+        cfg.work_queue_cache_bytes / 1_048_576,
+        cfg.work_segment_max_bytes / 1_048_576,
+        cfg.fan_in,
+        cfg.read_buf_bytes / 1024
     ));
 
     let mut housekeeping = || -> Result<(), FoldError> {
@@ -715,12 +740,6 @@ fn process_txt_file(
     )?;
 
     metrics.add_log(format!("Archive saved: {}", archive_path.display()));
-    if let Some(offload_bytes) = offload_archive_dir(&archive_path, &metrics)? {
-        metrics.add_log(format!(
-            "Archive offloaded ({} bytes); removed local copy",
-            offload_bytes
-        ));
-    }
 
     // Update largest archive
     metrics.update_largest_archive(|la| {
@@ -754,6 +773,12 @@ fn merge_archives(
     role: Role,
 ) -> Result<(), FoldError> {
     let run_start = Instant::now();
+    let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
+    let _offload_guard =
+        configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
+    disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
+    log_offload_policy(metrics, &offload_cfg);
+
     // Get archive ortho counts for display BEFORE ingest moves them
     let orthos_a = file_handler::load_archive_metadata(archive_a_path).unwrap_or(0);
     let orthos_b = file_handler::load_archive_metadata(archive_b_path).unwrap_or(0);
@@ -840,18 +865,14 @@ fn merge_archives(
         g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
     });
 
-    // Get memory configuration
-    let Some(cfg) = Config::compute_config(role) else {
-        metrics.add_log("Follower bailing: insufficient memory for merge".to_string());
-        return Err(FoldError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Follower: insufficient memory",
-        )));
-    };
-
-    // Acquire memory claim
-    let interner_bytes = merged_interner.to_bytes()?.len();
-    let mem_claim = acquire_memory_claim_simple(role, config, metrics, interner_bytes)?;
+    let memory_budget = memory_budget_for_role(role)?;
+    let mem_claim = acquire_memory_claim_simple(role, config, &memory_budget)?;
+    let _memory_guard = memory_safety::ScopedProcessMemory::new(
+        mem_claim.granted_bytes(),
+        Some(metrics.clone_handle()),
+    );
+    let cfg = Config::from_memory_budget(&memory_budget);
+    apply_memory_budget_metrics(metrics, &cfg, &memory_budget);
 
     // Initialize GenerationStore for merge
     let store_path = PathBuf::from(ingestion.work_queue_path())
@@ -862,11 +883,14 @@ fn merge_archives(
     store.configure(&cfg);
 
     metrics.add_log(format!(
-        "[{} merge init] generation_store configured: run_budget={} MB, work_cache={} orthos, bufwriter={} KB",
+        "[{} merge init] generation_store configured: claim={} MB, arena={} MB, work_cache={} MB, segment_max={} MB, fan_in={}, read_buf={} KB",
         role_as_str(role),
+        memory_budget.process_claim_bytes / 1_048_576,
         cfg.run_budget_bytes / 1_048_576,
-        cfg.work_queue_cache_size,
-        cfg.bufwriter_capacity / 1024
+        cfg.work_queue_cache_bytes / 1_048_576,
+        cfg.work_segment_max_bytes / 1_048_576,
+        cfg.fan_in,
+        cfg.read_buf_bytes / 1024
     ));
 
     // Seed with empty ortho
@@ -1253,7 +1277,7 @@ fn merge_archives(
                 sys.refresh_memory();
                 let (used_bytes, total_bytes) =
                     normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-                let proc_rss_bytes = current_process_rss_bytes(&mut sys);
+                let proc_rss_bytes = memory_safety::current_process_rss_bytes();
                 let percent = if total_bytes > 0 {
                     ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
                 } else {
@@ -1266,15 +1290,6 @@ fn merge_archives(
                     g.system_memory_percent = percent;
                     g.distinct_jobs_count = jobs_count;
                 });
-
-                // Follower bail-out
-                if role == Role::Follower && percent >= 85 {
-                    metrics.add_log(format!("Follower exiting: memory pressure ({}%)", percent));
-                    return Err(FoldError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Follower: memory pressure",
-                    )));
-                }
             }
 
             if total_processed % 50000 == 0 {
@@ -1623,23 +1638,17 @@ fn is_ortho_impacted_fast(ortho: &Ortho, impacted_prefixes: &[Vec<usize>]) -> bo
 #[allow(dead_code)]
 fn archive_generation_config() -> Config {
     let run_budget_bytes = 256 * 1024 * 1024; // 256MB for archive materialization
-    let read_buf_bytes = 64 * 1024;
-    let fan_in = {
-        if read_buf_bytes == 0 {
-            8
-        } else {
-            (run_budget_bytes / read_buf_bytes).clamp(8, 128)
-        }
-    };
+    let read_buf_bytes = 256 * 1024;
+    let fan_in = 64;
 
     Config {
         run_budget_bytes,
         fan_in,
         read_buf_bytes,
         allow_compaction: false,
-        work_queue_cache_size: 50_000,
+        work_queue_cache_bytes: 64 * 1024 * 1024,
         bufwriter_capacity: 256 * 1024,
-        work_segment_size: 50_000,
+        work_segment_max_bytes: 16 * 1024 * 1024,
         history_cache_bytes: 8 * 1024 * 1024,
         landing_flush_threshold: 4 * 1024 * 1024,
     }
@@ -1759,6 +1768,7 @@ fn move_history_runs_to_archive(
     Ok(())
 }
 
+#[cfg(test)]
 fn offload_archive_dir(path: &Path, metrics: &Metrics) -> Result<Option<u64>, FoldError> {
     let mut uploaded_bytes = 0u64;
 
@@ -1772,7 +1782,7 @@ fn offload_archive_dir(path: &Path, metrics: &Metrics) -> Result<Option<u64>, Fo
             }
         } else if path.is_file() {
             let size = fs::metadata(path).map_err(FoldError::Io)?.len();
-            if generation_store::offload_path_if_configured(path).map_err(FoldError::Io)? {
+            if fold::generation_store::offload_path_if_configured(path).map_err(FoldError::Io)? {
                 offloaded_any = true;
                 *uploaded = uploaded.saturating_add(size);
             }
@@ -1831,17 +1841,54 @@ fn print_optimal(_ortho: &Ortho, _interner: &Interner) {
     // Optimal ortho info is now displayed in TUI metrics
 }
 
-// Simplified memory claim for GenerationStore model
+fn memory_budget_for_role(role: Role) -> Result<MemoryBudget, FoldError> {
+    let total_ram_bytes = memory_safety::total_system_ram_bytes();
+    MemoryBudget::for_role(role, total_ram_bytes)
+}
+
+fn log_offload_policy(metrics: &Metrics, cfg: &OffloadConfig) {
+    for message in cfg.startup_messages() {
+        metrics.add_log(message);
+    }
+}
+
+fn apply_memory_budget_metrics(metrics: &Metrics, cfg: &Config, budget: &MemoryBudget) {
+    metrics.update_global(|g| {
+        g.process_rss_cap_bytes = budget.process_claim_bytes;
+        g.run_budget_bytes = cfg.run_budget_bytes;
+        g.compaction_arena_cap_bytes = cfg.run_budget_bytes;
+        g.work_cache_cap_bytes = cfg.work_queue_cache_bytes;
+        g.segment_batch_cap_bytes = cfg.work_segment_max_bytes;
+        g.fan_in = cfg.fan_in;
+    });
+}
+
 fn acquire_memory_claim_simple(
     role: Role,
     config: &StateConfig,
-    _metrics: &Metrics,
-    _interner_bytes: usize,
+    budget: &MemoryBudget,
 ) -> Result<MemClaimGuard, FoldError> {
-    // GenerationStore manages its own memory via Config::compute_config
-    // This just creates a placeholder claim to participate in coordination
-    let granted_bytes = 100 * 1024 * 1024; // 100MB placeholder
-    file_handler::create_mem_claim(config, role_as_str(role), granted_bytes, granted_bytes)
+    let total_ram_bytes = memory_safety::total_system_ram_bytes();
+    let claim_pool_bytes = total_ram_bytes.saturating_sub(budget.system_reserve_bytes);
+    let active_claims = file_handler::load_active_mem_claims(config)?;
+    let active_granted_bytes = active_claims
+        .iter()
+        .map(|claim| claim.granted_bytes)
+        .sum::<usize>();
+
+    if active_granted_bytes.saturating_add(budget.process_claim_bytes) > claim_pool_bytes {
+        return Err(FoldError::MemoryBudgetExceeded(format!(
+            "insufficient shared memory budget: active_claims={} requested={} pool={}",
+            active_granted_bytes, budget.process_claim_bytes, claim_pool_bytes
+        )));
+    }
+
+    file_handler::create_mem_claim(
+        config,
+        role_as_str(role),
+        budget.process_claim_bytes,
+        budget.process_claim_bytes,
+    )
 }
 
 fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
@@ -1880,16 +1927,6 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
         (used_raw as usize).saturating_mul(factor),
         (total_raw as usize).saturating_mul(factor),
     )
-}
-
-fn current_process_rss_bytes(sys: &mut sysinfo::System) -> usize {
-    if let Ok(pid) = sysinfo::get_current_pid() {
-        let _ = sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-        if let Some(proc) = sys.process(pid) {
-            return proc.memory() as usize;
-        }
-    }
-    0
 }
 
 // Old acquire_memory_claim kept for any remaining merge_archives code
@@ -2221,7 +2258,46 @@ mod tests {
     use super::*;
     use fold::generation_store::{RunOffloader, set_run_offloader};
     use std::io::ErrorKind;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn with_test_memory_overrides<T>(f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let total_ram = memory_safety::total_system_ram_bytes();
+        let leader = total_ram.to_string();
+        let follower = (total_ram / 2).to_string();
+        let reserve = "0".to_string();
+        let prev_leader = std::env::var("FOLD_MEMORY_LEADER_MAX_BYTES").ok();
+        let prev_follower = std::env::var("FOLD_MEMORY_FOLLOWER_MAX_BYTES").ok();
+        let prev_reserve = std::env::var("FOLD_MEMORY_SYSTEM_RESERVE_BYTES").ok();
+
+        unsafe {
+            std::env::set_var("FOLD_MEMORY_LEADER_MAX_BYTES", &leader);
+            std::env::set_var("FOLD_MEMORY_FOLLOWER_MAX_BYTES", &follower);
+            std::env::set_var("FOLD_MEMORY_SYSTEM_RESERVE_BYTES", &reserve);
+        }
+
+        let result = f();
+
+        unsafe {
+            match prev_leader {
+                Some(value) => std::env::set_var("FOLD_MEMORY_LEADER_MAX_BYTES", value),
+                None => std::env::remove_var("FOLD_MEMORY_LEADER_MAX_BYTES"),
+            }
+            match prev_follower {
+                Some(value) => std::env::set_var("FOLD_MEMORY_FOLLOWER_MAX_BYTES", value),
+                None => std::env::remove_var("FOLD_MEMORY_FOLLOWER_MAX_BYTES"),
+            }
+            match prev_reserve {
+                Some(value) => std::env::set_var("FOLD_MEMORY_SYSTEM_RESERVE_BYTES", value),
+                None => std::env::remove_var("FOLD_MEMORY_SYSTEM_RESERVE_BYTES"),
+            }
+        }
+
+        result
+    }
 
     #[test]
     fn test_score() {
@@ -2263,103 +2339,105 @@ mod tests {
 
     #[test]
     fn merge_seeds_impacted_work_queue() {
-        use tempfile::TempDir;
+        with_test_memory_overrides(|| {
+            use tempfile::TempDir;
 
-        // Temp state
-        let temp = TempDir::new().unwrap();
-        let config = StateConfig::custom(temp.path().to_path_buf());
-        file_handler::initialize_with_config(&config).unwrap();
+            // Temp state
+            let temp = TempDir::new().unwrap();
+            let config = StateConfig::custom(temp.path().to_path_buf());
+            file_handler::initialize_with_config(&config).unwrap();
 
-        // Build interner A (foo bar) and impacted/non-impacted orthos
-        let interner_a = Interner::from_text("foo bar");
-        let foo_idx_a = interner_a
-            .vocabulary()
-            .iter()
-            .position(|w| w == "foo")
+            // Build interner A (foo bar) and impacted/non-impacted orthos
+            let interner_a = Interner::from_text("foo bar");
+            let foo_idx_a = interner_a
+                .vocabulary()
+                .iter()
+                .position(|w| w == "foo")
+                .unwrap();
+            let bar_idx_a = interner_a
+                .vocabulary()
+                .iter()
+                .position(|w| w == "bar")
+                .unwrap();
+            let foo_val_a = PayloadVal::try_from(foo_idx_a).unwrap();
+            let bar_val_a = PayloadVal::try_from(bar_idx_a).unwrap();
+
+            let impacted_a = {
+                let first = Ortho::new().add(foo_val_a)[0].clone();
+                first.add(bar_val_a)[0].clone()
+            };
+            let non_impacted_a = {
+                let first = Ortho::new().add(bar_val_a)[0].clone();
+                first.add(foo_val_a)[0].clone()
+            };
+
+            let (archive_a_path, _) = save_archive_vec_internal(
+                &interner_a,
+                vec![impacted_a.clone(), non_impacted_a],
+                Some(&impacted_a),
+                "\"A\"",
+                2,
+                "foo bar",
+                2,
+                &config,
+            )
             .unwrap();
-        let bar_idx_a = interner_a
-            .vocabulary()
-            .iter()
-            .position(|w| w == "bar")
+
+            // Build interner B (foo baz) and impacted/non-impacted orthos
+            let interner_b = Interner::from_text("foo baz");
+            let foo_idx_b = interner_b
+                .vocabulary()
+                .iter()
+                .position(|w| w == "foo")
+                .unwrap();
+            let baz_idx_b = interner_b
+                .vocabulary()
+                .iter()
+                .position(|w| w == "baz")
+                .unwrap();
+            let foo_val_b = PayloadVal::try_from(foo_idx_b).unwrap();
+            let baz_val_b = PayloadVal::try_from(baz_idx_b).unwrap();
+
+            let impacted_b = {
+                let first = Ortho::new().add(foo_val_b)[0].clone();
+                first.add(baz_val_b)[0].clone()
+            };
+            let non_impacted_b = {
+                let first = Ortho::new().add(baz_val_b)[0].clone();
+                first.add(foo_val_b)[0].clone()
+            };
+
+            let (archive_b_path, _) = save_archive_vec_internal(
+                &interner_b,
+                vec![impacted_b.clone(), non_impacted_b],
+                Some(&impacted_b),
+                "\"B\"",
+                2,
+                "foo baz",
+                2,
+                &config,
+            )
             .unwrap();
-        let foo_val_a = PayloadVal::try_from(foo_idx_a).unwrap();
-        let bar_val_a = PayloadVal::try_from(bar_idx_a).unwrap();
 
-        let impacted_a = {
-            let first = Ortho::new().add(foo_val_a)[0].clone();
-            first.add(bar_val_a)[0].clone()
-        };
-        let non_impacted_a = {
-            let first = Ortho::new().add(bar_val_a)[0].clone();
-            first.add(foo_val_a)[0].clone()
-        };
-
-        let (archive_a_path, _) = save_archive_vec_internal(
-            &interner_a,
-            vec![impacted_a.clone(), non_impacted_a],
-            Some(&impacted_a),
-            "\"A\"",
-            2,
-            "foo bar",
-            2,
-            &config,
-        )
-        .unwrap();
-
-        // Build interner B (foo baz) and impacted/non-impacted orthos
-        let interner_b = Interner::from_text("foo baz");
-        let foo_idx_b = interner_b
-            .vocabulary()
-            .iter()
-            .position(|w| w == "foo")
+            // Merge and verify impacted queues are non-zero
+            let metrics = Metrics::new();
+            merge_archives(
+                &archive_a_path,
+                &archive_b_path,
+                &config,
+                &metrics,
+                Role::Leader,
+            )
             .unwrap();
-        let baz_idx_b = interner_b
-            .vocabulary()
-            .iter()
-            .position(|w| w == "baz")
-            .unwrap();
-        let foo_val_b = PayloadVal::try_from(foo_idx_b).unwrap();
-        let baz_val_b = PayloadVal::try_from(baz_idx_b).unwrap();
 
-        let impacted_b = {
-            let first = Ortho::new().add(foo_val_b)[0].clone();
-            first.add(baz_val_b)[0].clone()
-        };
-        let non_impacted_b = {
-            let first = Ortho::new().add(baz_val_b)[0].clone();
-            first.add(foo_val_b)[0].clone()
-        };
-
-        let (archive_b_path, _) = save_archive_vec_internal(
-            &interner_b,
-            vec![impacted_b.clone(), non_impacted_b],
-            Some(&impacted_b),
-            "\"B\"",
-            2,
-            "foo baz",
-            2,
-            &config,
-        )
-        .unwrap();
-
-        // Merge and verify impacted queues are non-zero
-        let metrics = Metrics::new();
-        merge_archives(
-            &archive_a_path,
-            &archive_b_path,
-            &config,
-            &metrics,
-            Role::Leader,
-        )
-        .unwrap();
-
-        let snapshot = metrics.snapshot();
-        assert!(
-            snapshot.merge.impacted_queued_a > 0 && snapshot.merge.impacted_queued_b > 0,
-            "impacted queues should be non-empty (got A:{} B:{})",
-            snapshot.merge.impacted_queued_a,
-            snapshot.merge.impacted_queued_b
-        );
+            let snapshot = metrics.snapshot();
+            assert!(
+                snapshot.merge.impacted_queued_a > 0 && snapshot.merge.impacted_queued_b > 0,
+                "impacted queues should be non-empty (got A:{} B:{})",
+                snapshot.merge.impacted_queued_a,
+                snapshot.merge.impacted_queued_b
+            );
+        });
     }
 
     struct ArchiveOffloader {

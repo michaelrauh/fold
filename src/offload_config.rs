@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-/// Configuration for offloading runs to S3-compatible storage under disk-pressure.
+/// Configuration for local-first spill handling and remote reclaim/offload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffloadConfig {
     pub enabled: bool,
@@ -97,6 +97,35 @@ impl OffloadConfig {
         }
 
         cfg
+    }
+
+    pub fn startup_messages(&self) -> Vec<String> {
+        if !self.enabled {
+            return vec!["Offload policy: disabled".to_string()];
+        }
+
+        let landing = self
+            .landing_bytes_high_water
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "disabled".to_string());
+        let disk = self
+            .disk_free_low_water
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "disabled".to_string());
+
+        let mut messages = vec![format!(
+            "Offload policy: landing_high_water={} => local spill only; disk_free_low_water={} => remote reclaim only; cache_cap={}",
+            landing, disk, self.cache_bytes_cap
+        )];
+
+        if self.min_offload_bytes.is_some() || self.batch_offload_bytes.is_some() {
+            messages.push(
+                "Offload compatibility: FOLD_OFFLOAD_MIN_FILE_BYTES and FOLD_OFFLOAD_BATCH_BYTES are ignored in local-first mode"
+                    .to_string(),
+            );
+        }
+
+        messages
     }
 }
 
@@ -280,5 +309,23 @@ mod tests {
         let cfg = OffloadConfig::from_env();
 
         assert_eq!(cfg.cache_dir, base_path.join("offload_cache"));
+    }
+
+    #[test]
+    fn startup_messages_describe_local_first_policy_and_deprecation() {
+        let mut cfg = OffloadConfig::with_base_dir("./fold_state");
+        cfg.enabled = true;
+        cfg.landing_bytes_high_water = Some(123);
+        cfg.disk_free_low_water = Some(456);
+        cfg.min_offload_bytes = Some(789);
+
+        let messages = cfg.startup_messages();
+        assert!(messages.iter().any(|m| m.contains("local spill only")));
+        assert!(messages.iter().any(|m| m.contains("remote reclaim only")));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("ignored in local-first mode"))
+        );
     }
 }

@@ -1,9 +1,12 @@
 pub mod completion_pruning;
+pub mod disk_safety;
 pub mod error;
 pub mod file_handler;
 pub mod generation_runner;
 pub mod generation_store;
 pub mod interner;
+pub mod memory_budget;
+pub mod memory_safety;
 pub mod metrics;
 pub mod offload_cache;
 pub mod offload_config;

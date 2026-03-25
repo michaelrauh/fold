@@ -4,12 +4,13 @@ use crate::{
     file_handler::StateConfig,
     generation_store::{Config, GenerationStore, ProgressCallback, Role},
     interner::Interner,
+    memory_safety,
     metrics::{GenerationStat, Metrics},
     offload_config::OffloadConfig,
     ortho::{Ortho, PayloadVal, payload_to_usize},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Disks, ProcessesToUpdate, System, get_current_pid};
+use sysinfo::Disks;
 
 pub const COMPLETION_CHUNK_SIZE: usize = 1_000;
 pub const FANOUT_LOG_THRESHOLD: usize = COMPLETION_CHUNK_SIZE;
@@ -17,7 +18,6 @@ const EST_BYTES_PER_ORTHO: u64 = 200;
 
 struct PressureWatchdog {
     landing_bytes_high_water: Option<u64>,
-    disk_free_low_water: Option<u64>,
     enabled: bool,
 }
 
@@ -25,47 +25,39 @@ impl PressureWatchdog {
     fn from_config(cfg: OffloadConfig) -> Self {
         Self {
             landing_bytes_high_water: cfg.landing_bytes_high_water,
-            disk_free_low_water: cfg.disk_free_low_water,
             enabled: cfg.enabled,
         }
     }
 
-    fn should_trigger(&self, landing_bytes: u64, disk_free: Option<u64>) -> bool {
+    fn should_trigger(&self, landing_bytes: u64) -> bool {
         if !self.enabled {
             return false;
         }
-        let landing_trigger = self
-            .landing_bytes_high_water
+        self.landing_bytes_high_water
             .map(|t| landing_bytes >= t)
-            .unwrap_or(false);
-        let disk_trigger = self
-            .disk_free_low_water
-            .and_then(|t| disk_free.map(|free| free <= t))
-            .unwrap_or(false);
-        landing_trigger || disk_trigger
+            .unwrap_or(false)
     }
 
     fn maybe_handle(
         &self,
         store: &mut GenerationStore,
         cfg: &Config,
-        disk_free: Option<u64>,
         metrics: &Metrics,
     ) -> Result<bool, FoldError> {
         let landing_est_bytes =
             (store.total_landing_size() as u64).saturating_mul(EST_BYTES_PER_ORTHO);
-        if !self.should_trigger(landing_est_bytes, disk_free) {
+        if !self.should_trigger(landing_est_bytes) {
             return Ok(false);
         }
         metrics.add_log(format!(
-            "Pressure watchdog: landing_est_bytes={}, disk_free={:?}",
-            landing_est_bytes, disk_free
+            "Pressure watchdog: landing_est_bytes={}",
+            landing_est_bytes
         ));
         metrics.record_pressure_trigger();
-        let stats = store.pressure_spill_and_maybe_offload(cfg)?;
+        let stats = store.pressure_spill_to_local_runs(cfg)?;
         metrics.add_log(format!(
-            "Pressure watchdog spill: buckets_drained={}, spill_runs_created={}, spill_runs_offloaded={}",
-            stats.buckets_drained, stats.spill_runs_created, stats.spill_runs_offloaded
+            "Pressure spill (local): buckets_drained={}, spill_runs_created={}, spill_bytes_created={}",
+            stats.buckets_drained, stats.spill_runs_created, stats.spill_bytes_created
         ));
         metrics.record_landing_buffer_count(store.total_landing_size());
         Ok(true)
@@ -160,9 +152,9 @@ where
     let mut generation_stats: Vec<GenerationStat> = Vec::new();
     let offload_cfg = OffloadConfig::from_env();
     let pressure_watchdog = PressureWatchdog::from_config(offload_cfg);
-    let mut last_disk_available: Option<u64> = None;
     let mut prev_new_work: Option<u64> = None;
     crate::generation_store::set_offload_metrics_handle(Some(metrics.clone_handle()));
+    store.sync_runtime_metrics();
 
     // One-time snapshot: prefix_stats for single-token prefixes (to detect underestimation)
     {
@@ -344,7 +336,7 @@ where
                 sys.refresh_memory();
                 let (used_bytes, total_bytes) =
                     normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-                let proc_rss_bytes = current_process_rss_bytes(&mut sys);
+                let proc_rss_bytes = memory_safety::current_process_rss_bytes();
                 let percent = if total_bytes > 0 {
                     ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
                 } else {
@@ -378,7 +370,6 @@ where
                     }
                     if let Some((total, available, _)) = best {
                         metrics.set_disk_usage(total, available);
-                        last_disk_available = Some(available);
                     }
                 }
 
@@ -390,7 +381,7 @@ where
                 housekeeping()?;
 
                 // Pressure watchdog: drain/compact/offload under landing/disk pressure.
-                let _ = pressure_watchdog.maybe_handle(store, cfg, last_disk_available, metrics)?;
+                let _ = pressure_watchdog.maybe_handle(store, cfg, metrics)?;
             }
 
             // Get requirements from ortho
@@ -560,16 +551,6 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
     )
 }
 
-fn current_process_rss_bytes(sys: &mut System) -> usize {
-    if let Ok(pid) = get_current_pid() {
-        let _ = sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-        if let Some(proc_) = sys.process(pid) {
-            return proc_.memory() as usize;
-        }
-    }
-    0
-}
-
 #[cfg(test)]
 mod pressure_watchdog_tests {
     use super::*;
@@ -625,9 +606,7 @@ mod pressure_watchdog_tests {
             ..OffloadConfig::with_base_dir(base_path.clone())
         });
         let metrics = Metrics::new();
-        let triggered = watchdog
-            .maybe_handle(&mut store, &cfg, Some(u64::MAX), &metrics)
-            .unwrap();
+        let triggered = watchdog.maybe_handle(&mut store, &cfg, &metrics).unwrap();
         assert!(triggered);
         assert_eq!(store.total_landing_size(), 0);
     }

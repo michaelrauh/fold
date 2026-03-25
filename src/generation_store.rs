@@ -1,17 +1,19 @@
 use crate::{
     completion_pruning::bound_existing_ortho,
+    disk_safety,
     interner::Interner,
+    memory_budget::MemoryBudget,
+    memory_safety,
     ortho::{Ortho, OrthoId},
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread_local;
-use sysinfo::System;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
@@ -39,10 +41,10 @@ pub struct Config {
     pub fan_in: usize,
     pub read_buf_bytes: usize,
     pub allow_compaction: bool,
-    pub work_queue_cache_size: usize, // Max orthos to keep in memory
-    pub bufwriter_capacity: usize,    // Buffer size for each bucket writer
-    pub work_segment_size: usize,     // Orthos per segment file
-    pub history_cache_bytes: usize,   // RAM budget for caching history runs
+    pub work_queue_cache_bytes: usize, // Max bytes to keep in the decoded work queue cache
+    pub bufwriter_capacity: usize,     // Buffer size for each bucket writer
+    pub work_segment_max_bytes: usize, // Max decoded bytes per persisted work segment
+    pub history_cache_bytes: usize,    // RAM budget for caching history runs
     pub landing_flush_threshold: usize, // Bytes before forcing flush
 }
 
@@ -55,153 +57,26 @@ impl Config {
             fan_in,
             read_buf_bytes: 64 * 1024,
             allow_compaction: false,
-            work_queue_cache_size: 10_000,
+            work_queue_cache_bytes: 1024 * 1024,
             bufwriter_capacity: 64 * 1024,
-            work_segment_size: 1000,
+            work_segment_max_bytes: 256 * 1024,
             history_cache_bytes: 1024 * 1024,
             landing_flush_threshold: 64 * 1024,
         }
     }
-
-    /// Compute config based on role and current system memory state
-    ///
-    /// RAM Policy:
-    /// - Target 85% total RAM usage aggressively
-    /// - Leader: Scale down only above 85% usage
-    /// - Follower: Scale down starting at 70% usage
-    /// - Allocate budget across: run_budget (70%), work cache (10%), buffers (10%), history cache (10%)
-    /// - Follower bails if run_budget < 128MB when already at lowest budget and RSS stays above minimum target
-    pub fn compute_config(role: Role) -> Option<Self> {
-        let (used_bytes, total_bytes, _headroom_bytes) = get_memory_state();
-        let used_pct = (used_bytes as f64 / total_bytes as f64) * 100.0;
-
-        // Target 85% of total RAM
-        let target_usage_bytes = (total_bytes as f64 * 0.85) as usize;
-        let available_bytes = target_usage_bytes.saturating_sub(used_bytes);
-
-        // Define scale-down thresholds based on role
-        let scale_threshold = match role {
-            Role::Leader => 85.0,   // Start scaling down at 85%
-            Role::Follower => 70.0, // Start scaling down at 70%
-        };
-
-        // Base budgets (at low usage)
-        let (base_budget, min_budget) = match role {
-            Role::Leader => (available_bytes, 2_000_000_000), // Use all available, min 2GB
-            Role::Follower => (available_bytes.min(4_000_000_000), 256_000_000), // Cap at 4GB, min 256MB
-        };
-
-        // Scale down budget if above threshold
-        let budget = if used_pct > scale_threshold {
-            // Linear scale-down from 100% at threshold to min at 95%
-            let scale_range = 95.0 - scale_threshold;
-            let position = ((used_pct - scale_threshold) / scale_range).min(1.0);
-            let budget_range = (base_budget - min_budget) as f64;
-            base_budget - (budget_range * position) as usize
-        } else {
-            base_budget
-        };
-
-        // Check follower bail-out condition
-        if role == Role::Follower {
-            let run_budget = (budget as f64 * 0.3) as usize;
-            if run_budget < 128_000_000 && used_pct >= scale_threshold {
-                return None;
-            }
-        }
-
-        // Allocate budget across subsystems
-        let run_budget_bytes = (budget as f64 * 0.70) as usize; // 70% for LSM runs
-        let work_cache_budget = (budget as f64 * 0.10) as usize; // 10% for work queue cache
-        let buffer_budget = (budget as f64 * 0.10) as usize; // 10% for write buffers
-        let history_cache_bytes = (budget as f64 * 0.10) as usize; // 10% for history caching
-
-        // Work queue cache: assume ~200 bytes per ortho
-        let work_queue_cache_size = work_cache_budget / 200;
-
-        // BufWriter capacity: divide among 8 buckets, min 64KB, max 16MB per bucket
-        let bufwriter_capacity = (buffer_budget / 8).clamp(64 * 1024, 16 * 1024 * 1024);
-
-        // Work segment size: larger segments = fewer files, assume ~200 bytes per ortho
-        // Target segments of ~10MB each = 50k orthos
-        let work_segment_size = 50_000;
-
-        // Landing flush threshold: 1-10MB depending on buffer capacity
-        let landing_flush_threshold = bufwriter_capacity.clamp(1024 * 1024, 10 * 1024 * 1024);
-
-        // Derive read buffer from run budget: target ~256KB-2MB per run
-        let read_buf_bytes = (run_budget_bytes / 256).clamp(256 * 1024, 2 * 1024 * 1024);
-        let fan_in = compute_fan_in(run_budget_bytes, read_buf_bytes);
-
-        Some(Self {
-            run_budget_bytes,
-            fan_in,
-            read_buf_bytes,
+    pub fn from_memory_budget(budget: &MemoryBudget) -> Self {
+        Self {
+            run_budget_bytes: budget.compaction_arena_bytes,
+            fan_in: budget.fan_in,
+            read_buf_bytes: budget.read_buf_bytes,
             allow_compaction: true,
-            work_queue_cache_size,
-            bufwriter_capacity,
-            work_segment_size,
-            history_cache_bytes,
-            landing_flush_threshold,
-        })
-    }
-}
-
-/// Get current memory state: (used_bytes, total_bytes, headroom_bytes)
-fn get_memory_state() -> (usize, usize, usize) {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-
-    let total_raw = sys.total_memory();
-    let used_raw = sys.used_memory();
-
-    // Use the same normalization as main.rs for consistency
-    let (used_bytes, total_bytes) = normalize_sysinfo_mem(total_raw, used_raw);
-    let headroom_bytes = total_bytes.saturating_sub(used_bytes);
-
-    (used_bytes, total_bytes, headroom_bytes)
-}
-
-/// Normalize sysinfo memory values (copied from main.rs for now)
-fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-            if let Some(mem_total_kib) = meminfo
-                .lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                let mem_total_kib_f = mem_total_kib as f64;
-                // If sysinfo matches /proc/meminfo in KiB, convert to bytes.
-                fn within_10_pct(a: f64, b: f64) -> bool {
-                    (a - b).abs() / a.max(b) <= 0.1
-                }
-                if within_10_pct(total_raw as f64, mem_total_kib_f) {
-                    let factor = 1024usize;
-                    return (
-                        (used_raw as usize).saturating_mul(factor),
-                        (total_raw as usize).saturating_mul(factor),
-                    );
-                }
-                let mem_total_bytes_f = mem_total_kib_f * 1024.0;
-                if within_10_pct(total_raw as f64, mem_total_bytes_f) {
-                    return (used_raw as usize, total_raw as usize);
-                }
-            }
+            work_queue_cache_bytes: budget.work_cache_bytes,
+            bufwriter_capacity: budget.bufwriter_capacity,
+            work_segment_max_bytes: budget.work_segment_max_bytes.min(budget.work_cache_bytes),
+            history_cache_bytes: budget.history_cache_bytes,
+            landing_flush_threshold: budget.landing_flush_threshold,
         }
     }
-    (used_raw as usize, total_raw as usize)
-}
-
-/// Calculate fan_in: clamp(budget / read_buf, 8, 256)
-fn compute_fan_in(budget: usize, read_buf_bytes: usize) -> usize {
-    if read_buf_bytes == 0 {
-        return 8;
-    }
-    let raw_fan_in = budget / read_buf_bytes;
-    raw_fan_in.clamp(8, 256)
 }
 
 /// Callback for reporting generation transition progress
@@ -241,15 +116,18 @@ pub struct GenerationStore {
     work_segment_counter: usize,
     total_work_len: u64,
     work_queue_cache: VecDeque<Ortho>, // In-memory cache of work items
-    work_queue_cache_max: usize,       // Max cache size
+    work_queue_cache_bytes: usize,     // Current decoded bytes in the work queue cache
+    work_queue_cache_max_bytes: usize, // Max decoded bytes in the work queue cache
     work_segment_batch: Vec<Ortho>,    // Batch for writing segments
-    work_segment_batch_max: usize,     // Max batch size before flush
+    work_segment_batch_bytes: usize,   // Current decoded bytes in the pending work batch
+    work_segment_batch_max_bytes: usize, // Max decoded bytes before flushing a work segment
     cached_best_volume: Cell<Option<usize>>, // Cached best volume across work caches
     cached_best_ortho: RefCell<Option<Ortho>>, // Cached best ortho across work caches
     best_volume_dirty: Cell<bool>,     // Whether cached best needs recompute
     bufwriter_capacity: usize,         // Buffer capacity for bucket writers
     landing_flush_threshold: usize,    // Threshold for flushing landing writes
-    spill_runs: Vec<Vec<PathBuf>>,     // Per-bucket pending spill runs for the current generation
+    compaction_arena_cap_bytes: usize, // Max streamed bytes allowed in compaction
+    spill_runs: Vec<Vec<TrackedSpillRun>>, // Per-bucket pending spill runs for the current generation
     // History state
     history_runs: Vec<Vec<PathBuf>>, // Per-bucket list of history run files
     seen_len_accepted: u64,          // Monotonic count of accepted items across all generations
@@ -278,7 +156,19 @@ impl RawStream {
 pub struct PressureSpillStats {
     pub buckets_drained: usize,
     pub spill_runs_created: usize,
-    pub spill_runs_offloaded: usize,
+    pub spill_bytes_created: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TrackedSpillRun {
+    path: PathBuf,
+    size_bytes: u64,
+}
+
+impl TrackedSpillRun {
+    fn new(path: PathBuf, size_bytes: u64) -> Self {
+        Self { path, size_bytes }
+    }
 }
 
 /// Sorted run of orthos
@@ -331,6 +221,7 @@ pub fn set_run_downloader(ctx: Option<(PathBuf, Arc<dyn RunDownloader>)>) {
 
 /// Set or clear a metrics handle for offload/download counters.
 pub fn set_offload_metrics_handle(handle: Option<crate::metrics::Metrics>) {
+    crate::disk_safety::set_metrics_handle(handle.clone());
     METRICS_HANDLE.with(|slot| *slot.borrow_mut() = handle);
 }
 
@@ -431,7 +322,7 @@ fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
     }
 }
 
-fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
+pub fn resolve_managed_path(path: &Path) -> io::Result<PathBuf> {
     if path.exists() {
         return Ok(path.to_path_buf());
     }
@@ -460,6 +351,30 @@ fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(cached)
+}
+
+fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
+    resolve_managed_path(path)
+}
+
+fn estimate_streamed_run_bytes(arena: &[StreamedOrtho]) -> u64 {
+    arena
+        .iter()
+        .map(|item| (ORTHO_RECORD_HEADER_SIZE + item.bytes.len()) as u64)
+        .sum()
+}
+
+fn file_size_or_zero(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn estimate_compressed_run_set_bytes(runs: &[Run]) -> io::Result<u64> {
+    let mut total = 0u64;
+    for run in runs {
+        let resolved = resolve_managed_path(run.path())?;
+        total = total.saturating_add(file_size_or_zero(&resolved));
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -637,6 +552,12 @@ impl StreamedOrtho {
         // Safe because bytes come from rkyv::to_bytes and remain owned here.
         unsafe { rkyv::archived_root::<Ortho>(&self.bytes) }
     }
+
+    fn heap_bytes_estimate(&self) -> usize {
+        mem::size_of::<StreamedOrtho>()
+            .saturating_add(self.bytes.capacity())
+            .saturating_add(self.bytes_read)
+    }
 }
 
 fn archived_eq(a: &StreamedOrtho, b: &StreamedOrtho) -> bool {
@@ -710,6 +631,10 @@ fn write_ortho_record_bytes<W: Write>(
 
 fn compress_file(path: &PathBuf, level: i32) -> io::Result<(u64, u64)> {
     let uncompressed = fs::metadata(path)?.len();
+    disk_safety::ensure_write_budget(
+        uncompressed.saturating_add(64 * 1024),
+        &format!("compress {}", path.display()),
+    )?;
     let tmp_path = path.with_extension("zsttmp");
     let input = File::open(path)?;
     let output = File::create(&tmp_path)?;
@@ -811,6 +736,44 @@ impl Iterator for HistoryIterator {
 }
 
 impl GenerationStore {
+    fn sync_memory_metrics(&self) {
+        if let Some(metrics) = metrics_handle() {
+            metrics.update_global(|g| {
+                g.work_cache_bytes = self.work_queue_cache_bytes;
+                g.work_cache_cap_bytes = self.work_queue_cache_max_bytes;
+                g.segment_batch_bytes = self.work_segment_batch_bytes;
+                g.segment_batch_cap_bytes = self.work_segment_batch_max_bytes;
+                g.compaction_arena_cap_bytes = self.compaction_arena_cap_bytes;
+            });
+        }
+    }
+
+    fn sync_spill_metrics(&self) {
+        if let Some(metrics) = metrics_handle() {
+            let pending_files = self.spill_runs.iter().map(|runs| runs.len() as u64).sum();
+            let pending_bytes = self
+                .spill_runs
+                .iter()
+                .flatten()
+                .map(|run| run.size_bytes)
+                .sum();
+            metrics.set_spill_pending(pending_files, pending_bytes);
+        }
+    }
+
+    pub fn sync_runtime_metrics(&self) {
+        self.sync_memory_metrics();
+        self.sync_spill_metrics();
+    }
+
+    fn set_compaction_bytes(bytes: usize) {
+        if let Some(metrics) = metrics_handle() {
+            metrics.update_global(|g| {
+                g.compaction_arena_bytes = bytes;
+            });
+        }
+    }
+
     /// Create a new generation store with specified base path and bucket count
     pub fn new_with_config(base_path: PathBuf, bucket_count: usize) -> io::Result<Self> {
         // Bucket count must be a power of two
@@ -860,14 +823,17 @@ impl GenerationStore {
             work_segment_counter: 0,
             total_work_len: 0,
             work_queue_cache: VecDeque::new(),
-            work_queue_cache_max: 100_000, // Default, will be updated with config
+            work_queue_cache_bytes: 0,
+            work_queue_cache_max_bytes: 1024 * 1024, // Default, will be updated with config
             work_segment_batch: Vec::new(),
-            work_segment_batch_max: 50_000, // Default, will be updated with config
+            work_segment_batch_bytes: 0,
+            work_segment_batch_max_bytes: 256 * 1024, // Default, will be updated with config
             cached_best_volume: Cell::new(None),
             cached_best_ortho: RefCell::new(None),
             best_volume_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024, // Default 16MB
             landing_flush_threshold: 10 * 1024 * 1024, // Default 10MB
+            compaction_arena_cap_bytes: 256 * 1024 * 1024,
             spill_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
             history_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
@@ -943,13 +909,14 @@ impl GenerationStore {
 
         let mut contents = String::new();
         for bucket in 0..self.bucket_count {
-            for path in &self.spill_runs[bucket] {
-                let relative = path
+            for spill in &self.spill_runs[bucket] {
+                let relative = spill
+                    .path
                     .strip_prefix(&self.base_path)
-                    .unwrap_or(path)
+                    .unwrap_or(&spill.path)
                     .to_string_lossy()
                     .into_owned();
-                contents.push_str(&format!("{}\t{}\n", bucket, relative));
+                contents.push_str(&format!("{}\t{}\t{}\n", bucket, relative, spill.size_bytes));
             }
         }
 
@@ -968,19 +935,23 @@ impl GenerationStore {
 
     fn load_spill_runs_from_disk(&mut self) -> io::Result<()> {
         self.spill_runs = (0..self.bucket_count).map(|_| Vec::new()).collect();
-        let mut per_bucket: Vec<BTreeSet<PathBuf>> =
-            (0..self.bucket_count).map(|_| BTreeSet::new()).collect();
+        let mut per_bucket: Vec<BTreeMap<PathBuf, u64>> =
+            (0..self.bucket_count).map(|_| BTreeMap::new()).collect();
 
         let manifest_path = self.spill_manifest_path();
         if let Ok(contents) = fs::read_to_string(&manifest_path) {
             for line in contents.lines() {
-                let mut parts = line.splitn(2, '\t');
+                let mut parts = line.splitn(3, '\t');
                 let Some(bucket_str) = parts.next() else {
                     continue;
                 };
                 let Some(path_str) = parts.next() else {
                     continue;
                 };
+                let size_bytes = parts
+                    .next()
+                    .and_then(|part| part.parse::<u64>().ok())
+                    .unwrap_or(0);
                 let Ok(bucket) = bucket_str.parse::<usize>() else {
                     continue;
                 };
@@ -993,7 +964,12 @@ impl GenerationStore {
                 } else {
                     self.base_path.join(path)
                 };
-                per_bucket[bucket].insert(full_path);
+                let size = if size_bytes > 0 {
+                    size_bytes
+                } else {
+                    fs::metadata(&full_path).map(|meta| meta.len()).unwrap_or(0)
+                };
+                per_bucket[bucket].insert(full_path, size);
             }
         }
 
@@ -1004,32 +980,40 @@ impl GenerationStore {
                     let entry = entry?;
                     let path = entry.path();
                     if path.is_file() {
-                        per_bucket[bucket].insert(path);
+                        let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                        per_bucket[bucket].insert(path, size);
                     }
                 }
             }
-            self.spill_runs[bucket] = per_bucket[bucket].iter().cloned().collect();
+            self.spill_runs[bucket] = per_bucket[bucket]
+                .iter()
+                .map(|(path, size_bytes)| TrackedSpillRun::new(path.clone(), *size_bytes))
+                .collect();
         }
 
         Ok(())
     }
 
-    fn spill_runs_for_bucket(&self, bucket: usize) -> Vec<PathBuf> {
+    fn spill_runs_for_bucket(&self, bucket: usize) -> Vec<TrackedSpillRun> {
         self.spill_runs[bucket].clone()
     }
 
     fn clear_spill_runs_for_bucket(&mut self, bucket: usize) -> io::Result<()> {
         self.spill_runs[bucket].clear();
-        self.persist_spill_manifest()
+        self.persist_spill_manifest()?;
+        self.sync_spill_metrics();
+        Ok(())
     }
 
     fn extend_spill_runs<I>(&mut self, bucket: usize, paths: I) -> io::Result<()>
     where
-        I: IntoIterator<Item = PathBuf>,
+        I: IntoIterator<Item = TrackedSpillRun>,
     {
         self.spill_runs[bucket].extend(paths);
         self.spill_runs[bucket].sort();
-        self.persist_spill_manifest()
+        self.persist_spill_manifest()?;
+        self.sync_spill_metrics();
+        Ok(())
     }
 
     /// Create a new empty generation store
@@ -1045,14 +1029,17 @@ impl GenerationStore {
             work_segment_counter: 0,
             total_work_len: 0,
             work_queue_cache: VecDeque::new(),
-            work_queue_cache_max: 100_000,
+            work_queue_cache_bytes: 0,
+            work_queue_cache_max_bytes: 1024 * 1024,
             work_segment_batch: Vec::new(),
-            work_segment_batch_max: 50_000,
+            work_segment_batch_bytes: 0,
+            work_segment_batch_max_bytes: 256 * 1024,
             cached_best_volume: Cell::new(None),
             cached_best_ortho: RefCell::new(None),
             best_volume_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024,
             landing_flush_threshold: 10 * 1024 * 1024,
+            compaction_arena_cap_bytes: 256 * 1024 * 1024,
             spill_runs: (0..8).map(|_| Vec::new()).collect(),
             history_runs: (0..8).map(|_| Vec::new()).collect(),
             seen_len_accepted: 0,
@@ -1106,6 +1093,10 @@ impl GenerationStore {
         // Track buffer size and flush if over threshold
         self.landing_buffer_sizes[bucket] += encoded_len;
         if self.landing_buffer_sizes[bucket] >= flush_threshold {
+            disk_safety::ensure_write_budget(
+                self.landing_buffer_sizes[bucket] as u64,
+                &format!("flush landing bucket {}", bucket),
+            )?;
             writer.flush()?;
             self.landing_buffer_sizes[bucket] = 0;
         }
@@ -1118,6 +1109,12 @@ impl GenerationStore {
         // Flush and close any active writer for this bucket
         if let Some(writer) = self.bucket_writers[bucket].take() {
             let mut writer = writer;
+            if self.landing_buffer_sizes[bucket] > 0 {
+                disk_safety::ensure_write_budget(
+                    self.landing_buffer_sizes[bucket] as u64,
+                    &format!("flush landing bucket {}", bucket),
+                )?;
+            }
             writer.flush()?;
         }
 
@@ -1152,18 +1149,29 @@ impl GenerationStore {
             return Ok(());
         }
 
-        // Add items to batch
-        if !self.best_volume_dirty.get() {
-            if let Some(best_item) = items.iter().max_by_key(|o| o.volume()) {
-                self.update_cached_best(best_item);
+        for ortho in items {
+            if !self.best_volume_dirty.get() {
+                self.update_cached_best(&ortho);
+            }
+
+            let ortho_bytes = ortho.heap_bytes_estimate().max(1);
+            if !self.work_segment_batch.is_empty()
+                && self.work_segment_batch_bytes.saturating_add(ortho_bytes)
+                    > self.work_segment_batch_max_bytes
+            {
+                self.flush_work_segment_batch()?;
+            }
+
+            self.work_segment_batch_bytes =
+                self.work_segment_batch_bytes.saturating_add(ortho_bytes);
+            self.work_segment_batch.push(ortho);
+
+            if self.work_segment_batch_bytes >= self.work_segment_batch_max_bytes {
+                self.flush_work_segment_batch()?;
             }
         }
-        self.work_segment_batch.extend(items);
 
-        // Flush batch if it exceeds max size
-        if self.work_segment_batch.len() >= self.work_segment_batch_max {
-            self.flush_work_segment_batch()?;
-        }
+        self.sync_memory_metrics();
 
         Ok(())
     }
@@ -1174,7 +1182,20 @@ impl GenerationStore {
             return Ok(());
         }
 
+        memory_safety::ensure_phase_headroom(
+            self.work_segment_batch_bytes
+                .saturating_mul(2)
+                .saturating_add(64 * 1024),
+            "flush work segment batch",
+        )?;
+
         let count = self.work_segment_batch.len() as u64;
+        let bytes_needed = (self.work_segment_batch_bytes as u64)
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of_val(&count) as u64)
+            .saturating_add((count as u64).saturating_mul(8));
+        disk_safety::ensure_write_budget(bytes_needed, "flush work segment batch")?;
+
         let segment_path = self
             .base_path
             .join("work")
@@ -1197,7 +1218,9 @@ impl GenerationStore {
         self.work_segments.push(segment_path);
         self.total_work_len += count;
         self.work_segment_batch.clear();
+        self.work_segment_batch_bytes = 0;
         self.best_volume_dirty.set(true);
+        self.sync_memory_metrics();
 
         Ok(())
     }
@@ -1208,7 +1231,11 @@ impl GenerationStore {
         // Try to pop from cache first
         if let Some(ortho) = self.work_queue_cache.pop_front() {
             self.total_work_len -= 1;
+            self.work_queue_cache_bytes = self
+                .work_queue_cache_bytes
+                .saturating_sub(ortho.heap_bytes_estimate());
             self.handle_removed_volume(ortho.volume());
+            self.sync_memory_metrics();
             return Ok(Some(ortho));
         }
 
@@ -1219,10 +1246,15 @@ impl GenerationStore {
         {
             let batch_len = self.work_segment_batch.len() as u64;
             self.total_work_len = self.total_work_len.saturating_add(batch_len);
+            self.work_queue_cache_bytes = self
+                .work_queue_cache_bytes
+                .saturating_add(self.work_segment_batch_bytes);
             let batch = std::mem::take(&mut self.work_segment_batch);
+            self.work_segment_batch_bytes = 0;
             for ortho in batch {
                 self.work_queue_cache.push_back(ortho);
             }
+            self.sync_memory_metrics();
         }
 
         // Cache is empty, refill from disk segments
@@ -1231,7 +1263,11 @@ impl GenerationStore {
         // Pop from cache after refill
         if let Some(ortho) = self.work_queue_cache.pop_front() {
             self.total_work_len -= 1;
+            self.work_queue_cache_bytes = self
+                .work_queue_cache_bytes
+                .saturating_sub(ortho.heap_bytes_estimate());
             self.handle_removed_volume(ortho.volume());
+            self.sync_memory_metrics();
             return Ok(Some(ortho));
         }
 
@@ -1240,24 +1276,38 @@ impl GenerationStore {
 
     /// Refill work queue cache from disk segments
     fn refill_work_cache(&mut self) -> io::Result<()> {
-        let target_max = self.work_queue_cache_max.max(1);
-        while self.work_queue_cache.len() < target_max && !self.work_segments.is_empty() {
-            // Take next segment
-            let segment_path = self.work_segments.remove(0);
-            let mut file = File::open(&segment_path)?;
+        let target_max = self.work_queue_cache_max_bytes.max(1);
+        if self.work_queue_cache_bytes >= target_max || !self.work_queue_cache.is_empty() {
+            return Ok(());
+        }
 
-            // Read count
+        while self.work_queue_cache.is_empty() && !self.work_segments.is_empty() {
+            let segment_path = self.work_segments.remove(0);
+            let resolved_path = resolve_managed_path(&segment_path)?;
+            let mut file = File::open(&resolved_path)?;
+
             let mut count_bytes = [0u8; 8];
             file.read_exact(&mut count_bytes)?;
             let count = u64::from_le_bytes(count_bytes) as usize;
 
             if count == 0 {
                 drop(file);
-                fs::remove_file(&segment_path)?;
+                match fs::remove_file(&segment_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
                 continue;
             }
 
-            // Read all orthos from segment into cache
+            let reserve_bytes = self.work_queue_cache_max_bytes.max(target_max);
+            memory_safety::ensure_phase_headroom(
+                reserve_bytes.saturating_add(64 * 1024),
+                "refill work queue cache",
+            )?;
+
+            let mut loaded = VecDeque::with_capacity(count);
+            let mut loaded_bytes = 0usize;
             for _ in 0..count {
                 let mut len_bytes = [0u8; 8];
                 file.read_exact(&mut len_bytes)?;
@@ -1267,27 +1317,31 @@ impl GenerationStore {
                 file.read_exact(&mut ortho_bytes)?;
                 let ortho: Ortho = Ortho::from_bytes(&ortho_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-                self.work_queue_cache.push_back(ortho);
-                if !self.best_volume_dirty.get() {
-                    if let Some(last) = self.work_queue_cache.back() {
-                        self.update_cached_best(last);
-                    }
-                }
-
-                // Stop if cache is full
-                if self.work_queue_cache.len() >= self.work_queue_cache_max {
-                    break;
-                }
+                loaded_bytes = loaded_bytes.saturating_add(ortho.heap_bytes_estimate());
+                loaded.push_back(ortho);
             }
 
-            // Delete consumed segment
-            drop(file);
-            fs::remove_file(&segment_path)?;
+            if loaded_bytes > self.work_queue_cache_max_bytes && loaded.len() > 1 {
+                return Err(io::Error::other(format!(
+                    "work segment exceeded cache budget: {} > {}",
+                    loaded_bytes, self.work_queue_cache_max_bytes
+                )));
+            }
 
-            // Stop if cache is full
-            if self.work_queue_cache.len() >= self.work_queue_cache_max {
-                break;
+            self.work_queue_cache = loaded;
+            self.work_queue_cache_bytes = loaded_bytes;
+            if !self.best_volume_dirty.get() {
+                if let Some(best_item) = self.work_queue_cache.iter().max_by_key(|o| o.volume()) {
+                    self.update_cached_best(best_item);
+                }
+            }
+            self.sync_memory_metrics();
+
+            drop(file);
+            match fs::remove_file(&segment_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
             }
         }
 
@@ -1296,10 +1350,12 @@ impl GenerationStore {
 
     /// Configure the store with Config settings
     pub fn configure(&mut self, cfg: &Config) {
-        self.work_queue_cache_max = cfg.work_queue_cache_size.max(1);
-        self.work_segment_batch_max = cfg.work_segment_size;
+        self.work_queue_cache_max_bytes = cfg.work_queue_cache_bytes.max(1);
+        self.work_segment_batch_max_bytes = cfg.work_segment_max_bytes.max(1);
         self.bufwriter_capacity = cfg.bufwriter_capacity;
         self.landing_flush_threshold = cfg.landing_flush_threshold;
+        self.compaction_arena_cap_bytes = cfg.run_budget_bytes;
+        self.sync_runtime_metrics();
     }
 
     /// Flush all pending buffers (landing + work segments)
@@ -1322,6 +1378,22 @@ impl GenerationStore {
     /// Get just the in-memory work cache size (for debugging)
     pub fn work_queue_cache_len(&self) -> usize {
         self.work_queue_cache.len() + self.work_segment_batch.len()
+    }
+
+    pub fn work_queue_cache_bytes(&self) -> usize {
+        self.work_queue_cache_bytes
+    }
+
+    pub fn work_queue_cache_cap_bytes(&self) -> usize {
+        self.work_queue_cache_max_bytes
+    }
+
+    pub fn work_segment_batch_bytes(&self) -> usize {
+        self.work_segment_batch_bytes
+    }
+
+    pub fn work_segment_batch_cap_bytes(&self) -> usize {
+        self.work_segment_batch_max_bytes
     }
 
     /// Get current statistics
@@ -1388,6 +1460,12 @@ impl GenerationStore {
             for run_path in runs {
                 let run = Run::new(run_path.clone());
                 let mut reader = run.iter(read_buf_bytes)?;
+                let resolved_run_path = resolve_managed_path(&run_path)?;
+                let rewrite_budget = file_size_or_zero(&resolved_run_path).saturating_mul(8);
+                disk_safety::ensure_write_budget(
+                    rewrite_budget.saturating_add(64 * 1024),
+                    &format!("rewrite pruned history run {}", run_path.display()),
+                )?;
                 let tmp_path = run_path.with_extension("pruned");
                 let tmp_parent = tmp_path
                     .parent()
@@ -1417,7 +1495,6 @@ impl GenerationStore {
 
                 if wrote_any {
                     fs::rename(&tmp_path, &run_path)?;
-                    maybe_offload_and_delete(&run_path)?;
                     new_runs.push(run_path);
                 } else {
                     let _ = fs::remove_file(&run_path);
@@ -1445,7 +1522,6 @@ impl GenerationStore {
 
         // Move the run file to history
         fs::rename(run.path(), &dest_path)?;
-        maybe_offload_and_delete(&dest_path)?;
 
         // Track the history run
         self.history_runs[bucket].push(dest_path);
@@ -1460,7 +1536,7 @@ impl GenerationStore {
     /// Returns the number of orthos enqueued.
     fn enqueue_work_run(&mut self, run: Run, read_buf_bytes: usize) -> io::Result<usize> {
         let mut reader = run.iter(read_buf_bytes)?;
-        let mut batch: Vec<Ortho> = Vec::with_capacity(self.work_segment_batch_max.max(1));
+        let mut batch: Vec<Ortho> = Vec::new();
         let mut count = 0usize;
 
         while let Some(item) = reader.next() {
@@ -1470,10 +1546,7 @@ impl GenerationStore {
             batch.push(ortho);
             count += 1;
 
-            if batch.len() >= self.work_segment_batch_max {
-                let flushed = std::mem::take(&mut batch);
-                self.push_segments(flushed)?;
-            }
+            self.push_segments(std::mem::take(&mut batch))?;
         }
 
         if !batch.is_empty() {
@@ -1522,11 +1595,8 @@ impl GenerationStore {
             .collect()
     }
 
-    /// Emergency path: drain all buckets into tracked spill runs and optionally offload them.
-    pub fn pressure_spill_and_maybe_offload(
-        &mut self,
-        cfg: &Config,
-    ) -> io::Result<PressureSpillStats> {
+    /// Emergency path: drain all buckets into tracked local spill runs.
+    pub fn pressure_spill_to_local_runs(&mut self, cfg: &Config) -> io::Result<PressureSpillStats> {
         self.flush_all()?;
         let mut stats = PressureSpillStats::default();
         for bucket in 0..self.bucket_count {
@@ -1555,13 +1625,20 @@ impl GenerationStore {
                     fs::create_dir_all(parent)?;
                 }
                 fs::rename(run.path(), &spill_path)?;
-                if offload_and_delete_if_configured(&spill_path)? {
-                    stats.spill_runs_offloaded += 1;
-                }
-                tracked_paths.push(spill_path);
+                let size_bytes = fs::metadata(&spill_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                tracked_paths.push(TrackedSpillRun::new(spill_path, size_bytes));
             }
             stats.spill_runs_created += tracked_paths.len();
+            stats.spill_bytes_created = stats
+                .spill_bytes_created
+                .saturating_add(tracked_paths.iter().map(|run| run.size_bytes).sum::<u64>());
             self.extend_spill_runs(bucket, tracked_paths)?;
+        }
+        if let Some(metrics) = metrics_handle() {
+            metrics
+                .record_spill_created(stats.spill_runs_created as u64, stats.spill_bytes_created);
         }
         Ok(stats)
     }
@@ -1617,9 +1694,16 @@ impl GenerationStore {
 
     /// Flush all bucket writers
     pub fn flush(&mut self) -> io::Result<()> {
-        for writer in self.bucket_writers.iter_mut() {
+        for (bucket, writer) in self.bucket_writers.iter_mut().enumerate() {
             if let Some(w) = writer {
+                if self.landing_buffer_sizes[bucket] > 0 {
+                    disk_safety::ensure_write_budget(
+                        self.landing_buffer_sizes[bucket] as u64,
+                        &format!("flush landing bucket {}", bucket),
+                    )?;
+                }
                 w.flush()?;
+                self.landing_buffer_sizes[bucket] = 0;
             }
         }
         Ok(())
@@ -1704,13 +1788,16 @@ impl GenerationStore {
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:sorting", bucket));
             }
-            let mut runs: Vec<Run> = spill_runs.iter().cloned().map(Run::new).collect();
+            let mut runs: Vec<Run> = spill_runs
+                .iter()
+                .map(|spill| Run::new(spill.path.clone()))
+                .collect();
             let raw_runs = compact_landing(
                 bucket,
                 raw,
                 cfg,
                 &self.base_path,
-                true,
+                false,
                 Some(&mut self.compression_stats),
             )?;
             runs.extend(raw_runs);
@@ -1768,6 +1855,10 @@ impl GenerationStore {
             // Enqueue new work from run in bounded batches
             let bucket_new_work = self.enqueue_work_run(new_work_run, cfg.read_buf_bytes)?;
             if !spill_runs.is_empty() {
+                if let Some(metrics) = metrics_handle() {
+                    let consumed_bytes = spill_runs.iter().map(|run| run.size_bytes).sum();
+                    metrics.record_spill_consumed(spill_runs.len() as u64, consumed_bytes);
+                }
                 self.clear_spill_runs_for_bucket(bucket)?;
                 if let Some(cb) = &progress {
                     cb(&format!(
@@ -1906,9 +1997,17 @@ pub fn compact_landing(
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     static RUN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    memory_safety::ensure_phase_headroom(
+        cfg.run_budget_bytes
+            .saturating_add(cfg.read_buf_bytes.saturating_mul(2))
+            .saturating_add(64 * 1024),
+        &format!("compact landing bucket {}", bucket),
+    )?;
+
     let mut runs = Vec::new();
     let mut arena: Vec<StreamedOrtho> = Vec::new();
     let mut current_size: usize = 0;
+    GenerationStore::set_compaction_bytes(0);
 
     // Read all drain files with bounded buffering
     for file_path in raw.files() {
@@ -1920,7 +2019,7 @@ pub fn compact_landing(
                     format!("Failed to decode ortho: {}", e),
                 )
             })?;
-            let ortho_size = streamed.decoded_size_est;
+            let ortho_size = streamed.heap_bytes_estimate();
             if !arena.is_empty() && current_size.saturating_add(ortho_size) > cfg.run_budget_bytes {
                 // Flush before adding this item to keep arena under budget.
                 arena.sort_unstable_by_key(|o| o.id);
@@ -1933,11 +2032,14 @@ pub fn compact_landing(
                 runs.push(Run::new(run_path));
 
                 arena.clear();
+                arena.shrink_to_fit();
                 current_size = 0;
+                GenerationStore::set_compaction_bytes(0);
             }
 
             arena.push(streamed);
             current_size = current_size.saturating_add(ortho_size);
+            GenerationStore::set_compaction_bytes(current_size);
         }
     }
 
@@ -1951,7 +2053,10 @@ pub fn compact_landing(
 
         write_streamed_run(&arena, &run_path, offload_after_write, stats.as_deref_mut())?;
         runs.push(Run::new(run_path));
+        arena.clear();
+        arena.shrink_to_fit();
     }
+    GenerationStore::set_compaction_bytes(0);
 
     // Best-effort cleanup of drained landing files now that they are incorporated.
     for file_path in raw.files() {
@@ -1971,6 +2076,14 @@ fn write_streamed_run(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    let estimated_raw_bytes = estimate_streamed_run_bytes(arena);
+    disk_safety::ensure_write_budget(
+        estimated_raw_bytes
+            .saturating_mul(2)
+            .saturating_add(64 * 1024),
+        &format!("write run {}", path.display()),
+    )?;
 
     let mut writer = BufWriter::with_capacity(64 * 1024, File::create(path)?);
     for streamed in arena {
@@ -2038,6 +2151,20 @@ pub fn merge_unique(
     let unique_path = base_path
         .join("runs")
         .join(format!("unique-{}.dat", merge_id));
+    let merge_memory_budget = runs
+        .len()
+        .saturating_mul(cfg.read_buf_bytes)
+        .saturating_add(cfg.bufwriter_capacity)
+        .saturating_add(64 * 1024);
+    memory_safety::ensure_phase_headroom(
+        merge_memory_budget,
+        &format!("merge unique {}", unique_path.display()),
+    )?;
+    let merge_budget = estimate_compressed_run_set_bytes(&runs)?.saturating_mul(8);
+    disk_safety::ensure_write_budget(
+        merge_budget.saturating_add(64 * 1024),
+        &format!("merge unique {}", unique_path.display()),
+    )?;
     let mut writer = BufWriter::new(File::create(&unique_path)?);
 
     #[derive(Eq, PartialEq)]
@@ -2120,7 +2247,6 @@ pub fn merge_unique(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    maybe_offload_and_delete(&unique_path)?;
     cleanup_runs(&runs);
 
     Ok(UniqueRun::new(unique_path))
@@ -2142,6 +2268,20 @@ fn merge_ortho_chunk(
     let chunk_path = base_path
         .join("runs")
         .join(format!("chunk-{}.dat", chunk_id));
+    let merge_memory_budget = runs
+        .len()
+        .saturating_mul(cfg.read_buf_bytes)
+        .saturating_add(cfg.bufwriter_capacity)
+        .saturating_add(64 * 1024);
+    memory_safety::ensure_phase_headroom(
+        merge_memory_budget,
+        &format!("merge chunk {}", chunk_path.display()),
+    )?;
+    let merge_budget = estimate_compressed_run_set_bytes(runs)?.saturating_mul(8);
+    disk_safety::ensure_write_budget(
+        merge_budget.saturating_add(64 * 1024),
+        &format!("merge chunk {}", chunk_path.display()),
+    )?;
     let mut writer = BufWriter::new(File::create(&chunk_path)?);
 
     #[derive(Eq, PartialEq)]
@@ -2206,7 +2346,6 @@ fn merge_ortho_chunk(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    maybe_offload_and_delete(&chunk_path)?;
     Ok(Run::new(chunk_path))
 }
 
@@ -2233,6 +2372,10 @@ pub fn anti_join_orthos(
     static ANTI_JOIN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let anti_join_id = ANTI_JOIN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
+    memory_safety::ensure_phase_headroom(
+        read_buf_bytes.saturating_mul(4).saturating_add(256 * 1024),
+        &format!("anti join {}", anti_join_id),
+    )?;
     let seen_run_path = base_path
         .join("runs")
         .join(format!("seen-{}.dat", anti_join_id));
@@ -2629,6 +2772,35 @@ mod tests {
         set_offload_metrics_handle(None);
     }
 
+    #[test]
+    fn on_generation_end_keeps_history_local_when_space_is_healthy() {
+        use crate::ortho::Ortho;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let offload_dir = base_path.join("offloaded");
+        let uploads: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let offloader = Arc::new(RecordingOffloader::new(
+            offload_dir,
+            uploads.clone(),
+            base_path.clone(),
+        ));
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+        store.record_result(&Ortho::new()).unwrap();
+        store.on_generation_end(&cfg, None).unwrap();
+
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "healthy runs should remain local until reclaim needs space"
+        );
+        assert_eq!(count_history_orthos(&store, cfg.read_buf_bytes), 1);
+    }
+
     struct CachedDownloader {
         client: OffloadClient,
         cache: Mutex<OffloadCache>,
@@ -2817,6 +2989,46 @@ mod tests {
     }
 
     #[test]
+    fn pop_work_hydrates_offloaded_work_segment() {
+        use crate::offload_runtime::configure_offload_runtime;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let local_store = temp_dir.path().join("store");
+        let mut offload_cfg = crate::offload_config::OffloadConfig::with_base_dir(&base_path);
+        offload_cfg.enabled = true;
+        offload_cfg.local_store_dir = Some(local_store);
+        offload_cfg.cache_dir = base_path.join("offload_cache");
+        let _guard = configure_offload_runtime(&base_path, &offload_cfg)
+            .unwrap()
+            .expect("offload runtime");
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        let seed = Ortho::new();
+        let child = seed.add(1)[0].clone();
+        store
+            .push_segments(vec![seed.clone(), child.clone()])
+            .unwrap();
+        store.flush_all().unwrap();
+        assert_eq!(store.work_segments.len(), 1);
+
+        let segment_path = store.work_segments[0].clone();
+        assert!(offload_path_if_configured(&segment_path).unwrap());
+        fs::remove_file(&segment_path).unwrap();
+
+        let first = store.pop_work().unwrap().unwrap();
+        let second = store.pop_work().unwrap().unwrap();
+        let mut ids = vec![first.id(), second.id()];
+        ids.sort_unstable();
+        let mut expected = vec![seed.id(), child.id()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
     fn test_compact_landing_millions_of_orthos() {
         use crate::ortho::Ortho;
 
@@ -2956,13 +3168,13 @@ mod tests {
 
         assert!(new_work_run.path().exists());
         assert!(seen_run.path().exists());
-        assert_eq!(uploads.lock().unwrap().len(), 0);
+        let uploads_before_history = uploads.lock().unwrap().len();
 
         store.add_history_run(0, seen_run, accepted).unwrap();
         assert!(!store.history_runs[0].is_empty());
         assert!(
-            !uploads.lock().unwrap().is_empty(),
-            "history offload should only happen after add_history_run consumes the local file"
+            uploads.lock().unwrap().len() == uploads_before_history,
+            "local-first mode should not eagerly offload accepted history runs"
         );
 
         let enqueued = store
@@ -2991,7 +3203,7 @@ mod tests {
         }
         store.flush_all().unwrap();
 
-        let spill_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+        let spill_stats = store.pressure_spill_to_local_runs(&cfg).unwrap();
         assert!(spill_stats.buckets_drained > 0);
         assert!(spill_stats.spill_runs_created > 0);
         assert_eq!(store.total_landing_size(), 0);
@@ -3010,6 +3222,50 @@ mod tests {
     }
 
     #[test]
+    fn pressure_spill_stays_local_when_disk_is_healthy() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let offload_dir = base_path.join("offloaded");
+        let uploads: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let offloader = Arc::new(RecordingOffloader::new(
+            offload_dir,
+            uploads.clone(),
+            base_path.clone(),
+        ));
+        let _guard = OffloaderGuard;
+        set_run_offloader(Some(offloader));
+
+        let metrics = Metrics::new();
+        set_offload_metrics_handle(Some(metrics.clone_handle()));
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        for ortho in [
+            Ortho::new(),
+            Ortho::new().add(1)[0].clone(),
+            Ortho::new().add(2)[0].clone(),
+        ] {
+            store.record_result(&ortho).unwrap();
+        }
+        store.flush_all().unwrap();
+
+        let spill_stats = store.pressure_spill_to_local_runs(&cfg).unwrap();
+        assert!(spill_stats.spill_runs_created > 0);
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "pressure spill should remain local when disk is healthy"
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.global.offloaded_files, 0);
+        assert!(snapshot.global.spill_created_files > 0);
+        assert!(snapshot.global.spill_pending_files > 0);
+        set_offload_metrics_handle(None);
+    }
+
+    #[test]
     fn repeated_pressure_spills_preserve_all_outputs() {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_path_buf();
@@ -3025,7 +3281,7 @@ mod tests {
             store.record_result(ortho).unwrap();
         }
         store.flush_all().unwrap();
-        let first_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+        let first_stats = store.pressure_spill_to_local_runs(&cfg).unwrap();
         assert!(first_stats.spill_runs_created > 0);
 
         let second_batch = vec![
@@ -3037,7 +3293,7 @@ mod tests {
             store.record_result(ortho).unwrap();
         }
         store.flush_all().unwrap();
-        let second_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+        let second_stats = store.pressure_spill_to_local_runs(&cfg).unwrap();
         assert!(second_stats.spill_runs_created > 0);
         assert!(store.spill_runs.iter().flatten().count() >= 2);
 
@@ -3067,7 +3323,7 @@ mod tests {
                 store.record_result(ortho).unwrap();
             }
             store.flush_all().unwrap();
-            let spill_stats = store.pressure_spill_and_maybe_offload(&cfg).unwrap();
+            let spill_stats = store.pressure_spill_to_local_runs(&cfg).unwrap();
             assert!(spill_stats.spill_runs_created > 0);
             assert!(store.spill_manifest_path().exists());
             orthos.len()
@@ -3225,73 +3481,29 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_fan_in() {
-        // fan_in = clamp(budget / read_buf, 8, 256)
-        let read_buf = 512 * 1024; // 512KB
+    fn config_from_memory_budget_uses_fixed_leader_caps() {
+        let budget = MemoryBudget::for_role(Role::Leader, 16 * 1024 * 1024 * 1024).unwrap();
+        let config = Config::from_memory_budget(&budget);
 
-        // Small budget: should clamp to 8
-        assert_eq!(compute_fan_in(100_000, read_buf), 8);
-
-        // Medium budget: should be in range
-        let budget = 1_000_000_000; // 1GB
-        let fan_in = compute_fan_in(budget, read_buf);
-        assert!(fan_in >= 8 && fan_in <= 256);
-
-        // Large budget: should clamp to 128
-        let budget = 100_000_000_000; // 100GB
-        assert_eq!(compute_fan_in(budget, read_buf), 256);
-
-        // Zero read_buf: should return 8
-        assert_eq!(compute_fan_in(1_000_000, 0), 8);
-    }
-
-    #[test]
-    fn test_compute_config_leader_aggressive() {
-        // This test validates the structure but cannot control actual system memory
-        // In real usage, leader at low memory pressure should get max budget (6GB)
-        let config = Config::compute_config(Role::Leader);
-
-        // Should not bail out
-        assert!(config.is_some());
-
-        let config = config.unwrap();
-
-        // run_budget should be 70% of some budget
-        // fan_in should be between 8 and 256
-        assert!(config.fan_in >= 8 && config.fan_in <= 256);
-        assert!(config.run_budget_bytes > 0);
-        assert!(config.read_buf_bytes >= 256 * 1024);
-        assert!(config.read_buf_bytes <= 2 * 1024 * 1024);
+        assert_eq!(config.run_budget_bytes, 384 * 1024 * 1024);
+        assert_eq!(config.work_queue_cache_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.work_segment_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.fan_in, 64);
+        assert_eq!(config.read_buf_bytes, 256 * 1024);
         assert!(config.allow_compaction);
     }
 
     #[test]
-    fn test_compute_config_follower() {
-        // Follower should have smaller budget than leader
-        let config = Config::compute_config(Role::Follower);
+    fn config_from_memory_budget_uses_fixed_follower_caps() {
+        let budget = MemoryBudget::for_role(Role::Follower, 16 * 1024 * 1024 * 1024).unwrap();
+        let config = Config::from_memory_budget(&budget);
 
-        // May bail out if system memory is very constrained, but typically should succeed
-        if let Some(config) = config {
-            assert!(config.fan_in >= 8 && config.fan_in <= 256);
-            assert!(config.run_budget_bytes > 0);
-            assert!(config.read_buf_bytes >= 256 * 1024);
-            assert!(config.read_buf_bytes <= 2 * 1024 * 1024);
-            assert!(config.allow_compaction);
-        }
-        // If None, follower decided to bail due to memory pressure
-    }
-
-    #[test]
-    fn test_run_budget_calculation() {
-        // Verify run_budget is 70% of total budget
-        let budget = 1_000_000_000; // 1GB
-        let run_budget = (budget as f64 * 0.7) as usize;
-        assert_eq!(run_budget, 700_000_000);
-
-        // Test edge case: very small budget
-        let budget = 128_000_000; // 128MB
-        let run_budget = (budget as f64 * 0.7) as usize;
-        assert!(run_budget < 128_000_000);
+        assert_eq!(config.run_budget_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.work_queue_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.work_segment_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.fan_in, 32);
+        assert_eq!(config.read_buf_bytes, 128 * 1024);
+        assert!(config.allow_compaction);
     }
 
     // ============ TASK 11 TESTS ============
@@ -3338,8 +3550,8 @@ mod tests {
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
 
         let mut cfg = Config::test_config(1024 * 1024, 8);
-        cfg.work_queue_cache_size = 0;
-        cfg.work_segment_size = usize::MAX; // prevent auto-flush
+        cfg.work_queue_cache_bytes = 0;
+        cfg.work_segment_max_bytes = usize::MAX; // prevent auto-flush
         store.configure(&cfg);
 
         let ortho = Ortho::new();
@@ -3486,7 +3698,7 @@ mod tests {
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
 
         let mut cfg = Config::test_config(2 * 1024 * 1024, 8);
-        cfg.work_queue_cache_size = 16;
+        cfg.work_queue_cache_bytes = 16 * 1024;
         store.configure(&cfg);
 
         // Seed with a base ortho and one that is almost full to force an "up" expansion path

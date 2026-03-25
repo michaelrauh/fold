@@ -44,6 +44,7 @@ pub struct GlobalMetrics {
     pub distinct_jobs_count: usize,
     pub ram_bytes: usize,
     pub process_rss_bytes: usize,
+    pub process_rss_cap_bytes: usize,
     pub disk_total_bytes: u64,
     pub disk_available_bytes: u64,
     pub compression_uncompressed_bytes: u64,
@@ -54,7 +55,19 @@ pub struct GlobalMetrics {
     pub work_len: u64,
     pub seen_len_accepted: u64,
     pub run_budget_bytes: usize,
+    pub compaction_arena_cap_bytes: usize,
+    pub compaction_arena_bytes: usize,
     pub fan_in: usize,
+    pub work_cache_cap_bytes: usize,
+    pub work_cache_bytes: usize,
+    pub segment_batch_cap_bytes: usize,
+    pub segment_batch_bytes: usize,
+    pub spill_created_files: u64,
+    pub spill_created_bytes: u64,
+    pub spill_pending_files: u64,
+    pub spill_pending_bytes: u64,
+    pub spill_consumed_files: u64,
+    pub spill_consumed_bytes: u64,
     // Offload/caching
     pub offloaded_files: u64,
     pub offloaded_bytes: u64,
@@ -87,6 +100,7 @@ impl Default for GlobalMetrics {
             distinct_jobs_count: 0,
             ram_bytes: 0,
             process_rss_bytes: 0,
+            process_rss_cap_bytes: 0,
             disk_total_bytes: 0,
             disk_available_bytes: 0,
             compression_uncompressed_bytes: 0,
@@ -96,7 +110,19 @@ impl Default for GlobalMetrics {
             work_len: 0,
             seen_len_accepted: 0,
             run_budget_bytes: 0,
+            compaction_arena_cap_bytes: 0,
+            compaction_arena_bytes: 0,
             fan_in: 0,
+            work_cache_cap_bytes: 0,
+            work_cache_bytes: 0,
+            segment_batch_cap_bytes: 0,
+            segment_batch_bytes: 0,
+            spill_created_files: 0,
+            spill_created_bytes: 0,
+            spill_pending_files: 0,
+            spill_pending_bytes: 0,
+            spill_consumed_files: 0,
+            spill_consumed_bytes: 0,
             offloaded_files: 0,
             offloaded_bytes: 0,
             downloaded_files: 0,
@@ -457,6 +483,24 @@ impl Metrics {
     pub fn record_pressure_trigger(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.global.pressure_triggers = inner.global.pressure_triggers.saturating_add(1);
+    }
+
+    pub fn record_spill_created(&self, files: u64, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.spill_created_files = inner.global.spill_created_files.saturating_add(files);
+        inner.global.spill_created_bytes = inner.global.spill_created_bytes.saturating_add(bytes);
+    }
+
+    pub fn record_spill_consumed(&self, files: u64, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.spill_consumed_files = inner.global.spill_consumed_files.saturating_add(files);
+        inner.global.spill_consumed_bytes = inner.global.spill_consumed_bytes.saturating_add(bytes);
+    }
+
+    pub fn set_spill_pending(&self, files: u64, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.spill_pending_files = files;
+        inner.global.spill_pending_bytes = bytes;
     }
 
     pub fn set_disk_usage(&self, total_bytes: u64, available_bytes: u64) {

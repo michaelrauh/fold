@@ -56,6 +56,17 @@ impl Ortho {
         self.id
     }
 
+    pub fn heap_bytes_estimate(&self) -> usize {
+        let dims_cap = self.dims.capacity();
+        let payload_cap = self.payload.capacity();
+        let vec_overhead =
+            std::mem::size_of::<Vec<Dim>>() + std::mem::size_of::<Vec<Option<PayloadVal>>>();
+        std::mem::size_of::<Ortho>()
+            + vec_overhead
+            + dims_cap.saturating_mul(std::mem::size_of::<Dim>())
+            + payload_cap.saturating_mul(std::mem::size_of::<Option<PayloadVal>>())
+    }
+
     pub fn archived_id(archived: &rkyv::Archived<Ortho>) -> OrthoId {
         archived.id
     }
