@@ -7,7 +7,7 @@ use crate::{
     memory_safety,
     metrics::{GenerationStat, Metrics},
     offload_config::OffloadConfig,
-    ortho::{Ortho, PayloadVal, payload_to_usize},
+    ortho::{Ortho, OrthoScore, PayloadVal, payload_to_usize},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::Disks;
@@ -66,7 +66,7 @@ impl PressureWatchdog {
 
 pub struct GenerationRunResult {
     pub best_ortho: Ortho,
-    pub best_score: (usize, usize),
+    pub best_score: OrthoScore,
     pub generation_stats: Vec<GenerationStat>,
     pub total_processed: u64,
     pub optimal_dirty: bool,
@@ -101,21 +101,23 @@ where
     let mut optimal_dirty = false;
     let mut total_processed = 0u64;
     let update_optimal_metrics = |ortho: &Ortho| {
-        let (volume, fullness) = ortho.score();
+        let score = ortho.score();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         metrics.update_optimal_ortho(|opt| {
-            opt.volume = volume;
+            opt.volume = score.volume;
+            opt.variance_num = score.variance_num;
+            opt.variance_den = score.variance_den;
             opt.dims = ortho.dims().clone();
-            opt.fullness = fullness;
+            opt.fullness = score.fullness;
             opt.capacity = ortho.payload().len();
             opt.payload = ortho.payload().clone();
             opt.vocab = interner.vocabulary().to_vec();
             opt.last_update_time = now;
         });
-        metrics.record_optimal_volume(volume);
+        metrics.record_optimal_volume(score.volume);
     };
 
     // Push seed to work queue
@@ -208,12 +210,14 @@ where
         });
         // Extra logging to debug early queue exhaustion
         metrics.add_log(format!(
-            "Gen {} start: work_len={}, landing={}, best_score=({},{}), prev_new_work={}",
+            "Gen {} start: work_len={}, landing={}, best_score=(v={}, var={}/{}, f={}), prev_new_work={}",
             generation,
             work_len,
             store.total_landing_size(),
-            best_score.0,
-            best_score.1,
+            best_score.volume,
+            best_score.variance_num,
+            best_score.variance_den,
+            best_score.fullness,
             prev_new_work
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_string())
@@ -247,7 +251,7 @@ where
         if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
             if cache_ortho.volume() > best_ortho.volume() {
                 let cache_score = cache_ortho.score();
-                metrics.record_optimal_volume(cache_score.0);
+                metrics.record_optimal_volume(cache_score.volume);
                 if cache_score > best_score {
                     best_ortho = cache_ortho;
                     best_score = cache_score;

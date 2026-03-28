@@ -4,7 +4,7 @@ use crate::{
     interner::Interner,
     memory_budget::MemoryBudget,
     memory_safety,
-    ortho::{Ortho, OrthoId},
+    ortho::{Ortho, OrthoId, OrthoScore},
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -121,9 +121,9 @@ pub struct GenerationStore {
     work_segment_batch: Vec<Ortho>,    // Batch for writing segments
     work_segment_batch_bytes: usize,   // Current decoded bytes in the pending work batch
     work_segment_batch_max_bytes: usize, // Max decoded bytes before flushing a work segment
-    cached_best_volume: Cell<Option<usize>>, // Cached best volume across work caches
+    cached_best_score: Cell<Option<OrthoScore>>, // Cached best score across work caches
     cached_best_ortho: RefCell<Option<Ortho>>, // Cached best ortho across work caches
-    best_volume_dirty: Cell<bool>,     // Whether cached best needs recompute
+    best_score_dirty: Cell<bool>,      // Whether cached best needs recompute
     bufwriter_capacity: usize,         // Buffer capacity for bucket writers
     landing_flush_threshold: usize,    // Threshold for flushing landing writes
     compaction_arena_cap_bytes: usize, // Max streamed bytes allowed in compaction
@@ -652,6 +652,32 @@ fn compress_file(path: &PathBuf, level: i32) -> io::Result<(u64, u64)> {
     Ok((uncompressed, compressed))
 }
 
+fn create_compressed_writer(
+    path: &Path,
+    level: i32,
+    bufwriter_capacity: usize,
+) -> io::Result<ZstdEncoder<'static, BufWriter<File>>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let writer = BufWriter::with_capacity(bufwriter_capacity.max(64 * 1024), File::create(path)?);
+    ZstdEncoder::new(writer, level)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+fn finish_compressed_writer(
+    path: &Path,
+    writer: ZstdEncoder<'static, BufWriter<File>>,
+    uncompressed_bytes: u64,
+) -> io::Result<(u64, u64)> {
+    let mut output = writer
+        .finish()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    output.flush()?;
+    let compressed_bytes = fs::metadata(path)?.len();
+    Ok((uncompressed_bytes, compressed_bytes))
+}
+
 /// Sorted and deduplicated run of orthos
 #[derive(Clone)]
 pub struct UniqueRun {
@@ -828,9 +854,9 @@ impl GenerationStore {
             work_segment_batch: Vec::new(),
             work_segment_batch_bytes: 0,
             work_segment_batch_max_bytes: 256 * 1024, // Default, will be updated with config
-            cached_best_volume: Cell::new(None),
+            cached_best_score: Cell::new(None),
             cached_best_ortho: RefCell::new(None),
-            best_volume_dirty: Cell::new(false),
+            best_score_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024, // Default 16MB
             landing_flush_threshold: 10 * 1024 * 1024, // Default 10MB
             compaction_arena_cap_bytes: 256 * 1024 * 1024,
@@ -1034,9 +1060,9 @@ impl GenerationStore {
             work_segment_batch: Vec::new(),
             work_segment_batch_bytes: 0,
             work_segment_batch_max_bytes: 256 * 1024,
-            cached_best_volume: Cell::new(None),
+            cached_best_score: Cell::new(None),
             cached_best_ortho: RefCell::new(None),
-            best_volume_dirty: Cell::new(false),
+            best_score_dirty: Cell::new(false),
             bufwriter_capacity: 16 * 1024 * 1024,
             landing_flush_threshold: 10 * 1024 * 1024,
             compaction_arena_cap_bytes: 256 * 1024 * 1024,
@@ -1150,7 +1176,7 @@ impl GenerationStore {
         }
 
         for ortho in items {
-            if !self.best_volume_dirty.get() {
+            if !self.best_score_dirty.get() {
                 self.update_cached_best(&ortho);
             }
 
@@ -1219,7 +1245,7 @@ impl GenerationStore {
         self.total_work_len += count;
         self.work_segment_batch.clear();
         self.work_segment_batch_bytes = 0;
-        self.best_volume_dirty.set(true);
+        self.best_score_dirty.set(true);
         self.sync_memory_metrics();
 
         Ok(())
@@ -1234,7 +1260,7 @@ impl GenerationStore {
             self.work_queue_cache_bytes = self
                 .work_queue_cache_bytes
                 .saturating_sub(ortho.heap_bytes_estimate());
-            self.handle_removed_volume(ortho.volume());
+            self.handle_removed_score(ortho.score());
             self.sync_memory_metrics();
             return Ok(Some(ortho));
         }
@@ -1266,7 +1292,7 @@ impl GenerationStore {
             self.work_queue_cache_bytes = self
                 .work_queue_cache_bytes
                 .saturating_sub(ortho.heap_bytes_estimate());
-            self.handle_removed_volume(ortho.volume());
+            self.handle_removed_score(ortho.score());
             self.sync_memory_metrics();
             return Ok(Some(ortho));
         }
@@ -1330,8 +1356,8 @@ impl GenerationStore {
 
             self.work_queue_cache = loaded;
             self.work_queue_cache_bytes = loaded_bytes;
-            if !self.best_volume_dirty.get() {
-                if let Some(best_item) = self.work_queue_cache.iter().max_by_key(|o| o.volume()) {
+            if !self.best_score_dirty.get() {
+                if let Some(best_item) = self.work_queue_cache.iter().max_by_key(|o| o.score()) {
                     self.update_cached_best(best_item);
                 }
             }
@@ -1443,11 +1469,11 @@ impl GenerationStore {
     pub fn prune_history_with_bound(
         &mut self,
         interner: &Interner,
-        best_score: (usize, usize),
+        best_score: OrthoScore,
         impacted_prefixes: Option<&[Vec<usize>]>,
         read_buf_bytes: usize,
     ) -> io::Result<(u64, u64)> {
-        if best_score == (0, 0) {
+        if best_score == OrthoScore::zero() {
             return Ok((self.seen_len_accepted, 0));
         }
 
@@ -1644,27 +1670,27 @@ impl GenerationStore {
     }
 
     fn update_cached_best(&self, candidate: &Ortho) {
-        if self.best_volume_dirty.get() {
+        if self.best_score_dirty.get() {
             return;
         }
-        let candidate_volume = candidate.volume();
-        match self.cached_best_volume.get() {
-            Some(current) if current >= candidate_volume => {}
+        let candidate_score = candidate.score();
+        match self.cached_best_score.get() {
+            Some(current) if current >= candidate_score => {}
             _ => {
-                self.cached_best_volume.set(Some(candidate_volume));
+                self.cached_best_score.set(Some(candidate_score));
                 *self.cached_best_ortho.borrow_mut() = Some(candidate.clone());
             }
         }
     }
 
-    fn handle_removed_volume(&self, removed: usize) {
-        if !self.best_volume_dirty.get() && self.cached_best_volume.get() == Some(removed) {
-            self.best_volume_dirty.set(true);
+    fn handle_removed_score(&self, removed: OrthoScore) {
+        if !self.best_score_dirty.get() && self.cached_best_score.get() == Some(removed) {
+            self.best_score_dirty.set(true);
         }
     }
 
     fn recompute_cached_best(&self) {
-        let mut best_volume: Option<usize> = None;
+        let mut best_score: Option<OrthoScore> = None;
         let mut best_ortho: Option<Ortho> = None;
 
         for ortho in self
@@ -1672,21 +1698,21 @@ impl GenerationStore {
             .iter()
             .chain(self.work_segment_batch.iter())
         {
-            let volume = ortho.volume();
-            if best_volume.map(|v| volume > v).unwrap_or(true) {
-                best_volume = Some(volume);
+            let score = ortho.score();
+            if best_score.map(|current| score > current).unwrap_or(true) {
+                best_score = Some(score);
                 best_ortho = Some(ortho.clone());
             }
         }
 
-        self.cached_best_volume.set(best_volume);
+        self.cached_best_score.set(best_score);
         *self.cached_best_ortho.borrow_mut() = best_ortho;
-        self.best_volume_dirty.set(false);
+        self.best_score_dirty.set(false);
     }
 
     /// Peek at the best ortho currently in work cache (without removing)
     pub fn peek_best_ortho_in_cache(&self) -> Option<Ortho> {
-        if self.best_volume_dirty.get() {
+        if self.best_score_dirty.get() {
             self.recompute_cached_best();
         }
         self.cached_best_ortho.borrow().clone()
@@ -2080,22 +2106,22 @@ fn write_streamed_run(
     let estimated_raw_bytes = estimate_streamed_run_bytes(arena);
     disk_safety::ensure_write_budget(
         estimated_raw_bytes
-            .saturating_mul(2)
+            .saturating_add(estimated_raw_bytes / 8)
             .saturating_add(64 * 1024),
         &format!("write run {}", path.display()),
     )?;
 
-    let mut writer = BufWriter::with_capacity(64 * 1024, File::create(path)?);
+    let mut writer = create_compressed_writer(path, 3, 64 * 1024)?;
+    let mut uncompressed_bytes = 0u64;
     for streamed in arena {
-        write_ortho_record_bytes(
+        uncompressed_bytes = uncompressed_bytes.saturating_add(write_ortho_record_bytes(
             &mut writer,
             &streamed.bytes,
             streamed.decoded_size_est,
-            stats.as_deref_mut(),
-        )?;
+            None,
+        )? as u64);
     }
-    writer.flush()?;
-    let (unc, comp) = compress_file(path, 3)?;
+    let (unc, comp) = finish_compressed_writer(path, writer, uncompressed_bytes)?;
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
@@ -2162,10 +2188,12 @@ pub fn merge_unique(
     )?;
     let merge_budget = estimate_compressed_run_set_bytes(&runs)?.saturating_mul(8);
     disk_safety::ensure_write_budget(
-        merge_budget.saturating_add(64 * 1024),
+        merge_budget
+            .saturating_add(merge_budget / 8)
+            .saturating_add(64 * 1024),
         &format!("merge unique {}", unique_path.display()),
     )?;
-    let mut writer = BufWriter::new(File::create(&unique_path)?);
+    let mut writer = create_compressed_writer(&unique_path, 3, cfg.bufwriter_capacity)?;
 
     #[derive(Eq, PartialEq)]
     struct HeapItem {
@@ -2207,6 +2235,7 @@ pub fn merge_unique(
     }
 
     let mut last_written: Option<StreamedOrtho> = None;
+    let mut uncompressed_bytes = 0u64;
 
     // K-way merge with deduplication by id + equality
     while let Some(item) = heap.pop() {
@@ -2218,12 +2247,12 @@ pub fn merge_unique(
             .map(|last| last.id == item.id && archived_eq(last, &streamed))
             .unwrap_or(false);
         if !is_duplicate {
-            write_ortho_record_bytes(
+            uncompressed_bytes = uncompressed_bytes.saturating_add(write_ortho_record_bytes(
                 &mut writer,
                 &streamed.bytes,
                 streamed.decoded_size_est,
-                stats.as_deref_mut(),
-            )?;
+                None,
+            )? as u64);
             last_written = Some(streamed);
         } else {
             // Keep last_written so adjacent duplicates continue to collapse correctly
@@ -2242,8 +2271,7 @@ pub fn merge_unique(
         }
     }
 
-    writer.flush()?;
-    let (unc, comp) = compress_file(&unique_path, 3)?;
+    let (unc, comp) = finish_compressed_writer(&unique_path, writer, uncompressed_bytes)?;
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
@@ -2279,10 +2307,12 @@ fn merge_ortho_chunk(
     )?;
     let merge_budget = estimate_compressed_run_set_bytes(runs)?.saturating_mul(8);
     disk_safety::ensure_write_budget(
-        merge_budget.saturating_add(64 * 1024),
+        merge_budget
+            .saturating_add(merge_budget / 8)
+            .saturating_add(64 * 1024),
         &format!("merge chunk {}", chunk_path.display()),
     )?;
-    let mut writer = BufWriter::new(File::create(&chunk_path)?);
+    let mut writer = create_compressed_writer(&chunk_path, 3, cfg.bufwriter_capacity)?;
 
     #[derive(Eq, PartialEq)]
     struct HeapItem {
@@ -2321,14 +2351,15 @@ fn merge_ortho_chunk(
     }
 
     // No deduplication in intermediate passes - just merge
+    let mut uncompressed_bytes = 0u64;
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
-        write_ortho_record_bytes(
+        uncompressed_bytes = uncompressed_bytes.saturating_add(write_ortho_record_bytes(
             &mut writer,
             &streamed.bytes,
             streamed.decoded_size_est,
-            stats.as_deref_mut(),
-        )?;
+            None,
+        )? as u64);
 
         if let Some(result) = iterators[item.run_idx].next() {
             let streamed = result?;
@@ -2341,8 +2372,7 @@ fn merge_ortho_chunk(
         }
     }
 
-    writer.flush()?;
-    let (unc, comp) = compress_file(&chunk_path, 3)?;
+    let (unc, comp) = finish_compressed_writer(&chunk_path, writer, uncompressed_bytes)?;
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
@@ -2376,18 +2406,30 @@ pub fn anti_join_orthos(
         read_buf_bytes.saturating_mul(4).saturating_add(256 * 1024),
         &format!("anti join {}", anti_join_id),
     )?;
+    let unique_budget = resolve_managed_path(unique_gen.path())
+        .map(|path| file_size_or_zero(&path))
+        .unwrap_or(0)
+        .saturating_mul(4);
+    if unique_budget > 0 {
+        disk_safety::ensure_write_budget(
+            unique_budget.saturating_add(64 * 1024),
+            &format!("anti join {}", anti_join_id),
+        )?;
+    }
     let seen_run_path = base_path
         .join("runs")
         .join(format!("seen-{}.dat", anti_join_id));
-    let mut seen_writer = BufWriter::new(File::create(&seen_run_path)?);
+    let mut seen_writer = create_compressed_writer(&seen_run_path, 3, 64 * 1024)?;
 
     let new_work_path = base_path
         .join("runs")
         .join(format!("new-work-{}.dat", anti_join_id));
-    let mut new_work_writer = BufWriter::new(File::create(&new_work_path)?);
+    let mut new_work_writer = create_compressed_writer(&new_work_path, 3, 64 * 1024)?;
 
     let mut gen_iter = unique_gen.iter(read_buf_bytes)?;
     let mut accepted_count = 0u64;
+    let mut seen_uncompressed_bytes = 0u64;
+    let mut new_work_uncompressed_bytes = 0u64;
 
     // Current values from each stream
     let mut gen_val = gen_iter.next().transpose()?;
@@ -2399,18 +2441,17 @@ pub fn anti_join_orthos(
             (None, _) => break,
             (Some(g), None) => {
                 // No more history - all remaining gen values are new
-                write_ortho_record_bytes(
-                    &mut seen_writer,
-                    &g.bytes,
-                    g.decoded_size_est,
-                    stats.as_deref_mut(),
-                )?;
-                write_ortho_record_bytes(
-                    &mut new_work_writer,
-                    &g.bytes,
-                    g.decoded_size_est,
-                    stats.as_deref_mut(),
-                )?;
+                seen_uncompressed_bytes = seen_uncompressed_bytes.saturating_add(
+                    write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est, None)?
+                        as u64,
+                );
+                new_work_uncompressed_bytes =
+                    new_work_uncompressed_bytes.saturating_add(write_ortho_record_bytes(
+                        &mut new_work_writer,
+                        &g.bytes,
+                        g.decoded_size_est,
+                        None,
+                    )? as u64);
                 accepted_count += 1;
                 gen_val = gen_iter.next().transpose()?;
             }
@@ -2421,18 +2462,22 @@ pub fn anti_join_orthos(
                 match g_id.cmp(&h_id) {
                     std::cmp::Ordering::Less => {
                         // g < h: g is new (not in history)
-                        write_ortho_record_bytes(
-                            &mut seen_writer,
-                            &g.bytes,
-                            g.decoded_size_est,
-                            stats.as_deref_mut(),
-                        )?;
-                        write_ortho_record_bytes(
-                            &mut new_work_writer,
-                            &g.bytes,
-                            g.decoded_size_est,
-                            stats.as_deref_mut(),
-                        )?;
+                        seen_uncompressed_bytes = seen_uncompressed_bytes.saturating_add(
+                            write_ortho_record_bytes(
+                                &mut seen_writer,
+                                &g.bytes,
+                                g.decoded_size_est,
+                                None,
+                            )? as u64,
+                        );
+                        new_work_uncompressed_bytes = new_work_uncompressed_bytes.saturating_add(
+                            write_ortho_record_bytes(
+                                &mut new_work_writer,
+                                &g.bytes,
+                                g.decoded_size_est,
+                                None,
+                            )? as u64,
+                        );
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
                     }
@@ -2440,27 +2485,32 @@ pub fn anti_join_orthos(
                         // Same ID: check structural equality
                         if archived_eq(g, h) {
                             // Exact duplicate - reject from work, but add to seen
-                            write_ortho_record_bytes(
-                                &mut seen_writer,
-                                &g.bytes,
-                                g.decoded_size_est,
-                                stats.as_deref_mut(),
-                            )?;
+                            seen_uncompressed_bytes = seen_uncompressed_bytes.saturating_add(
+                                write_ortho_record_bytes(
+                                    &mut seen_writer,
+                                    &g.bytes,
+                                    g.decoded_size_est,
+                                    None,
+                                )? as u64,
+                            );
                         } else {
                             // ID collision with different structure - treat as new
                             // Note: This is extremely rare and indicates hash collision
-                            write_ortho_record_bytes(
-                                &mut seen_writer,
-                                &g.bytes,
-                                g.decoded_size_est,
-                                stats.as_deref_mut(),
-                            )?;
-                            write_ortho_record_bytes(
-                                &mut new_work_writer,
-                                &g.bytes,
-                                g.decoded_size_est,
-                                stats.as_deref_mut(),
-                            )?;
+                            seen_uncompressed_bytes = seen_uncompressed_bytes.saturating_add(
+                                write_ortho_record_bytes(
+                                    &mut seen_writer,
+                                    &g.bytes,
+                                    g.decoded_size_est,
+                                    None,
+                                )? as u64,
+                            );
+                            new_work_uncompressed_bytes = new_work_uncompressed_bytes
+                                .saturating_add(write_ortho_record_bytes(
+                                    &mut new_work_writer,
+                                    &g.bytes,
+                                    g.decoded_size_est,
+                                    None,
+                                )? as u64);
                             accepted_count += 1;
                         }
                         gen_val = gen_iter.next().transpose()?;
@@ -2475,16 +2525,13 @@ pub fn anti_join_orthos(
         }
     }
 
-    seen_writer.flush()?;
-    new_work_writer.flush()?;
+    let (seen_unc, seen_comp) =
+        finish_compressed_writer(&seen_run_path, seen_writer, seen_uncompressed_bytes)?;
+    let (new_work_unc, new_work_comp) =
+        finish_compressed_writer(&new_work_path, new_work_writer, new_work_uncompressed_bytes)?;
     if let Some(s) = stats.as_deref_mut() {
-        let (unc, comp) = compress_file(&seen_run_path, 3)?;
-        s.record(unc, comp);
-        let (unc2, comp2) = compress_file(&new_work_path, 3)?;
-        s.record(unc2, comp2);
-    } else {
-        let _ = compress_file(&seen_run_path, 3)?;
-        let _ = compress_file(&new_work_path, 3)?;
+        s.record(seen_unc, seen_comp);
+        s.record(new_work_unc, new_work_comp);
     }
     Ok((
         Run::new(new_work_path),
@@ -2522,6 +2569,8 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
     fn collect_run(run: &Run, read_buf_bytes: usize) -> Vec<Ortho> {
         let mut out = Vec::new();
         let mut iter = run.iter(read_buf_bytes).unwrap();
@@ -2530,6 +2579,13 @@ mod tests {
             out.push(Ortho::from_bytes(&s.bytes).unwrap());
         }
         out
+    }
+
+    fn read_magic(path: &Path) -> [u8; 4] {
+        let mut file = File::open(path).unwrap();
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).unwrap();
+        buf
     }
 
     fn count_history_orthos(store: &GenerationStore, read_buf_bytes: usize) -> usize {
@@ -3392,7 +3448,7 @@ mod tests {
         let history_run = Run::new(history_path);
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
-        let (work_run, _seen_run, accepted) =
+        let (work_run, seen_run, accepted) =
             anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
 
         // ortho3 is already in history, so only ortho2, ortho4, ortho5 should be in work
@@ -3403,6 +3459,8 @@ mod tests {
         let mut expected = vec![ortho2, ortho4, ortho5];
         expected.sort_by_key(|o| o.id());
         assert_eq!(work, expected);
+        assert_eq!(read_magic(work_run.path()), ZSTD_MAGIC);
+        assert_eq!(read_magic(seen_run.path()), ZSTD_MAGIC);
     }
 
     #[test]
@@ -3901,7 +3959,7 @@ mod tests {
         let _ = store.on_generation_end(&cfg, None).unwrap();
 
         // Prune with a best_score just above the short ortho but below the long one.
-        let best_score = (short.volume(), short.fullness() + 1);
+        let best_score = OrthoScore::optimistic_bound(short.volume(), short.fullness() + 1);
         let (kept, pruned) = store
             .prune_history_with_bound(&interner, best_score, None, cfg.read_buf_bytes)
             .unwrap();
@@ -3909,6 +3967,57 @@ mod tests {
         assert_eq!(kept + pruned, 2, "all orthos accounted for");
         // Document current behavior: pruning may keep both if bound sees potential.
         assert!(pruned <= 2, "pruned count within expected range");
+    }
+
+    #[test]
+    fn cached_best_uses_full_score_not_just_volume() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path, 2).unwrap();
+        let cfg = Config::test_config(512 * 1024, 8);
+        store.configure(&cfg);
+
+        let skinny = Ortho::from_test_parts(
+            vec![2, 7],
+            {
+                let mut payload = vec![Some(1); 13];
+                payload.push(None);
+                payload
+            },
+            None,
+        );
+        let squareish = Ortho::from_test_parts(
+            vec![3, 4],
+            {
+                let mut payload = vec![Some(1); 11];
+                payload.push(None);
+                payload
+            },
+            None,
+        );
+
+        assert_eq!(
+            skinny.volume(),
+            squareish.volume(),
+            "setup expects equal volume"
+        );
+        assert!(
+            squareish.score() > skinny.score(),
+            "setup expects lower variance to win"
+        );
+
+        store
+            .push_segments(vec![skinny.clone(), squareish.clone()])
+            .unwrap();
+
+        let cached_best = store
+            .peek_best_ortho_in_cache()
+            .expect("cached best should exist");
+        assert_eq!(
+            cached_best.id(),
+            squareish.id(),
+            "cache best should prefer the better variance-aware score"
+        );
     }
 
     #[test]

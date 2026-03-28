@@ -1,6 +1,6 @@
 use fold::completion_pruning::{bound_completion, bound_existing_ortho, upper_bound_score};
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal};
+use fold::ortho::{Ortho, OrthoScore, PayloadVal};
 
 fn vocab_index(interner: &Interner, word: &str) -> usize {
     interner
@@ -49,10 +49,10 @@ fn pruning_skips_low_potential_completion_but_keeps_higher() {
     );
 
     // Choose a best_score that prunes the short branch ([a b]) but not the longer one ([a c ...]).
-    let best_score = if potential_c.0 > potential_b.0 {
-        (potential_c.0.saturating_sub(1), usize::MAX)
+    let best_score = if potential_c.volume > potential_b.volume {
+        OrthoScore::optimistic_bound(potential_c.volume.saturating_sub(1), usize::MAX)
     } else {
-        (potential_c.0, potential_c.1.saturating_sub(1))
+        OrthoScore::optimistic_bound(potential_c.volume, potential_c.fullness.saturating_sub(1))
     };
     assert!(best_score >= potential_b);
     assert!(best_score < potential_c);
@@ -116,10 +116,13 @@ fn impacted_seeding_prunes_hopeless_prefixes() {
             ortho_a.dims().len(),
             total_ac,
         );
-        if potential_ac.0 > potential_ab.0 {
-            (potential_ac.0.saturating_sub(1), usize::MAX)
+        if potential_ac.volume > potential_ab.volume {
+            OrthoScore::optimistic_bound(potential_ac.volume.saturating_sub(1), usize::MAX)
         } else {
-            (potential_ac.0, potential_ac.1.saturating_sub(1))
+            OrthoScore::optimistic_bound(
+                potential_ac.volume,
+                potential_ac.fullness.saturating_sub(1),
+            )
         }
     };
 

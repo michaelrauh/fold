@@ -25,6 +25,7 @@ anyhow = "1.0"
 zstd = "0.13"
 lru = "0.12"
 rust-s3 = { version = "0.35", features = ["blocking"] }
+tokio = { version = "1", features = ["fs", "io-util"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

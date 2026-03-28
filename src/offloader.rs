@@ -4,13 +4,13 @@ use s3::region::Region;
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
     path::Path,
     str::FromStr,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
+use tokio::fs::File as TokioFile;
 
 /// Errors that can occur during offload/download.
 #[derive(Debug)]
@@ -306,17 +306,19 @@ impl ObjectStore for SpacesObjectStore {
                 self.bucket, bucket
             )));
         }
-        let data = fs::read(path)?;
+        let file = fs::File::open(path)?;
+        let mut reader = TokioFile::from_std(file);
         let response = self
             .client
-            .put_object_blocking(key, &data)
+            .put_object_stream_blocking(&mut reader, key)
             .map_err(|e| OffloadError::Other(e.to_string()))?;
-        if response.status_code() / 100 == 2 {
+        let status = response.status_code();
+        if status / 100 == 2 {
             Ok(())
         } else {
             Err(OffloadError::Other(format!(
-                "put_object failed: status {}",
-                response.status_code()
+                "put_object_stream failed: status {}",
+                status
             )))
         }
     }
@@ -328,19 +330,21 @@ impl ObjectStore for SpacesObjectStore {
                 self.bucket, bucket
             )));
         }
-        let response = self
-            .client
-            .get_object_blocking(key)
-            .map_err(|e| OffloadError::Other(e.to_string()))?;
-        if response.status_code() / 100 != 2 {
-            return Err(OffloadError::Missing(key.to_string()));
-        }
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::File::create(dest_path)?;
-        file.write_all(response.as_slice())?;
-        Ok(())
+        let file = fs::File::create(dest_path)?;
+        let mut writer = TokioFile::from_std(file);
+        let status = self
+            .client
+            .get_object_to_writer_blocking(key, &mut writer)
+            .map_err(|e| OffloadError::Other(e.to_string()))?;
+        drop(writer);
+        if status / 100 == 2 {
+            Ok(())
+        } else {
+            Err(OffloadError::Missing(key.to_string()))
+        }
     }
 }
 

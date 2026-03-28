@@ -1,4 +1,4 @@
-use crate::ortho::{Dim, PayloadVal};
+use crate::ortho::{Dim, OrthoScore, PayloadVal};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -242,6 +242,8 @@ impl Default for LargestArchive {
 #[derive(Clone, Debug)]
 pub struct OptimalOrtho {
     pub volume: usize,
+    pub variance_num: u128,
+    pub variance_den: u128,
     pub dims: Vec<Dim>,
     pub fullness: usize,
     pub capacity: usize,
@@ -263,6 +265,8 @@ impl Default for OptimalOrtho {
     fn default() -> Self {
         Self {
             volume: 0,
+            variance_num: 0,
+            variance_den: 1,
             dims: vec![],
             fullness: 0,
             capacity: 0,
@@ -417,9 +421,14 @@ impl Metrics {
         update(&mut inner.optimal_ortho);
     }
 
-    pub fn optimal_score(&self) -> (usize, usize) {
+    pub fn optimal_score(&self) -> OrthoScore {
         let inner = self.inner.lock().unwrap();
-        (inner.optimal_ortho.volume, inner.optimal_ortho.fullness)
+        OrthoScore {
+            volume: inner.optimal_ortho.volume,
+            variance_num: inner.optimal_ortho.variance_num,
+            variance_den: inner.optimal_ortho.variance_den,
+            fullness: inner.optimal_ortho.fullness,
+        }
     }
 
     pub fn reset_seen_history(&self) {

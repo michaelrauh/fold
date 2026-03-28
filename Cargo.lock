@@ -658,6 +658,7 @@ dependencies = [
  "smallvec",
  "sysinfo",
  "tempfile",
+ "tokio",
  "zstd",
 ]
 

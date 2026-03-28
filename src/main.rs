@@ -11,7 +11,7 @@ use fold::{
     metrics::{GenerationStat, Metrics},
     offload_config::OffloadConfig,
     offload_runtime::configure_offload_runtime,
-    ortho::{Ortho, PayloadVal, payload_to_usize},
+    ortho::{Ortho, OrthoScore, PayloadVal, payload_to_usize},
     tui::Tui,
 };
 use std::any::Any;
@@ -102,15 +102,17 @@ fn main() -> Result<(), FoldError> {
         let optimal_ortho = file_handler::load_optimal_ortho(&largest.path)?;
         let interner = file_handler::load_interner(&largest.path)?;
 
-        let (volume, fullness) = optimal_ortho.score();
+        let score = optimal_ortho.score();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         metrics.update_optimal_ortho(|opt| {
-            opt.volume = volume;
+            opt.volume = score.volume;
+            opt.variance_num = score.variance_num;
+            opt.variance_den = score.variance_den;
             opt.dims = optimal_ortho.dims().clone();
-            opt.fullness = fullness;
+            opt.fullness = score.fullness;
             opt.capacity = optimal_ortho.payload().len();
             opt.payload = optimal_ortho.payload().clone();
             opt.vocab = interner.vocabulary().to_vec();
@@ -122,7 +124,7 @@ fn main() -> Result<(), FoldError> {
         });
         metrics.add_log(format!(
             "Restored optimal ortho from archive: volume={}",
-            volume
+            score.volume
         ));
     }
 
@@ -685,15 +687,17 @@ fn process_txt_file(
     ));
 
     if run_result.optimal_dirty {
-        let (volume, fullness) = run_result.best_score;
+        let score = run_result.best_score;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         metrics.update_optimal_ortho(|opt| {
-            opt.volume = volume;
+            opt.volume = score.volume;
+            opt.variance_num = score.variance_num;
+            opt.variance_den = score.variance_den;
             opt.dims = run_result.best_ortho.dims().clone();
-            opt.fullness = fullness;
+            opt.fullness = score.fullness;
             opt.capacity = run_result.best_ortho.payload().len();
             opt.payload = run_result.best_ortho.payload().clone();
             opt.vocab = interner.vocabulary().to_vec();
@@ -917,13 +921,13 @@ fn merge_archives(
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
     // Load per-archive optimal scores for symmetric pruning
-    let load_opt_score = |path: &str| -> Option<(usize, usize)> {
+    let load_opt_score = |path: &str| -> Option<OrthoScore> {
         file_handler::load_optimal_ortho(path)
             .ok()
             .map(|o| o.score())
     };
-    let opt_score_a = load_opt_score(&results_a_path).unwrap_or((0, 0));
-    let opt_score_b = load_opt_score(&results_b_path).unwrap_or((0, 0));
+    let opt_score_a = load_opt_score(&results_a_path).unwrap_or(OrthoScore::zero());
+    let opt_score_b = load_opt_score(&results_b_path).unwrap_or(OrthoScore::zero());
     let max_opt_score = std::cmp::max(opt_score_a, opt_score_b);
 
     // Set up paths and impacted keys for each archive
@@ -1174,7 +1178,7 @@ fn merge_archives(
         if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
             if cache_ortho.volume() > best_ortho.volume() {
                 let cache_score = cache_ortho.score();
-                metrics.record_optimal_volume(cache_score.0);
+                metrics.record_optimal_volume(cache_score.volume);
                 if cache_score > best_score {
                     best_ortho = cache_ortho;
                     best_score = cache_score;
@@ -1256,15 +1260,17 @@ fn merge_archives(
                 metrics.update_bucket_metrics(bucket_metrics);
 
                 if optimal_dirty {
-                    let (volume, fullness) = best_score;
+                    let score = best_score;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
                     metrics.update_optimal_ortho(|opt| {
-                        opt.volume = volume;
+                        opt.volume = score.volume;
+                        opt.variance_num = score.variance_num;
+                        opt.variance_den = score.variance_den;
                         opt.dims = best_ortho.dims().clone();
-                        opt.fullness = fullness;
+                        opt.fullness = score.fullness;
                         opt.capacity = best_ortho.payload().len();
                         opt.payload = best_ortho.payload().clone();
                         opt.vocab = merged_interner.vocabulary().to_vec();
@@ -1514,15 +1520,17 @@ fn merge_archives(
     ));
 
     if optimal_dirty {
-        let (volume, fullness) = best_score;
+        let score = best_score;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         metrics.update_optimal_ortho(|opt| {
-            opt.volume = volume;
+            opt.volume = score.volume;
+            opt.variance_num = score.variance_num;
+            opt.variance_den = score.variance_den;
             opt.dims = best_ortho.dims().clone();
-            opt.fullness = fullness;
+            opt.fullness = score.fullness;
             opt.capacity = best_ortho.payload().len();
             opt.payload = best_ortho.payload().clone();
             opt.vocab = merged_interner.vocabulary().to_vec();
@@ -2302,11 +2310,11 @@ mod tests {
     #[test]
     fn test_score() {
         let ortho = Ortho::new();
-        let (volume, fullness) = ortho.score();
+        let score = ortho.score();
         // Empty ortho with dims [2,2] has volume (2-1)*(2-1) = 1
-        assert_eq!(volume, 1);
+        assert_eq!(score.volume, 1);
         // All 4 slots are None
-        assert_eq!(fullness, 0);
+        assert_eq!(score.fullness, 0);
     }
 
     #[test]

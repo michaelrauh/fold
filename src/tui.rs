@@ -578,6 +578,11 @@ impl Tui {
         } else {
             0
         };
+        let variance = if opt.variance_den > 0 {
+            opt.variance_num as f64 / opt.variance_den as f64
+        } else {
+            0.0
+        };
 
         // Calculate time since last update
         let now = std::time::SystemTime::now()
@@ -599,6 +604,10 @@ impl Tui {
             Line::from(vec![
                 Span::styled("Shape: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(truncate_string(&dims_str, max_width.saturating_sub(7))),
+            ]),
+            Line::from(vec![
+                Span::styled("Variance: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{variance:.3}")),
             ]),
             Line::from(vec![
                 Span::styled("Filled: ", Style::default().fg(Color::DarkGray)),

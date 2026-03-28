@@ -2,6 +2,7 @@ use crate::{FoldError, spatial};
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 use rustc_hash::FxHasher;
+use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -15,6 +16,72 @@ pub fn dim_to_usize(value: Dim) -> usize {
 
 pub fn payload_to_usize(value: PayloadVal) -> usize {
     usize::try_from(value).expect("payload value overflowed usize")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrthoScore {
+    pub volume: usize,
+    pub variance_num: u128,
+    pub variance_den: u128,
+    pub fullness: usize,
+}
+
+impl OrthoScore {
+    pub const fn zero() -> Self {
+        Self {
+            volume: 0,
+            variance_num: 0,
+            variance_den: 1,
+            fullness: 0,
+        }
+    }
+
+    pub const fn optimistic_bound(volume: usize, fullness: usize) -> Self {
+        Self {
+            volume,
+            variance_num: 0,
+            variance_den: 1,
+            fullness,
+        }
+    }
+
+    pub fn variance_cmp(&self, other: &Self) -> Ordering {
+        let lhs = self.variance_num.saturating_mul(other.variance_den);
+        let rhs = other.variance_num.saturating_mul(self.variance_den);
+        lhs.cmp(&rhs)
+    }
+
+    pub fn variance_as_f64(&self) -> f64 {
+        if self.variance_den == 0 {
+            return 0.0;
+        }
+        self.variance_num as f64 / self.variance_den as f64
+    }
+}
+
+impl Default for OrthoScore {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl Ord for OrthoScore {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.volume.cmp(&other.volume) {
+            Ordering::Equal => match self.variance_cmp(other) {
+                Ordering::Less => Ordering::Greater,
+                Ordering::Greater => Ordering::Less,
+                Ordering::Equal => self.fullness.cmp(&other.fullness),
+            },
+            non_eq => non_eq,
+        }
+    }
+}
+
+impl PartialOrd for OrthoScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(PartialEq, Debug, Clone, Archive, Serialize, Deserialize)]
@@ -43,6 +110,15 @@ impl Ortho {
             up_axis,
             id,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        dims: Vec<Dim>,
+        payload: Vec<Option<PayloadVal>>,
+        up_axis: Option<Dim>,
+    ) -> Self {
+        Self::from_parts(dims, payload, up_axis)
     }
 
     pub fn new() -> Self {
@@ -281,23 +357,42 @@ impl Ortho {
     pub fn up_axis(&self) -> Option<Dim> {
         self.up_axis
     }
-    fn compute_score_components(&self) -> (usize, usize) {
+    fn compute_score_components(&self) -> OrthoScore {
         let volume = self
             .dims
             .iter()
             .map(|x| usize::from(*x).saturating_sub(1))
             .product::<usize>();
+        let dim_count = self.dims.len() as u128;
+        let dim_sum = self.dims.iter().map(|&d| u128::from(d)).sum::<u128>();
+        let dim_sum_sq = self
+            .dims
+            .iter()
+            .map(|&d| {
+                let value = u128::from(d);
+                value.saturating_mul(value)
+            })
+            .sum::<u128>();
+        let variance_num = dim_count
+            .saturating_mul(dim_sum_sq)
+            .saturating_sub(dim_sum.saturating_mul(dim_sum));
+        let variance_den = dim_count.saturating_mul(dim_count).max(1);
         let fullness = self.payload.iter().filter(|x| x.is_some()).count();
-        (volume, fullness)
+        OrthoScore {
+            volume,
+            variance_num,
+            variance_den,
+            fullness,
+        }
     }
-    pub fn score(&self) -> (usize, usize) {
+    pub fn score(&self) -> OrthoScore {
         self.compute_score_components()
     }
     pub fn volume(&self) -> usize {
-        self.score().0
+        self.score().volume
     }
     pub fn fullness(&self) -> usize {
-        self.score().1
+        self.score().fullness
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, FoldError> {
@@ -469,7 +564,15 @@ mod tests {
             0,
             "fullness should be 0 (no filled slots)"
         );
-        assert_eq!(ortho.score(), (1, 0));
+        assert_eq!(
+            ortho.score(),
+            OrthoScore {
+                volume: 1,
+                variance_num: 0,
+                variance_den: 4,
+                fullness: 0,
+            }
+        );
     }
 
     #[test]
@@ -899,22 +1002,36 @@ mod tests {
 
     #[test]
     fn test_cached_score_matches_computed() {
-        // Helper to compute score the old way
-        fn compute_score_old_way(ortho: &Ortho) -> (usize, usize) {
+        fn compute_score_directly(ortho: &Ortho) -> OrthoScore {
             let volume = ortho
                 .dims()
                 .iter()
                 .map(|x| usize::from(*x).saturating_sub(1))
                 .product::<usize>();
+            let dim_count = ortho.dims().len() as u128;
+            let dim_sum = ortho.dims().iter().map(|&d| u128::from(d)).sum::<u128>();
+            let dim_sum_sq = ortho
+                .dims()
+                .iter()
+                .map(|&d| {
+                    let value = u128::from(d);
+                    value * value
+                })
+                .sum::<u128>();
             let fullness = ortho.payload().iter().filter(|x| x.is_some()).count();
-            (volume, fullness)
+            OrthoScore {
+                volume,
+                variance_num: dim_count * dim_sum_sq - dim_sum * dim_sum,
+                variance_den: dim_count * dim_count,
+                fullness,
+            }
         }
 
         // Test new ortho
         let ortho = Ortho::new();
         assert_eq!(
             ortho.score(),
-            compute_score_old_way(&ortho),
+            compute_score_directly(&ortho),
             "New ortho score mismatch"
         );
 
@@ -922,21 +1039,21 @@ mod tests {
         let ortho = ortho.add(1).pop().unwrap();
         assert_eq!(
             ortho.score(),
-            compute_score_old_way(&ortho),
+            compute_score_directly(&ortho),
             "After add(1) score mismatch"
         );
 
         let ortho = ortho.add(2).pop().unwrap();
         assert_eq!(
             ortho.score(),
-            compute_score_old_way(&ortho),
+            compute_score_directly(&ortho),
             "After add(2) score mismatch"
         );
 
         let ortho = ortho.add(3).pop().unwrap();
         assert_eq!(
             ortho.score(),
-            compute_score_old_way(&ortho),
+            compute_score_directly(&ortho),
             "After add(3) score mismatch"
         );
 
@@ -945,7 +1062,7 @@ mod tests {
         for (i, expanded_ortho) in expansions.iter().enumerate() {
             assert_eq!(
                 expanded_ortho.score(),
-                compute_score_old_way(expanded_ortho),
+                compute_score_directly(expanded_ortho),
                 "Expansion {} score mismatch",
                 i
             );
@@ -957,9 +1074,78 @@ mod tests {
         if let Some(remapped) = ortho_to_remap.remap(&vocab_map) {
             assert_eq!(
                 remapped.score(),
-                compute_score_old_way(&remapped),
+                compute_score_directly(&remapped),
                 "Remapped ortho score mismatch"
             );
         }
+    }
+
+    #[test]
+    fn lower_variance_beats_higher_fullness_on_equal_volume() {
+        let squareish = mk_ortho(
+            vec![3, 4],
+            {
+                let mut payload = vec![Some(1); 11];
+                payload.push(None);
+                payload
+            },
+            None,
+        );
+        let skinny = mk_ortho(
+            vec![2, 7],
+            {
+                let mut payload = vec![Some(1); 13];
+                payload.push(None);
+                payload
+            },
+            None,
+        );
+
+        assert_eq!(
+            squareish.volume(),
+            skinny.volume(),
+            "setup expects equal volume"
+        );
+        assert!(
+            squareish.score() > skinny.score(),
+            "lower variance should beat higher fullness at equal volume"
+        );
+    }
+
+    #[test]
+    fn fullness_breaks_ties_when_variance_matches() {
+        let less_full = mk_ortho(
+            vec![3, 4, 5],
+            {
+                let mut payload = vec![Some(1); 10];
+                payload.extend(vec![None; 50]);
+                payload
+            },
+            None,
+        );
+        let more_full = mk_ortho(
+            vec![5, 4, 3],
+            {
+                let mut payload = vec![Some(1); 11];
+                payload.extend(vec![None; 49]);
+                payload
+            },
+            None,
+        );
+
+        assert_eq!(
+            less_full.volume(),
+            more_full.volume(),
+            "setup expects equal volume"
+        );
+        assert_eq!(
+            less_full.score().variance_cmp(&more_full.score()),
+            Ordering::Equal,
+            "setup expects equal variance"
+        );
+        assert!(
+            more_full.score() > less_full.score(),
+            "fullness should break ties when volume and variance match"
+        );
     }
 }

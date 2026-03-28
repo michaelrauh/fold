@@ -1,11 +1,14 @@
-use crate::{interner::Interner, ortho::Ortho, ortho::payload_to_usize};
+use crate::{
+    interner::Interner,
+    ortho::{Ortho, OrthoScore, payload_to_usize},
+};
 
 /// Returns true if the candidate should be pruned (optimistic bound cannot beat best_score).
 pub fn bound_completion(
     ortho: &Ortho,
     completion: usize,
     interner: &Interner,
-    best_score: (usize, usize),
+    best_score: OrthoScore,
 ) -> bool {
     let (_forbidden, required) = ortho.get_requirements();
 
@@ -17,7 +20,7 @@ pub fn bound_completion(
             .count_ones(..);
         return completion_count <= 1;
     }
-    if best_score == (0, 0) {
+    if best_score == OrthoScore::zero() {
         return false;
     }
 
@@ -55,10 +58,10 @@ pub fn bound_completion(
 pub fn bound_existing_ortho(
     ortho: &Ortho,
     interner: &Interner,
-    best_score: (usize, usize),
+    best_score: OrthoScore,
     impacted_prefixes: Option<&[Vec<usize>]>,
 ) -> bool {
-    if best_score == (0, 0) {
+    if best_score == OrthoScore::zero() {
         return false;
     }
     let ortho_score = ortho.score();
@@ -139,7 +142,7 @@ pub fn upper_bound_score(
     min_fullness: usize,
     dim_count: usize,
     fallback_total: usize,
-) -> (usize, usize) {
+) -> OrthoScore {
     let fallback_total = fallback_total.max(2); // keep optimism for missing axes
 
     // Pick the top `dim_count` axes (descending) and pad with fallback_total if needed.
@@ -165,13 +168,16 @@ pub fn upper_bound_score(
     }
     fullness_upper = fullness_upper.max(min_fullness);
 
-    (volume_upper, fullness_upper)
+    OrthoScore::optimistic_bound(volume_upper, fullness_upper)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{interner::Interner, ortho::PayloadVal};
+    use crate::{
+        interner::Interner,
+        ortho::{OrthoScore, PayloadVal},
+    };
 
     fn vocab_index(interner: &Interner, word: &str) -> usize {
         interner
@@ -186,7 +192,7 @@ mod tests {
         let interner = Interner::from_text("a b");
         let ortho = Ortho::new();
         let a_idx = vocab_index(&interner, "a");
-        let should_prune = bound_completion(&ortho, a_idx, &interner, (0, 0));
+        let should_prune = bound_completion(&ortho, a_idx, &interner, OrthoScore::zero());
         assert!(
             should_prune,
             "root should prune single-span candidates even before best score advances"
@@ -200,7 +206,7 @@ mod tests {
         let b_idx = vocab_index(&interner, "b");
 
         let ortho = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0].clone();
-        let should_prune = bound_completion(&ortho, b_idx, &interner, (0, 0));
+        let should_prune = bound_completion(&ortho, b_idx, &interner, OrthoScore::zero());
         assert!(!should_prune);
     }
 
@@ -211,7 +217,12 @@ mod tests {
         let b_idx = vocab_index(&interner, "b");
 
         let ortho = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0].clone();
-        let should_prune = bound_completion(&ortho, b_idx, &interner, (10, 10));
+        let should_prune = bound_completion(
+            &ortho,
+            b_idx,
+            &interner,
+            OrthoScore::optimistic_bound(10, 10),
+        );
         assert!(should_prune);
     }
 
@@ -269,7 +280,10 @@ mod tests {
         );
 
         // Best score high enough to prune the shallow branch but not the deeper one.
-        let best_score = (potential_z.0, potential_z.1.saturating_sub(1));
+        let best_score = OrthoScore::optimistic_bound(
+            potential_z.volume,
+            potential_z.fullness.saturating_sub(1),
+        );
 
         let prunes_y = bound_completion(&ortho, y_idx, &interner, best_score);
         let _prunes_z = bound_completion(&ortho, z_idx, &interner, best_score);
@@ -296,7 +310,7 @@ mod tests {
         let ortho = Ortho::new();
 
         // Even with zero best score, single-span should prune; multi-span should remain.
-        let best_score = (0, 0);
+        let best_score = OrthoScore::zero();
 
         let prunes_b = bound_completion(&ortho, b_idx, &interner, best_score);
         let prunes_a = bound_completion(&ortho, a_idx, &interner, best_score);
@@ -315,20 +329,27 @@ mod tests {
     fn fullness_upper_not_capped_by_excess_volume() {
         // Axis totals imply two axes of length 3 each.
         let axis_totals = vec![3, 3];
-        let (volume_upper, fullness_upper) =
-            upper_bound_score(&axis_totals, 1, 2, axis_totals.len(), 2);
+        let potential = upper_bound_score(&axis_totals, 1, 2, axis_totals.len(), 2);
 
         assert_eq!(
-            volume_upper, 4,
+            potential.volume, 4,
             "volume upper uses excess volume product (len-1 per axis)"
         );
         assert_eq!(
-            fullness_upper, 9,
+            potential.fullness, 9,
             "fullness upper should use full capacity (product of axis totals)"
         );
         assert!(
-            fullness_upper > volume_upper,
+            potential.fullness > potential.volume,
             "fullness can exceed excess volume and should not be clamped"
+        );
+        assert_eq!(
+            potential.variance_num, 0,
+            "optimistic bound uses perfect variance"
+        );
+        assert_eq!(
+            potential.variance_den, 1,
+            "optimistic bound denominator should be 1"
         );
     }
 
@@ -337,13 +358,12 @@ mod tests {
         // axis_totals only has one axis, but dim_count expects two.
         let axis_totals = vec![3]; // from prefix [a] row length 3
         let fallback_total = 5; // optimistic single-token depth for candidate on the missing axis
-        let (volume_upper, fullness_upper) =
-            upper_bound_score(&axis_totals, 1, 1, 2, fallback_total);
+        let potential = upper_bound_score(&axis_totals, 1, 1, 2, fallback_total);
 
-        assert_eq!(volume_upper, (3 - 1) * (5 - 1));
-        assert_eq!(fullness_upper, 3 * 5);
+        assert_eq!(potential.volume, (3 - 1) * (5 - 1));
+        assert_eq!(potential.fullness, 3 * 5);
         assert!(
-            fullness_upper >= 15,
+            potential.fullness >= 15,
             "fallback should inflate capacity for missing axis"
         );
     }
@@ -352,9 +372,9 @@ mod tests {
     fn upper_bound_uses_largest_axes() {
         // Three axes totals, but dim_count=2. Bound should pick 10 and 2 (largest two).
         let axis_totals = vec![2, 2, 10]; // unsorted; largest is last
-        let (vol, full) = upper_bound_score(&axis_totals, 1, 1, 2, 2);
-        assert_eq!(vol, (10 - 1) * (2 - 1));
-        assert_eq!(full, 10 * 2);
+        let potential = upper_bound_score(&axis_totals, 1, 1, 2, 2);
+        assert_eq!(potential.volume, (10 - 1) * (2 - 1));
+        assert_eq!(potential.fullness, 10 * 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::{generation_store, metrics::Metrics, offload_config::OffloadConfig};
+use crate::{generation_store, memory_safety, metrics::Metrics, offload_config::OffloadConfig};
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -8,6 +8,7 @@ use sysinfo::Disks;
 
 const ARCHIVE_PAYLOAD_MAGIC: &[u8; 8] = b"FOLDRSLT";
 const ARCHIVE_PAYLOAD_VERSION: u32 = 1;
+const RECLAIM_IO_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone)]
 struct DiskSafetyContext {
     enabled: bool,
@@ -99,16 +100,18 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
         return Ok(());
     }
 
+    let rss_before = sync_process_rss_metrics();
     log(format!(
-        "Disk gate: reason={}, bytes_needed={}, free_before={}, target_free={}",
-        reason, bytes_needed, free_before, target_free
+        "Disk gate: reason={}, bytes_needed={}, free_before={}, target_free={}, rss_before={}",
+        reason, bytes_needed, free_before, target_free, rss_before
     ));
     reclaim_until(&ctx, target_free, reason)?;
     let free_after = available_space_for(&ctx.base_dir)?;
+    let rss_after = sync_process_rss_metrics();
     if free_after < target_free {
         return Err(io::Error::other(format!(
-            "disk safety denied write: reason={}, bytes_needed={}, free_before={}, free_after={}, floor={}",
-            reason, bytes_needed, free_before, free_after, floor_bytes
+            "disk safety denied write: reason={}, bytes_needed={}, free_before={}, free_after={}, floor={}, rss_before={}, rss_after={}",
+            reason, bytes_needed, free_before, free_after, floor_bytes, rss_before, rss_after
         )));
     }
 
@@ -512,6 +515,11 @@ fn file_info(path: &Path) -> io::Result<FileInfo> {
 
 fn offload_and_delete(path: &Path) -> io::Result<bool> {
     let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    memory_safety::ensure_phase_headroom(
+        RECLAIM_IO_HEADROOM_BYTES,
+        &format!("disk reclaim offload {}", path.display()),
+    )?;
+    let rss_before = sync_process_rss_metrics();
     match generation_store::offload_path_if_configured(path)? {
         true => {
             let _ = fs::remove_file(path);
@@ -520,10 +528,13 @@ fn offload_and_delete(path: &Path) -> io::Result<bool> {
                     metrics.record_offload(1, size);
                 }
             });
+            let rss_after = sync_process_rss_metrics();
             log(format!(
-                "Disk reclaim offloaded: {} bytes from {}",
+                "Disk reclaim offloaded: {} bytes from {} (rss_before={} rss_after={})",
                 size,
-                path.display()
+                path.display(),
+                rss_before,
+                rss_after
             ));
             Ok(true)
         }
@@ -717,6 +728,16 @@ fn log(message: String) {
             metrics.add_log(message);
         }
     });
+}
+
+fn sync_process_rss_metrics() -> usize {
+    let rss_bytes = memory_safety::current_process_rss_bytes();
+    METRICS.with(|slot| {
+        if let Some(metrics) = slot.borrow().clone() {
+            metrics.update_global(|g| g.process_rss_bytes = rss_bytes);
+        }
+    });
+    rss_bytes
 }
 
 #[cfg(test)]
