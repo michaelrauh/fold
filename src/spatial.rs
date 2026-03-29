@@ -228,6 +228,27 @@ pub fn get_requirements(
     )
 }
 
+pub fn fill_requirements(
+    loc: usize,
+    dims: &[Dim],
+    up_axis: Option<Dim>,
+    prefixes_out: &mut Vec<Vec<usize>>,
+    diagonals_out: &mut Vec<usize>,
+) {
+    let meta = get_meta_with_axis(dims, up_axis);
+    let prefixes = &meta.impacted_phrase_locations[loc];
+    while prefixes_out.len() < prefixes.len() {
+        prefixes_out.push(Vec::new());
+    }
+    prefixes_out.truncate(prefixes.len());
+    for (dst, src) in prefixes_out.iter_mut().zip(prefixes.iter()) {
+        dst.clear();
+        dst.extend_from_slice(src);
+    }
+    diagonals_out.clear();
+    diagonals_out.extend_from_slice(&meta.diagonals[loc]);
+}
+
 pub fn get_axis_positions(dims: &[Dim]) -> Vec<usize> {
     get_meta(dims).axis_positions.clone()
 }

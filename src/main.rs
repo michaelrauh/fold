@@ -1,6 +1,6 @@
 use fold::{
     FoldError,
-    completion_pruning::{bound_completion, bound_existing_ortho},
+    completion_pruning::{CompletionContext, bound_completion_ctx, bound_existing_ortho},
     disk_safety,
     file_handler::{self, MemClaimGuard, StateConfig},
     generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
@@ -8,12 +8,13 @@ use fold::{
     interner::Interner,
     memory_budget::MemoryBudget,
     memory_safety,
-    metrics::{GenerationStat, Metrics},
+    metrics::{GenerationStat, Metrics, OperationDeltas},
     offload_config::OffloadConfig,
     offload_runtime::configure_offload_runtime,
     ortho::{Ortho, OrthoScore, PayloadVal, payload_to_usize},
     tui::Tui,
 };
+use fixedbitset::FixedBitSet;
 use std::any::Any;
 use std::fs;
 use std::io::IsTerminal;
@@ -1193,6 +1194,11 @@ fn merge_archives(
         ));
 
         let mut gen_processed = 0;
+        let mut hot_deltas = OperationDeltas::default();
+        let mut completion_ctx = CompletionContext::default();
+        let mut completion_bits = FixedBitSet::with_capacity(merged_interner.vocab_size());
+        completion_bits.grow(merged_interner.vocab_size());
+        let mut completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
 
         let gen_start = std::time::Instant::now();
         let accepted_before = store.seen_len_accepted();
@@ -1204,6 +1210,7 @@ fn merge_archives(
 
             // Periodic updates on a time cadence
             if last_housekeeping.elapsed().as_millis() >= 1000 {
+                flush_operation_deltas(metrics, &mut hot_deltas);
                 // Update progress for current generation
                 metrics.update_operation(|op| {
                     op.progress_current = gen_processed;
@@ -1313,53 +1320,118 @@ fn merge_archives(
             }
 
             // Get requirements and completions
-            let (forbidden, required) = ortho.get_requirements();
-            let forbidden_usize: Vec<usize> =
-                forbidden.iter().map(|v| payload_to_usize(*v)).collect();
-            let required_usize: Vec<Vec<usize>> = required
-                .iter()
-                .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
-                .collect();
-            let completions = merged_interner.intersect(&required_usize, &forbidden_usize);
+            completion_ctx.reset(&ortho);
+            merged_interner.intersect_into(
+                completion_ctx.required_usize(),
+                completion_ctx.forbidden_usize(),
+                &mut completion_bits,
+            );
 
-            if completions.len() > FANOUT_LOG_THRESHOLD {
+            let total_completions = completion_bits.count_ones(..);
+            if total_completions > FANOUT_LOG_THRESHOLD {
                 let chunks =
-                    (completions.len() + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
+                    (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
                 metrics.add_log(format!(
                     "Fanout: {} completions; {} chunks",
-                    completions.len(),
+                    total_completions,
                     chunks
                 ));
             }
 
             // Generate children
-            for completion in completions {
-                if bound_completion(&ortho, completion, &merged_interner, best_score) {
-                    metrics.increment_pruned_completions(1);
+            completion_chunk.clear();
+            for completion in completion_bits.ones() {
+                completion_chunk.push(completion);
+                if completion_chunk.len() < COMPLETION_CHUNK_SIZE {
                     continue;
                 }
-                metrics.increment_expanded_completions(1);
-                let completion_val =
-                    PayloadVal::try_from(completion).expect("completion overflowed u32");
-                let children = ortho.add(completion_val);
-                for child in children {
-                    let candidate_score = child.score();
-                    if candidate_score > best_score {
-                        best_ortho = child.clone();
-                        best_score = candidate_score;
-                    }
-                    if candidate_score > global_score {
-                        global_score = candidate_score;
-                        optimal_dirty = true;
-                    }
 
-                    store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                for &completion in &completion_chunk {
+                    if bound_completion_ctx(
+                        &mut completion_ctx,
+                        completion,
+                        &merged_interner,
+                        best_score,
+                    ) {
+                        hot_deltas.pruned_completions =
+                            hot_deltas.pruned_completions.saturating_add(1);
+                        if completion_ctx.is_root() {
+                            hot_deltas.pruned_root_span =
+                                hot_deltas.pruned_root_span.saturating_add(1);
+                        } else {
+                            hot_deltas.pruned_bound =
+                                hot_deltas.pruned_bound.saturating_add(1);
+                        }
+                        continue;
+                    }
+                    hot_deltas.expanded_completions =
+                        hot_deltas.expanded_completions.saturating_add(1);
+                    let completion_val =
+                        PayloadVal::try_from(completion).expect("completion overflowed u32");
+                    let children = ortho.add(completion_val);
+                    for child in children {
+                        let candidate_score = child.score();
+                        if candidate_score > best_score {
+                            best_ortho = child.clone();
+                            best_score = candidate_score;
+                        }
+                        if candidate_score > global_score {
+                            global_score = candidate_score;
+                            optimal_dirty = true;
+                        }
 
-                    // Increment new orthos counter for each generated ortho
-                    metrics.increment_new_orthos(1);
+                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
+                    }
                 }
+                flush_operation_deltas(metrics, &mut hot_deltas);
+                completion_chunk.clear();
+            }
+
+            if !completion_chunk.is_empty() {
+                for &completion in &completion_chunk {
+                    if bound_completion_ctx(
+                        &mut completion_ctx,
+                        completion,
+                        &merged_interner,
+                        best_score,
+                    ) {
+                        hot_deltas.pruned_completions =
+                            hot_deltas.pruned_completions.saturating_add(1);
+                        if completion_ctx.is_root() {
+                            hot_deltas.pruned_root_span =
+                                hot_deltas.pruned_root_span.saturating_add(1);
+                        } else {
+                            hot_deltas.pruned_bound =
+                                hot_deltas.pruned_bound.saturating_add(1);
+                        }
+                        continue;
+                    }
+                    hot_deltas.expanded_completions =
+                        hot_deltas.expanded_completions.saturating_add(1);
+                    let completion_val =
+                        PayloadVal::try_from(completion).expect("completion overflowed u32");
+                    let children = ortho.add(completion_val);
+                    for child in children {
+                        let candidate_score = child.score();
+                        if candidate_score > best_score {
+                            best_ortho = child.clone();
+                            best_score = candidate_score;
+                        }
+                        if candidate_score > global_score {
+                            global_score = candidate_score;
+                            optimal_dirty = true;
+                        }
+
+                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
+                    }
+                }
+                flush_operation_deltas(metrics, &mut hot_deltas);
             }
         }
+
+        flush_operation_deltas(metrics, &mut hot_deltas);
 
         metrics.add_log(format!(
             "Merge Generation {}: processed {} orthos",
@@ -1935,6 +2007,11 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
         (used_raw as usize).saturating_mul(factor),
         (total_raw as usize).saturating_mul(factor),
     )
+}
+
+fn flush_operation_deltas(metrics: &Metrics, deltas: &mut OperationDeltas) {
+    metrics.apply_operation_deltas(*deltas);
+    *deltas = OperationDeltas::default();
 }
 
 // Old acquire_memory_claim kept for any remaining merge_archives code

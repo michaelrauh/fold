@@ -196,6 +196,15 @@ pub struct MergeStatus {
     pub compaction_pruned: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationDeltas {
+    pub new_orthos: usize,
+    pub pruned_completions: usize,
+    pub expanded_completions: usize,
+    pub pruned_root_span: usize,
+    pub pruned_bound: usize,
+}
+
 impl Default for MergeStatus {
     fn default() -> Self {
         Self {
@@ -457,6 +466,30 @@ impl Metrics {
     pub fn increment_new_orthos(&self, count: usize) {
         let mut inner = self.inner.lock().unwrap();
         inner.operation.new_orthos = inner.operation.new_orthos.saturating_add(count);
+    }
+
+    pub fn apply_operation_deltas(&self, delta: OperationDeltas) {
+        if delta == OperationDeltas::default() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.operation.new_orthos = inner.operation.new_orthos.saturating_add(delta.new_orthos);
+        inner.operation.pruned_completions = inner
+            .operation
+            .pruned_completions
+            .saturating_add(delta.pruned_completions);
+        inner.operation.expanded_completions = inner
+            .operation
+            .expanded_completions
+            .saturating_add(delta.expanded_completions);
+        inner.operation.pruned_root_span = inner
+            .operation
+            .pruned_root_span
+            .saturating_add(delta.pruned_root_span);
+        inner.operation.pruned_bound = inner
+            .operation
+            .pruned_bound
+            .saturating_add(delta.pruned_bound);
     }
 
     pub fn reset_prune_counts(&self) {
@@ -823,4 +856,28 @@ fn strip_ansi_codes(input: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_operation_deltas_updates_hot_counts_in_one_step() {
+        let metrics = Metrics::new();
+        metrics.apply_operation_deltas(OperationDeltas {
+            new_orthos: 3,
+            pruned_completions: 5,
+            expanded_completions: 7,
+            pruned_root_span: 11,
+            pruned_bound: 13,
+        });
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.operation.new_orthos, 3);
+        assert_eq!(snapshot.operation.pruned_completions, 5);
+        assert_eq!(snapshot.operation.expanded_completions, 7);
+        assert_eq!(snapshot.operation.pruned_root_span, 11);
+        assert_eq!(snapshot.operation.pruned_bound, 13);
+    }
 }

@@ -329,7 +329,7 @@ impl Interner {
             .expect("Index out of bounds in Interner::string_for_index")
     }
 
-    pub fn completions_for_prefix(&self, prefix: &Vec<usize>) -> Option<&FixedBitSet> {
+    pub fn completions_for_prefix(&self, prefix: &[usize]) -> Option<&FixedBitSet> {
         self.prefix_to_completions.get(prefix)
     }
 
@@ -369,25 +369,23 @@ impl Interner {
         result
     }
 
-    fn get_forbidden_bits(&self, forbidden: &[usize]) -> FixedBitSet {
-        let mut bitset = FixedBitSet::with_capacity(self.vocabulary.len());
-        bitset.grow(self.vocabulary.len());
-        if forbidden.is_empty() {
-            bitset.set_range(.., true);
-            return bitset;
-        }
-        bitset.set_range(.., true);
+    pub fn intersect_into(
+        &self,
+        required: &[Vec<usize>],
+        forbidden: &[usize],
+        out: &mut FixedBitSet,
+    ) {
+        let required_bits = self.get_required_bits(required);
+        out.clone_from(&required_bits);
         for &idx in forbidden {
-            bitset.set(idx, false);
+            out.set(idx, false);
         }
-        bitset
     }
 
     pub fn intersect(&self, required: &[Vec<usize>], forbidden: &[usize]) -> Vec<usize> {
-        let required_bits = self.get_required_bits(required);
-        let forbidden_bits = self.get_forbidden_bits(forbidden);
-        let mut intersection = required_bits.clone();
-        intersection.intersect_with(&forbidden_bits);
+        let mut intersection = FixedBitSet::with_capacity(self.vocabulary.len());
+        intersection.grow(self.vocabulary.len());
+        self.intersect_into(required, forbidden, &mut intersection);
         intersection.ones().collect()
     }
 

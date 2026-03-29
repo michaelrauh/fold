@@ -1,15 +1,16 @@
 use crate::{
-    completion_pruning::bound_completion,
+    completion_pruning::{CompletionContext, bound_completion_ctx},
     disk_safety,
     error::FoldError,
     file_handler::StateConfig,
     generation_store::{Config, GenerationStore, ProgressCallback, Role},
     interner::Interner,
     memory_safety,
-    metrics::{GenerationStat, Metrics},
+    metrics::{GenerationStat, Metrics, OperationDeltas},
     offload_config::OffloadConfig,
-    ortho::{Ortho, OrthoScore, PayloadVal, payload_to_usize},
+    ortho::{Ortho, OrthoScore, PayloadVal},
 };
+use fixedbitset::FixedBitSet;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::Disks;
 
@@ -85,6 +86,11 @@ fn maybe_run_processing_reclaim_safe_point(
         reason, reservation, target_free
     ));
     Ok(true)
+}
+
+fn flush_operation_deltas(metrics: &Metrics, deltas: &mut OperationDeltas) {
+    metrics.apply_operation_deltas(*deltas);
+    *deltas = OperationDeltas::default();
 }
 
 pub struct GenerationRunResult {
@@ -295,6 +301,11 @@ where
         metrics.reset_prune_counts();
         let mut gen_processed = 0u64;
         let mut pop_work_calls = 0u64;
+        let mut hot_deltas = OperationDeltas::default();
+        let mut completion_ctx = CompletionContext::default();
+        let mut completion_bits = FixedBitSet::with_capacity(interner.vocab_size());
+        completion_bits.grow(interner.vocab_size());
+        let mut completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
 
         let gen_start = Instant::now();
         let accepted_before = store.seen_len_accepted();
@@ -311,6 +322,7 @@ where
 
             // Periodic updates on a time cadence
             if last_housekeeping.elapsed().as_millis() >= 1000 {
+                flush_operation_deltas(metrics, &mut hot_deltas);
                 // Update progress for current generation
                 metrics.update_operation(|op| {
                     op.progress_current = gen_processed as usize;
@@ -427,18 +439,15 @@ where
                 }
             }
 
-            // Get requirements from ortho
-            let (forbidden, required) = ortho.get_requirements();
-            let forbidden_usize: Vec<usize> =
-                forbidden.iter().map(|v| payload_to_usize(*v)).collect();
-            let required_usize: Vec<Vec<usize>> = required
-                .iter()
-                .map(|r| r.iter().map(|v| payload_to_usize(*v)).collect())
-                .collect();
+            completion_ctx.reset(&ortho);
 
             // Get completions from interner
-            let completions = interner.intersect(&required_usize, &forbidden_usize);
-            let total_completions = completions.len();
+            interner.intersect_into(
+                completion_ctx.required_usize(),
+                completion_ctx.forbidden_usize(),
+                &mut completion_bits,
+            );
+            let total_completions = completion_bits.count_ones(..);
             if total_completions > FANOUT_LOG_THRESHOLD {
                 let chunks =
                     (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
@@ -449,7 +458,12 @@ where
             }
 
             // Generate child orthos and record results
-            for completion_chunk in completions.chunks(COMPLETION_CHUNK_SIZE) {
+            completion_chunk.clear();
+            for completion in completion_bits.ones() {
+                completion_chunk.push(completion);
+                if completion_chunk.len() < COMPLETION_CHUNK_SIZE {
+                    continue;
+                }
                 reclaim_pending = reclaim_pending
                     || disk_safety::reclaim_required(store.processing_reclaim_reservation_bytes())?
                         .is_some();
@@ -463,18 +477,22 @@ where
                     reclaim_pending = false;
                 }
 
-                for &completion in completion_chunk {
-                    if bound_completion(&ortho, completion, interner, best_score) {
-                        metrics.increment_pruned_completions(1);
-                        if required.is_empty() {
+                for &completion in &completion_chunk {
+                    if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
+                        hot_deltas.pruned_completions =
+                            hot_deltas.pruned_completions.saturating_add(1);
+                        if completion_ctx.is_root() {
                             // Root span prune
-                            metrics.increment_pruned_root_span(1);
+                            hot_deltas.pruned_root_span =
+                                hot_deltas.pruned_root_span.saturating_add(1);
                         } else {
-                            metrics.increment_pruned_bound(1);
+                            hot_deltas.pruned_bound =
+                                hot_deltas.pruned_bound.saturating_add(1);
                         }
                         continue;
                     }
-                    metrics.increment_expanded_completions(1);
+                    hot_deltas.expanded_completions =
+                        hot_deltas.expanded_completions.saturating_add(1);
                     let completion_val =
                         PayloadVal::try_from(completion).expect("completion overflowed u32");
                     let children = ortho.add(completion_val);
@@ -494,11 +512,66 @@ where
                         store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
 
                         // Increment new orthos counter for each generated ortho
-                        metrics.increment_new_orthos(1);
+                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
                     }
                 }
+                flush_operation_deltas(metrics, &mut hot_deltas);
+                completion_chunk.clear();
+            }
+
+            if !completion_chunk.is_empty() {
+                reclaim_pending = reclaim_pending
+                    || disk_safety::reclaim_required(store.processing_reclaim_reservation_bytes())?
+                        .is_some();
+                if reclaim_pending
+                    && maybe_run_processing_reclaim_safe_point(
+                        store,
+                        metrics,
+                        "processing completion chunk",
+                    )?
+                {
+                    reclaim_pending = false;
+                }
+
+                for &completion in &completion_chunk {
+                    if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
+                        hot_deltas.pruned_completions =
+                            hot_deltas.pruned_completions.saturating_add(1);
+                        if completion_ctx.is_root() {
+                            hot_deltas.pruned_root_span =
+                                hot_deltas.pruned_root_span.saturating_add(1);
+                        } else {
+                            hot_deltas.pruned_bound =
+                                hot_deltas.pruned_bound.saturating_add(1);
+                        }
+                        continue;
+                    }
+                    hot_deltas.expanded_completions =
+                        hot_deltas.expanded_completions.saturating_add(1);
+                    let completion_val =
+                        PayloadVal::try_from(completion).expect("completion overflowed u32");
+                    let children = ortho.add(completion_val);
+                    for child in children {
+                        let candidate_score = child.score();
+                        if candidate_score > best_score {
+                            best_ortho = child.clone();
+                            best_score = candidate_score;
+                            update_optimal_metrics(&best_ortho);
+                        }
+                        if candidate_score > global_score {
+                            global_score = candidate_score;
+                            optimal_dirty = true;
+                        }
+
+                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
+                    }
+                }
+                flush_operation_deltas(metrics, &mut hot_deltas);
             }
         }
+
+        flush_operation_deltas(metrics, &mut hot_deltas);
 
         metrics.add_log(format!(
             "Generation {}: processed={}, pop_work_calls={}",

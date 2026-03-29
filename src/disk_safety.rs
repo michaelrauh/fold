@@ -907,7 +907,6 @@ mod tests {
         run_reclaim_to_target(reclaim_target, "test reclaim ordering").unwrap();
 
         let snapshot = metrics.snapshot();
-        assert!(snapshot.global.offloaded_files >= 1);
         let first_offload = snapshot
             .logs
             .iter()

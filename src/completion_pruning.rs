@@ -3,6 +3,62 @@ use crate::{
     ortho::{Ortho, OrthoScore, payload_to_usize},
 };
 
+#[derive(Clone, Debug, Default)]
+pub struct CompletionContext {
+    required_usize: Vec<Vec<usize>>,
+    forbidden_usize: Vec<usize>,
+    prefix_positions: Vec<Vec<usize>>,
+    diagonal_positions: Vec<usize>,
+    prefix_with_completion: Vec<Vec<usize>>,
+    totals: Vec<usize>,
+    dim_count: usize,
+    base_volume: usize,
+    base_fullness: usize,
+    is_root: bool,
+}
+
+impl CompletionContext {
+    pub fn from_ortho(ortho: &Ortho) -> Self {
+        let mut ctx = Self::default();
+        ctx.reset(ortho);
+        ctx
+    }
+
+    pub fn reset(&mut self, ortho: &Ortho) {
+        ortho.fill_requirements_usize(
+            &mut self.forbidden_usize,
+            &mut self.required_usize,
+            &mut self.prefix_positions,
+            &mut self.diagonal_positions,
+        );
+        self.prefix_with_completion.clear();
+        self.prefix_with_completion
+            .extend(self.required_usize.iter().map(|prefix| {
+                let mut with_completion = Vec::with_capacity(prefix.len().saturating_add(1));
+                with_completion.extend_from_slice(prefix);
+                with_completion
+            }));
+        self.totals.clear();
+        self.totals.reserve(self.required_usize.len());
+        self.dim_count = ortho.dims().len();
+        self.base_volume = ortho.volume();
+        self.base_fullness = ortho.fullness();
+        self.is_root = self.required_usize.is_empty();
+    }
+
+    pub fn required_usize(&self) -> &[Vec<usize>] {
+        &self.required_usize
+    }
+
+    pub fn forbidden_usize(&self) -> &[usize] {
+        &self.forbidden_usize
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.is_root
+    }
+}
+
 /// Returns true if the candidate should be pruned (optimistic bound cannot beat best_score).
 pub fn bound_completion(
     ortho: &Ortho,
@@ -10,12 +66,20 @@ pub fn bound_completion(
     interner: &Interner,
     best_score: OrthoScore,
 ) -> bool {
-    let (_forbidden, required) = ortho.get_requirements();
+    let mut ctx = CompletionContext::from_ortho(ortho);
+    bound_completion_ctx(&mut ctx, completion, interner, best_score)
+}
 
-    if required.is_empty() {
+pub fn bound_completion_ctx(
+    ctx: &mut CompletionContext,
+    completion: usize,
+    interner: &Interner,
+    best_score: OrthoScore,
+) -> bool {
+    if ctx.is_root {
         // Empty ortho: require initial span > 1 (i.e., more than a single chain).
         let completion_count = interner
-            .completions_for_prefix(&vec![completion])
+            .completions_for_prefix(&[completion])
             .expect("missing completions bitset for single-token prefix")
             .count_ones(..);
         return completion_count <= 1;
@@ -24,28 +88,25 @@ pub fn bound_completion(
         return false;
     }
 
-    let dim_count = ortho.dims().len();
-    let mut totals: Vec<usize> = Vec::with_capacity(required.len());
-    for prefix in required {
-        let mut prefix_usize: Vec<usize> = prefix.iter().map(|p| payload_to_usize(*p)).collect();
-        prefix_usize.push(completion);
-        match interner.prefix_stats(&prefix_usize) {
-            Some(max_desc_len) => {
-                totals.push(max_desc_len);
-            }
+    ctx.totals.clear();
+    for prefix in &mut ctx.prefix_with_completion {
+        prefix.push(completion);
+        match interner.prefix_stats(prefix.as_slice()) {
+            Some(max_desc_len) => ctx.totals.push(max_desc_len),
             None => {
-                panic!("[bound][panic] missing prefix stats for {:?}", prefix_usize);
+                panic!("[bound][panic] missing prefix stats for {:?}", prefix);
             }
         }
+        prefix.pop();
     }
 
     let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2); // optimistic for missing axes
 
     let potential_score = upper_bound_score(
-        &totals,
-        ortho.volume(),
-        ortho.fullness().saturating_add(1),
-        dim_count,
+        &ctx.totals,
+        ctx.base_volume,
+        ctx.base_fullness.saturating_add(1),
+        ctx.dim_count,
         fallback_total,
     );
 
@@ -69,22 +130,21 @@ pub fn bound_existing_ortho(
         // Do not prune if we haven't found a strictly better score yet.
         return false;
     }
-    let (_forbidden, required) = ortho.get_requirements();
-    if required.is_empty() {
+    let ctx = CompletionContext::from_ortho(ortho);
+    if ctx.is_root() {
         return false;
     }
 
-    let mut totals: Vec<usize> = Vec::with_capacity(required.len());
-    for prefix in required {
-        let prefix_usize: Vec<usize> = prefix.iter().map(|p| payload_to_usize(*p)).collect();
-        match interner.prefix_stats(&prefix_usize) {
+    let mut totals: Vec<usize> = Vec::with_capacity(ctx.required_usize().len());
+    for prefix in ctx.required_usize() {
+        match interner.prefix_stats(prefix.as_slice()) {
             Some(max_desc_len) => {
                 totals.push(max_desc_len);
             }
             None => {
                 panic!(
                     "[bound][panic] missing prefix stats for impacted prefix {:?}",
-                    prefix_usize
+                    prefix
                 );
             }
         }
@@ -387,6 +447,38 @@ mod tests {
         assert!(
             bound_completion(&ortho, a_idx, &interner, best_score),
             "equal potential should prune under current <= rule"
+        );
+    }
+
+    #[test]
+    fn completion_context_matches_ortho_requirements() {
+        let interner = Interner::from_text("a b c");
+        let a_idx = vocab_index(&interner, "a");
+        let b_idx = vocab_index(&interner, "b");
+        let ortho = Ortho::new()
+            .add(PayloadVal::try_from(a_idx).unwrap())[0]
+            .add(PayloadVal::try_from(b_idx).unwrap())[0]
+            .clone();
+
+        let (forbidden, required) = ortho.get_requirements();
+        let mut ctx = CompletionContext::from_ortho(&ortho);
+
+        let expected_forbidden: Vec<usize> = forbidden.into_iter().map(payload_to_usize).collect();
+        let expected_required: Vec<Vec<usize>> = required
+            .into_iter()
+            .map(|prefix| prefix.into_iter().map(payload_to_usize).collect())
+            .collect();
+
+        assert_eq!(ctx.forbidden_usize(), expected_forbidden.as_slice());
+        assert_eq!(ctx.required_usize(), expected_required.as_slice());
+        assert!(!ctx.is_root());
+
+        let c_idx = vocab_index(&interner, "c");
+        let best_score = OrthoScore::zero();
+        assert_eq!(
+            bound_completion(&ortho, c_idx, &interner, best_score),
+            bound_completion_ctx(&mut ctx, c_idx, &interner, best_score),
+            "context path should preserve pruning behavior"
         );
     }
 }

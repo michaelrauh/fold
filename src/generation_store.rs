@@ -6,6 +6,16 @@ use crate::{
     memory_safety,
     ortho::{Ortho, OrthoId, OrthoScore},
 };
+use rkyv::{
+    AlignedVec,
+    ser::{
+        Serializer,
+        serializers::{
+            AlignedSerializer, AllocScratch, CompositeSerializer, FallbackScratch, HeapScratch,
+            SharedSerializeMap,
+        },
+    },
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -112,7 +122,7 @@ pub struct GenerationStore {
     landing_buffer_sizes: Vec<usize>, // Track bytes written to each bucket writer
     landing_counts: Vec<usize>,       // Track ortho counts in landing per bucket
     // Work queue state
-    work_segments: Vec<PathBuf>,
+    work_segments: VecDeque<PathBuf>,
     work_segment_counter: usize,
     total_work_len: u64,
     work_queue_cache: VecDeque<Ortho>, // In-memory cache of work items
@@ -134,6 +144,8 @@ pub struct GenerationStore {
     #[allow(dead_code)]
     history_cache: std::collections::HashMap<PathBuf, Vec<u8>>, // Cached history run contents (future optimization)
     compression_stats: CompressionStats,
+    record_write_scratch: AlignedVec,
+    record_read_scratch: Vec<u8>,
 }
 
 /// Placeholder for unsorted drained data
@@ -565,6 +577,7 @@ fn archived_eq(a: &StreamedOrtho, b: &StreamedOrtho) -> bool {
 }
 
 const ORTHO_RECORD_HEADER_SIZE: usize = mem::size_of::<u64>() * 2;
+const ORTHO_SERIALIZER_SCRATCH_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CompressionStats {
@@ -596,9 +609,36 @@ fn write_ortho_record<W: Write>(
     ortho: &Ortho,
     stats: Option<&mut CompressionStats>,
 ) -> io::Result<usize> {
-    let encoded = ortho
-        .to_bytes()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut scratch = AlignedVec::new();
+    write_ortho_record_with_scratch(writer, ortho, &mut scratch, stats)
+}
+
+fn serialize_ortho_into_scratch(ortho: &Ortho, scratch: &mut AlignedVec) -> io::Result<usize> {
+    scratch.clear();
+    {
+        let mut serializer = CompositeSerializer::new(
+            AlignedSerializer::new(&mut *scratch),
+            FallbackScratch::new(
+                HeapScratch::<ORTHO_SERIALIZER_SCRATCH_BYTES>::new(),
+                AllocScratch::default(),
+            ),
+            SharedSerializeMap::new(),
+        );
+        serializer
+            .serialize_value(ortho)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+    Ok(scratch.len())
+}
+
+fn write_ortho_record_with_scratch<W: Write>(
+    writer: &mut W,
+    ortho: &Ortho,
+    scratch: &mut AlignedVec,
+    stats: Option<&mut CompressionStats>,
+) -> io::Result<usize> {
+    let encoded_len_usize = serialize_ortho_into_scratch(ortho, scratch)?;
+    let encoded = &scratch[..encoded_len_usize];
     let decoded_est = estimate_decoded_size(ortho) as u64;
     let encoded_len = encoded.len() as u64;
 
@@ -849,7 +889,7 @@ impl GenerationStore {
             drain_counter: vec![0; bucket_count],
             landing_buffer_sizes: vec![0; bucket_count],
             landing_counts: vec![0; bucket_count],
-            work_segments: Vec::new(),
+            work_segments: VecDeque::new(),
             work_segment_counter: 0,
             total_work_len: 0,
             work_queue_cache: VecDeque::new(),
@@ -869,6 +909,8 @@ impl GenerationStore {
             seen_len_accepted: 0,
             history_cache: std::collections::HashMap::new(),
             compression_stats: CompressionStats::default(),
+            record_write_scratch: AlignedVec::new(),
+            record_read_scratch: Vec::new(),
         })
     }
 
@@ -1055,7 +1097,7 @@ impl GenerationStore {
             drain_counter: vec![0; 8],
             landing_buffer_sizes: vec![0; 8],
             landing_counts: vec![0; 8],
-            work_segments: Vec::new(),
+            work_segments: VecDeque::new(),
             work_segment_counter: 0,
             total_work_len: 0,
             work_queue_cache: VecDeque::new(),
@@ -1075,6 +1117,8 @@ impl GenerationStore {
             seen_len_accepted: 0,
             history_cache: std::collections::HashMap::new(),
             compression_stats: CompressionStats::default(),
+            record_write_scratch: AlignedVec::new(),
+            record_read_scratch: Vec::new(),
         }
     }
 
@@ -1118,7 +1162,7 @@ impl GenerationStore {
         // Write ortho using rkyv
         let encoded_len = {
             let writer = self.bucket_writers[bucket].as_mut().unwrap();
-            write_ortho_record(writer, ortho, None)?
+            write_ortho_record_with_scratch(writer, ortho, &mut self.record_write_scratch, None)?
         };
         self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
 
@@ -1248,16 +1292,14 @@ impl GenerationStore {
         let mut file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&segment_path)?);
         file.write_all(&count.to_le_bytes())?;
         for ortho in &self.work_segment_batch {
-            let encoded = ortho
-                .to_bytes()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            file.write_all(&(encoded.len() as u64).to_le_bytes())?;
-            file.write_all(&encoded)?;
+            let encoded_len = serialize_ortho_into_scratch(ortho, &mut self.record_write_scratch)?;
+            file.write_all(&(encoded_len as u64).to_le_bytes())?;
+            file.write_all(&self.record_write_scratch[..encoded_len])?;
         }
         file.flush()?;
 
         // Add to work segments and update totals
-        self.work_segments.push(segment_path);
+        self.work_segments.push_back(segment_path);
         self.total_work_len += count;
         self.work_segment_batch.clear();
         self.work_segment_batch_bytes = 0;
@@ -1324,7 +1366,10 @@ impl GenerationStore {
         }
 
         while self.work_queue_cache.is_empty() && !self.work_segments.is_empty() {
-            let segment_path = self.work_segments.remove(0);
+            let segment_path = self
+                .work_segments
+                .pop_front()
+                .expect("work segment queue unexpectedly empty during refill");
             let resolved_path = resolve_managed_path(&segment_path)?;
             let mut file = File::open(&resolved_path)?;
 
@@ -1355,9 +1400,10 @@ impl GenerationStore {
                 file.read_exact(&mut len_bytes)?;
                 let len = u64::from_le_bytes(len_bytes) as usize;
 
-                let mut ortho_bytes = vec![0u8; len];
-                file.read_exact(&mut ortho_bytes)?;
-                let ortho: Ortho = Ortho::from_bytes(&ortho_bytes)
+                self.record_read_scratch.clear();
+                self.record_read_scratch.resize(len, 0);
+                file.read_exact(&mut self.record_read_scratch)?;
+                let ortho: Ortho = Ortho::from_bytes(&self.record_read_scratch)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 loaded_bytes = loaded_bytes.saturating_add(ortho.heap_bytes_estimate());
                 loaded.push_back(ortho);
@@ -4106,6 +4152,28 @@ mod tests {
             squareish.id(),
             "cache best should prefer the better variance-aware score"
         );
+    }
+
+    #[test]
+    fn work_segment_refill_preserves_fifo_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path, 2).unwrap();
+        let mut cfg = Config::test_config(64 * 1024, 4);
+        cfg.work_queue_cache_bytes = 1;
+        cfg.work_segment_max_bytes = 1;
+        store.configure(&cfg);
+
+        let first = Ortho::new().add(1).pop().unwrap();
+        let second = Ortho::new().add(2).pop().unwrap();
+
+        store.push_segments(vec![first.clone()]).unwrap();
+        store.flush_work_segment_batch().unwrap();
+        store.push_segments(vec![second.clone()]).unwrap();
+        store.flush_work_segment_batch().unwrap();
+
+        assert_eq!(store.pop_work().unwrap(), Some(first));
+        assert_eq!(store.pop_work().unwrap(), Some(second));
     }
 
     #[test]

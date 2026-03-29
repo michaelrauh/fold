@@ -18,7 +18,8 @@ pub fn payload_to_usize(value: PayloadVal) -> usize {
     usize::try_from(value).expect("payload value overflowed usize")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[archive_attr(derive(Debug, PartialEq, CheckBytes))]
 pub struct OrthoScore {
     pub volume: usize,
     pub variance_num: u128,
@@ -90,6 +91,9 @@ pub struct Ortho {
     dims: Vec<Dim>,
     payload: Vec<Option<PayloadVal>>,
     up_axis: Option<Dim>, // Records the last "up" transform axis (None = last expansion was over or base)
+    fill_count: u32,      // Cached number of filled payload cells
+    next_empty: u32,      // Cached insertion position (payload.len() when full)
+    score: OrthoScore,    // Cached score for hot comparisons
     id: OrthoId,          // Cached hash of dims/payload/up_axis for fast lookups
 }
 
@@ -104,12 +108,60 @@ impl Ortho {
 
     fn from_parts(dims: Vec<Dim>, payload: Vec<Option<PayloadVal>>, up_axis: Option<Dim>) -> Self {
         let id = Self::compute_id(&dims, &payload, up_axis);
+        let (fill_count, next_empty, score) = Self::compute_cached_fields(&dims, &payload);
         Ortho {
             dims,
             payload,
             up_axis,
+            fill_count,
+            next_empty,
+            score,
             id,
         }
+    }
+
+    fn compute_score_components(dims: &[Dim], fullness: usize) -> OrthoScore {
+        let volume = dims
+            .iter()
+            .map(|x| usize::from(*x).saturating_sub(1))
+            .product::<usize>();
+        let dim_count = dims.len() as u128;
+        let dim_sum = dims.iter().map(|&d| u128::from(d)).sum::<u128>();
+        let dim_sum_sq = dims
+            .iter()
+            .map(|&d| {
+                let value = u128::from(d);
+                value.saturating_mul(value)
+            })
+            .sum::<u128>();
+        let variance_num = dim_count
+            .saturating_mul(dim_sum_sq)
+            .saturating_sub(dim_sum.saturating_mul(dim_sum));
+        let variance_den = dim_count.saturating_mul(dim_count).max(1);
+        OrthoScore {
+            volume,
+            variance_num,
+            variance_den,
+            fullness,
+        }
+    }
+
+    fn compute_cached_fields(dims: &[Dim], payload: &[Option<PayloadVal>]) -> (u32, u32, OrthoScore) {
+        let mut fill_count = 0usize;
+        let mut next_empty = payload.len();
+        for (idx, cell) in payload.iter().enumerate() {
+            if cell.is_some() {
+                fill_count += 1;
+            } else if next_empty == payload.len() {
+                next_empty = idx;
+            }
+        }
+        let fill_count_u32 =
+            u32::try_from(fill_count).expect("fill count overflowed cached u32 field");
+        let next_empty_u32 =
+            u32::try_from(next_empty).expect("next empty position overflowed cached u32 field");
+        let score = Self::compute_score_components(dims, fill_count);
+        (fill_count_u32, next_empty_u32, score)
     }
 
     #[cfg(test)]
@@ -147,14 +199,11 @@ impl Ortho {
         archived.id
     }
     pub fn get_current_position(&self) -> usize {
-        self.payload
-            .iter()
-            .position(|x| x.is_none())
-            .unwrap_or(self.payload.len())
+        self.next_empty as usize
     }
     pub fn add(&self, value: PayloadVal) -> Vec<Self> {
         let insertion_index = self.get_current_position();
-        let total_empty = self.payload.iter().filter(|x| x.is_none()).count();
+        let total_empty = self.payload.len().saturating_sub(self.fill_count as usize);
         if total_empty == 1 {
             if spatial::is_base(&self.dims) {
                 let insert_axis = self.get_insert_position(value);
@@ -162,10 +211,16 @@ impl Ortho {
                     self,
                     spatial::expand_up(&self.dims, insert_axis),
                     value,
+                    insertion_index,
                     insert_axis,
                 );
             } else {
-                return Self::expand_over(self, spatial::expand_over(&self.dims), value);
+                return Self::expand_over(
+                    self,
+                    spatial::expand_over(&self.dims),
+                    value,
+                    insertion_index,
+                );
             }
         }
         if insertion_index == 2 && self.dims.as_slice() == [2, 2] {
@@ -202,13 +257,10 @@ impl Ortho {
         ortho: &Ortho,
         expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
         value: PayloadVal,
+        insertion_index: usize,
     ) -> Vec<Ortho> {
         let mut old_payload_with_value = ortho.payload.clone();
-        let insert_pos = old_payload_with_value
-            .iter()
-            .position(|x| x.is_none())
-            .unwrap();
-        old_payload_with_value[insert_pos] = Some(value);
+        old_payload_with_value[insertion_index] = Some(value);
 
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
@@ -225,14 +277,11 @@ impl Ortho {
         ortho: &Ortho,
         expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
         value: PayloadVal,
+        insertion_index: usize,
         insert_axis: usize,
     ) -> Vec<Ortho> {
         let mut old_payload_with_value = ortho.payload.clone();
-        let insert_pos = old_payload_with_value
-            .iter()
-            .position(|x| x.is_none())
-            .unwrap();
-        old_payload_with_value[insert_pos] = Some(value);
+        old_payload_with_value[insertion_index] = Some(value);
 
         let mut out = Vec::with_capacity(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
@@ -264,6 +313,52 @@ impl Ortho {
         }
         idx
     }
+
+    fn ensure_nested_capacity(buffer: &mut Vec<Vec<usize>>, required_len: usize) {
+        while buffer.len() < required_len {
+            buffer.push(Vec::new());
+        }
+        buffer.truncate(required_len);
+    }
+
+    pub fn fill_requirements_usize(
+        &self,
+        forbidden_out: &mut Vec<usize>,
+        required_out: &mut Vec<Vec<usize>>,
+        prefix_positions: &mut Vec<Vec<usize>>,
+        diagonal_positions: &mut Vec<usize>,
+    ) {
+        let pos = self.get_current_position();
+        spatial::fill_requirements(
+            pos,
+            &self.dims,
+            self.up_axis,
+            prefix_positions,
+            diagonal_positions,
+        );
+
+        forbidden_out.clear();
+        for &idx in diagonal_positions.iter() {
+            if let Some(value) = self.payload.get(idx).and_then(|v| *v) {
+                forbidden_out.push(payload_to_usize(value));
+            }
+        }
+
+        let non_empty_prefixes = prefix_positions.iter().filter(|prefix| !prefix.is_empty()).count();
+        Self::ensure_nested_capacity(required_out, non_empty_prefixes);
+        let mut out_idx = 0usize;
+        for prefix in prefix_positions.iter().filter(|prefix| !prefix.is_empty()) {
+            let out = &mut required_out[out_idx];
+            out.clear();
+            for &idx in prefix {
+                if let Some(value) = self.payload.get(idx).and_then(|v| *v) {
+                    out.push(payload_to_usize(value));
+                }
+            }
+            out_idx += 1;
+        }
+    }
+
     pub fn get_requirements(&self) -> (Vec<PayloadVal>, Vec<Vec<PayloadVal>>) {
         let pos = self.get_current_position();
         let (prefixes, diagonals) = spatial::get_requirements(pos, &self.dims, self.up_axis);
@@ -357,42 +452,14 @@ impl Ortho {
     pub fn up_axis(&self) -> Option<Dim> {
         self.up_axis
     }
-    fn compute_score_components(&self) -> OrthoScore {
-        let volume = self
-            .dims
-            .iter()
-            .map(|x| usize::from(*x).saturating_sub(1))
-            .product::<usize>();
-        let dim_count = self.dims.len() as u128;
-        let dim_sum = self.dims.iter().map(|&d| u128::from(d)).sum::<u128>();
-        let dim_sum_sq = self
-            .dims
-            .iter()
-            .map(|&d| {
-                let value = u128::from(d);
-                value.saturating_mul(value)
-            })
-            .sum::<u128>();
-        let variance_num = dim_count
-            .saturating_mul(dim_sum_sq)
-            .saturating_sub(dim_sum.saturating_mul(dim_sum));
-        let variance_den = dim_count.saturating_mul(dim_count).max(1);
-        let fullness = self.payload.iter().filter(|x| x.is_some()).count();
-        OrthoScore {
-            volume,
-            variance_num,
-            variance_den,
-            fullness,
-        }
-    }
     pub fn score(&self) -> OrthoScore {
-        self.compute_score_components()
+        self.score
     }
     pub fn volume(&self) -> usize {
-        self.score().volume
+        self.score.volume
     }
     pub fn fullness(&self) -> usize {
-        self.score().fullness
+        self.fill_count as usize
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, FoldError> {
@@ -1147,5 +1214,19 @@ mod tests {
             more_full.score() > less_full.score(),
             "fullness should break ties when volume and variance match"
         );
+    }
+
+    #[test]
+    fn serialization_preserves_cached_hot_fields() {
+        let ortho = Ortho::new()
+            .add(1).pop().unwrap()
+            .add(2).pop().unwrap()
+            .add(3).pop().unwrap();
+        let bytes = ortho.to_bytes().unwrap();
+        let decoded = Ortho::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.get_current_position(), ortho.get_current_position());
+        assert_eq!(decoded.fullness(), ortho.fullness());
+        assert_eq!(decoded.score(), ortho.score());
     }
 }
