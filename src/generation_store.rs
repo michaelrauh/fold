@@ -631,6 +631,10 @@ fn write_ortho_record_bytes<W: Write>(
 
 fn compress_file(path: &PathBuf, level: i32) -> io::Result<(u64, u64)> {
     let uncompressed = fs::metadata(path)?.len();
+    let _ = disk_safety::maybe_reclaim(
+        uncompressed.saturating_add(64 * 1024),
+        &format!("compress {}", path.display()),
+    )?;
     disk_safety::ensure_write_budget(
         uncompressed.saturating_add(64 * 1024),
         &format!("compress {}", path.display()),
@@ -1112,17 +1116,25 @@ impl GenerationStore {
         }
 
         // Write ortho using rkyv
-        let writer = self.bucket_writers[bucket].as_mut().unwrap();
-        let encoded_len = write_ortho_record(writer, ortho, None)?;
+        let encoded_len = {
+            let writer = self.bucket_writers[bucket].as_mut().unwrap();
+            write_ortho_record(writer, ortho, None)?
+        };
         self.landing_counts[bucket] = self.landing_counts[bucket].saturating_add(1);
 
         // Track buffer size and flush if over threshold
         self.landing_buffer_sizes[bucket] += encoded_len;
         if self.landing_buffer_sizes[bucket] >= flush_threshold {
-            disk_safety::ensure_write_budget(
-                self.landing_buffer_sizes[bucket] as u64,
+            let bytes_needed = self.landing_buffer_sizes[bucket] as u64;
+            self.maybe_reclaim_before_write(
+                bytes_needed,
                 &format!("flush landing bucket {}", bucket),
             )?;
+            disk_safety::ensure_write_budget(
+                bytes_needed,
+                &format!("flush landing bucket {}", bucket),
+            )?;
+            let writer = self.bucket_writers[bucket].as_mut().unwrap();
             writer.flush()?;
             self.landing_buffer_sizes[bucket] = 0;
         }
@@ -1136,6 +1148,10 @@ impl GenerationStore {
         if let Some(writer) = self.bucket_writers[bucket].take() {
             let mut writer = writer;
             if self.landing_buffer_sizes[bucket] > 0 {
+                self.maybe_reclaim_before_write(
+                    self.landing_buffer_sizes[bucket] as u64,
+                    &format!("flush landing bucket {}", bucket),
+                )?;
                 disk_safety::ensure_write_budget(
                     self.landing_buffer_sizes[bucket] as u64,
                     &format!("flush landing bucket {}", bucket),
@@ -1208,18 +1224,18 @@ impl GenerationStore {
             return Ok(());
         }
 
+        let count = self.work_segment_batch.len() as u64;
+        let bytes_needed = (self.work_segment_batch_bytes as u64)
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of_val(&count) as u64)
+            .saturating_add((count as u64).saturating_mul(8));
+        self.maybe_reclaim_before_write(bytes_needed, "flush work segment batch")?;
         memory_safety::ensure_phase_headroom(
             self.work_segment_batch_bytes
                 .saturating_mul(2)
                 .saturating_add(64 * 1024),
             "flush work segment batch",
         )?;
-
-        let count = self.work_segment_batch.len() as u64;
-        let bytes_needed = (self.work_segment_batch_bytes as u64)
-            .saturating_mul(2)
-            .saturating_add(std::mem::size_of_val(&count) as u64)
-            .saturating_add((count as u64).saturating_mul(8));
         disk_safety::ensure_write_budget(bytes_needed, "flush work segment batch")?;
 
         let segment_path = self
@@ -1384,6 +1400,29 @@ impl GenerationStore {
         self.sync_runtime_metrics();
     }
 
+    pub fn processing_reclaim_reservation_bytes(&self) -> u64 {
+        let landing_flush = self
+            .landing_flush_threshold
+            .max(self.bufwriter_capacity)
+            .max(64 * 1024) as u64;
+        let work_flush = (self.work_segment_batch_max_bytes as u64)
+            .saturating_mul(2)
+            .saturating_add(64 * 1024);
+        landing_flush.max(work_flush)
+    }
+
+    pub fn prepare_for_reclaim(&mut self) -> io::Result<()> {
+        self.sync_memory_metrics();
+        GenerationStore::set_compaction_bytes(0);
+        Ok(())
+    }
+
+    fn maybe_reclaim_before_write(&mut self, bytes_needed: u64, reason: &str) -> io::Result<()> {
+        self.prepare_for_reclaim()?;
+        let _ = disk_safety::maybe_reclaim(bytes_needed, reason)?;
+        Ok(())
+    }
+
     /// Flush all pending buffers (landing + work segments)
     pub fn flush_all(&mut self) -> io::Result<()> {
         // Flush all bucket writers
@@ -1488,6 +1527,10 @@ impl GenerationStore {
                 let mut reader = run.iter(read_buf_bytes)?;
                 let resolved_run_path = resolve_managed_path(&run_path)?;
                 let rewrite_budget = file_size_or_zero(&resolved_run_path).saturating_mul(8);
+                self.maybe_reclaim_before_write(
+                    rewrite_budget.saturating_add(64 * 1024),
+                    &format!("rewrite pruned history run {}", run_path.display()),
+                )?;
                 disk_safety::ensure_write_budget(
                     rewrite_budget.saturating_add(64 * 1024),
                     &format!("rewrite pruned history run {}", run_path.display()),
@@ -1720,14 +1763,19 @@ impl GenerationStore {
 
     /// Flush all bucket writers
     pub fn flush(&mut self) -> io::Result<()> {
-        for (bucket, writer) in self.bucket_writers.iter_mut().enumerate() {
-            if let Some(w) = writer {
+        for bucket in 0..self.bucket_writers.len() {
+            if self.bucket_writers[bucket].is_some() {
                 if self.landing_buffer_sizes[bucket] > 0 {
+                    self.maybe_reclaim_before_write(
+                        self.landing_buffer_sizes[bucket] as u64,
+                        &format!("flush landing bucket {}", bucket),
+                    )?;
                     disk_safety::ensure_write_budget(
                         self.landing_buffer_sizes[bucket] as u64,
                         &format!("flush landing bucket {}", bucket),
                     )?;
                 }
+                let w = self.bucket_writers[bucket].as_mut().unwrap();
                 w.flush()?;
                 self.landing_buffer_sizes[bucket] = 0;
             }
@@ -1814,6 +1862,17 @@ impl GenerationStore {
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:sorting", bucket));
             }
+            let compact_budget = raw
+                .files()
+                .iter()
+                .map(|path| file_size_or_zero(path))
+                .fold(0u64, u64::saturating_add)
+                .saturating_add(cfg.run_budget_bytes as u64)
+                .saturating_add(64 * 1024);
+            self.maybe_reclaim_before_write(
+                compact_budget,
+                &format!("compact landing bucket {}", bucket),
+            )?;
             let mut runs: Vec<Run> = spill_runs
                 .iter()
                 .map(|spill| Run::new(spill.path.clone()))
@@ -1853,6 +1912,14 @@ impl GenerationStore {
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:merging", bucket));
             }
+            let merge_estimate = estimate_compressed_run_set_bytes(&runs)?;
+            self.maybe_reclaim_before_write(
+                merge_estimate
+                    .saturating_mul(8)
+                    .saturating_add(merge_estimate / 8)
+                    .saturating_add(64 * 1024),
+                &format!("merge unique bucket {}", bucket),
+            )?;
             let unique_run = merge_unique(
                 runs,
                 cfg,
@@ -1863,6 +1930,17 @@ impl GenerationStore {
             // Phase: Anti-join against history
             if let Some(cb) = &progress {
                 cb(&format!("BUCKET_STATE:{}:antijoining", bucket));
+            }
+            let anti_join_budget = resolve_managed_path(unique_run.path())
+                .map(|path| file_size_or_zero(&path))
+                .unwrap_or(0)
+                .saturating_mul(4)
+                .saturating_add(64 * 1024);
+            if anti_join_budget > 64 * 1024 {
+                self.maybe_reclaim_before_write(
+                    anti_join_budget,
+                    &format!("anti join bucket {}", bucket),
+                )?;
             }
             let history_iter = self.history_iter_with_buffer(bucket, cfg.read_buf_bytes)?;
             let (new_work_run, seen_run, accepted) = anti_join_orthos(
@@ -1978,6 +2056,14 @@ impl GenerationStore {
             .iter()
             .map(|path| Run::new(path.clone()))
             .collect();
+        let merge_estimate = estimate_compressed_run_set_bytes(&runs_to_merge)?;
+        self.maybe_reclaim_before_write(
+            merge_estimate
+                .saturating_mul(8)
+                .saturating_add(merge_estimate / 8)
+                .saturating_add(64 * 1024),
+            &format!("compact history bucket {}", bucket),
+        )?;
 
         // Merge them into a single unique run
         let merged = merge_unique(
@@ -3055,6 +3141,8 @@ mod tests {
         offload_cfg.enabled = true;
         offload_cfg.local_store_dir = Some(local_store);
         offload_cfg.cache_dir = base_path.join("offload_cache");
+        offload_cfg.disk_free_low_water = Some(0);
+        offload_cfg.disk_hysteresis_margin_bytes = 0;
         let _guard = configure_offload_runtime(&base_path, &offload_cfg)
             .unwrap()
             .expect("offload runtime");

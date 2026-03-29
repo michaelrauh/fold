@@ -1,5 +1,6 @@
 use crate::{
     completion_pruning::bound_completion,
+    disk_safety,
     error::FoldError,
     file_handler::StateConfig,
     generation_store::{Config, GenerationStore, ProgressCallback, Role},
@@ -62,6 +63,28 @@ impl PressureWatchdog {
         metrics.record_landing_buffer_count(store.total_landing_size());
         Ok(true)
     }
+}
+
+fn maybe_run_processing_reclaim_safe_point(
+    store: &mut GenerationStore,
+    metrics: &Metrics,
+    reason: &str,
+) -> Result<bool, FoldError> {
+    let reservation = store.processing_reclaim_reservation_bytes();
+    let Some(target_free) = disk_safety::reclaim_required(reservation)? else {
+        return Ok(false);
+    };
+    metrics.add_log(format!(
+        "Reclaim pending at safe point: reason={}, reservation_bytes={}, target_free={}",
+        reason, reservation, target_free
+    ));
+    store.prepare_for_reclaim()?;
+    disk_safety::run_reclaim_to_target(target_free, reason)?;
+    metrics.add_log(format!(
+        "Reclaim complete at safe point: reason={}, reservation_bytes={}, target_free={}",
+        reason, reservation, target_free
+    ));
+    Ok(true)
 }
 
 pub struct GenerationRunResult {
@@ -152,9 +175,12 @@ where
     });
     let mut generation = 0u64;
     let mut generation_stats: Vec<GenerationStat> = Vec::new();
-    let offload_cfg = OffloadConfig::from_env();
-    let pressure_watchdog = PressureWatchdog::from_config(offload_cfg);
+    let offload_cfg = state_config
+        .map(|cfg| OffloadConfig::from_env_with_base(&cfg.base_dir))
+        .unwrap_or_else(OffloadConfig::from_env);
+    let pressure_watchdog = PressureWatchdog::from_config(offload_cfg.clone());
     let mut prev_new_work: Option<u64> = None;
+    let mut reclaim_pending = false;
     crate::generation_store::set_offload_metrics_handle(Some(metrics.clone_handle()));
     store.sync_runtime_metrics();
 
@@ -386,6 +412,19 @@ where
 
                 // Pressure watchdog: drain/compact/offload under landing/disk pressure.
                 let _ = pressure_watchdog.maybe_handle(store, cfg, metrics)?;
+                reclaim_pending = disk_safety::reclaim_required(
+                    store.processing_reclaim_reservation_bytes(),
+                )?
+                .is_some();
+                if reclaim_pending
+                    && maybe_run_processing_reclaim_safe_point(
+                        store,
+                        metrics,
+                        "processing housekeeping",
+                    )?
+                {
+                    reclaim_pending = false;
+                }
             }
 
             // Get requirements from ortho
@@ -410,38 +449,53 @@ where
             }
 
             // Generate child orthos and record results
-            for completion in completions {
-                if bound_completion(&ortho, completion, interner, best_score) {
-                    metrics.increment_pruned_completions(1);
-                    if required.is_empty() {
-                        // Root span prune
-                        metrics.increment_pruned_root_span(1);
-                    } else {
-                        metrics.increment_pruned_bound(1);
-                    }
-                    continue;
+            for completion_chunk in completions.chunks(COMPLETION_CHUNK_SIZE) {
+                reclaim_pending = reclaim_pending
+                    || disk_safety::reclaim_required(store.processing_reclaim_reservation_bytes())?
+                        .is_some();
+                if reclaim_pending
+                    && maybe_run_processing_reclaim_safe_point(
+                        store,
+                        metrics,
+                        "processing completion chunk",
+                    )?
+                {
+                    reclaim_pending = false;
                 }
-                metrics.increment_expanded_completions(1);
-                let completion_val =
-                    PayloadVal::try_from(completion).expect("completion overflowed u32");
-                let children = ortho.add(completion_val);
-                for child in children {
-                    let candidate_score = child.score();
-                    if candidate_score > best_score {
-                        best_ortho = child.clone();
-                        best_score = candidate_score;
-                        update_optimal_metrics(&best_ortho);
-                    }
-                    if candidate_score > global_score {
-                        global_score = candidate_score;
-                        optimal_dirty = true;
-                    }
 
-                    // Record result to landing zone
-                    store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                for &completion in completion_chunk {
+                    if bound_completion(&ortho, completion, interner, best_score) {
+                        metrics.increment_pruned_completions(1);
+                        if required.is_empty() {
+                            // Root span prune
+                            metrics.increment_pruned_root_span(1);
+                        } else {
+                            metrics.increment_pruned_bound(1);
+                        }
+                        continue;
+                    }
+                    metrics.increment_expanded_completions(1);
+                    let completion_val =
+                        PayloadVal::try_from(completion).expect("completion overflowed u32");
+                    let children = ortho.add(completion_val);
+                    for child in children {
+                        let candidate_score = child.score();
+                        if candidate_score > best_score {
+                            best_ortho = child.clone();
+                            best_score = candidate_score;
+                            update_optimal_metrics(&best_ortho);
+                        }
+                        if candidate_score > global_score {
+                            global_score = candidate_score;
+                            optimal_dirty = true;
+                        }
 
-                    // Increment new orthos counter for each generated ortho
-                    metrics.increment_new_orthos(1);
+                        // Record result to landing zone
+                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+
+                        // Increment new orthos counter for each generated ortho
+                        metrics.increment_new_orthos(1);
+                    }
                 }
             }
         }

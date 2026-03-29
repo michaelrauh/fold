@@ -1,5 +1,12 @@
 use std::path::{Path, PathBuf};
 
+const GIB_U64: u64 = 1024 * 1024 * 1024;
+const MIB_USIZE: usize = 1024 * 1024;
+const DEFAULT_DISK_FREE_LOW_WATER_BYTES: u64 = 500 * GIB_U64;
+const DEFAULT_DISK_HYSTERESIS_MARGIN_BYTES: u64 = 16 * GIB_U64;
+const DEFAULT_OFFLOAD_PART_BYTES: usize = 8 * MIB_USIZE;
+const DEFAULT_OFFLOAD_HEADROOM_BYTES: usize = 512 * MIB_USIZE;
+
 /// Configuration for local-first spill handling and remote reclaim/offload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffloadConfig {
@@ -16,6 +23,9 @@ pub struct OffloadConfig {
     pub batch_offload_bytes: Option<u64>,
     pub landing_bytes_high_water: Option<u64>,
     pub disk_free_low_water: Option<u64>,
+    pub disk_hysteresis_margin_bytes: u64,
+    pub offload_part_bytes: usize,
+    pub offload_headroom_bytes: usize,
     pub cache_dir: PathBuf,
     pub cache_bytes_cap: u64,
 }
@@ -43,7 +53,10 @@ impl OffloadConfig {
             min_offload_bytes: None,
             batch_offload_bytes: None,
             landing_bytes_high_water: None,
-            disk_free_low_water: None,
+            disk_free_low_water: Some(DEFAULT_DISK_FREE_LOW_WATER_BYTES),
+            disk_hysteresis_margin_bytes: DEFAULT_DISK_HYSTERESIS_MARGIN_BYTES,
+            offload_part_bytes: DEFAULT_OFFLOAD_PART_BYTES,
+            offload_headroom_bytes: DEFAULT_OFFLOAD_HEADROOM_BYTES,
             cache_dir: base_dir.join("offload_cache"),
             cache_bytes_cap: 20 * 1024 * 1024 * 1024, // 20 GiB cache cap by default
         }
@@ -88,6 +101,15 @@ impl OffloadConfig {
             env_u64("FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER").or(cfg.landing_bytes_high_water);
         cfg.disk_free_low_water =
             env_u64("FOLD_OFFLOAD_DISK_FREE_LOW_WATER").or(cfg.disk_free_low_water);
+        if let Some(bytes) = env_u64("FOLD_OFFLOAD_DISK_HYSTERESIS_MARGIN_BYTES") {
+            cfg.disk_hysteresis_margin_bytes = bytes;
+        }
+        if let Some(bytes) = env_usize("FOLD_OFFLOAD_PART_BYTES") {
+            cfg.offload_part_bytes = bytes;
+        }
+        if let Some(bytes) = env_usize("FOLD_OFFLOAD_HEADROOM_BYTES") {
+            cfg.offload_headroom_bytes = bytes;
+        }
 
         if let Some(cache_dir) = env_string("FOLD_OFFLOAD_CACHE_DIR") {
             cfg.cache_dir = PathBuf::from(cache_dir);
@@ -114,8 +136,13 @@ impl OffloadConfig {
             .unwrap_or_else(|| "disabled".to_string());
 
         let mut messages = vec![format!(
-            "Offload policy: landing_high_water={} => local spill only; disk_free_low_water={} => remote reclaim only; cache_cap={}",
-            landing, disk, self.cache_bytes_cap
+            "Offload policy: landing_high_water={} => local spill only; disk_free_low_water={} => remote reclaim only; hysteresis={}; part_bytes={}; offload_headroom={}; cache_cap={}",
+            landing,
+            disk,
+            self.disk_hysteresis_margin_bytes,
+            self.offload_part_bytes,
+            self.offload_headroom_bytes,
+            self.cache_bytes_cap
         )];
 
         if self.min_offload_bytes.is_some() || self.batch_offload_bytes.is_some() {
@@ -157,6 +184,12 @@ fn env_u64(var: &str) -> Option<u64> {
         .and_then(|v| v.replace('_', "").parse::<u64>().ok())
 }
 
+fn env_usize(var: &str) -> Option<usize> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.replace('_', "").parse::<usize>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +213,9 @@ mod tests {
         "FOLD_OFFLOAD_BATCH_BYTES",
         "FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER",
         "FOLD_OFFLOAD_DISK_FREE_LOW_WATER",
+        "FOLD_OFFLOAD_DISK_HYSTERESIS_MARGIN_BYTES",
+        "FOLD_OFFLOAD_PART_BYTES",
+        "FOLD_OFFLOAD_HEADROOM_BYTES",
         "FOLD_OFFLOAD_CACHE_DIR",
         "FOLD_OFFLOAD_CACHE_BYTES_CAP",
     ];
@@ -244,7 +280,16 @@ mod tests {
         assert_eq!(cfg.min_offload_bytes, None);
         assert_eq!(cfg.batch_offload_bytes, None);
         assert_eq!(cfg.landing_bytes_high_water, None);
-        assert_eq!(cfg.disk_free_low_water, None);
+        assert_eq!(
+            cfg.disk_free_low_water,
+            Some(DEFAULT_DISK_FREE_LOW_WATER_BYTES)
+        );
+        assert_eq!(
+            cfg.disk_hysteresis_margin_bytes,
+            DEFAULT_DISK_HYSTERESIS_MARGIN_BYTES
+        );
+        assert_eq!(cfg.offload_part_bytes, DEFAULT_OFFLOAD_PART_BYTES);
+        assert_eq!(cfg.offload_headroom_bytes, DEFAULT_OFFLOAD_HEADROOM_BYTES);
         assert_eq!(cfg.cache_dir, PathBuf::from("./fold_state/offload_cache"));
         assert_eq!(cfg.cache_bytes_cap, 20 * 1024 * 1024 * 1024);
     }
@@ -271,6 +316,9 @@ mod tests {
         set_env("FOLD_OFFLOAD_BATCH_BYTES", "107374182400");
         set_env("FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER", "1048576");
         set_env("FOLD_OFFLOAD_DISK_FREE_LOW_WATER", "2097152");
+        set_env("FOLD_OFFLOAD_DISK_HYSTERESIS_MARGIN_BYTES", "3145728");
+        set_env("FOLD_OFFLOAD_PART_BYTES", "8388608");
+        set_env("FOLD_OFFLOAD_HEADROOM_BYTES", "268435456");
         set_env("FOLD_OFFLOAD_CACHE_DIR", &cache_override);
         set_env("FOLD_OFFLOAD_CACHE_BYTES_CAP", "4096");
 
@@ -292,6 +340,9 @@ mod tests {
         assert_eq!(cfg.batch_offload_bytes, Some(107_374_182_400));
         assert_eq!(cfg.landing_bytes_high_water, Some(1_048_576));
         assert_eq!(cfg.disk_free_low_water, Some(2_097_152));
+        assert_eq!(cfg.disk_hysteresis_margin_bytes, 3_145_728);
+        assert_eq!(cfg.offload_part_bytes, 8_388_608);
+        assert_eq!(cfg.offload_headroom_bytes, 268_435_456);
         assert_eq!(cfg.cache_dir, cache_override);
         assert_eq!(cfg.cache_bytes_cap, 4_096);
     }
@@ -317,11 +368,17 @@ mod tests {
         cfg.enabled = true;
         cfg.landing_bytes_high_water = Some(123);
         cfg.disk_free_low_water = Some(456);
+        cfg.disk_hysteresis_margin_bytes = 789;
+        cfg.offload_part_bytes = 1_024;
+        cfg.offload_headroom_bytes = 2_048;
         cfg.min_offload_bytes = Some(789);
 
         let messages = cfg.startup_messages();
         assert!(messages.iter().any(|m| m.contains("local spill only")));
         assert!(messages.iter().any(|m| m.contains("remote reclaim only")));
+        assert!(messages.iter().any(|m| m.contains("hysteresis=789")));
+        assert!(messages.iter().any(|m| m.contains("part_bytes=1024")));
+        assert!(messages.iter().any(|m| m.contains("offload_headroom=2048")));
         assert!(
             messages
                 .iter()

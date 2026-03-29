@@ -8,6 +8,7 @@ const MIB: usize = 1024 * 1024;
 pub struct MemoryBudget {
     pub process_claim_bytes: usize,
     pub system_reserve_bytes: usize,
+    pub offload_headroom_bytes: usize,
     pub compaction_arena_bytes: usize,
     pub work_cache_bytes: usize,
     pub work_segment_max_bytes: usize,
@@ -20,16 +21,20 @@ pub struct MemoryBudget {
 
 impl MemoryBudget {
     pub fn for_role(role: Role, total_ram_bytes: usize) -> Result<Self, FoldError> {
-        let leader_claim = env_or_default("FOLD_MEMORY_LEADER_MAX_BYTES", 6 * GIB);
+        let leader_claim = env_or_default("FOLD_MEMORY_LEADER_MAX_BYTES", 8 * GIB);
         let follower_claim = env_or_default("FOLD_MEMORY_FOLLOWER_MAX_BYTES", 2 * GIB);
         let system_reserve = env_or_default("FOLD_MEMORY_SYSTEM_RESERVE_BYTES", 6 * GIB);
+        let offload_headroom = env_or_default("FOLD_MEMORY_OFFLOAD_HEADROOM_BYTES", 512 * MIB);
 
         let process_claim_bytes = match role {
             Role::Leader => leader_claim,
             Role::Follower => follower_claim,
         };
 
-        if total_ram_bytes <= system_reserve || process_claim_bytes > total_ram_bytes {
+        if total_ram_bytes <= system_reserve
+            || process_claim_bytes > total_ram_bytes
+            || process_claim_bytes.saturating_add(system_reserve) > total_ram_bytes
+        {
             return Err(FoldError::Other(format!(
                 "memory budget is not satisfiable on this host: total_ram={} reserve={} claim={}",
                 total_ram_bytes, system_reserve, process_claim_bytes
@@ -71,6 +76,7 @@ impl MemoryBudget {
         Ok(Self {
             process_claim_bytes,
             system_reserve_bytes: system_reserve,
+            offload_headroom_bytes: offload_headroom,
             compaction_arena_bytes,
             work_cache_bytes,
             work_segment_max_bytes,
@@ -97,8 +103,9 @@ mod tests {
     #[test]
     fn leader_budget_uses_expected_defaults() {
         let budget = MemoryBudget::for_role(Role::Leader, 16 * GIB).unwrap();
-        assert_eq!(budget.process_claim_bytes, 6 * GIB);
+        assert_eq!(budget.process_claim_bytes, 8 * GIB);
         assert_eq!(budget.system_reserve_bytes, 6 * GIB);
+        assert_eq!(budget.offload_headroom_bytes, 512 * MIB);
         assert_eq!(budget.compaction_arena_bytes, 384 * MIB);
         assert_eq!(budget.work_cache_bytes, 256 * MIB);
         assert_eq!(budget.work_segment_max_bytes, 64 * MIB);
@@ -110,10 +117,17 @@ mod tests {
     fn follower_budget_uses_expected_defaults() {
         let budget = MemoryBudget::for_role(Role::Follower, 16 * GIB).unwrap();
         assert_eq!(budget.process_claim_bytes, 2 * GIB);
+        assert_eq!(budget.offload_headroom_bytes, 512 * MIB);
         assert_eq!(budget.compaction_arena_bytes, 128 * MIB);
         assert_eq!(budget.work_cache_bytes, 64 * MIB);
         assert_eq!(budget.work_segment_max_bytes, 16 * MIB);
         assert_eq!(budget.fan_in, 32);
         assert_eq!(budget.read_buf_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn rejects_claim_plus_reserve_over_total_ram() {
+        let err = MemoryBudget::for_role(Role::Leader, 13 * GIB).unwrap_err();
+        assert!(err.to_string().contains("memory budget is not satisfiable"));
     }
 }

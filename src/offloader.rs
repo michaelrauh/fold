@@ -4,13 +4,16 @@ use s3::region::Region;
 use std::{
     collections::HashMap,
     fs,
+    io::Read,
     path::Path,
     str::FromStr,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
-use tokio::fs::File as TokioFile;
+
+const MULTIPART_MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// Errors that can occur during offload/download.
 #[derive(Debug)]
@@ -262,6 +265,7 @@ impl ObjectStore for LocalDiskObjectStore {
 pub struct SpacesObjectStore {
     bucket: String,
     client: s3::Bucket,
+    part_bytes: usize,
 }
 
 impl SpacesObjectStore {
@@ -271,6 +275,7 @@ impl SpacesObjectStore {
         endpoint: Option<String>,
         access_key: &str,
         secret_key: &str,
+        part_bytes: usize,
     ) -> Result<Self, OffloadError> {
         let region = match (region, endpoint) {
             (Some(r), Some(e)) => Region::Custom {
@@ -294,7 +299,89 @@ impl SpacesObjectStore {
         Ok(Self {
             bucket: bucket.name,
             client,
+            part_bytes: part_bytes.max(MULTIPART_MIN_PART_BYTES),
         })
+    }
+
+    fn put_small_object(&self, key: &str, path: &Path) -> Result<(), OffloadError> {
+        let file_len = fs::metadata(path)?.len() as usize;
+        let mut file = fs::File::open(path)?;
+        let mut buf = Vec::with_capacity(file_len);
+        file.read_to_end(&mut buf)?;
+        let response = self
+            .client
+            .put_object_blocking(key, &buf)
+            .map_err(|e| OffloadError::Other(e.to_string()))?;
+        let status = response.status_code();
+        if status / 100 == 2 {
+            Ok(())
+        } else {
+            Err(OffloadError::Other(format!(
+                "put_object failed: status {}",
+                status
+            )))
+        }
+    }
+
+    fn put_large_object(&self, key: &str, path: &Path) -> Result<(), OffloadError> {
+        let upload = self
+            .client
+            .initiate_multipart_upload_blocking(key, DEFAULT_CONTENT_TYPE)
+            .map_err(|e| OffloadError::Other(e.to_string()))?;
+        let mut file = fs::File::open(path)?;
+        let mut parts = Vec::new();
+        let mut part_number = 1u32;
+
+        let upload_result = (|| -> Result<(), OffloadError> {
+            loop {
+                let chunk = read_part(&mut file, self.part_bytes)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let is_last = chunk.len() < self.part_bytes;
+                let part = self
+                    .client
+                    .put_multipart_chunk_blocking(
+                        chunk,
+                        &upload.key,
+                        part_number,
+                        &upload.upload_id,
+                        DEFAULT_CONTENT_TYPE,
+                    )
+                    .map_err(|e| OffloadError::Other(e.to_string()))?;
+                parts.push(part);
+                part_number = part_number.saturating_add(1);
+                if is_last {
+                    break;
+                }
+            }
+            if parts.is_empty() {
+                return Err(OffloadError::Other(format!(
+                    "multipart upload produced no parts for {}",
+                    path.display()
+                )));
+            }
+            let response = self
+                .client
+                .complete_multipart_upload_blocking(&upload.key, &upload.upload_id, parts)
+                .map_err(|e| OffloadError::Other(e.to_string()))?;
+            let status = response.status_code();
+            if status / 100 == 2 {
+                Ok(())
+            } else {
+                Err(OffloadError::Other(format!(
+                    "complete_multipart_upload failed: status {}",
+                    status
+                )))
+            }
+        })();
+
+        if upload_result.is_err() {
+            let _ = self
+                .client
+                .abort_upload_blocking(&upload.key, &upload.upload_id);
+        }
+        upload_result
     }
 }
 
@@ -306,20 +393,11 @@ impl ObjectStore for SpacesObjectStore {
                 self.bucket, bucket
             )));
         }
-        let file = fs::File::open(path)?;
-        let mut reader = TokioFile::from_std(file);
-        let response = self
-            .client
-            .put_object_stream_blocking(&mut reader, key)
-            .map_err(|e| OffloadError::Other(e.to_string()))?;
-        let status = response.status_code();
-        if status / 100 == 2 {
-            Ok(())
+        let file_len = fs::metadata(path)?.len() as usize;
+        if file_len <= self.part_bytes {
+            self.put_small_object(key, path)
         } else {
-            Err(OffloadError::Other(format!(
-                "put_object_stream failed: status {}",
-                status
-            )))
+            self.put_large_object(key, path)
         }
     }
 
@@ -333,18 +411,46 @@ impl ObjectStore for SpacesObjectStore {
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = fs::File::create(dest_path)?;
-        let mut writer = TokioFile::from_std(file);
-        let status = self
+        let (head, status) = self
             .client
-            .get_object_to_writer_blocking(key, &mut writer)
+            .head_object_blocking(key)
             .map_err(|e| OffloadError::Other(e.to_string()))?;
-        drop(writer);
-        if status / 100 == 2 {
-            Ok(())
-        } else {
-            Err(OffloadError::Missing(key.to_string()))
+        if status == 404 {
+            return Err(OffloadError::Missing(key.to_string()));
         }
+        if status / 100 != 2 {
+            return Err(OffloadError::Other(format!(
+                "head_object failed: status {}",
+                status
+            )));
+        }
+        let total_bytes = head
+            .content_length
+            .ok_or_else(|| {
+                OffloadError::Other(format!("missing content length for object {}", key))
+            })?
+            .try_into()
+            .map_err(|_| {
+                OffloadError::Other(format!("negative content length for object {}", key))
+            })?;
+
+        download_in_parts(dest_path, total_bytes, self.part_bytes, |start, end| {
+            let response = self
+                .client
+                .get_object_range_blocking(key, start, Some(end))
+                .map_err(|e| OffloadError::Other(e.to_string()))?;
+            let status = response.status_code();
+            if !(200..300).contains(&status) {
+                if status == 404 {
+                    return Err(OffloadError::Missing(key.to_string()));
+                }
+                return Err(OffloadError::Other(format!(
+                    "get_object_range failed: status {}",
+                    status
+                )));
+            }
+            Ok(response.to_vec())
+        })
     }
 }
 
@@ -353,6 +459,69 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn read_part_limits_each_chunk_to_configured_size() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("input.bin");
+        fs::write(&src, vec![7u8; 19]).unwrap();
+        let mut file = fs::File::open(&src).unwrap();
+        let mut chunk_sizes = Vec::new();
+
+        loop {
+            let chunk = read_part(&mut file, 8).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            chunk_sizes.push(chunk.len());
+        }
+
+        assert_eq!(chunk_sizes, vec![8, 8, 3]);
+    }
+
+    #[test]
+    fn download_in_parts_writes_expected_ranges() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+        let source = b"abcdefghijklmnopqrs".to_vec();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let requested_clone = Arc::clone(&requested);
+
+        download_in_parts(&dest, source.len() as u64, 8, move |start, end| {
+            requested_clone.lock().unwrap().push((start, end));
+            Ok(source[start as usize..=end as usize].to_vec())
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"abcdefghijklmnopqrs");
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec![(0, 7), (8, 15), (16, 18)]
+        );
+    }
+
+    #[test]
+    fn download_in_parts_rejects_mismatched_chunk_length() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+
+        let err = download_in_parts(&dest, 9, 8, |_start, _end| Ok(vec![1, 2, 3])).unwrap_err();
+
+        assert!(err.to_string().contains("range download returned"));
+    }
+
+    #[test]
+    fn download_in_parts_creates_empty_file_for_zero_length_object() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("empty.bin");
+
+        download_in_parts(&dest, 0, 8, |_start, _end| {
+            panic!("zero-length download should not fetch ranges")
+        })
+        .unwrap();
+
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 0);
+    }
 
     #[test]
     fn uploads_and_downloads_with_retry() {
@@ -418,4 +587,58 @@ mod tests {
                 .exists()
         );
     }
+}
+
+fn read_part<R: Read>(reader: &mut R, part_bytes: usize) -> Result<Vec<u8>, OffloadError> {
+    let mut chunk = vec![0u8; part_bytes];
+    let mut read_total = 0usize;
+    while read_total < chunk.len() {
+        let read = reader.read(&mut chunk[read_total..])?;
+        if read == 0 {
+            break;
+        }
+        read_total += read;
+    }
+    chunk.truncate(read_total);
+    Ok(chunk)
+}
+
+fn download_in_parts<F>(
+    dest_path: &Path,
+    total_bytes: u64,
+    part_bytes: usize,
+    mut fetch_range: F,
+) -> Result<(), OffloadError>
+where
+    F: FnMut(u64, u64) -> Result<Vec<u8>, OffloadError>,
+{
+    let mut writer = fs::File::create(dest_path)?;
+    if total_bytes == 0 {
+        return Ok(());
+    }
+
+    let chunk_bytes = part_bytes.max(1) as u64;
+    let mut start = 0u64;
+    while start < total_bytes {
+        let end = start
+            .saturating_add(chunk_bytes)
+            .saturating_sub(1)
+            .min(total_bytes.saturating_sub(1));
+        let expected_len = (end - start + 1) as usize;
+        let chunk = fetch_range(start, end)?;
+        if chunk.len() != expected_len {
+            return Err(OffloadError::Other(format!(
+                "range download returned {} bytes for {}-{} (expected {})",
+                chunk.len(),
+                start,
+                end,
+                expected_len
+            )));
+        }
+        std::io::Write::write_all(&mut writer, &chunk)?;
+        start = end.saturating_add(1);
+    }
+
+    std::io::Write::flush(&mut writer)?;
+    Ok(())
 }

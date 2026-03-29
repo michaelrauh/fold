@@ -8,12 +8,15 @@ use sysinfo::Disks;
 
 const ARCHIVE_PAYLOAD_MAGIC: &[u8; 8] = b"FOLDRSLT";
 const ARCHIVE_PAYLOAD_VERSION: u32 = 1;
-const RECLAIM_IO_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
+const RECLAIM_STOP_GAP_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+
 #[derive(Clone)]
 struct DiskSafetyContext {
     enabled: bool,
     base_dir: PathBuf,
     floor_bytes: Option<u64>,
+    hysteresis_bytes: u64,
+    offload_headroom_bytes: usize,
     cache_dir: PathBuf,
     cache_bytes_cap: u64,
     full_runs_dir: PathBuf,
@@ -62,6 +65,8 @@ pub fn configure(base_dir: PathBuf, cfg: &OffloadConfig) {
             enabled: cfg.enabled,
             base_dir,
             floor_bytes: cfg.disk_free_low_water,
+            hysteresis_bytes: cfg.disk_hysteresis_margin_bytes,
+            offload_headroom_bytes: cfg.offload_headroom_bytes,
             cache_dir: cfg.cache_dir.clone(),
             cache_bytes_cap: cfg.cache_bytes_cap,
             full_runs_dir: PathBuf::from("fold_history").join("full_runs"),
@@ -94,27 +99,97 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
         return Ok(());
     }
 
-    let target_free = floor_bytes.saturating_add(bytes_needed);
+    let target_free = write_admission_target(&ctx, bytes_needed);
     let free_before = available_space_for(&ctx.base_dir)?;
     if free_before >= target_free {
         return Ok(());
     }
 
+    apply_local_cleanup(&ctx)?;
+    let free_after_cleanup = available_space_for(&ctx.base_dir)?;
+    if free_after_cleanup >= target_free {
+        return Ok(());
+    }
+
     let rss_before = sync_process_rss_metrics();
     log(format!(
-        "Disk gate: reason={}, bytes_needed={}, free_before={}, target_free={}, rss_before={}",
-        reason, bytes_needed, free_before, target_free, rss_before
+        "Disk gate denied inline write: reason={}, bytes_needed={}, free_before={}, free_after_cleanup={}, target_free={}, rss_before={}",
+        reason, bytes_needed, free_before, free_after_cleanup, target_free, rss_before
+    ));
+    let rss_after = sync_process_rss_metrics();
+    Err(io::Error::other(format!(
+        "disk safety requires reclaim: reason={}, bytes_needed={}, free_before={}, free_after_cleanup={}, target_free={}, floor={}, rss_before={}, rss_after={}",
+        reason,
+        bytes_needed,
+        free_before,
+        free_after_cleanup,
+        target_free,
+        floor_bytes,
+        rss_before,
+        rss_after
+    )))
+}
+
+pub fn reclaim_required(bytes_needed: u64) -> io::Result<Option<u64>> {
+    let Some(ctx) = current_ctx() else {
+        return Ok(None);
+    };
+    if !ctx.enabled || bytes_needed == 0 {
+        return Ok(None);
+    }
+    let Some(floor_bytes) = ctx.floor_bytes else {
+        return Ok(None);
+    };
+    if floor_bytes == 0 || IN_RECLAIM.with(|flag| flag.get()) {
+        return Ok(None);
+    }
+
+    let write_target = write_admission_target(&ctx, bytes_needed);
+    apply_local_cleanup(&ctx)?;
+    let free_now = available_space_for(&ctx.base_dir)?;
+    if free_now >= write_target {
+        return Ok(None);
+    }
+
+    let reclaim_target = reclaim_stop_target(&ctx, bytes_needed);
+    Ok(Some(reclaim_target))
+}
+
+pub fn maybe_reclaim(bytes_needed: u64, reason: &str) -> io::Result<bool> {
+    let Some(target_free) = reclaim_required(bytes_needed)? else {
+        return Ok(false);
+    };
+    run_reclaim_to_target(target_free, reason)?;
+    Ok(true)
+}
+
+pub fn run_reclaim_to_target(target_free: u64, reason: &str) -> io::Result<()> {
+    let Some(ctx) = current_ctx() else {
+        return Ok(());
+    };
+    if !ctx.enabled || IN_RECLAIM.with(|flag| flag.get()) {
+        return Ok(());
+    }
+
+    let free_before = available_space_for(&ctx.base_dir)?;
+    let rss_before = sync_process_rss_metrics();
+    log(format!(
+        "Reclaim start: reason={}, free_before={}, target_free={}, rss_before={}",
+        reason, free_before, target_free, rss_before
     ));
     reclaim_until(&ctx, target_free, reason)?;
     let free_after = available_space_for(&ctx.base_dir)?;
     let rss_after = sync_process_rss_metrics();
+    log(format!(
+        "Reclaim finish: reason={}, free_after={}, target_free={}, rss_after={}",
+        reason, free_after, target_free, rss_after
+    ));
     if free_after < target_free {
         return Err(io::Error::other(format!(
-            "disk safety denied write: reason={}, bytes_needed={}, free_before={}, free_after={}, floor={}, rss_before={}, rss_after={}",
-            reason, bytes_needed, free_before, free_after, floor_bytes, rss_before, rss_after
+            "disk reclaim exhausted without satisfying target: reason={}, free_after={}, target_free={}, rss_after={}",
+            reason, free_after, target_free, rss_after
         )));
     }
-
     Ok(())
 }
 
@@ -128,6 +203,10 @@ pub fn ensure_archive_results_local(archive_path: &Path) -> io::Result<()> {
     let resolved_payload = generation_store::resolve_managed_path(&payload_path)?;
     let mut reader = BufReader::new(File::open(&resolved_payload)?);
     let header = read_archive_payload_header(&mut reader)?;
+    let _ = maybe_reclaim(
+        header.total_bytes.saturating_add(64 * 1024),
+        &format!("restore archive results {}", archive_path.display()),
+    )?;
     ensure_write_budget(
         header.total_bytes.saturating_add(64 * 1024),
         &format!("restore archive results {}", archive_path.display()),
@@ -170,20 +249,7 @@ fn reclaim_until(ctx: &DiskSafetyContext, target_free: u64, reason: &str) -> io:
     IN_RECLAIM.with(|flag| flag.set(true));
     let _guard = ReclaimGuard;
 
-    if available_space_for(&ctx.base_dir)? >= target_free {
-        return Ok(());
-    }
-
-    prune_cache_to_cap(&ctx.cache_dir, ctx.cache_bytes_cap)?;
-    if available_space_for(&ctx.base_dir)? >= target_free {
-        return Ok(());
-    }
-
-    prune_bundle_root(&ctx.full_runs_dir)?;
-    if available_space_for(&ctx.base_dir)? >= target_free {
-        return Ok(());
-    }
-    prune_bundle_root(&ctx.doubling_runs_dir)?;
+    apply_local_cleanup(ctx)?;
     if available_space_for(&ctx.base_dir)? >= target_free {
         return Ok(());
     }
@@ -202,6 +268,13 @@ fn reclaim_until(ctx: &DiskSafetyContext, target_free: u64, reason: &str) -> io:
         "Disk reclaim exhausted without reaching target: reason={}, target_free={}",
         reason, target_free
     ));
+    Ok(())
+}
+
+fn apply_local_cleanup(ctx: &DiskSafetyContext) -> io::Result<()> {
+    prune_cache_to_cap(&ctx.cache_dir, ctx.cache_bytes_cap)?;
+    prune_bundle_root(&ctx.full_runs_dir)?;
+    prune_bundle_root(&ctx.doubling_runs_dir)?;
     Ok(())
 }
 
@@ -515,8 +588,11 @@ fn file_info(path: &Path) -> io::Result<FileInfo> {
 
 fn offload_and_delete(path: &Path) -> io::Result<bool> {
     let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let offload_headroom = current_ctx()
+        .map(|ctx| ctx.offload_headroom_bytes)
+        .unwrap_or(16 * 1024 * 1024);
     memory_safety::ensure_phase_headroom(
-        RECLAIM_IO_HEADROOM_BYTES,
+        offload_headroom,
         &format!("disk reclaim offload {}", path.display()),
     )?;
     let rss_before = sync_process_rss_metrics();
@@ -611,6 +687,19 @@ fn pack_and_offload_archive_results(archive_path: &Path) -> io::Result<u64> {
 
     offload_and_delete(&payload_path)?;
     Ok(total_bytes)
+}
+
+fn write_admission_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
+    ctx.floor_bytes
+        .unwrap_or(0)
+        .saturating_add(bytes_needed)
+        .saturating_add(ctx.hysteresis_bytes)
+}
+
+fn reclaim_stop_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
+    let floor = ctx.floor_bytes.unwrap_or(0);
+    let phase_gap = bytes_needed.saturating_add(ctx.hysteresis_bytes);
+    floor.saturating_add(RECLAIM_STOP_GAP_BYTES.max(phase_gap))
 }
 
 fn collect_archive_entries(
@@ -812,20 +901,23 @@ mod tests {
 
         let metrics = Metrics::new();
         set_metrics_handle(Some(metrics.clone_handle()));
-        ensure_write_budget(1, "test reclaim ordering").unwrap();
-
-        assert!(!spill_path.exists(), "spill file should be reclaimed first");
-        assert!(history_path.exists());
-        assert!(run_path.exists());
-        assert!(segment_path.exists());
+        let reclaim_target = available_space_for(&base)
+            .unwrap()
+            .saturating_add(3 * 1024 * 1024);
+        run_reclaim_to_target(reclaim_target, "test reclaim ordering").unwrap();
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.global.offloaded_files, 1);
+        assert!(snapshot.global.offloaded_files >= 1);
+        let first_offload = snapshot
+            .logs
+            .iter()
+            .find(|log| log.message.contains("Disk reclaim offloaded"))
+            .expect("expected disk reclaim offload log");
         assert!(
-            snapshot
-                .logs
-                .iter()
-                .any(|log| log.message.contains("Disk reclaim offloaded"))
+            first_offload
+                .message
+                .contains(&spill_path.display().to_string()),
+            "spill file should be reclaimed before history/run/segment files"
         );
         set_metrics_handle(None);
     }

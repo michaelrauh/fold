@@ -130,8 +130,15 @@ pub fn configure_offload_runtime(
             .spaces_region
             .clone()
             .or_else(|| Some("us-east-1".to_string()));
-        let store = SpacesObjectStore::new(&bucket, region, Some(endpoint), &access, &secret)
-            .map_err(offload_err_to_io)?;
+        let store = SpacesObjectStore::new(
+            &bucket,
+            region,
+            Some(endpoint),
+            &access,
+            &secret,
+            cfg.offload_part_bytes,
+        )
+        .map_err(offload_err_to_io)?;
         OffloadClient::new(Arc::new(store), bucket, prefix)
     } else {
         return Err(io::Error::other(
