@@ -146,7 +146,10 @@ impl Ortho {
         }
     }
 
-    fn compute_cached_fields(dims: &[Dim], payload: &[Option<PayloadVal>]) -> (u32, u32, OrthoScore) {
+    fn compute_cached_fields(
+        dims: &[Dim],
+        payload: &[Option<PayloadVal>],
+    ) -> (u32, u32, OrthoScore) {
         let mut fill_count = 0usize;
         let mut next_empty = payload.len();
         for (idx, cell) in payload.iter().enumerate() {
@@ -344,7 +347,10 @@ impl Ortho {
             }
         }
 
-        let non_empty_prefixes = prefix_positions.iter().filter(|prefix| !prefix.is_empty()).count();
+        let non_empty_prefixes = prefix_positions
+            .iter()
+            .filter(|prefix| !prefix.is_empty())
+            .count();
         Self::ensure_nested_capacity(required_out, non_empty_prefixes);
         let mut out_idx = 0usize;
         for prefix in prefix_positions.iter().filter(|prefix| !prefix.is_empty()) {
@@ -1219,9 +1225,15 @@ mod tests {
     #[test]
     fn serialization_preserves_cached_hot_fields() {
         let ortho = Ortho::new()
-            .add(1).pop().unwrap()
-            .add(2).pop().unwrap()
-            .add(3).pop().unwrap();
+            .add(1)
+            .pop()
+            .unwrap()
+            .add(2)
+            .pop()
+            .unwrap()
+            .add(3)
+            .pop()
+            .unwrap();
         let bytes = ortho.to_bytes().unwrap();
         let decoded = Ortho::from_bytes(&bytes).unwrap();
 

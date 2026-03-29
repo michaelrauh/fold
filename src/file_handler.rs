@@ -1044,9 +1044,39 @@ pub fn get_two_smallest_archives() -> Result<Option<(String, String)>, FoldError
     get_two_smallest_archives_with_config(&StateConfig::default())
 }
 
-/// Get the two largest archives with custom config
-pub fn get_two_largest_archives_with_config(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchivePairPolicy {
+    LargestLargest,
+    SmallestSmallest,
+    LargestSmallest,
+}
+
+fn select_archive_pair_from_counts(
+    archives_with_counts: &[(String, usize)],
+    policy: ArchivePairPolicy,
+) -> Option<(String, String)> {
+    if archives_with_counts.len() < 2 {
+        return None;
+    }
+
+    let mut sorted = archives_with_counts.to_vec();
+    sorted.sort_by_key(|(_, count)| *count);
+
+    match policy {
+        ArchivePairPolicy::LargestLargest => Some((
+            sorted[sorted.len() - 2].0.clone(),
+            sorted[sorted.len() - 1].0.clone(),
+        )),
+        ArchivePairPolicy::SmallestSmallest => Some((sorted[0].0.clone(), sorted[1].0.clone())),
+        ArchivePairPolicy::LargestSmallest => {
+            Some((sorted[0].0.clone(), sorted[sorted.len() - 1].0.clone()))
+        }
+    }
+}
+
+pub fn get_archive_pair_with_config(
     config: &StateConfig,
+    policy: ArchivePairPolicy,
 ) -> Result<Option<(String, String)>, FoldError> {
     let archives = find_archives(config.input_dir().to_str().unwrap())?;
 
@@ -1054,51 +1084,29 @@ pub fn get_two_largest_archives_with_config(
         return Ok(None);
     }
 
-    // Collect archives with valid metadata (ortho counts)
-    let mut archives_with_counts: Vec<(String, usize)> = archives
+    let archives_with_counts: Vec<(String, usize)> = archives
         .into_iter()
         .filter_map(|(path, _size)| load_metadata(&path).ok().map(|count| (path, count)))
         .collect();
 
-    if archives_with_counts.len() < 2 {
-        return Ok(None);
-    }
+    Ok(select_archive_pair_from_counts(
+        &archives_with_counts,
+        policy,
+    ))
+}
 
-    archives_with_counts.sort_by_key(|(_, count)| *count);
-    let largest = archives_with_counts[archives_with_counts.len() - 1]
-        .0
-        .clone();
-    let second_largest = archives_with_counts[archives_with_counts.len() - 2]
-        .0
-        .clone();
-
-    Ok(Some((second_largest, largest)))
+/// Get the two largest archives with custom config
+pub fn get_two_largest_archives_with_config(
+    config: &StateConfig,
+) -> Result<Option<(String, String)>, FoldError> {
+    get_archive_pair_with_config(config, ArchivePairPolicy::LargestLargest)
 }
 
 /// Get the two smallest archives with custom config
 pub fn get_two_smallest_archives_with_config(
     config: &StateConfig,
 ) -> Result<Option<(String, String)>, FoldError> {
-    let archives = find_archives(config.input_dir().to_str().unwrap())?;
-
-    if archives.len() < 2 {
-        return Ok(None);
-    }
-
-    let mut archives_with_counts: Vec<(String, usize)> = archives
-        .into_iter()
-        .filter_map(|(path, _size)| load_metadata(&path).ok().map(|count| (path, count)))
-        .collect();
-
-    if archives_with_counts.len() < 2 {
-        return Ok(None);
-    }
-
-    archives_with_counts.sort_by_key(|(_, count)| *count);
-    let smallest = archives_with_counts[0].0.clone();
-    let second_smallest = archives_with_counts[1].0.clone();
-
-    Ok(Some((smallest, second_smallest)))
+    get_archive_pair_with_config(config, ArchivePairPolicy::SmallestSmallest)
 }
 
 /// Archive metadata for initialization
@@ -1567,5 +1575,27 @@ mod tests {
         // Should return b.txt (skip a.txt because its work folder is active)
         let next = find_txt_file_with_config(&config).unwrap();
         assert_eq!(next.as_deref(), Some(second.to_str().unwrap()));
+    }
+
+    #[test]
+    fn archive_pair_policy_selects_expected_pairs() {
+        let archives = vec![
+            ("archive_small".to_string(), 10usize),
+            ("archive_mid".to_string(), 30usize),
+            ("archive_large".to_string(), 50usize),
+        ];
+
+        assert_eq!(
+            select_archive_pair_from_counts(&archives, ArchivePairPolicy::LargestLargest),
+            Some(("archive_mid".to_string(), "archive_large".to_string()))
+        );
+        assert_eq!(
+            select_archive_pair_from_counts(&archives, ArchivePairPolicy::SmallestSmallest),
+            Some(("archive_small".to_string(), "archive_mid".to_string()))
+        );
+        assert_eq!(
+            select_archive_pair_from_counts(&archives, ArchivePairPolicy::LargestSmallest),
+            Some(("archive_small".to_string(), "archive_large".to_string()))
+        );
     }
 }

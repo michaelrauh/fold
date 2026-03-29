@@ -1,8 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# Start a single staged leader in the current shell after building with DWARF
-# info for perf. Run this from inside tmux if you want it to stay attached.
+# Legacy local workflow: start two fold instances in tmux after staging fresh
+# input and building with DWARF info for perf.
 
 if [ -f .env ]; then
   set -a
@@ -14,16 +14,20 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+TMUX_SESSION="${TMUX_SESSION:-fold}"
+TMUX_SOCKET="${TMUX_SOCKET:-/tmp/fold_tmux.sock}"
 STATE_DIR="$SCRIPT_DIR/fold_state"
 APP_BIN="$SCRIPT_DIR/target/release/fold"
 CARGO_ENV="$HOME/.cargo/env"
 FOLD_OFFLOAD_ENABLED="${FOLD_OFFLOAD_ENABLED:-}"
-FOLD_FORCE_ROLE="${FOLD_FORCE_ROLE:-leader}"
-FOLD_MERGE_POLICY="${FOLD_MERGE_POLICY:-largest_smallest}"
 
-# Default to debuginfo + frame pointers for better perf attribution; allow override via env.
 RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2}"
 export RUSTFLAGS
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is required to run this script" >&2
+  exit 1
+fi
 
 if [ -f "$CARGO_ENV" ]; then
   # shellcheck disable=SC1090
@@ -53,17 +57,6 @@ rm -rf "$STATE_DIR"
 echo "Staging e.txt into fold_state/input..."
 ./stage.sh "$SCRIPT_DIR/e.txt"
 
-if [ -z "${FOLD_MERGE_THREADS:-}" ]; then
-  CPU_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-  if [ "${CPU_COUNT:-1}" -le 1 ]; then
-    FOLD_MERGE_THREADS=1
-  else
-    FOLD_MERGE_THREADS=$((CPU_COUNT - 1))
-  fi
-fi
-
-# Export offload env if set so the app can pick up Spaces/local store config.
-# Auto-map legacy SPACES_* vars into FOLD_OFFLOAD_* if the latter are unset.
 if [ -z "${FOLD_OFFLOAD_SPACES_BUCKET:-}" ] && [ -n "${SPACES_BUCKET:-}" ]; then
   FOLD_OFFLOAD_SPACES_BUCKET="$SPACES_BUCKET"
 fi
@@ -105,15 +98,16 @@ if [ -n "${FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER:-}" ]; then export FOLD_OFFLOAD
 if [ -n "${FOLD_OFFLOAD_DISK_FREE_LOW_WATER:-}" ]; then export FOLD_OFFLOAD_DISK_FREE_LOW_WATER; fi
 if [ -n "${FOLD_OFFLOAD_LOCAL_STORE_DIR:-}" ]; then export FOLD_OFFLOAD_LOCAL_STORE_DIR; fi
 if [ -n "${FOLD_OFFLOAD_IN_MEMORY_STORE:-}" ]; then export FOLD_OFFLOAD_IN_MEMORY_STORE; fi
-export FOLD_FORCE_ROLE
-export FOLD_MERGE_POLICY
-export FOLD_MERGE_THREADS
 
-echo "Starting single staged leader in the current shell..."
-echo "FOLD_FORCE_ROLE=$FOLD_FORCE_ROLE"
-echo "FOLD_MERGE_POLICY=$FOLD_MERGE_POLICY"
-echo "FOLD_MERGE_THREADS=$FOLD_MERGE_THREADS"
-echo "Legacy two-worker startup: ./start_fold_legacy.sh"
-echo "Run this script from inside tmux if you want the session to stay alive."
+tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+tmux -S "$TMUX_SOCKET" kill-server 2>/dev/null || true
 
-exec "$APP_BIN"
+ENV_INIT="if [ -f \"$CARGO_ENV\" ]; then source \"$CARGO_ENV\"; fi; cd \"$SCRIPT_DIR\""
+APP_CMD="$ENV_INIT; \"$APP_BIN\""
+
+echo "Starting legacy tmux session $TMUX_SESSION with two fold instances..."
+TMUX= tmux -S "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -n "fold-1" "$APP_CMD"
+TMUX= tmux -S "$TMUX_SOCKET" new-window -d -t "$TMUX_SESSION:1" -n "fold-2" "$APP_CMD"
+TMUX= tmux -S "$TMUX_SOCKET" set-window-option -g remain-on-exit on
+
+echo "Attach with: tmux -S $TMUX_SOCKET attach -t $TMUX_SESSION"

@@ -494,10 +494,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(&dest).unwrap(), b"abcdefghijklmnopqrs");
-        assert_eq!(
-            *requested.lock().unwrap(),
-            vec![(0, 7), (8, 15), (16, 18)]
-        );
+        assert_eq!(*requested.lock().unwrap(), vec![(0, 7), (8, 15), (16, 18)]);
     }
 
     #[test]

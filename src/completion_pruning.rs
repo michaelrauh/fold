@@ -455,8 +455,7 @@ mod tests {
         let interner = Interner::from_text("a b c");
         let a_idx = vocab_index(&interner, "a");
         let b_idx = vocab_index(&interner, "b");
-        let ortho = Ortho::new()
-            .add(PayloadVal::try_from(a_idx).unwrap())[0]
+        let ortho = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0]
             .add(PayloadVal::try_from(b_idx).unwrap())[0]
             .clone();
 

@@ -650,6 +650,7 @@ dependencies = [
  "lru",
  "nohash-hasher",
  "ratatui",
+ "rayon",
  "rkyv",
  "rust-s3",
  "rustc-hash",

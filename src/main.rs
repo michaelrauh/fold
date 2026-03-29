@@ -1,20 +1,19 @@
 use fold::{
     FoldError,
-    completion_pruning::{CompletionContext, bound_completion_ctx, bound_existing_ortho},
+    completion_pruning::bound_existing_ortho,
     disk_safety,
-    file_handler::{self, MemClaimGuard, StateConfig},
-    generation_runner::{COMPLETION_CHUNK_SIZE, FANOUT_LOG_THRESHOLD, run_generation_loop},
+    file_handler::{self, ArchivePairPolicy, MemClaimGuard, StateConfig},
+    generation_runner::{merge_threads_from_env, run_generation_loop, run_merge_generation_loop},
     generation_store::{Config, GenerationStore, Role},
     interner::Interner,
     memory_budget::MemoryBudget,
     memory_safety,
-    metrics::{GenerationStat, Metrics, OperationDeltas},
+    metrics::Metrics,
     offload_config::OffloadConfig,
     offload_runtime::configure_offload_runtime,
-    ortho::{Ortho, OrthoScore, PayloadVal, payload_to_usize},
+    ortho::{Ortho, OrthoScore, payload_to_usize},
     tui::Tui,
 };
-use fixedbitset::FixedBitSet;
 use std::any::Any;
 use std::fs;
 use std::io::IsTerminal;
@@ -30,6 +29,55 @@ fn role_as_str(role: Role) -> &'static str {
         Role::Leader => "leader",
         Role::Follower => "follower",
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergePolicy {
+    LargestSmallest,
+    LargestLargest,
+    SmallestSmallest,
+}
+
+impl MergePolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "largest_smallest" => Some(Self::LargestSmallest),
+            "largest_largest" => Some(Self::LargestLargest),
+            "smallest_smallest" => Some(Self::SmallestSmallest),
+            _ => None,
+        }
+    }
+
+    fn default_for_role(role: Role) -> Self {
+        match role {
+            Role::Leader => Self::LargestLargest,
+            Role::Follower => Self::SmallestSmallest,
+        }
+    }
+
+    fn archive_pair_policy(self) -> ArchivePairPolicy {
+        match self {
+            Self::LargestSmallest => ArchivePairPolicy::LargestSmallest,
+            Self::LargestLargest => ArchivePairPolicy::LargestLargest,
+            Self::SmallestSmallest => ArchivePairPolicy::SmallestSmallest,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LargestSmallest => "largest_smallest",
+            Self::LargestLargest => "largest_largest",
+            Self::SmallestSmallest => "smallest_smallest",
+        }
+    }
+}
+
+fn merge_policy_for_role(role: Role) -> MergePolicy {
+    std::env::var("FOLD_MERGE_POLICY")
+        .ok()
+        .as_deref()
+        .and_then(MergePolicy::parse)
+        .unwrap_or_else(|| MergePolicy::default_for_role(role))
 }
 
 enum RunFailure {
@@ -168,19 +216,25 @@ fn main() -> Result<(), FoldError> {
 
                 match role {
                     Role::Leader => {
-                        // Leaders prioritize merging largest archives, then process text
-                        let archive_pair =
-                            file_handler::get_two_largest_archives_with_config(&config)?;
+                        let merge_policy = merge_policy_for_role(role);
+                        let archive_pair = file_handler::get_archive_pair_with_config(
+                            &config,
+                            merge_policy.archive_pair_policy(),
+                        )?;
 
-                        if let Some((second_largest, largest)) = archive_pair {
+                        if let Some((archive_a, archive_b)) = archive_pair {
                             // Mode 1: Merge archives
                             metrics.update_global(|g| g.mode = "Merging Archives".to_string());
                             metrics.clear_chart_history();
                             metrics.add_log("MODE 1: Merging archives".to_string());
-                            metrics.add_log(format!("Merging: {} + {}", second_largest, largest));
+                            metrics.add_log(format!(
+                                "Merging (policy={}): {} + {}",
+                                merge_policy.as_str(),
+                                archive_a,
+                                archive_b
+                            ));
 
-                            match merge_archives(&second_largest, &largest, &config, &metrics, role)
-                            {
+                            match merge_archives(&archive_a, &archive_b, &config, &metrics, role) {
                                 Ok(()) => {}
                                 Err(e) if is_concurrent_claim_error(&e) => {
                                     metrics.add_log(format!(
@@ -226,6 +280,7 @@ fn main() -> Result<(), FoldError> {
                         }
                     }
                     Role::Follower => {
+                        let merge_policy = merge_policy_for_role(role);
                         // Followers prioritize ingesting new text; merge smallest archives only when none available
                         if let Some(txt_file) = file_handler::find_txt_file_with_config(&config)? {
                             metrics.update_global(|g| g.mode = "Processing Text".to_string());
@@ -249,22 +304,24 @@ fn main() -> Result<(), FoldError> {
                                 }
                                 Err(e) => return Err(e),
                             }
-                        } else if let Some((smallest, second_smallest)) =
-                            file_handler::get_two_smallest_archives_with_config(&config)?
+                        } else if let Some((archive_a, archive_b)) =
+                            file_handler::get_archive_pair_with_config(
+                                &config,
+                                merge_policy.archive_pair_policy(),
+                            )?
                         {
-                            // Mode 1 for followers: merge the two smallest archives when no text is free
+                            // Mode 1 for followers: merge archives using the configured policy when no text is free
                             metrics.update_global(|g| g.mode = "Merging Archives".to_string());
                             metrics.clear_chart_history();
                             metrics.add_log("MODE 1: Merging archives".to_string());
-                            metrics.add_log(format!("Merging: {} + {}", smallest, second_smallest));
+                            metrics.add_log(format!(
+                                "Merging (policy={}): {} + {}",
+                                merge_policy.as_str(),
+                                archive_a,
+                                archive_b
+                            ));
 
-                            match merge_archives(
-                                &smallest,
-                                &second_smallest,
-                                &config,
-                                &metrics,
-                                role,
-                            ) {
+                            match merge_archives(&archive_a, &archive_b, &config, &metrics, role) {
                                 Ok(()) => {}
                                 Err(e) if is_concurrent_claim_error(&e) => {
                                     metrics.add_log(format!(
@@ -902,8 +959,6 @@ fn merge_archives(
     let seed_ortho = Ortho::new();
     let mut best_ortho = seed_ortho.clone();
     let mut best_score = best_ortho.score();
-    let mut global_score = metrics.optimal_score();
-    let mut optimal_dirty = false;
 
     store.push_segments(vec![seed_ortho])?;
 
@@ -970,9 +1025,6 @@ fn merge_archives(
                 best_ortho = ortho.clone();
                 best_score = candidate_score;
             }
-            if candidate_score > global_score {
-                global_score = candidate_score;
-            }
 
             // If impacted, also seed to work queue
             if is_ortho_impacted_fast(&ortho, larger_impacted_ref) {
@@ -1036,9 +1088,6 @@ fn merge_archives(
                 if candidate_score > best_score {
                     best_ortho = remapped.clone();
                     best_score = candidate_score;
-                }
-                if candidate_score > global_score {
-                    global_score = candidate_score;
                 }
 
                 // If impacted, also seed to work queue
@@ -1105,489 +1154,131 @@ fn merge_archives(
         }
     ));
 
-    // Now process generations just like in process_txt_file
-    let mut sys = sysinfo::System::new();
-    let mut generation = 0u64;
-    let mut total_processed = 0;
-    let mut generation_stats: Vec<GenerationStat> = Vec::new();
+    // Process generations in the shared runner. Merge-only threading stays behind the
+    // coordinator so store mutation and pruning order remain deterministic.
+    let merge_threads = merge_threads_from_env();
+    metrics.add_log(format!(
+        "Merge scheduling: threads={}, policy={}",
+        merge_threads,
+        merge_policy_for_role(role).as_str()
+    ));
 
-    metrics.set_operation_status("Processing merge generations".to_string());
+    let mut housekeeping = || -> Result<(), FoldError> {
+        print_optimal(&best_ortho, &merged_interner);
+        ingestion.touch_heartbeat()?;
+        mem_claim.touch()?;
+        touch_leader_lock_if_owner(config)?;
+        Ok(())
+    };
 
-    // Initialize metrics with initial merge state
-    metrics.update_global(|g| {
-        g.generation = 0;
-        g.phase = "Idle".to_string();
-        g.work_len = store.work_len();
-        g.seen_len_accepted = store.seen_len_accepted();
-        g.run_budget_bytes = cfg.run_budget_bytes;
-        g.fan_in = cfg.fan_in;
-    });
-    metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
-
-    // Check cache for initial optimal ortho in merge
-    if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
-        metrics.record_optimal_volume(cache_ortho.volume());
-    }
-
-    // Tracking for throughput calculation
-    let mut last_report_time = std::time::Instant::now();
-    let mut last_report_count = 0;
-    let mut last_housekeeping = std::time::Instant::now();
-
-    loop {
-        let work_len = store.work_len();
-        if work_len == 0 {
-            break;
-        }
-
-        // Update global metrics at start of merge generation
-        metrics.update_global(|g| {
-            g.generation = generation;
-            g.phase = format!("Merge Gen {} Processing", generation);
-            g.work_len = work_len;
-            g.seen_len_accepted = store.seen_len_accepted();
-            g.run_budget_bytes = cfg.run_budget_bytes;
-            g.fan_in = cfg.fan_in;
-        });
-        metrics.set_operation_status(format!("Processing Merge Gen {}", generation));
-        // Set progress tracking for this generation
-        metrics.update_operation(|op| {
-            op.progress_total = work_len as usize;
-            op.progress_current = 0;
-        });
-        // Record samples for charts
-        metrics.record_work_len(work_len as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
-
-        // Update bucket metrics
-        let bucket_stats = store.bucket_stats();
-        let bucket_metrics: Vec<_> = bucket_stats
-            .into_iter()
-            .map(|bs| fold::metrics::BucketMetrics {
-                bucket_id: bs.bucket_id,
-                run_count: bs.run_count,
-                landing_size: bs.landing_size,
-                history_size_estimate: bs.history_size_estimate,
-                state: fold::metrics::BucketState::Pending,
-                new_work: 0,
-            })
-            .collect();
-        metrics.update_bucket_metrics(bucket_metrics);
-
-        // Low-frequency cache check (once per generation)
-        if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
-            if cache_ortho.volume() > best_ortho.volume() {
-                let cache_score = cache_ortho.score();
-                metrics.record_optimal_volume(cache_score.volume);
-                if cache_score > best_score {
-                    best_ortho = cache_ortho;
-                    best_score = cache_score;
-                    optimal_dirty = true;
+    let metrics_handle = metrics.clone_handle();
+    let progress_factory = move |gen_for_closure: u64| {
+        let metrics_clone = metrics_handle.clone_handle();
+        Some(Box::new(move |msg: &str| {
+            if msg.starts_with("TRANSITION_START:") {
+                if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
+                    if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
+                        let initial_buckets: Vec<_> = (0..bucket_count)
+                            .map(|i| fold::metrics::BucketMetrics {
+                                bucket_id: i,
+                                run_count: 0,
+                                landing_size: 0,
+                                history_size_estimate: 0,
+                                state: fold::metrics::BucketState::Pending,
+                                new_work: 0,
+                            })
+                            .collect();
+                        metrics_clone.update_bucket_metrics(initial_buckets);
+                    }
                 }
-            }
-        }
+            } else if msg.starts_with("BUCKET_STATE:") {
+                let parts: Vec<&str> = msg
+                    .strip_prefix("BUCKET_STATE:")
+                    .unwrap()
+                    .split(':')
+                    .collect();
+                if parts.len() >= 2 {
+                    if let Ok(bucket_id) = parts[0].parse::<usize>() {
+                        let state_str = parts[1];
+                        let new_work = if parts.len() >= 3 {
+                            parts[2].parse::<usize>().unwrap_or(0)
+                        } else {
+                            0
+                        };
 
-        metrics.add_log(format!(
-            "Merge Generation {}: processing {} work items",
-            generation, work_len
-        ));
+                        let state = match state_str {
+                            "draining" => fold::metrics::BucketState::Draining,
+                            "sorting" => fold::metrics::BucketState::Sorting,
+                            "merging" => fold::metrics::BucketState::Merging,
+                            "antijoining" => fold::metrics::BucketState::AntiJoining,
+                            "compacting" => fold::metrics::BucketState::Compacting,
+                            "complete" => fold::metrics::BucketState::Complete,
+                            "empty" => fold::metrics::BucketState::Empty,
+                            _ => fold::metrics::BucketState::Pending,
+                        };
 
-        let mut gen_processed = 0;
-        let mut hot_deltas = OperationDeltas::default();
-        let mut completion_ctx = CompletionContext::default();
-        let mut completion_bits = FixedBitSet::with_capacity(merged_interner.vocab_size());
-        completion_bits.grow(merged_interner.vocab_size());
-        let mut completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
-
-        let gen_start = std::time::Instant::now();
-        let accepted_before = store.seen_len_accepted();
-
-        // Process all work in this generation
-        while let Some(ortho) = store.pop_work()? {
-            gen_processed += 1;
-            total_processed += 1;
-
-            // Periodic updates on a time cadence
-            if last_housekeeping.elapsed().as_millis() >= 1000 {
-                flush_operation_deltas(metrics, &mut hot_deltas);
-                // Update progress for current generation
-                metrics.update_operation(|op| {
-                    op.progress_current = gen_processed;
-                });
-
-                let now = std::time::Instant::now();
-                let elapsed = now.duration_since(last_report_time).as_secs_f64();
-
-                // Calculate throughput
-                let processed_since_last = total_processed - last_report_count;
-                let throughput = if elapsed > 0.0 {
-                    (processed_since_last as f64 / elapsed) as usize
-                } else {
-                    0
-                };
-
-                // Update every second for visibility
-                if elapsed >= 1.0 {
-                    metrics.update_global(|g| {
-                        g.phase = format!("Merge Gen {} Processing ({}/s)", generation, throughput);
-                    });
-                    last_report_time = now;
-                    last_report_count = total_processed;
+                        let snapshot = metrics_clone.snapshot();
+                        let mut updated_buckets = snapshot.bucket_metrics.clone();
+                        if bucket_id < updated_buckets.len() {
+                            updated_buckets[bucket_id].state = state;
+                            updated_buckets[bucket_id].new_work = new_work;
+                            metrics_clone.update_bucket_metrics(updated_buckets);
+                        }
+                    }
                 }
-                last_housekeeping = now;
-
-                metrics.record_optimal_volume(best_ortho.volume());
-
-                metrics.update_operation(|op| {
-                    op.progress_current = total_processed;
-                });
-
-                // Update work queue metrics during merge
-                metrics.update_global(|g| {
-                    g.work_len = store.work_len();
-                    g.seen_len_accepted = store.seen_len_accepted();
-                });
-                metrics.record_work_len(store.work_len() as usize);
-                metrics.record_landing_buffer_count(store.total_landing_size());
-
-                // Update bucket metrics for TUI visualization
-                let bucket_stats = store.bucket_stats();
-                let bucket_metrics: Vec<_> = bucket_stats
-                    .into_iter()
-                    .map(|bs| fold::metrics::BucketMetrics {
-                        bucket_id: bs.bucket_id,
-                        run_count: bs.run_count,
-                        landing_size: bs.landing_size,
-                        history_size_estimate: bs.history_size_estimate,
+            } else if msg == "TRANSITION_COMPLETE" {
+                let snapshot = metrics_clone.snapshot();
+                let reset_buckets: Vec<_> = snapshot
+                    .bucket_metrics
+                    .iter()
+                    .map(|b| fold::metrics::BucketMetrics {
+                        bucket_id: b.bucket_id,
+                        run_count: b.run_count,
+                        landing_size: b.landing_size,
+                        history_size_estimate: b.history_size_estimate,
                         state: fold::metrics::BucketState::Pending,
                         new_work: 0,
                     })
                     .collect();
-                metrics.update_bucket_metrics(bucket_metrics);
+                metrics_clone.update_bucket_metrics(reset_buckets);
+            }
 
-                if optimal_dirty {
-                    let score = best_score;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    metrics.update_optimal_ortho(|opt| {
-                        opt.volume = score.volume;
-                        opt.variance_num = score.variance_num;
-                        opt.variance_den = score.variance_den;
-                        opt.dims = best_ortho.dims().clone();
-                        opt.fullness = score.fullness;
-                        opt.capacity = best_ortho.payload().len();
-                        opt.payload = best_ortho.payload().clone();
-                        opt.vocab = merged_interner.vocabulary().to_vec();
-                        opt.last_update_time = now;
-                    });
-                    optimal_dirty = false;
-                }
-
-                // Update RAM
-                sys.refresh_memory();
-                let (used_bytes, total_bytes) =
-                    normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-                let proc_rss_bytes = memory_safety::current_process_rss_bytes();
-                let percent = if total_bytes > 0 {
-                    ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
-                } else {
-                    0
-                };
-                let jobs_count = file_handler::count_running_jobs_with_config(config).unwrap_or(0);
-                metrics.update_global(|g| {
-                    g.ram_bytes = used_bytes;
-                    g.process_rss_bytes = proc_rss_bytes;
-                    g.system_memory_percent = percent;
-                    g.distinct_jobs_count = jobs_count;
+            if !msg.starts_with("BUCKET_STATE:")
+                && !msg.starts_with("TRANSITION_START:")
+                && msg != "TRANSITION_COMPLETE"
+            {
+                metrics_clone.update_global(|g| {
+                    g.phase = format!(
+                        "Merge Gen {} → {}: {}",
+                        gen_for_closure,
+                        gen_for_closure + 1,
+                        msg
+                    );
                 });
+                metrics_clone.add_log(format!("Merge Gen {} transition: {}", gen_for_closure, msg));
             }
+        }) as fold::generation_store::ProgressCallback)
+    };
 
-            if total_processed % 50000 == 0 {
-                metrics.add_log(format!(
-                    "Merge progress: {} orthos processed",
-                    total_processed
-                ));
-            }
+    let run_result = run_merge_generation_loop(
+        &merged_interner,
+        &mut store,
+        &cfg,
+        metrics,
+        &mut housekeeping,
+        progress_factory,
+        merge_threads,
+        Some(config),
+    )?;
 
-            if total_processed % 100000 == 0 {
-                print_optimal(&best_ortho, &merged_interner);
-                ingestion.touch_heartbeat()?;
-                mem_claim.touch()?;
-                touch_leader_lock_if_owner(config)?;
-            }
-
-            // Get requirements and completions
-            completion_ctx.reset(&ortho);
-            merged_interner.intersect_into(
-                completion_ctx.required_usize(),
-                completion_ctx.forbidden_usize(),
-                &mut completion_bits,
-            );
-
-            let total_completions = completion_bits.count_ones(..);
-            if total_completions > FANOUT_LOG_THRESHOLD {
-                let chunks =
-                    (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
-                metrics.add_log(format!(
-                    "Fanout: {} completions; {} chunks",
-                    total_completions,
-                    chunks
-                ));
-            }
-
-            // Generate children
-            completion_chunk.clear();
-            for completion in completion_bits.ones() {
-                completion_chunk.push(completion);
-                if completion_chunk.len() < COMPLETION_CHUNK_SIZE {
-                    continue;
-                }
-
-                for &completion in &completion_chunk {
-                    if bound_completion_ctx(
-                        &mut completion_ctx,
-                        completion,
-                        &merged_interner,
-                        best_score,
-                    ) {
-                        hot_deltas.pruned_completions =
-                            hot_deltas.pruned_completions.saturating_add(1);
-                        if completion_ctx.is_root() {
-                            hot_deltas.pruned_root_span =
-                                hot_deltas.pruned_root_span.saturating_add(1);
-                        } else {
-                            hot_deltas.pruned_bound =
-                                hot_deltas.pruned_bound.saturating_add(1);
-                        }
-                        continue;
-                    }
-                    hot_deltas.expanded_completions =
-                        hot_deltas.expanded_completions.saturating_add(1);
-                    let completion_val =
-                        PayloadVal::try_from(completion).expect("completion overflowed u32");
-                    let children = ortho.add(completion_val);
-                    for child in children {
-                        let candidate_score = child.score();
-                        if candidate_score > best_score {
-                            best_ortho = child.clone();
-                            best_score = candidate_score;
-                        }
-                        if candidate_score > global_score {
-                            global_score = candidate_score;
-                            optimal_dirty = true;
-                        }
-
-                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
-                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
-                    }
-                }
-                flush_operation_deltas(metrics, &mut hot_deltas);
-                completion_chunk.clear();
-            }
-
-            if !completion_chunk.is_empty() {
-                for &completion in &completion_chunk {
-                    if bound_completion_ctx(
-                        &mut completion_ctx,
-                        completion,
-                        &merged_interner,
-                        best_score,
-                    ) {
-                        hot_deltas.pruned_completions =
-                            hot_deltas.pruned_completions.saturating_add(1);
-                        if completion_ctx.is_root() {
-                            hot_deltas.pruned_root_span =
-                                hot_deltas.pruned_root_span.saturating_add(1);
-                        } else {
-                            hot_deltas.pruned_bound =
-                                hot_deltas.pruned_bound.saturating_add(1);
-                        }
-                        continue;
-                    }
-                    hot_deltas.expanded_completions =
-                        hot_deltas.expanded_completions.saturating_add(1);
-                    let completion_val =
-                        PayloadVal::try_from(completion).expect("completion overflowed u32");
-                    let children = ortho.add(completion_val);
-                    for child in children {
-                        let candidate_score = child.score();
-                        if candidate_score > best_score {
-                            best_ortho = child.clone();
-                            best_score = candidate_score;
-                        }
-                        if candidate_score > global_score {
-                            global_score = candidate_score;
-                            optimal_dirty = true;
-                        }
-
-                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
-                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
-                    }
-                }
-                flush_operation_deltas(metrics, &mut hot_deltas);
-            }
-        }
-
-        flush_operation_deltas(metrics, &mut hot_deltas);
-
-        metrics.add_log(format!(
-            "Merge Generation {}: processed {} orthos",
-            generation, gen_processed
-        ));
-
-        // End of generation
-        let gen_for_closure = generation;
-        let metrics_clone = metrics.clone_handle();
-        let progress_callback: fold::generation_store::ProgressCallback =
-            Box::new(move |msg: &str| {
-                // Parse special bucket state messages
-                if msg.starts_with("TRANSITION_START:") {
-                    if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
-                        if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
-                            // Initialize all buckets as pending
-                            let initial_buckets: Vec<_> = (0..bucket_count)
-                                .map(|i| fold::metrics::BucketMetrics {
-                                    bucket_id: i,
-                                    run_count: 0,
-                                    landing_size: 0,
-                                    history_size_estimate: 0,
-                                    state: fold::metrics::BucketState::Pending,
-                                    new_work: 0,
-                                })
-                                .collect();
-                            metrics_clone.update_bucket_metrics(initial_buckets);
-                        }
-                    }
-                } else if msg.starts_with("BUCKET_STATE:") {
-                    // Parse: BUCKET_STATE:bucket_id:state[:new_work]
-                    let parts: Vec<&str> = msg
-                        .strip_prefix("BUCKET_STATE:")
-                        .unwrap()
-                        .split(':')
-                        .collect();
-                    if parts.len() >= 2 {
-                        if let Ok(bucket_id) = parts[0].parse::<usize>() {
-                            let state_str = parts[1];
-                            let new_work = if parts.len() >= 3 {
-                                parts[2].parse::<usize>().unwrap_or(0)
-                            } else {
-                                0
-                            };
-
-                            let state = match state_str {
-                                "draining" => fold::metrics::BucketState::Draining,
-                                "sorting" => fold::metrics::BucketState::Sorting,
-                                "merging" => fold::metrics::BucketState::Merging,
-                                "antijoining" => fold::metrics::BucketState::AntiJoining,
-                                "compacting" => fold::metrics::BucketState::Compacting,
-                                "complete" => fold::metrics::BucketState::Complete,
-                                "empty" => fold::metrics::BucketState::Empty,
-                                _ => fold::metrics::BucketState::Pending,
-                            };
-
-                            // Update specific bucket state without wiping existing metrics
-                            let snapshot = metrics_clone.snapshot();
-                            let mut updated_buckets = snapshot.bucket_metrics.clone();
-                            if bucket_id < updated_buckets.len() {
-                                updated_buckets[bucket_id].state = state;
-                                updated_buckets[bucket_id].new_work = new_work;
-                                metrics_clone.update_bucket_metrics(updated_buckets);
-                            }
-                        }
-                    }
-                } else if msg == "TRANSITION_COMPLETE" {
-                    // Reset all buckets to normal state
-                    let snapshot = metrics_clone.snapshot();
-                    let reset_buckets: Vec<_> = snapshot
-                        .bucket_metrics
-                        .iter()
-                        .map(|b| fold::metrics::BucketMetrics {
-                            bucket_id: b.bucket_id,
-                            run_count: b.run_count,
-                            landing_size: b.landing_size,
-                            history_size_estimate: b.history_size_estimate,
-                            state: fold::metrics::BucketState::Pending,
-                            new_work: 0,
-                        })
-                        .collect();
-                    metrics_clone.update_bucket_metrics(reset_buckets);
-                }
-
-                // Update phase display (for non-control messages)
-                if !msg.starts_with("BUCKET_STATE:")
-                    && !msg.starts_with("TRANSITION_START:")
-                    && msg != "TRANSITION_COMPLETE"
-                {
-                    metrics_clone.update_global(|g| {
-                        g.phase = format!(
-                            "Merge Gen {} → {}: {}",
-                            gen_for_closure,
-                            gen_for_closure + 1,
-                            msg
-                        );
-                    });
-                    metrics_clone
-                        .add_log(format!("Merge Gen {} transition: {}", gen_for_closure, msg));
-                }
-            });
-
-        metrics.update_global(|g| {
-            g.phase = format!(
-                "Merge Gen {} → {} transition starting",
-                generation,
-                generation + 1
-            );
-        });
-        metrics.set_operation_status(format!(
-            "Merge Gen {} → {} transition",
-            generation,
-            generation + 1
-        ));
-
-        let processing_secs = gen_start.elapsed().as_secs_f64();
-        let transition_start = std::time::Instant::now();
-        let new_work = store.on_generation_end(&cfg, Some(&progress_callback))?;
-        let transition_secs = transition_start.elapsed().as_secs_f64();
-        let accepted_delta = store.seen_len_accepted().saturating_sub(accepted_before);
-        generation_stats.push(GenerationStat {
-            generation,
-            processing_secs,
-            transition_secs,
-            accepted: accepted_delta,
-            new_work,
-        });
-
-        // Update metrics after merge generation transition
-        metrics.update_global(|g| {
-            g.work_len = store.work_len();
-            g.seen_len_accepted = store.seen_len_accepted();
-            g.phase = format!("Merge Gen {} complete", generation);
-        });
-        metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
-
-        metrics.add_log(format!(
-            "Merge Generation {} complete: {} new work, {} total seen",
-            generation,
-            new_work,
-            store.seen_len_accepted()
-        ));
-
-        generation += 1;
-
-        if new_work == 0 {
-            metrics.add_log("No new work after transition; stopping merge generations".to_string());
-            break;
-        }
-    }
+    best_ortho = run_result.best_ortho;
+    best_score = run_result.best_score;
+    let optimal_dirty = run_result.optimal_dirty;
 
     let mut compacted_counts: Option<(u64, u64)> = None;
     metrics.add_log(format!(
         "Merge completed {} generations, {} total orthos",
-        generation,
+        run_result.generation_stats.len(),
         store.seen_len_accepted()
     ));
 
@@ -1669,7 +1360,7 @@ fn merge_archives(
     });
 
     metrics.update_global(|g| g.processed_chunks += 1);
-    metrics.set_generation_stats(generation_stats);
+    metrics.set_generation_stats(run_result.generation_stats);
 
     // Update merge metrics on completion
     metrics.update_merge(|m| {
@@ -1969,49 +1660,6 @@ fn acquire_memory_claim_simple(
         budget.process_claim_bytes,
         budget.process_claim_bytes,
     )
-}
-
-fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-            if let Some(mem_total_kib) = meminfo
-                .lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                let mem_total_kib_f = mem_total_kib as f64;
-                // If sysinfo matches /proc/meminfo in KiB, convert to bytes.
-                fn within_10_pct(a: f64, b: f64) -> bool {
-                    (a - b).abs() / a.max(b) <= 0.1
-                }
-                if within_10_pct(total_raw as f64, mem_total_kib_f) {
-                    let factor = 1024usize;
-                    return (
-                        (used_raw as usize).saturating_mul(factor),
-                        (total_raw as usize).saturating_mul(factor),
-                    );
-                }
-                // If sysinfo already reports bytes (matches /proc/meminfo bytes), keep as-is.
-                let mem_total_bytes_f = mem_total_kib_f * 1024.0;
-                if within_10_pct(total_raw as f64, mem_total_bytes_f) {
-                    return (used_raw as usize, total_raw as usize);
-                }
-            }
-        }
-    }
-    // Fallback: assume values are in KiB, convert to bytes.
-    let factor = 1024usize;
-    (
-        (used_raw as usize).saturating_mul(factor),
-        (total_raw as usize).saturating_mul(factor),
-    )
-}
-
-fn flush_operation_deltas(metrics: &Metrics, deltas: &mut OperationDeltas) {
-    metrics.apply_operation_deltas(*deltas);
-    *deltas = OperationDeltas::default();
 }
 
 // Old acquire_memory_claim kept for any remaining merge_archives code
@@ -2342,6 +1990,7 @@ fn directory_size(path: &Path) -> Result<u64, FoldError> {
 mod tests {
     use super::*;
     use fold::generation_store::{RunOffloader, set_run_offloader};
+    use fold::ortho::PayloadVal;
     use std::io::ErrorKind;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
@@ -2384,6 +2033,119 @@ mod tests {
         result
     }
 
+    fn with_env_override<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let previous = std::env::var(name).ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        let result = f();
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        result
+    }
+
+    fn build_test_merge_archives(config: &StateConfig) -> (String, String) {
+        let interner_a = Interner::from_text("foo bar");
+        let foo_idx_a = interner_a
+            .vocabulary()
+            .iter()
+            .position(|w| w == "foo")
+            .unwrap();
+        let bar_idx_a = interner_a
+            .vocabulary()
+            .iter()
+            .position(|w| w == "bar")
+            .unwrap();
+        let foo_val_a = PayloadVal::try_from(foo_idx_a).unwrap();
+        let bar_val_a = PayloadVal::try_from(bar_idx_a).unwrap();
+
+        let impacted_a = {
+            let first = Ortho::new().add(foo_val_a)[0].clone();
+            first.add(bar_val_a)[0].clone()
+        };
+        let non_impacted_a = {
+            let first = Ortho::new().add(bar_val_a)[0].clone();
+            first.add(foo_val_a)[0].clone()
+        };
+
+        let (archive_a_path, _) = save_archive_vec_internal(
+            &interner_a,
+            vec![impacted_a.clone(), non_impacted_a],
+            Some(&impacted_a),
+            "\"A\"",
+            2,
+            "foo bar",
+            2,
+            config,
+        )
+        .unwrap();
+
+        let interner_b = Interner::from_text("foo baz");
+        let foo_idx_b = interner_b
+            .vocabulary()
+            .iter()
+            .position(|w| w == "foo")
+            .unwrap();
+        let baz_idx_b = interner_b
+            .vocabulary()
+            .iter()
+            .position(|w| w == "baz")
+            .unwrap();
+        let foo_val_b = PayloadVal::try_from(foo_idx_b).unwrap();
+        let baz_val_b = PayloadVal::try_from(baz_idx_b).unwrap();
+
+        let impacted_b = {
+            let first = Ortho::new().add(foo_val_b)[0].clone();
+            first.add(baz_val_b)[0].clone()
+        };
+        let non_impacted_b = {
+            let first = Ortho::new().add(baz_val_b)[0].clone();
+            first.add(foo_val_b)[0].clone()
+        };
+
+        let (archive_b_path, _) = save_archive_vec_internal(
+            &interner_b,
+            vec![impacted_b.clone(), non_impacted_b],
+            Some(&impacted_b),
+            "\"B\"",
+            2,
+            "foo baz",
+            2,
+            config,
+        )
+        .unwrap();
+
+        (archive_a_path, archive_b_path)
+    }
+
+    fn capture_archive_signature(config: &StateConfig) -> (Ortho, String, Vec<u64>) {
+        let largest = file_handler::find_largest_archive_with_config(config)
+            .unwrap()
+            .expect("merged archive should exist");
+        let optimal = file_handler::load_optimal_ortho(&largest.path).unwrap();
+        let lineage = fs::read_to_string(Path::new(&largest.path).join("lineage.txt")).unwrap();
+        let reader =
+            GenerationStore::from_existing(Path::new(&largest.path).join("results"), 8).unwrap();
+        let mut ids = Vec::new();
+        for bucket in 0..8 {
+            for result in reader.history_iter_with_buffer(bucket, 64 * 1024).unwrap() {
+                let ortho = Ortho::from_bytes(result.unwrap().bytes.as_ref()).unwrap();
+                ids.push(ortho.id());
+            }
+        }
+        ids.sort_unstable();
+        (optimal, lineage, ids)
+    }
+
     #[test]
     fn test_score() {
         let ortho = Ortho::new();
@@ -2423,86 +2185,77 @@ mod tests {
     }
 
     #[test]
+    fn merge_policy_defaults_and_env_override() {
+        with_env_override("FOLD_MERGE_POLICY", None, || {
+            assert_eq!(
+                merge_policy_for_role(Role::Leader),
+                MergePolicy::LargestLargest
+            );
+            assert_eq!(
+                merge_policy_for_role(Role::Follower),
+                MergePolicy::SmallestSmallest
+            );
+        });
+
+        with_env_override("FOLD_MERGE_POLICY", Some("largest_smallest"), || {
+            assert_eq!(
+                merge_policy_for_role(Role::Leader),
+                MergePolicy::LargestSmallest
+            );
+            assert_eq!(
+                merge_policy_for_role(Role::Follower),
+                MergePolicy::LargestSmallest
+            );
+        });
+    }
+
+    #[test]
+    fn threaded_merge_matches_single_threaded_archive_output() {
+        with_test_memory_overrides(|| {
+            let run_merge = |merge_threads: &str| {
+                let temp = TempDir::new().unwrap();
+                let config = StateConfig::custom(temp.path().to_path_buf());
+                file_handler::initialize_with_config(&config).unwrap();
+                let (archive_a_path, archive_b_path) = build_test_merge_archives(&config);
+                let metrics = Metrics::new();
+
+                with_env_override("FOLD_MERGE_THREADS", Some(merge_threads), || {
+                    merge_archives(
+                        &archive_a_path,
+                        &archive_b_path,
+                        &config,
+                        &metrics,
+                        Role::Leader,
+                    )
+                    .unwrap();
+                });
+
+                capture_archive_signature(&config)
+            };
+
+            let single_thread = run_merge("1");
+            let multi_thread = run_merge("3");
+
+            assert_eq!(
+                single_thread.0, multi_thread.0,
+                "optimal ortho should match"
+            );
+            assert_eq!(single_thread.1, multi_thread.1, "lineage should match");
+            assert_eq!(
+                single_thread.2, multi_thread.2,
+                "archive contents should match"
+            );
+        });
+    }
+
+    #[test]
     fn merge_seeds_impacted_work_queue() {
         with_test_memory_overrides(|| {
-            use tempfile::TempDir;
-
             // Temp state
             let temp = TempDir::new().unwrap();
             let config = StateConfig::custom(temp.path().to_path_buf());
             file_handler::initialize_with_config(&config).unwrap();
-
-            // Build interner A (foo bar) and impacted/non-impacted orthos
-            let interner_a = Interner::from_text("foo bar");
-            let foo_idx_a = interner_a
-                .vocabulary()
-                .iter()
-                .position(|w| w == "foo")
-                .unwrap();
-            let bar_idx_a = interner_a
-                .vocabulary()
-                .iter()
-                .position(|w| w == "bar")
-                .unwrap();
-            let foo_val_a = PayloadVal::try_from(foo_idx_a).unwrap();
-            let bar_val_a = PayloadVal::try_from(bar_idx_a).unwrap();
-
-            let impacted_a = {
-                let first = Ortho::new().add(foo_val_a)[0].clone();
-                first.add(bar_val_a)[0].clone()
-            };
-            let non_impacted_a = {
-                let first = Ortho::new().add(bar_val_a)[0].clone();
-                first.add(foo_val_a)[0].clone()
-            };
-
-            let (archive_a_path, _) = save_archive_vec_internal(
-                &interner_a,
-                vec![impacted_a.clone(), non_impacted_a],
-                Some(&impacted_a),
-                "\"A\"",
-                2,
-                "foo bar",
-                2,
-                &config,
-            )
-            .unwrap();
-
-            // Build interner B (foo baz) and impacted/non-impacted orthos
-            let interner_b = Interner::from_text("foo baz");
-            let foo_idx_b = interner_b
-                .vocabulary()
-                .iter()
-                .position(|w| w == "foo")
-                .unwrap();
-            let baz_idx_b = interner_b
-                .vocabulary()
-                .iter()
-                .position(|w| w == "baz")
-                .unwrap();
-            let foo_val_b = PayloadVal::try_from(foo_idx_b).unwrap();
-            let baz_val_b = PayloadVal::try_from(baz_idx_b).unwrap();
-
-            let impacted_b = {
-                let first = Ortho::new().add(foo_val_b)[0].clone();
-                first.add(baz_val_b)[0].clone()
-            };
-            let non_impacted_b = {
-                let first = Ortho::new().add(baz_val_b)[0].clone();
-                first.add(foo_val_b)[0].clone()
-            };
-
-            let (archive_b_path, _) = save_archive_vec_internal(
-                &interner_b,
-                vec![impacted_b.clone(), non_impacted_b],
-                Some(&impacted_b),
-                "\"B\"",
-                2,
-                "foo baz",
-                2,
-                &config,
-            )
-            .unwrap();
+            let (archive_a_path, archive_b_path) = build_test_merge_archives(&config);
 
             // Merge and verify impacted queues are non-zero
             let metrics = Metrics::new();
