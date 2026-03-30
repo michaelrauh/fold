@@ -15,6 +15,7 @@ use fold::{
     tui::Tui,
 };
 use std::any::Any;
+use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -790,7 +791,8 @@ fn process_txt_file(
 
     let archive_path = build_archive_path(config)?;
     let lineage = format!("\"{}\"", ingestion.filename);
-    move_history_runs_to_archive(&store.history_run_paths(), &archive_path)?;
+    let history_runs = history_run_paths_for_archive(&store)?;
+    move_history_runs_to_archive(&history_runs, &archive_path)?;
     write_archive_artifacts(
         &archive_path,
         &interner,
@@ -877,6 +879,8 @@ fn merge_archives(
     // Both impacted_larger and impacted_smaller are returned in MERGED vocabulary space
     let impacted_larger = merged_interner.impacted_keys(&larger_interner);
     let impacted_smaller = merged_interner.impacted_keys(&smaller_interner);
+    let impacted_larger_set = build_impacted_prefix_set(&impacted_larger);
+    let impacted_smaller_set = build_impacted_prefix_set(&impacted_smaller);
 
     // Build vocab mapping for remapping orthos (not keys) from smaller to merged
     let vocab_map_smaller =
@@ -955,10 +959,37 @@ fn merge_archives(
         cfg.read_buf_bytes / 1024
     ));
 
-    // Seed with empty ortho
+    // Get results paths
+    let (results_a_path, results_b_path) = ingestion.get_results_paths();
+    // Load per-archive optimal orthos/scores so merge ingest doesn't have to rediscover them.
+    let opt_ortho_a = file_handler::load_optimal_ortho(&results_a_path).ok();
+    let opt_ortho_b = file_handler::load_optimal_ortho(&results_b_path).ok();
+    let opt_score_a = opt_ortho_a
+        .as_ref()
+        .map(|ortho| ortho.score())
+        .unwrap_or(OrthoScore::zero());
+    let opt_score_b = opt_ortho_b
+        .as_ref()
+        .map(|ortho| ortho.score())
+        .unwrap_or(OrthoScore::zero());
+    let max_opt_score = std::cmp::max(opt_score_a, opt_score_b);
+
+    // Seed with empty ortho, then lift the merge best from archive-level optima.
     let seed_ortho = Ortho::new();
     let mut best_ortho = seed_ortho.clone();
     let mut best_score = best_ortho.score();
+    if let Some(opt) = opt_ortho_a.as_ref() {
+        if opt.score() > best_score {
+            best_ortho = opt.clone();
+            best_score = opt.score();
+        }
+    }
+    if let Some(opt) = opt_ortho_b.as_ref() {
+        if opt.score() > best_score {
+            best_ortho = opt.clone();
+            best_score = opt.score();
+        }
+    }
 
     store.push_segments(vec![seed_ortho])?;
 
@@ -974,60 +1005,48 @@ fn merge_archives(
     metrics.record_work_len(store.work_len() as usize);
     metrics.record_landing_buffer_count(store.total_landing_size());
 
-    // Get results paths
-    let (results_a_path, results_b_path) = ingestion.get_results_paths();
-    // Load per-archive optimal scores for symmetric pruning
-    let load_opt_score = |path: &str| -> Option<OrthoScore> {
-        file_handler::load_optimal_ortho(path)
-            .ok()
-            .map(|o| o.score())
-    };
-    let opt_score_a = load_opt_score(&results_a_path).unwrap_or(OrthoScore::zero());
-    let opt_score_b = load_opt_score(&results_b_path).unwrap_or(OrthoScore::zero());
-    let max_opt_score = std::cmp::max(opt_score_a, opt_score_b);
-
     // Set up paths and impacted keys for each archive
     // Note: larger archive orthos don't need remapping, their impacted keys are already in merged space
     // smaller archive orthos need remapping, and we use the remapped impacted keys
-    let (larger_path, larger_impacted_ref, larger_name) = if a_is_smaller {
-        (&results_b_path, &impacted_larger, "B")
+    let (larger_path, larger_impacted_ref, larger_impacted_set, larger_name) = if a_is_smaller {
+        (&results_b_path, &impacted_larger, &impacted_larger_set, "B")
     } else {
-        (&results_a_path, &impacted_larger, "A")
+        (&results_a_path, &impacted_larger, &impacted_larger_set, "A")
     };
 
-    let (smaller_path, smaller_impacted_ref, smaller_name) = if a_is_smaller {
-        (&results_a_path, &impacted_smaller, "A")
+    let (smaller_path, smaller_impacted_ref, smaller_impacted_set, smaller_name) = if a_is_smaller {
+        (
+            &results_a_path,
+            &impacted_smaller,
+            &impacted_smaller_set,
+            "A",
+        )
     } else {
-        (&results_b_path, &impacted_smaller, "B")
+        (
+            &results_b_path,
+            &impacted_smaller,
+            &impacted_smaller_set,
+            "B",
+        )
     };
 
-    // Process larger archive (no remapping needed) - stream directly into GenerationStore
+    // Process larger archive (no remapping needed). Carry forward its history directly and
+    // only decode orthos to discover the impacted subset that needs reseeding.
     metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
-
-    // Create a temporary GenerationStore to read from the archive's results
     let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
+    let larger_history_paths = larger_store.history_run_paths();
 
     let mut total_from_larger = 0;
     let mut impacted_from_larger = 0;
+    let mut larger_impacted_scratch = ImpactedScratch::default();
 
-    // Stream all orthos from larger archive's history into our merge store
     for bucket in 0..8 {
         for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
             let ortho_bytes = result?.bytes;
             let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
             total_from_larger += 1;
 
-            // Record to landing zone (will be deduped during generation end)
-            store.record_result(&ortho)?;
-
-            let candidate_score = ortho.score();
-            if candidate_score > best_score {
-                best_ortho = ortho.clone();
-                best_score = candidate_score;
-            }
-
-            // If impacted, also seed to work queue
-            if is_ortho_impacted_fast(&ortho, larger_impacted_ref) {
+            if is_ortho_impacted_fast(&ortho, larger_impacted_set, &mut larger_impacted_scratch) {
                 let prune_score = std::cmp::max(best_score, max_opt_score);
                 if !bound_existing_ortho(
                     &ortho,
@@ -1055,10 +1074,18 @@ fn merge_archives(
             }
         }
     }
+    store.adopt_history_runs(&larger_history_paths, total_from_larger as u64)?;
+    metrics.update_global(|g| {
+        g.seen_len_accepted = store.seen_len_accepted();
+    });
 
     metrics.add_log(format!(
         "Loaded {} orthos from larger archive {} ({} impacted)",
         total_from_larger, larger_name, impacted_from_larger
+    ));
+    metrics.add_log(format!(
+        "Adopted {} larger-archive orthos directly into merged history",
+        total_from_larger
     ));
 
     // Process smaller archive (needs remapping) - stream and remap into GenerationStore
@@ -1071,6 +1098,7 @@ fn merge_archives(
 
     let mut total_from_smaller = 0;
     let mut impacted_from_smaller = 0;
+    let mut smaller_impacted_scratch = ImpactedScratch::default();
 
     // Stream all orthos from smaller archive's history, remap, and store
     for bucket in 0..8 {
@@ -1091,7 +1119,11 @@ fn merge_archives(
                 }
 
                 // If impacted, also seed to work queue
-                if is_ortho_impacted_fast(&remapped, smaller_impacted_ref) {
+                if is_ortho_impacted_fast(
+                    &remapped,
+                    smaller_impacted_set,
+                    &mut smaller_impacted_scratch,
+                ) {
                     let prune_score = std::cmp::max(best_score, max_opt_score);
                     if !bound_existing_ortho(
                         &remapped,
@@ -1337,7 +1369,8 @@ fn merge_archives(
     );
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
 
-    move_history_runs_to_archive(&store.history_run_paths(), &archive_path)?;
+    let history_runs = history_run_paths_for_archive(&store)?;
+    move_history_runs_to_archive(&history_runs, &archive_path)?;
     write_archive_artifacts(
         &archive_path,
         &merged_interner,
@@ -1391,17 +1424,32 @@ fn build_vocab_mapping(old_vocab: &[String], new_vocab: &[String]) -> Vec<usize>
     mapping
 }
 
-// Helper function to check if ortho is impacted by checking if any requirement matches impacted prefixes
-fn is_ortho_impacted_fast(ortho: &Ortho, impacted_prefixes: &[Vec<usize>]) -> bool {
-    // Get the ortho's requirement prefixes (not the entire payload)
-    let requirements = ortho.get_requirement_phrases();
-    let requirements_usize: Vec<Vec<usize>> = requirements
-        .iter()
-        .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
-        .collect();
+#[derive(Default)]
+struct ImpactedScratch {
+    forbidden: Vec<usize>,
+    required: Vec<Vec<usize>>,
+    prefix_positions: Vec<Vec<usize>>,
+    diagonal_positions: Vec<usize>,
+}
 
-    // Check if any requirement prefix matches any impacted prefix
-    requirements_usize
+fn build_impacted_prefix_set(prefixes: &[Vec<usize>]) -> HashSet<Vec<usize>> {
+    prefixes.iter().cloned().collect()
+}
+
+// Helper function to check if ortho is impacted by checking if any requirement matches impacted prefixes
+fn is_ortho_impacted_fast(
+    ortho: &Ortho,
+    impacted_prefixes: &HashSet<Vec<usize>>,
+    scratch: &mut ImpactedScratch,
+) -> bool {
+    ortho.fill_requirements_usize(
+        &mut scratch.forbidden,
+        &mut scratch.required,
+        &mut scratch.prefix_positions,
+        &mut scratch.diagonal_positions,
+    );
+    scratch
+        .required
         .iter()
         .any(|req| impacted_prefixes.contains(req))
 }
@@ -1517,6 +1565,14 @@ fn build_archive_path(config: &StateConfig) -> Result<PathBuf, FoldError> {
     Ok(archive_path)
 }
 
+fn history_run_paths_for_archive(
+    store: &GenerationStore,
+) -> Result<Vec<(usize, Vec<PathBuf>)>, FoldError> {
+    let refreshed = GenerationStore::from_existing(store.base_path().clone(), store.bucket_count())
+        .map_err(FoldError::Io)?;
+    Ok(refreshed.history_run_paths())
+}
+
 fn move_history_runs_to_archive(
     history_runs: &[(usize, Vec<PathBuf>)],
     archive_path: &PathBuf,
@@ -1605,8 +1661,6 @@ fn write_archive_artifacts(
 
     Ok(())
 }
-
-// Old helper functions removed (build_vocab_mapping, is_ortho_impacted_fast) - were only used by merge_archives
 
 fn print_optimal(_ortho: &Ortho, _interner: &Interner) {
     // Optimal ortho info is now displayed in TUI metrics
@@ -2146,6 +2200,17 @@ mod tests {
         (optimal, lineage, ids)
     }
 
+    fn legacy_is_ortho_impacted(ortho: &Ortho, impacted_prefixes: &[Vec<usize>]) -> bool {
+        let requirements = ortho.get_requirement_phrases();
+        let requirements_usize: Vec<Vec<usize>> = requirements
+            .iter()
+            .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect())
+            .collect();
+        requirements_usize
+            .iter()
+            .any(|req| impacted_prefixes.contains(req))
+    }
+
     #[test]
     fn test_score() {
         let ortho = Ortho::new();
@@ -2207,6 +2272,97 @@ mod tests {
                 MergePolicy::LargestSmallest
             );
         });
+    }
+
+    #[test]
+    fn impacted_hash_lookup_matches_legacy_logic() {
+        let interner = Interner::from_text("foo bar baz");
+        let foo = PayloadVal::try_from(
+            interner
+                .vocabulary()
+                .iter()
+                .position(|w| w == "foo")
+                .unwrap(),
+        )
+        .unwrap();
+        let bar = PayloadVal::try_from(
+            interner
+                .vocabulary()
+                .iter()
+                .position(|w| w == "bar")
+                .unwrap(),
+        )
+        .unwrap();
+        let baz = PayloadVal::try_from(
+            interner
+                .vocabulary()
+                .iter()
+                .position(|w| w == "baz")
+                .unwrap(),
+        )
+        .unwrap();
+
+        let ortho = Ortho::new().add(foo)[0].clone().add(bar)[0].clone();
+        let impacted = vec![vec![payload_to_usize(foo), payload_to_usize(bar)]];
+        let impacted_set = build_impacted_prefix_set(&impacted);
+        let mut scratch = ImpactedScratch::default();
+
+        assert_eq!(
+            is_ortho_impacted_fast(&ortho, &impacted_set, &mut scratch),
+            legacy_is_ortho_impacted(&ortho, &impacted)
+        );
+
+        let other = Ortho::new().add(foo)[0].clone().add(baz)[0].clone();
+        let mut other_scratch = ImpactedScratch::default();
+        assert_eq!(
+            is_ortho_impacted_fast(&other, &impacted_set, &mut other_scratch),
+            legacy_is_ortho_impacted(&other, &impacted)
+        );
+    }
+
+    #[test]
+    fn archive_history_rescan_ignores_stale_in_memory_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let cfg = archive_generation_config();
+        let state = StateConfig::custom(temp_dir.path().join("state"));
+        fs::create_dir_all(state.input_dir()).unwrap();
+
+        let mut store =
+            GenerationStore::new_with_config(temp_dir.path().join("merge_work"), 8).unwrap();
+        store.configure(&cfg);
+        let ortho = Ortho::new().add(1)[0].clone();
+        store.record_result(&ortho).unwrap();
+        let _ = store.on_generation_end(&cfg, None).unwrap();
+        store.flush_all().unwrap();
+
+        let stale_paths = store.history_run_paths();
+        let (bucket, old_path) = stale_paths
+            .iter()
+            .find_map(|(bucket, paths)| paths.first().map(|path| (*bucket, path.clone())))
+            .expect("history run should exist");
+        let new_path = old_path.with_file_name("history-999.dat");
+        fs::rename(&old_path, &new_path).unwrap();
+
+        let rescanned = history_run_paths_for_archive(&store).unwrap();
+        assert!(
+            rescanned[bucket].1.contains(&new_path),
+            "rescanned archive paths should reflect the on-disk rename"
+        );
+        assert!(
+            !rescanned[bucket].1.contains(&old_path),
+            "rescanned archive paths should not keep stale in-memory entries"
+        );
+
+        let archive_path = build_archive_path(&state).unwrap();
+        move_history_runs_to_archive(&rescanned, &archive_path).unwrap();
+
+        assert!(
+            archive_path
+                .join("results")
+                .join(format!("history/b={:02}/history-999.dat", bucket))
+                .exists()
+        );
+        assert!(!new_path.exists());
     }
 
     #[test]

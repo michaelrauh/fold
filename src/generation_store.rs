@@ -1647,6 +1647,33 @@ impl GenerationStore {
         Ok(())
     }
 
+    /// Adopt existing history run files into this store without decoding/re-encoding them.
+    /// The source files are moved into this store's history layout.
+    pub fn adopt_history_runs(
+        &mut self,
+        runs_by_bucket: &[(usize, Vec<PathBuf>)],
+        accepted: u64,
+    ) -> io::Result<()> {
+        for (bucket, runs) in runs_by_bucket {
+            assert!(*bucket < self.bucket_count, "Invalid bucket index");
+            let history_dir = self
+                .base_path
+                .join("history")
+                .join(format!("b={:02}", bucket));
+            fs::create_dir_all(&history_dir)?;
+
+            for run_path in runs {
+                let run_id = self.history_runs[*bucket].len();
+                let dest_path = history_dir.join(format!("history-{}.dat", run_id));
+                fs::rename(run_path, &dest_path)?;
+                self.history_runs[*bucket].push(dest_path);
+            }
+        }
+
+        self.seen_len_accepted = self.seen_len_accepted.saturating_add(accepted);
+        Ok(())
+    }
+
     /// Read a run of work items and enqueue them in bounded batches.
     /// Returns the number of orthos enqueued.
     fn enqueue_work_run(&mut self, run: Run, read_buf_bytes: usize) -> io::Result<usize> {
@@ -3312,6 +3339,44 @@ mod tests {
             }
         }
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn adopt_history_runs_preserves_history_visibility_and_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_base = temp_dir.path().join("source");
+        let target_base = temp_dir.path().join("target");
+
+        let cfg = Config::test_config(256 * 1024, 8);
+
+        let mut source = GenerationStore::new_with_config(source_base.clone(), 8).unwrap();
+        source.configure(&cfg);
+        let ortho = Ortho::new().add(1)[0].clone();
+        source.record_result(&ortho).unwrap();
+        let _ = source.on_generation_end(&cfg, None).unwrap();
+        let source_count = source.seen_len_accepted();
+        let source_paths = source.history_run_paths();
+        drop(source);
+
+        let mut target = GenerationStore::new_with_config(target_base.clone(), 8).unwrap();
+        target.configure(&cfg);
+        target
+            .adopt_history_runs(&source_paths, source_count)
+            .unwrap();
+
+        assert_eq!(target.seen_len_accepted(), source_count);
+        assert_eq!(
+            count_history_orthos(&target, cfg.read_buf_bytes),
+            source_count as usize
+        );
+        for (_bucket, paths) in source_paths {
+            for old_path in paths {
+                assert!(
+                    !old_path.exists(),
+                    "adopted run should no longer exist at source path"
+                );
+            }
+        }
     }
 
     #[test]

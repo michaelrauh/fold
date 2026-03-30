@@ -834,7 +834,16 @@ mod tests {
     use super::*;
     use crate::metrics::Metrics;
     use crate::offload_runtime::configure_offload_runtime;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    struct CwdGuard(std::path::PathBuf);
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     #[test]
     fn archive_payload_round_trip_restores_results() {
@@ -871,7 +880,11 @@ mod tests {
 
     #[test]
     fn reclaim_prioritizes_spill_runs_before_other_active_files() {
+        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
+        let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
         let store_root = base.join("in_process").join("job.work");
         let spill_path = store_root.join("spill").join("b=00").join("spill-0.dat");
@@ -919,5 +932,6 @@ mod tests {
             "spill file should be reclaimed before history/run/segment files"
         );
         set_metrics_handle(None);
+        drop(prev_cwd);
     }
 }
