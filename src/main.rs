@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // Helper to convert Role to string
 fn role_as_str(role: Role) -> &'static str {
@@ -71,6 +71,10 @@ impl MergePolicy {
             Self::SmallestSmallest => "smallest_smallest",
         }
     }
+
+    fn leader_prefers_text_first(self) -> bool {
+        matches!(self, Self::SmallestSmallest)
+    }
 }
 
 fn merge_policy_for_role(role: Role) -> MergePolicy {
@@ -79,6 +83,25 @@ fn merge_policy_for_role(role: Role) -> MergePolicy {
         .as_deref()
         .and_then(MergePolicy::parse)
         .unwrap_or_else(|| MergePolicy::default_for_role(role))
+}
+
+fn stage_rate_per_sec(units: u64, elapsed: Duration) -> f64 {
+    let secs = elapsed.as_secs_f64();
+    if secs <= f64::EPSILON {
+        units as f64
+    } else {
+        units as f64 / secs
+    }
+}
+
+fn log_merge_stage(metrics: &Metrics, stage: &str, elapsed: Duration, details: &str) {
+    metrics.add_log(format!(
+        "Merge stage: stage={} elapsed_ms={} elapsed_s={:.3} {}",
+        stage,
+        elapsed.as_millis(),
+        elapsed.as_secs_f64(),
+        details
+    ));
 }
 
 enum RunFailure {
@@ -218,12 +241,45 @@ fn main() -> Result<(), FoldError> {
                 match role {
                     Role::Leader => {
                         let merge_policy = merge_policy_for_role(role);
-                        let archive_pair = file_handler::get_archive_pair_with_config(
-                            &config,
-                            merge_policy.archive_pair_policy(),
-                        )?;
+                        let text_first = merge_policy.leader_prefers_text_first();
+                        let txt_file = if text_first {
+                            file_handler::find_txt_file_with_config(&config)?
+                        } else {
+                            None
+                        };
 
-                        if let Some((archive_a, archive_b)) = archive_pair {
+                        if let Some(txt_file) = txt_file {
+                            metrics.update_global(|g| g.mode = "Processing Text".to_string());
+                            metrics.clear_chart_history();
+                            metrics.add_log("MODE 2: Processing text file".to_string());
+                            metrics.add_log(format!(
+                                "Leader scheduling: preferring text over merge because policy={}",
+                                merge_policy.as_str()
+                            ));
+
+                            match process_txt_file(
+                                txt_file.clone(),
+                                &config,
+                                &metrics,
+                                role,
+                                &should_quit,
+                            ) {
+                                Ok(()) => {}
+                                Err(e) if is_concurrent_claim_error(&e) => {
+                                    metrics.add_log(format!(
+                                        "Lost race to claim {}; retrying selection",
+                                        txt_file
+                                    ));
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        } else if let Some((archive_a, archive_b)) =
+                            file_handler::get_archive_pair_with_config(
+                                &config,
+                                merge_policy.archive_pair_policy(),
+                            )?
+                        {
                             // Mode 1: Merge archives
                             metrics.update_global(|g| g.mode = "Merging Archives".to_string());
                             metrics.clear_chart_history();
@@ -247,7 +303,6 @@ fn main() -> Result<(), FoldError> {
                                 Err(e) => return Err(e),
                             }
                         } else {
-                            // Mode 2: Process txt file
                             let txt_file = file_handler::find_txt_file_with_config(&config)?;
 
                             if txt_file.is_none() {
@@ -837,6 +892,7 @@ fn merge_archives(
     role: Role,
 ) -> Result<(), FoldError> {
     let run_start = Instant::now();
+    let merge_policy = merge_policy_for_role(role);
     let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
     let _offload_guard =
         configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
@@ -958,6 +1014,29 @@ fn merge_archives(
         cfg.fan_in,
         cfg.read_buf_bytes / 1024
     ));
+    let setup_stage_elapsed = run_start.elapsed();
+    log_merge_stage(
+        metrics,
+        "setup",
+        setup_stage_elapsed,
+        &format!(
+            "policy={} archive_a_orthos={} archive_b_orthos={} impacted_a={} impacted_b={} merged_vocab={}",
+            merge_policy.as_str(),
+            orthos_a,
+            orthos_b,
+            if a_is_smaller {
+                impacted_smaller.len()
+            } else {
+                impacted_larger.len()
+            },
+            if a_is_smaller {
+                impacted_larger.len()
+            } else {
+                impacted_smaller.len()
+            },
+            merged_interner.vocabulary().len()
+        ),
+    );
 
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
@@ -1033,6 +1112,7 @@ fn merge_archives(
     // Process larger archive (no remapping needed). Carry forward its history directly and
     // only decode orthos to discover the impacted subset that needs reseeding.
     metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
+    let larger_stage_start = Instant::now();
     let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
     let larger_history_paths = larger_store.history_run_paths();
 
@@ -1087,12 +1167,26 @@ fn merge_archives(
         "Adopted {} larger-archive orthos directly into merged history",
         total_from_larger
     ));
+    log_merge_stage(
+        metrics,
+        "stream_larger",
+        larger_stage_start.elapsed(),
+        &format!(
+            "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
+            larger_name,
+            total_from_larger,
+            impacted_from_larger,
+            impacted_from_larger,
+            stage_rate_per_sec(total_from_larger as u64, larger_stage_start.elapsed())
+        ),
+    );
 
     // Process smaller archive (needs remapping) - stream and remap into GenerationStore
     metrics.set_operation_status(format!(
         "Streaming & Remapping Smaller Archive {}",
         smaller_name
     ));
+    let smaller_stage_start = Instant::now();
 
     let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
 
@@ -1157,6 +1251,19 @@ fn merge_archives(
         "Loaded & remapped {} orthos from smaller archive {} ({} impacted)",
         total_from_smaller, smaller_name, impacted_from_smaller
     ));
+    log_merge_stage(
+        metrics,
+        "stream_smaller_remap",
+        smaller_stage_start.elapsed(),
+        &format!(
+            "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
+            smaller_name,
+            total_from_smaller,
+            impacted_from_smaller,
+            impacted_from_smaller,
+            stage_rate_per_sec(total_from_smaller as u64, smaller_stage_start.elapsed())
+        ),
+    );
 
     // Update metrics with impacted counts from both archives
     if a_is_smaller {
@@ -1192,7 +1299,7 @@ fn merge_archives(
     metrics.add_log(format!(
         "Merge scheduling: threads={}, policy={}",
         merge_threads,
-        merge_policy_for_role(role).as_str()
+        merge_policy.as_str()
     ));
 
     let mut housekeeping = || -> Result<(), FoldError> {
@@ -1292,6 +1399,7 @@ fn merge_archives(
         }) as fold::generation_store::ProgressCallback)
     };
 
+    let generation_stage_start = Instant::now();
     let run_result = run_merge_generation_loop(
         &merged_interner,
         &mut store,
@@ -1302,6 +1410,7 @@ fn merge_archives(
         merge_threads,
         Some(config),
     )?;
+    let generation_stage_elapsed = generation_stage_start.elapsed();
 
     best_ortho = run_result.best_ortho;
     best_score = run_result.best_score;
@@ -1313,8 +1422,23 @@ fn merge_archives(
         run_result.generation_stats.len(),
         store.seen_len_accepted()
     ));
+    log_merge_stage(
+        metrics,
+        "generation_loop",
+        generation_stage_elapsed,
+        &format!(
+            "generations={} accepted={} work_remaining={} best_volume={} rate_accepted_per_s={:.1}",
+            run_result.generation_stats.len(),
+            store.seen_len_accepted(),
+            store.work_len(),
+            best_score.volume,
+            stage_rate_per_sec(store.seen_len_accepted(), generation_stage_elapsed)
+        ),
+    );
 
+    let mut prune_stage_elapsed = Duration::ZERO;
     if optimal_dirty {
+        let prune_stage_start = Instant::now();
         let score = best_score;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1349,6 +1473,20 @@ fn merge_archives(
             "Pruning compaction kept {} orthos, pruned {}",
             kept, pruned
         ));
+        prune_stage_elapsed = prune_stage_start.elapsed();
+        log_merge_stage(
+            metrics,
+            "prune_history",
+            prune_stage_elapsed,
+            &format!("kept={} pruned={}", kept, pruned),
+        );
+    } else {
+        log_merge_stage(
+            metrics,
+            "prune_history",
+            prune_stage_elapsed,
+            "skipped=true reason=best_unchanged",
+        );
     }
 
     let total_orthos = compacted_counts
@@ -1359,6 +1497,7 @@ fn merge_archives(
 
     print_optimal(&best_ortho, &merged_interner);
 
+    let archive_stage_start = Instant::now();
     store.flush_all()?;
 
     let archive_path = build_archive_path(config)?;
@@ -1370,6 +1509,7 @@ fn merge_archives(
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
 
     let history_runs = history_run_paths_for_archive(&store)?;
+    let history_run_count: usize = history_runs.iter().map(|(_, runs)| runs.len()).sum();
     move_history_runs_to_archive(&history_runs, &archive_path)?;
     write_archive_artifacts(
         &archive_path,
@@ -1380,6 +1520,29 @@ fn merge_archives(
         &text_preview,
         word_count,
     )?;
+    let archive_stage_elapsed = archive_stage_start.elapsed();
+    log_merge_stage(
+        metrics,
+        "archive_finalize",
+        archive_stage_elapsed,
+        &format!(
+            "history_runs={} total_orthos={} archive_path={}",
+            history_run_count,
+            total_orthos,
+            archive_path.display()
+        ),
+    );
+    metrics.add_log(format!(
+        "Merge timing summary: policy={} setup_ms={} larger_ms={} smaller_ms={} generation_ms={} prune_ms={} archive_ms={} total_ms={}",
+        merge_policy.as_str(),
+        setup_stage_elapsed.as_millis(),
+        larger_stage_start.elapsed().as_millis(),
+        smaller_stage_start.elapsed().as_millis(),
+        generation_stage_elapsed.as_millis(),
+        prune_stage_elapsed.as_millis(),
+        archive_stage_elapsed.as_millis(),
+        run_start.elapsed().as_millis()
+    ));
 
     metrics.add_log(format!("Merged archive saved: {}", archive_path.display()));
 
@@ -2275,6 +2438,13 @@ mod tests {
     }
 
     #[test]
+    fn smallest_smallest_policy_makes_leader_text_first() {
+        assert!(!MergePolicy::LargestLargest.leader_prefers_text_first());
+        assert!(!MergePolicy::LargestSmallest.leader_prefers_text_first());
+        assert!(MergePolicy::SmallestSmallest.leader_prefers_text_first());
+    }
+
+    #[test]
     fn impacted_hash_lookup_matches_legacy_logic() {
         let interner = Interner::from_text("foo bar baz");
         let foo = PayloadVal::try_from(
@@ -2401,6 +2571,46 @@ mod tests {
                 single_thread.2, multi_thread.2,
                 "archive contents should match"
             );
+        });
+    }
+
+    #[test]
+    fn merge_emits_stage_timing_logs() {
+        with_test_memory_overrides(|| {
+            let temp = TempDir::new().unwrap();
+            let config = StateConfig::custom(temp.path().to_path_buf());
+            file_handler::initialize_with_config(&config).unwrap();
+            let (archive_a_path, archive_b_path) = build_test_merge_archives(&config);
+            let metrics = Metrics::new();
+
+            merge_archives(
+                &archive_a_path,
+                &archive_b_path,
+                &config,
+                &metrics,
+                Role::Leader,
+            )
+            .unwrap();
+
+            let snapshot = metrics.snapshot();
+            let messages: Vec<&str> = snapshot
+                .logs
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect();
+            for stage in [
+                "Merge stage: stage=setup",
+                "Merge stage: stage=stream_larger",
+                "Merge stage: stage=stream_smaller_remap",
+                "Merge stage: stage=generation_loop",
+                "Merge stage: stage=archive_finalize",
+                "Merge timing summary:",
+            ] {
+                assert!(
+                    messages.iter().any(|message| message.contains(stage)),
+                    "expected timing log containing {stage}"
+                );
+            }
         });
     }
 
