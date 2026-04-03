@@ -73,18 +73,18 @@ fn maybe_run_processing_reclaim_safe_point(
     reason: &str,
 ) -> Result<bool, FoldError> {
     let reservation = store.processing_reclaim_reservation_bytes();
-    let Some(target_free) = disk_safety::reclaim_required(reservation)? else {
+    let Some(targets) = disk_safety::reclaim_required(reservation)? else {
         return Ok(false);
     };
     metrics.add_log(format!(
-        "Reclaim pending at safe point: reason={}, reservation_bytes={}, target_free={}",
-        reason, reservation, target_free
+        "Reclaim pending at safe point: reason={}, reservation_bytes={}, write_target={}, reclaim_target={}",
+        reason, reservation, targets.write_target, targets.reclaim_target
     ));
     store.prepare_for_reclaim()?;
-    disk_safety::run_reclaim_to_target(target_free, reason)?;
+    disk_safety::run_reclaim_to_target(targets, reason)?;
     metrics.add_log(format!(
-        "Reclaim complete at safe point: reason={}, reservation_bytes={}, target_free={}",
-        reason, reservation, target_free
+        "Reclaim complete at safe point: reason={}, reservation_bytes={}, write_target={}, reclaim_target={}",
+        reason, reservation, targets.write_target, targets.reclaim_target
     ));
     Ok(true)
 }
@@ -195,6 +195,15 @@ pub struct GenerationRunResult {
     pub generation_stats: Vec<GenerationStat>,
     pub total_processed: u64,
     pub optimal_dirty: bool,
+}
+
+pub struct MergeGenerationStepResult {
+    pub best_ortho: Ortho,
+    pub best_score: OrthoScore,
+    pub generation_stat: GenerationStat,
+    pub processed: u64,
+    pub optimal_dirty: bool,
+    pub quiesced: bool,
 }
 
 /// Run the core generation loop over the provided store/interner.
@@ -755,7 +764,61 @@ where
 {
     let mut best_ortho = Ortho::new();
     let mut best_score = best_ortho.score();
-    let mut global_score = metrics.optimal_score();
+    let mut generation_stats: Vec<GenerationStat> = Vec::new();
+    let mut total_processed = 0u64;
+    let mut optimal_dirty = false;
+
+    let mut generation = 0u64;
+    while store.work_len() > 0 {
+        let step = run_single_merge_generation(
+            interner,
+            store,
+            cfg,
+            metrics,
+            &mut housekeeping,
+            progress_cb_factory(generation),
+            merge_threads,
+            state_config,
+            generation,
+            best_ortho,
+            best_score,
+        )?;
+        best_ortho = step.best_ortho;
+        best_score = step.best_score;
+        total_processed = total_processed.saturating_add(step.processed);
+        optimal_dirty |= step.optimal_dirty;
+        generation_stats.push(step.generation_stat);
+        generation = generation.saturating_add(1);
+        if step.quiesced {
+            break;
+        }
+    }
+
+    Ok(GenerationRunResult {
+        best_ortho,
+        best_score,
+        generation_stats,
+        total_processed,
+        optimal_dirty,
+    })
+}
+
+pub fn run_single_merge_generation<FHousekeeping>(
+    interner: &Interner,
+    store: &mut GenerationStore,
+    cfg: &Config,
+    metrics: &Metrics,
+    housekeeping: &mut FHousekeeping,
+    progress_callback: Option<ProgressCallback>,
+    merge_threads: usize,
+    state_config: Option<&StateConfig>,
+    generation: u64,
+    mut best_ortho: Ortho,
+    mut best_score: OrthoScore,
+) -> Result<MergeGenerationStepResult, FoldError>
+where
+    FHousekeeping: FnMut() -> Result<(), FoldError>,
+{
     let mut optimal_dirty = false;
     let mut total_processed = 0u64;
 
@@ -773,11 +836,47 @@ where
             .canonicalize()
             .unwrap_or_else(|_| cfg.base_dir.clone())
     });
-    let mut generation = 0u64;
-    let mut generation_stats: Vec<GenerationStat> = Vec::new();
 
     metrics.set_operation_status("Processing merge generations".to_string());
     metrics.record_work_len(store.work_len() as usize);
+    metrics.record_landing_buffer_count(store.total_landing_size());
+    update_bucket_metrics(metrics, store);
+
+    let mut last_report_time = Instant::now();
+    let mut last_report_count = 0u64;
+    let mut last_housekeeping = Instant::now();
+    let work_len = store.work_len();
+    if work_len == 0 {
+        return Ok(MergeGenerationStepResult {
+            best_ortho,
+            best_score,
+            generation_stat: GenerationStat {
+                generation,
+                processing_secs: 0.0,
+                transition_secs: 0.0,
+                accepted: 0,
+                new_work: 0,
+            },
+            processed: 0,
+            optimal_dirty: false,
+            quiesced: true,
+        });
+    }
+
+    metrics.update_global(|g| {
+        g.generation = generation;
+        g.phase = format!("Merge Gen {} Processing", generation);
+        g.work_len = work_len;
+        g.seen_len_accepted = store.seen_len_accepted();
+        g.run_budget_bytes = cfg.run_budget_bytes;
+        g.fan_in = cfg.fan_in;
+    });
+    metrics.update_operation(|op| {
+        op.progress_total = work_len as usize;
+        op.progress_current = 0;
+    });
+    metrics.set_operation_status(format!("Processing Merge Gen {}", generation));
+    metrics.record_work_len(work_len as usize);
     metrics.record_landing_buffer_count(store.total_landing_size());
     update_bucket_metrics(metrics, store);
 
@@ -791,295 +890,245 @@ where
         }
     }
 
-    let mut last_report_time = Instant::now();
-    let mut last_report_count = 0u64;
-    let mut last_housekeeping = Instant::now();
+    metrics.add_log(format!(
+        "Merge Generation {}: processing {} work items",
+        generation, work_len
+    ));
 
-    loop {
-        let work_len = store.work_len();
-        if work_len == 0 {
-            break;
-        }
+    metrics.reset_prune_counts();
+    let mut gen_processed = 0u64;
+    let mut hot_deltas = OperationDeltas::default();
+    let mut completion_ctx = CompletionContext::default();
+    let mut completion_bits = FixedBitSet::with_capacity(interner.vocab_size());
+    completion_bits.grow(interner.vocab_size());
+    let mut completion_batches = Vec::new();
+    let mut completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
 
-        metrics.update_global(|g| {
-            g.generation = generation;
-            g.phase = format!("Merge Gen {} Processing", generation);
-            g.work_len = work_len;
-            g.seen_len_accepted = store.seen_len_accepted();
-            g.run_budget_bytes = cfg.run_budget_bytes;
-            g.fan_in = cfg.fan_in;
-        });
-        metrics.update_operation(|op| {
-            op.progress_total = work_len as usize;
-            op.progress_current = 0;
-        });
-        metrics.set_operation_status(format!("Processing Merge Gen {}", generation));
-        metrics.record_work_len(work_len as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
-        update_bucket_metrics(metrics, store);
+    let gen_start = Instant::now();
+    let accepted_before = store.seen_len_accepted();
 
-        if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
-            let cache_score = cache_ortho.score();
-            if cache_score > best_score {
-                best_ortho = cache_ortho;
-                best_score = cache_score;
-                optimal_dirty = true;
-                update_optimal_metrics(metrics, interner, &best_ortho);
+    while let Some(ortho) = store.pop_work()? {
+        gen_processed += 1;
+        total_processed += 1;
+
+        if last_housekeeping.elapsed().as_millis() >= 1000 {
+            flush_operation_deltas(metrics, &mut hot_deltas);
+            metrics.update_operation(|op| {
+                op.progress_current = gen_processed as usize;
+            });
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_report_time).as_secs_f64();
+            let processed_since_last = total_processed - last_report_count;
+            let throughput = if elapsed > 0.0 {
+                (processed_since_last as f64 / elapsed) as usize
+            } else {
+                0
+            };
+            if elapsed >= 1.0 {
+                metrics.update_global(|g| {
+                    g.phase = format!("Merge Gen {} Processing ({}/s)", generation, throughput);
+                });
+                last_report_time = now;
+                last_report_count = total_processed;
             }
-        }
+            last_housekeeping = now;
 
-        metrics.add_log(format!(
-            "Merge Generation {}: processing {} work items",
-            generation, work_len
-        ));
+            metrics.record_optimal_volume(best_ortho.volume());
+            metrics.update_global(|g| {
+                g.work_len = store.work_len();
+                g.seen_len_accepted = store.seen_len_accepted();
+            });
+            metrics.record_work_len(store.work_len() as usize);
+            metrics.record_landing_buffer_count(store.total_landing_size());
+            update_bucket_metrics(metrics, store);
 
-        metrics.reset_prune_counts();
-        let mut gen_processed = 0u64;
-        let mut hot_deltas = OperationDeltas::default();
-        let mut completion_ctx = CompletionContext::default();
-        let mut completion_bits = FixedBitSet::with_capacity(interner.vocab_size());
-        completion_bits.grow(interner.vocab_size());
-        let mut completion_batches = Vec::new();
-        let mut completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
+            if optimal_dirty {
+                update_optimal_metrics(metrics, interner, &best_ortho);
+                optimal_dirty = false;
+            }
 
-        let gen_start = Instant::now();
-        let accepted_before = store.seen_len_accepted();
+            sys.refresh_memory();
+            let (used_bytes, total_bytes) =
+                normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
+            let proc_rss_bytes = memory_safety::current_process_rss_bytes();
+            let percent = if total_bytes > 0 {
+                ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
+            } else {
+                0
+            };
+            let jobs_count = if let Some(cfg) = state_config {
+                crate::file_handler::count_running_jobs_with_config(cfg).unwrap_or(0)
+            } else {
+                0
+            };
+            metrics.update_global(|g| {
+                g.ram_bytes = used_bytes;
+                g.process_rss_bytes = proc_rss_bytes;
+                g.system_memory_percent = percent;
+                g.distinct_jobs_count = jobs_count;
+            });
 
-        while let Some(ortho) = store.pop_work()? {
-            gen_processed += 1;
-            total_processed += 1;
-
-            if last_housekeeping.elapsed().as_millis() >= 1000 {
-                flush_operation_deltas(metrics, &mut hot_deltas);
-                metrics.update_operation(|op| {
-                    op.progress_current = gen_processed as usize;
-                });
-
-                let now = Instant::now();
-                let elapsed = now.duration_since(last_report_time).as_secs_f64();
-                let processed_since_last = total_processed - last_report_count;
-                let throughput = if elapsed > 0.0 {
-                    (processed_since_last as f64 / elapsed) as usize
-                } else {
-                    0
-                };
-                if elapsed >= 1.0 {
-                    metrics.update_global(|g| {
-                        g.phase = format!("Merge Gen {} Processing ({}/s)", generation, throughput);
-                    });
-                    last_report_time = now;
-                    last_report_count = total_processed;
-                }
-                last_housekeeping = now;
-
-                metrics.record_optimal_volume(best_ortho.volume());
-                metrics.update_global(|g| {
-                    g.work_len = store.work_len();
-                    g.seen_len_accepted = store.seen_len_accepted();
-                });
-                metrics.record_work_len(store.work_len() as usize);
-                metrics.record_landing_buffer_count(store.total_landing_size());
-                update_bucket_metrics(metrics, store);
-
-                if optimal_dirty {
-                    update_optimal_metrics(metrics, interner, &best_ortho);
-                    optimal_dirty = false;
-                }
-
-                sys.refresh_memory();
-                let (used_bytes, total_bytes) =
-                    normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-                let proc_rss_bytes = memory_safety::current_process_rss_bytes();
-                let percent = if total_bytes > 0 {
-                    ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
-                } else {
-                    0
-                };
-                let jobs_count = if let Some(cfg) = state_config {
-                    crate::file_handler::count_running_jobs_with_config(cfg).unwrap_or(0)
-                } else {
-                    0
-                };
-                metrics.update_global(|g| {
-                    g.ram_bytes = used_bytes;
-                    g.process_rss_bytes = proc_rss_bytes;
-                    g.system_memory_percent = percent;
-                    g.distinct_jobs_count = jobs_count;
-                });
-
-                if let Some(base_dir) = &disk_base {
-                    disks.refresh_list();
-                    disks.refresh();
-                    let mut best: Option<(u64, u64, usize)> = None;
-                    for disk in disks.iter() {
-                        let mount = disk.mount_point();
-                        if base_dir.starts_with(mount) {
-                            let score = mount.as_os_str().to_string_lossy().len();
-                            if best.map_or(true, |(_, _, best_len)| score > best_len) {
-                                best = Some((disk.total_space(), disk.available_space(), score));
-                            }
+            if let Some(base_dir) = &disk_base {
+                disks.refresh_list();
+                disks.refresh();
+                let mut best: Option<(u64, u64, usize)> = None;
+                for disk in disks.iter() {
+                    let mount = disk.mount_point();
+                    if base_dir.starts_with(mount) {
+                        let score = mount.as_os_str().to_string_lossy().len();
+                        if best.map_or(true, |(_, _, best_len)| score > best_len) {
+                            best = Some((disk.total_space(), disk.available_space(), score));
                         }
                     }
-                    if let Some((total, available, _)) = best {
-                        metrics.set_disk_usage(total, available);
-                    }
                 }
-
-                let comp = store.compression_stats();
-                metrics.set_compression_bytes(comp.uncompressed_bytes, comp.compressed_bytes);
-
-                housekeeping()?;
-            }
-
-            if total_processed % 50_000 == 0 {
-                metrics.add_log(format!(
-                    "Merge progress: {} orthos processed",
-                    total_processed
-                ));
-            }
-
-            if total_processed % 100_000 == 0 {
-                housekeeping()?;
-            }
-
-            completion_ctx.reset(&ortho);
-            interner.intersect_into(
-                completion_ctx.required_usize(),
-                completion_ctx.forbidden_usize(),
-                &mut completion_bits,
-            );
-
-            let total_completions = completion_bits.count_ones(..);
-            if total_completions > FANOUT_LOG_THRESHOLD {
-                let chunks =
-                    (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
-                metrics.add_log(format!(
-                    "Fanout: {} completions; {} chunks",
-                    total_completions, chunks
-                ));
-            }
-
-            completion_batches.clear();
-            completion_chunk.clear();
-            for completion in completion_bits.ones() {
-                completion_chunk.push(completion);
-                if completion_chunk.len() == COMPLETION_CHUNK_SIZE {
-                    completion_batches.push(std::mem::take(&mut completion_chunk));
-                    completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
+                if let Some((total, available, _)) = best {
+                    metrics.set_disk_usage(total, available);
                 }
             }
-            if !completion_chunk.is_empty() {
+
+            let comp = store.compression_stats();
+            metrics.set_compression_bytes(comp.uncompressed_bytes, comp.compressed_bytes);
+
+            housekeeping()?;
+        }
+
+        if total_processed % 50_000 == 0 {
+            metrics.add_log(format!(
+                "Merge progress: {} orthos processed",
+                total_processed
+            ));
+        }
+
+        if total_processed % 100_000 == 0 {
+            housekeeping()?;
+        }
+
+        completion_ctx.reset(&ortho);
+        interner.intersect_into(
+            completion_ctx.required_usize(),
+            completion_ctx.forbidden_usize(),
+            &mut completion_bits,
+        );
+
+        let total_completions = completion_bits.count_ones(..);
+        if total_completions > FANOUT_LOG_THRESHOLD {
+            let chunks = (total_completions + COMPLETION_CHUNK_SIZE - 1) / COMPLETION_CHUNK_SIZE;
+            metrics.add_log(format!(
+                "Fanout: {} completions; {} chunks",
+                total_completions, chunks
+            ));
+        }
+
+        completion_batches.clear();
+        completion_chunk.clear();
+        for completion in completion_bits.ones() {
+            completion_chunk.push(completion);
+            if completion_chunk.len() == COMPLETION_CHUNK_SIZE {
                 completion_batches.push(std::mem::take(&mut completion_chunk));
                 completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
             }
-
-            let child_batches =
-                materialize_child_batches(&ortho, &completion_batches, thread_pool.as_ref());
-
-            for (batch, expanded_children) in
-                completion_batches.iter().zip(child_batches.into_iter())
-            {
-                for (&completion, children) in batch.iter().zip(expanded_children.into_iter()) {
-                    if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
-                        hot_deltas.pruned_completions =
-                            hot_deltas.pruned_completions.saturating_add(1);
-                        if completion_ctx.is_root() {
-                            hot_deltas.pruned_root_span =
-                                hot_deltas.pruned_root_span.saturating_add(1);
-                        } else {
-                            hot_deltas.pruned_bound = hot_deltas.pruned_bound.saturating_add(1);
-                        }
-                        continue;
-                    }
-
-                    hot_deltas.expanded_completions =
-                        hot_deltas.expanded_completions.saturating_add(1);
-                    for (child, candidate_score) in children {
-                        if candidate_score > best_score {
-                            best_ortho = child.clone();
-                            best_score = candidate_score;
-                            optimal_dirty = true;
-                        }
-                        if candidate_score > global_score {
-                            global_score = candidate_score;
-                            optimal_dirty = true;
-                        }
-                        store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
-                        hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
-                    }
-                }
-                flush_operation_deltas(metrics, &mut hot_deltas);
-            }
+        }
+        if !completion_chunk.is_empty() {
+            completion_batches.push(std::mem::take(&mut completion_chunk));
+            completion_chunk = Vec::with_capacity(COMPLETION_CHUNK_SIZE);
         }
 
-        flush_operation_deltas(metrics, &mut hot_deltas);
+        let child_batches =
+            materialize_child_batches(&ortho, &completion_batches, thread_pool.as_ref());
 
-        metrics.add_log(format!(
-            "Merge Generation {}: processed {} orthos",
-            generation, gen_processed
-        ));
+        for (batch, expanded_children) in completion_batches.iter().zip(child_batches.into_iter()) {
+            for (&completion, children) in batch.iter().zip(expanded_children.into_iter()) {
+                if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
+                    hot_deltas.pruned_completions = hot_deltas.pruned_completions.saturating_add(1);
+                    if completion_ctx.is_root() {
+                        hot_deltas.pruned_root_span = hot_deltas.pruned_root_span.saturating_add(1);
+                    } else {
+                        hot_deltas.pruned_bound = hot_deltas.pruned_bound.saturating_add(1);
+                    }
+                    continue;
+                }
 
-        metrics.update_global(|g| {
-            g.phase = format!(
-                "Merge Gen {} → {} transition starting",
-                generation,
-                generation + 1
-            );
-        });
-        metrics.set_operation_status(format!(
-            "Merge Gen {} → {} transition",
+                hot_deltas.expanded_completions = hot_deltas.expanded_completions.saturating_add(1);
+                for (child, candidate_score) in children {
+                    if candidate_score > best_score {
+                        best_ortho = child.clone();
+                        best_score = candidate_score;
+                        optimal_dirty = true;
+                    }
+                    store.record_result_with_threshold(&child, cfg.landing_flush_threshold)?;
+                    hot_deltas.new_orthos = hot_deltas.new_orthos.saturating_add(1);
+                }
+            }
+            flush_operation_deltas(metrics, &mut hot_deltas);
+        }
+    }
+
+    flush_operation_deltas(metrics, &mut hot_deltas);
+
+    metrics.add_log(format!(
+        "Merge Generation {}: processed {} orthos",
+        generation, gen_processed
+    ));
+
+    metrics.update_global(|g| {
+        g.phase = format!(
+            "Merge Gen {} → {} transition starting",
             generation,
             generation + 1
-        ));
+        );
+    });
+    metrics.set_operation_status(format!(
+        "Merge Gen {} → {} transition",
+        generation,
+        generation + 1
+    ));
 
-        let processing_secs = gen_start.elapsed().as_secs_f64();
-        let transition_start = Instant::now();
-        let progress_callback = progress_cb_factory(generation);
-        let new_work = store.on_generation_end(cfg, progress_callback.as_ref())?;
-        let transition_secs = transition_start.elapsed().as_secs_f64();
-        let accepted_delta = store.seen_len_accepted().saturating_sub(accepted_before);
-        generation_stats.push(GenerationStat {
-            generation,
-            processing_secs,
-            transition_secs,
-            accepted: accepted_delta,
-            new_work,
-        });
+    let processing_secs = gen_start.elapsed().as_secs_f64();
+    let transition_start = Instant::now();
+    let new_work = store.on_generation_end(cfg, progress_callback.as_ref())?;
+    let transition_secs = transition_start.elapsed().as_secs_f64();
+    let accepted_delta = store.seen_len_accepted().saturating_sub(accepted_before);
+    let generation_stat = GenerationStat {
+        generation,
+        processing_secs,
+        transition_secs,
+        accepted: accepted_delta,
+        new_work,
+    };
 
-        metrics.update_global(|g| {
-            g.work_len = store.work_len();
-            g.seen_len_accepted = store.seen_len_accepted();
-            g.phase = format!("Merge Gen {} complete", generation);
-        });
-        metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
+    metrics.update_global(|g| {
+        g.work_len = store.work_len();
+        g.seen_len_accepted = store.seen_len_accepted();
+        g.phase = format!("Merge Gen {} complete", generation);
+    });
+    metrics.record_work_len(store.work_len() as usize);
+    metrics.record_landing_buffer_count(store.total_landing_size());
 
-        metrics.add_log(format!(
-            "Merge Generation {} complete: {} new work, {} total seen",
-            generation,
-            new_work,
-            store.seen_len_accepted()
-        ));
-        let (pruned, expanded, pruned_root_span, pruned_bound) = metrics.take_prune_counts();
-        metrics.record_prune_sample(generation, pruned, expanded, pruned_root_span, pruned_bound);
+    metrics.add_log(format!(
+        "Merge Generation {} complete: {} new work, {} total seen",
+        generation,
+        new_work,
+        store.seen_len_accepted()
+    ));
+    let (pruned, expanded, pruned_root_span, pruned_bound) = metrics.take_prune_counts();
+    metrics.record_prune_sample(generation, pruned, expanded, pruned_root_span, pruned_bound);
 
-        generation += 1;
-        if new_work == 0 {
-            metrics.add_log("No new work after transition; stopping merge generations".to_string());
-            break;
-        }
+    if new_work == 0 {
+        metrics.add_log("No new work after transition; stopping merge generations".to_string());
     }
 
     if optimal_dirty {
         update_optimal_metrics(metrics, interner, &best_ortho);
     }
 
-    Ok(GenerationRunResult {
+    Ok(MergeGenerationStepResult {
         best_ortho,
         best_score,
-        generation_stats,
-        total_processed,
+        generation_stat,
+        processed: total_processed,
         optimal_dirty,
+        quiesced: new_work == 0,
     })
 }
 

@@ -2,6 +2,12 @@ use std::collections::BTreeSet;
 
 pub struct Splitter;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentenceUnit {
+    pub raw: String,
+    pub words: Vec<String>,
+}
+
 impl Splitter {
     pub fn new() -> Self {
         Splitter
@@ -9,8 +15,8 @@ impl Splitter {
 
     pub fn vocabulary(&self, text: &str) -> Vec<String> {
         let mut vocab_set = BTreeSet::new();
-        for sentence in self.split_into_sentences(text) {
-            for word in self.clean_sentence(&sentence) {
+        for sentence in self.sentence_units(text) {
+            for word in sentence.words {
                 vocab_set.insert(word);
             }
         }
@@ -18,9 +24,9 @@ impl Splitter {
     }
 
     pub fn phrases(&self, text: &str) -> Vec<Vec<String>> {
-        self.split_into_sentences(text)
+        self.sentence_units(text)
             .into_iter()
-            .map(|sentence| self.clean_sentence(&sentence))
+            .map(|sentence| sentence.words)
             .filter(|words| words.len() >= 2)
             .flat_map(|words| self.generate_substrings(&words))
             .collect::<BTreeSet<_>>()
@@ -28,7 +34,7 @@ impl Splitter {
             .collect()
     }
 
-    fn split_into_sentences(&self, text: &str) -> Vec<String> {
+    pub fn split_into_sentences(&self, text: &str) -> Vec<String> {
         text.split("\n\n")
             .flat_map(|paragraph| {
                 paragraph
@@ -39,7 +45,7 @@ impl Splitter {
             .collect()
     }
 
-    fn clean_sentence(&self, sentence: &str) -> Vec<String> {
+    pub fn clean_sentence(&self, sentence: &str) -> Vec<String> {
         sentence
             .chars()
             .map(|c| self.filter_char(c))
@@ -47,6 +53,16 @@ impl Splitter {
             .split_whitespace()
             .map(|word| word.to_lowercase())
             .filter(|word| !word.is_empty())
+            .collect()
+    }
+
+    pub fn sentence_units(&self, text: &str) -> Vec<SentenceUnit> {
+        self.split_into_sentences(text)
+            .into_iter()
+            .map(|raw| SentenceUnit {
+                words: self.clean_sentence(&raw),
+                raw,
+            })
             .collect()
     }
 
@@ -156,6 +172,34 @@ mod tests {
             vec!["hello".to_string(), "world".to_string()],
         ];
         assert_eq!(phrases, expected);
+    }
+
+    #[test]
+    fn sentence_units_preserve_sentence_boundaries_and_clean_words() {
+        let splitter = Splitter::new();
+        let units = splitter.sentence_units("hello world. Foo, bar!\n\nBaz qux");
+
+        assert_eq!(
+            units,
+            vec![
+                SentenceUnit {
+                    raw: "hello world".to_string(),
+                    words: vec!["hello".to_string(), "world".to_string()],
+                },
+                SentenceUnit {
+                    raw: "Foo".to_string(),
+                    words: vec!["foo".to_string()],
+                },
+                SentenceUnit {
+                    raw: "bar".to_string(),
+                    words: vec!["bar".to_string()],
+                },
+                SentenceUnit {
+                    raw: "Baz qux".to_string(),
+                    words: vec!["baz".to_string(), "qux".to_string()],
+                },
+            ]
+        );
     }
 
     #[test]

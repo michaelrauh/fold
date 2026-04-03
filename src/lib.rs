@@ -7,6 +7,7 @@ pub mod generation_store;
 pub mod interner;
 pub mod memory_budget;
 pub mod memory_safety;
+pub mod merge_resume;
 pub mod metrics;
 pub mod offload_cache;
 pub mod offload_config;
@@ -15,6 +16,7 @@ pub mod offloader;
 pub mod ortho;
 pub mod spatial;
 pub mod splitter;
+pub mod stage_planner;
 pub mod tui;
 
 pub use error::*;

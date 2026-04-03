@@ -19,7 +19,7 @@ APP_BIN="$SCRIPT_DIR/target/release/fold"
 CARGO_ENV="$HOME/.cargo/env"
 FOLD_OFFLOAD_ENABLED="${FOLD_OFFLOAD_ENABLED:-}"
 FOLD_FORCE_ROLE="${FOLD_FORCE_ROLE:-leader}"
-FOLD_MERGE_POLICY="${FOLD_MERGE_POLICY:-largest_smallest}"
+FOLD_MERGE_POLICY="${FOLD_MERGE_POLICY:-adjacent_balanced}"
 
 # Default to debuginfo + frame pointers for better perf attribution; allow override via env.
 RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2}"
@@ -41,7 +41,7 @@ if [ ! -f "$SCRIPT_DIR/e.txt" ]; then
 fi
 
 echo "Building release binary with DWARF + frame pointers for perf..."
-cargo build --release
+cargo build --release --bins
 if [ ! -x "$APP_BIN" ]; then
   echo "Binary $APP_BIN not found after build" >&2
   exit 1

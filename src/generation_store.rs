@@ -542,6 +542,35 @@ impl OrthoStreamReader {
     }
 }
 
+fn count_ortho_records_in_file(
+    path: &Path,
+    read_buf_bytes: usize,
+    compressed: bool,
+) -> io::Result<usize> {
+    let file = File::open(path)?;
+    let reader = BufReader::with_capacity(read_buf_bytes, file);
+    let boxed_reader: Box<dyn Read> = if compressed {
+        Box::new(
+            ZstdDecoder::new(reader)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        )
+    } else {
+        Box::new(reader)
+    };
+    let mut iter = OrthoRunIterator {
+        reader: boxed_reader,
+        buffer: Vec::with_capacity(read_buf_bytes),
+        offset: 0,
+        read_buf_bytes,
+    };
+    let mut count = 0usize;
+    while let Some(result) = iter.next() {
+        result?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
 impl Iterator for OrthoStreamReader {
     type Item = io::Result<StreamedOrtho>;
 
@@ -919,6 +948,8 @@ impl GenerationStore {
         let mut store = Self::new_with_config(base_path, bucket_count)?;
         store.load_history_runs_from_disk()?;
         store.load_spill_runs_from_disk()?;
+        store.load_work_segments_from_disk()?;
+        store.load_landing_state_from_disk()?;
         Ok(store)
     }
 
@@ -1061,6 +1092,105 @@ impl GenerationStore {
                 .iter()
                 .map(|(path, size_bytes)| TrackedSpillRun::new(path.clone(), *size_bytes))
                 .collect();
+        }
+
+        Ok(())
+    }
+
+    fn load_work_segments_from_disk(&mut self) -> io::Result<()> {
+        self.work_segments.clear();
+        self.total_work_len = 0;
+        self.work_segment_counter = 0;
+
+        let work_dir = self.base_path.join("work");
+        if !work_dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries: Vec<(usize, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(&work_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let Some(segment_id) = file_name
+                .strip_prefix("segment-")
+                .and_then(|rest| rest.strip_suffix(".dat"))
+                .and_then(|rest| rest.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            entries.push((segment_id, path));
+        }
+
+        entries.sort_by_key(|(segment_id, _)| *segment_id);
+        for (segment_id, path) in entries {
+            let resolved_path = resolve_managed_path(&path)?;
+            let mut file = File::open(&resolved_path)?;
+            let mut count_bytes = [0u8; 8];
+            if file.read_exact(&mut count_bytes).is_err() {
+                continue;
+            }
+            let count = u64::from_le_bytes(count_bytes);
+            self.total_work_len = self.total_work_len.saturating_add(count);
+            self.work_segment_counter = self.work_segment_counter.max(segment_id.saturating_add(1));
+            self.work_segments.push_back(path);
+        }
+
+        Ok(())
+    }
+
+    fn load_landing_state_from_disk(&mut self) -> io::Result<()> {
+        self.landing_counts = vec![0; self.bucket_count];
+        self.landing_buffer_sizes = vec![0; self.bucket_count];
+        self.drain_counter = vec![0; self.bucket_count];
+
+        for bucket in 0..self.bucket_count {
+            let landing_dir = self
+                .base_path
+                .join("landing")
+                .join(format!("b={:02}", bucket));
+            if !landing_dir.exists() {
+                continue;
+            }
+
+            let mut next_drain_id = 0usize;
+            let mut total_count = 0usize;
+
+            let mut entries: Vec<PathBuf> = fs::read_dir(&landing_dir)?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.is_file())
+                .collect();
+            entries.sort();
+
+            for path in entries {
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if let Some(drain_id) = file_name
+                    .strip_prefix("drain-")
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                    .and_then(|rest| rest.parse::<usize>().ok())
+                {
+                    next_drain_id = next_drain_id.max(drain_id.saturating_add(1));
+                }
+
+                let compressed = file_name != "active.log";
+                total_count = total_count.saturating_add(count_ortho_records_in_file(
+                    &path,
+                    64 * 1024,
+                    compressed,
+                )?);
+            }
+
+            self.drain_counter[bucket] = next_drain_id;
+            self.landing_counts[bucket] = total_count;
         }
 
         Ok(())

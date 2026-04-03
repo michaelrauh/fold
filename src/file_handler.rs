@@ -1,4 +1,8 @@
-use crate::{FoldError, disk_safety, interner::Interner, ortho::Ortho};
+use crate::{
+    FoldError, disk_safety, generation_store, interner::Interner, merge_resume, ortho::Ortho,
+    stage_planner::PlannerMeta,
+};
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -39,7 +43,7 @@ fn create_text_preview(text: &str, first_n: usize, last_n: usize) -> String {
 }
 
 /// Configuration for state directory locations
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StateConfig {
     pub base_dir: PathBuf,
 }
@@ -101,6 +105,44 @@ pub fn check_and_recover_stale_work(config: &StateConfig) -> Result<(), FoldErro
     )
 }
 
+fn load_valid_resume_manifest(merge_work_path: &Path) -> Option<merge_resume::MergeResumeManifest> {
+    let manifest = merge_resume::read_manifest(merge_work_path).ok()?;
+    merge_resume::validate_manifest(merge_work_path, &manifest, 8)
+        .ok()
+        .map(|_| manifest)
+}
+
+fn protected_archive_paths_for_resumable_merges(in_process_path: &Path) -> HashSet<PathBuf> {
+    let mut protected = HashSet::new();
+    let Ok(entries) = fs::read_dir(in_process_path) else {
+        return protected;
+    };
+
+    for entry in entries.flatten() {
+        let merge_work_path = entry.path();
+        if !merge_work_path.is_dir() {
+            continue;
+        }
+        let name = merge_work_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !name.starts_with("merge_") || !name.ends_with(".work") {
+            continue;
+        }
+        let Some(manifest) = load_valid_resume_manifest(&merge_work_path) else {
+            continue;
+        };
+        if manifest.phase == merge_resume::ResumePhase::Archived {
+            continue;
+        }
+        protected.insert(PathBuf::from(manifest.archive_a_path));
+        protected.insert(PathBuf::from(manifest.archive_b_path));
+    }
+
+    protected
+}
+
 fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
     let in_process_path = std::path::Path::new(in_process_dir);
     let input_path = std::path::Path::new(input_dir);
@@ -114,6 +156,7 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
     }
 
     let mut recovered_count = 0;
+    let protected_archives = protected_archive_paths_for_resumable_merges(in_process_path);
 
     // Check for folders with stale heartbeats in in_process
     for entry in fs::read_dir(in_process_path).map_err(|e| FoldError::Io(e))? {
@@ -164,6 +207,26 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                     let folder_name_str = folder_name.to_str().unwrap_or("");
                     // If it's a merge_*.work folder with stale heartbeat, recover the merge
                     if folder_name_str.starts_with("merge_") && folder_name_str.ends_with(".work") {
+                        if let Some(manifest) = load_valid_resume_manifest(&entry_path) {
+                            if manifest.phase == merge_resume::ResumePhase::Archived {
+                                if Path::new(&manifest.archive_a_path).exists() {
+                                    let _ = fs::remove_dir_all(&manifest.archive_a_path);
+                                }
+                                if Path::new(&manifest.archive_b_path).exists() {
+                                    let _ = fs::remove_dir_all(&manifest.archive_b_path);
+                                }
+                                if let Some(temp_path) = manifest.archive_temp_path(&entry_path) {
+                                    if temp_path.exists() {
+                                        let _ = fs::remove_dir_all(temp_path);
+                                    }
+                                }
+                                fs::remove_dir_all(&entry_path).map_err(FoldError::Io)?;
+                                recovered_count += 1;
+                                continue;
+                            }
+                            continue;
+                        }
+
                         // Extract PID to find related archives and results
                         if let Some(pid_str) = folder_name_str
                             .strip_prefix("merge_")
@@ -181,6 +244,9 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                                                 .map(|e| e == "bin")
                                                 .unwrap_or(false)
                                         {
+                                            if protected_archives.contains(&bin_path) {
+                                                continue;
+                                            }
                                             // Remove heartbeat from archive
                                             let archive_heartbeat = bin_path.join("heartbeat");
                                             if archive_heartbeat.exists() {
@@ -222,6 +288,9 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                     }
                     // If it's an archive folder with stale heartbeat (orphaned from failed merge recovery), move it back
                     else if entry_path.to_string_lossy().ends_with(".bin") {
+                        if protected_archives.contains(&entry_path) {
+                            continue;
+                        }
                         // Remove the heartbeat before moving to input
                         let heartbeat_to_remove = entry_path.join("heartbeat");
                         if heartbeat_to_remove.exists() {
@@ -253,6 +322,9 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
             if entry_path.is_dir() {
                 if let Some(ext) = entry_path.extension() {
                     if ext == "bin" {
+                        if protected_archives.contains(&entry_path) {
+                            continue;
+                        }
                         let heartbeat = entry_path.join("heartbeat");
                         if !heartbeat.exists() {
                             let archive_name = entry_path.file_name().unwrap();
@@ -683,8 +755,7 @@ fn find_archives(input_dir: &str) -> Result<Vec<(String, u64)>, FoldError> {
 
 /// Load interner from an archive
 pub fn load_interner(archive_path: &str) -> Result<Interner, FoldError> {
-    let interner_path = format!("{}/interner.bin", archive_path);
-    let interner_bytes = fs::read(&interner_path).map_err(|e| FoldError::Io(e))?;
+    let interner_bytes = read_archive_artifact_bytes(archive_path, "interner.bin")?;
     Interner::from_bytes(&interner_bytes)
 }
 
@@ -692,14 +763,36 @@ fn get_results_path(archive_path: &str) -> String {
     format!("{}/results", archive_path)
 }
 
+fn resolve_archive_artifact_path(
+    archive_path: &str,
+    relative_path: &str,
+) -> Result<PathBuf, FoldError> {
+    let path = Path::new(archive_path).join(relative_path);
+    generation_store::resolve_managed_path(&path).map_err(FoldError::Io)
+}
+
+fn read_archive_artifact_bytes(
+    archive_path: &str,
+    relative_path: &str,
+) -> Result<Vec<u8>, FoldError> {
+    let path = resolve_archive_artifact_path(archive_path, relative_path)?;
+    fs::read(path).map_err(FoldError::Io)
+}
+
+fn read_archive_artifact_string(
+    archive_path: &str,
+    relative_path: &str,
+) -> Result<String, FoldError> {
+    let path = resolve_archive_artifact_path(archive_path, relative_path)?;
+    fs::read_to_string(path).map_err(FoldError::Io)
+}
+
 fn load_lineage(archive_path: &str) -> Result<String, FoldError> {
-    let lineage_path = format!("{}/lineage.txt", archive_path);
-    fs::read_to_string(&lineage_path).map_err(|e| FoldError::Io(e))
+    read_archive_artifact_string(archive_path, "lineage.txt")
 }
 
 fn load_metadata(archive_path: &str) -> Result<usize, FoldError> {
-    let metadata_path = format!("{}/metadata.txt", archive_path);
-    let content = fs::read_to_string(&metadata_path).map_err(|e| FoldError::Io(e))?;
+    let content = read_archive_artifact_string(archive_path, "metadata.txt")?;
     content
         .trim()
         .parse::<usize>()
@@ -709,8 +802,7 @@ fn load_metadata(archive_path: &str) -> Result<usize, FoldError> {
 /// Load text metadata (word count and preview) from archive
 /// Returns (word_count, text_preview)
 fn load_text_metadata(archive_path: &str) -> Result<(usize, String), FoldError> {
-    let text_meta_path = format!("{}/text_meta.txt", archive_path);
-    let content = fs::read_to_string(&text_meta_path).map_err(|e| FoldError::Io(e))?;
+    let content = read_archive_artifact_string(archive_path, "text_meta.txt")?;
     let mut lines = content.lines();
 
     let word_count = lines
@@ -880,6 +972,20 @@ pub struct ArchiveIngestion {
     config: StateConfig,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResumableMergeClaim {
+    pub merge_work_folder: String,
+    pub heartbeat_path: String,
+    pub archive_a_path: String,
+    pub archive_b_path: String,
+    pub text_preview_a: String,
+    pub text_preview_b: String,
+    pub word_count_a: usize,
+    pub word_count_b: usize,
+    pub manifest: merge_resume::MergeResumeManifest,
+    config: StateConfig,
+}
+
 impl ArchiveIngestion {
     /// Touch the heartbeat file (zero-arity as requested)
     pub fn touch_heartbeat(&self) -> Result<(), FoldError> {
@@ -918,6 +1024,14 @@ impl ArchiveIngestion {
         format!("{}/seen_shards", self.merge_work_folder)
     }
 
+    pub fn merge_work_folder(&self) -> &str {
+        &self.merge_work_folder
+    }
+
+    pub fn archive_paths(&self) -> (&str, &str) {
+        (&self.work_a_path, &self.work_b_path)
+    }
+
     /// Get the config for this ingestion
     pub fn config(&self) -> &StateConfig {
         &self.config
@@ -931,6 +1045,12 @@ impl ArchiveIngestion {
         }
         // Clean up the work paths (archives in in_process), not the original paths
         cleanup_archives(&[&self.work_a_path, &self.work_b_path])
+    }
+}
+
+impl ResumableMergeClaim {
+    pub fn config(&self) -> &StateConfig {
+        &self.config
     }
 }
 
@@ -1034,6 +1154,77 @@ pub fn find_txt_file_with_config(config: &StateConfig) -> Result<Option<String>,
     )
 }
 
+pub fn claim_resumable_merge_with_config(
+    config: &StateConfig,
+) -> Result<Option<ResumableMergeClaim>, FoldError> {
+    let in_process = config.in_process_dir();
+    if !in_process.exists() {
+        return Ok(None);
+    }
+
+    let mut merge_dirs: Vec<PathBuf> = fs::read_dir(&in_process)
+        .map_err(FoldError::Io)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            name.starts_with("merge_") && name.ends_with(".work")
+        })
+        .collect();
+    merge_dirs.sort();
+
+    for merge_work_path in merge_dirs {
+        let heartbeat = merge_work_path.join("heartbeat");
+        let stale_or_missing = !heartbeat.exists() || is_heartbeat_stale(&heartbeat)?;
+        if !stale_or_missing {
+            continue;
+        }
+
+        let Some(manifest) = load_valid_resume_manifest(&merge_work_path) else {
+            continue;
+        };
+        if manifest.phase == merge_resume::ResumePhase::Archived {
+            continue;
+        }
+
+        touch_heartbeat(heartbeat.to_str().unwrap())?;
+        touch_heartbeat(&format!("{}/heartbeat", manifest.archive_a_path))?;
+        touch_heartbeat(&format!("{}/heartbeat", manifest.archive_b_path))?;
+        disk_safety::ensure_archive_results_local(Path::new(&manifest.archive_a_path))
+            .map_err(FoldError::Io)?;
+        disk_safety::ensure_archive_results_local(Path::new(&manifest.archive_b_path))
+            .map_err(FoldError::Io)?;
+
+        let (word_count_a_orig, text_preview_a_orig) =
+            load_text_metadata(&manifest.archive_a_path).unwrap_or_else(|_| (0, String::new()));
+        let (word_count_b_orig, text_preview_b_orig) =
+            load_text_metadata(&manifest.archive_b_path).unwrap_or_else(|_| (0, String::new()));
+
+        return Ok(Some(ResumableMergeClaim {
+            merge_work_folder: merge_work_path.to_string_lossy().to_string(),
+            heartbeat_path: heartbeat.to_string_lossy().to_string(),
+            archive_a_path: manifest.archive_a_path.clone(),
+            archive_b_path: manifest.archive_b_path.clone(),
+            text_preview_a: if word_count_a_orig > 0 {
+                create_text_preview(&text_preview_a_orig, 2, 2)
+            } else {
+                String::new()
+            },
+            text_preview_b: if word_count_b_orig > 0 {
+                create_text_preview(&text_preview_b_orig, 2, 2)
+            } else {
+                String::new()
+            },
+            word_count_a: word_count_a_orig,
+            word_count_b: word_count_b_orig,
+            manifest,
+            config: config.clone(),
+        }));
+    }
+
+    Ok(None)
+}
+
 /// Get the two largest archives (uses default config)
 pub fn get_two_largest_archives() -> Result<Option<(String, String)>, FoldError> {
     get_two_largest_archives_with_config(&StateConfig::default())
@@ -1049,6 +1240,33 @@ pub enum ArchivePairPolicy {
     LargestLargest,
     SmallestSmallest,
     LargestSmallest,
+    AdjacentBalanced,
+}
+
+impl ArchivePairPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LargestLargest => "largest_largest",
+            Self::SmallestSmallest => "smallest_smallest",
+            Self::LargestSmallest => "largest_smallest",
+            Self::AdjacentBalanced => "adjacent_balanced",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivePairSelection {
+    pub pair: Option<(String, String)>,
+    pub effective_policy: ArchivePairPolicy,
+    pub warning: Option<String>,
+    pub selection_log: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ArchivePlannerRecord {
+    path: String,
+    ortho_count: usize,
+    planner_meta: Option<PlannerMeta>,
 }
 
 fn select_archive_pair_from_counts(
@@ -1071,6 +1289,135 @@ fn select_archive_pair_from_counts(
         ArchivePairPolicy::LargestSmallest => {
             Some((sorted[0].0.clone(), sorted[sorted.len() - 1].0.clone()))
         }
+        ArchivePairPolicy::AdjacentBalanced => None,
+    }
+}
+
+fn adjacent_priority_tuple(
+    left: &PlannerMeta,
+    right: &PlannerMeta,
+) -> (usize, usize, u128, u64, usize) {
+    let left_cost = left.planner_cost.max(1);
+    let right_cost = right.planner_cost.max(1);
+    let cost_imbalance = if left_cost >= right_cost {
+        (left_cost as u128) * 1_000 / (right_cost as u128)
+    } else {
+        (right_cost as u128) * 1_000 / (left_cost as u128)
+    };
+
+    (
+        left.merge_level.max(right.merge_level),
+        left.merge_level.abs_diff(right.merge_level),
+        cost_imbalance,
+        left.planner_cost.saturating_add(right.planner_cost),
+        left.range_start,
+    )
+}
+
+fn select_adjacent_balanced_pair(records: &[ArchivePlannerRecord]) -> ArchivePairSelection {
+    if records.len() < 2 {
+        return ArchivePairSelection {
+            pair: None,
+            effective_policy: ArchivePairPolicy::AdjacentBalanced,
+            warning: None,
+            selection_log: None,
+        };
+    }
+
+    if records.iter().any(|record| record.planner_meta.is_none()) {
+        let pair = select_archive_pair_from_counts(
+            &records
+                .iter()
+                .map(|record| (record.path.clone(), record.ortho_count))
+                .collect::<Vec<_>>(),
+            ArchivePairPolicy::SmallestSmallest,
+        );
+        return ArchivePairSelection {
+            pair,
+            effective_policy: ArchivePairPolicy::SmallestSmallest,
+            warning: Some(
+                "adjacent_balanced fallback: missing planner_meta.json; using smallest_smallest for this selection cycle"
+                    .to_string(),
+            ),
+            selection_log: None,
+        };
+    }
+
+    let mut sorted = records.to_vec();
+    sorted.sort_by_key(|record| {
+        record
+            .planner_meta
+            .as_ref()
+            .map(|meta| meta.range_start)
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut best_index = None;
+    let mut best_priority = None;
+
+    for index in 0..sorted.len().saturating_sub(1) {
+        let left = sorted[index].planner_meta.as_ref().unwrap();
+        let right = sorted[index + 1].planner_meta.as_ref().unwrap();
+        if left.range_end_exclusive != right.range_start {
+            continue;
+        }
+
+        let priority = adjacent_priority_tuple(left, right);
+        if best_priority
+            .as_ref()
+            .is_none_or(|current| priority < *current)
+        {
+            best_priority = Some(priority);
+            best_index = Some(index);
+        }
+    }
+
+    if let Some(index) = best_index {
+        let left_record = &sorted[index];
+        let right_record = &sorted[index + 1];
+        let left = left_record.planner_meta.as_ref().unwrap();
+        let right = right_record.planner_meta.as_ref().unwrap();
+        let priority = best_priority.unwrap();
+        return ArchivePairSelection {
+            pair: Some((left_record.path.clone(), right_record.path.clone())),
+            effective_policy: ArchivePairPolicy::AdjacentBalanced,
+            warning: None,
+            selection_log: Some(format!(
+                "Adjacent planner selected: left=[{}, {}) right=[{}, {}) leaves=({}, {}) levels=({}, {}) costs=({}, {}) priority=({},{},{},{},{})",
+                left.range_start,
+                left.range_end_exclusive,
+                right.range_start,
+                right.range_end_exclusive,
+                left.leaf_count,
+                right.leaf_count,
+                left.merge_level,
+                right.merge_level,
+                left.planner_cost,
+                right.planner_cost,
+                priority.0,
+                priority.1,
+                priority.2,
+                priority.3,
+                priority.4
+            )),
+        };
+    }
+
+    let pair = select_archive_pair_from_counts(
+        &sorted
+            .iter()
+            .map(|record| (record.path.clone(), record.ortho_count))
+            .collect::<Vec<_>>(),
+        ArchivePairPolicy::SmallestSmallest,
+    );
+    ArchivePairSelection {
+        pair,
+        effective_policy: ArchivePairPolicy::SmallestSmallest,
+        warning: Some(
+            "adjacent_balanced fallback: no adjacent planner ranges available; using smallest_smallest for this selection cycle"
+                .to_string(),
+        ),
+        selection_log: None,
     }
 }
 
@@ -1078,21 +1425,52 @@ pub fn get_archive_pair_with_config(
     config: &StateConfig,
     policy: ArchivePairPolicy,
 ) -> Result<Option<(String, String)>, FoldError> {
+    Ok(get_archive_pair_selection_with_config(config, policy)?.pair)
+}
+
+pub fn get_archive_pair_selection_with_config(
+    config: &StateConfig,
+    policy: ArchivePairPolicy,
+) -> Result<ArchivePairSelection, FoldError> {
     let archives = find_archives(config.input_dir().to_str().unwrap())?;
 
     if archives.len() < 2 {
-        return Ok(None);
+        return Ok(ArchivePairSelection {
+            pair: None,
+            effective_policy: policy,
+            warning: None,
+            selection_log: None,
+        });
     }
 
-    let archives_with_counts: Vec<(String, usize)> = archives
+    let records: Vec<ArchivePlannerRecord> = archives
         .into_iter()
-        .filter_map(|(path, _size)| load_metadata(&path).ok().map(|count| (path, count)))
+        .filter_map(|(path, _size)| {
+            load_metadata(&path).ok().map(|count| ArchivePlannerRecord {
+                planner_meta: load_archive_planner_meta(&path).ok(),
+                path,
+                ortho_count: count,
+            })
+        })
         .collect();
 
-    Ok(select_archive_pair_from_counts(
-        &archives_with_counts,
-        policy,
-    ))
+    let selection = match policy {
+        ArchivePairPolicy::AdjacentBalanced => select_adjacent_balanced_pair(&records),
+        _ => ArchivePairSelection {
+            pair: select_archive_pair_from_counts(
+                &records
+                    .iter()
+                    .map(|record| (record.path.clone(), record.ortho_count))
+                    .collect::<Vec<_>>(),
+                policy,
+            ),
+            effective_policy: policy,
+            warning: None,
+            selection_log: None,
+        },
+    };
+
+    Ok(selection)
 }
 
 /// Get the two largest archives with custom config
@@ -1121,10 +1499,20 @@ pub fn load_archive_metadata(archive_path: &str) -> Result<usize, FoldError> {
     load_metadata(archive_path)
 }
 
+pub fn load_archive_planner_meta(archive_path: &str) -> Result<PlannerMeta, FoldError> {
+    let bytes =
+        read_archive_artifact_bytes(archive_path, crate::stage_planner::PLANNER_META_FILENAME)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        FoldError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })
+}
+
 /// Load the optimal ortho from an archive (required - will error if missing)
 pub fn load_optimal_ortho(archive_path: &str) -> Result<Ortho, FoldError> {
-    let optimal_bin_path = format!("{}/optimal.bin", archive_path);
-    let optimal_bytes = fs::read(&optimal_bin_path).map_err(|e| FoldError::Io(e))?;
+    let optimal_bytes = read_archive_artifact_bytes(archive_path, "optimal.bin")?;
     Ortho::from_bytes(&optimal_bytes)
 }
 
@@ -1262,10 +1650,61 @@ pub fn ingest_archives_with_config(
     })
 }
 
+pub fn resume_archives_with_config(
+    claim: &ResumableMergeClaim,
+) -> Result<ArchiveIngestion, FoldError> {
+    let merge_work_folder = PathBuf::from(&claim.merge_work_folder);
+    fs::create_dir_all(&merge_work_folder).map_err(FoldError::Io)?;
+    touch_heartbeat(&claim.heartbeat_path)?;
+    disk_safety::ensure_archive_results_local(Path::new(&claim.archive_a_path))
+        .map_err(FoldError::Io)?;
+    disk_safety::ensure_archive_results_local(Path::new(&claim.archive_b_path))
+        .map_err(FoldError::Io)?;
+
+    Ok(ArchiveIngestion {
+        work_a_path: claim.archive_a_path.clone(),
+        work_b_path: claim.archive_b_path.clone(),
+        merge_work_folder: claim.merge_work_folder.clone(),
+        heartbeat_path: claim.heartbeat_path.clone(),
+        text_preview_a: claim.text_preview_a.clone(),
+        text_preview_b: claim.text_preview_b.clone(),
+        word_count_a: claim.word_count_a,
+        word_count_b: claim.word_count_b,
+        config: claim.config.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        generation_store::{self, GenerationStore},
+        merge_resume::{self, MergeResumeManifest, ResumePhase},
+        offload_config::OffloadConfig,
+        offload_runtime::configure_offload_runtime,
+        ortho::{Ortho, OrthoScore},
+    };
+    use filetime::{FileTime, set_file_mtime};
     use std::sync::{Arc, Barrier};
+    use sysinfo::Disks;
+
+    fn available_space_for_test(path: &Path) -> u64 {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut disks = Disks::new_with_refreshed_list();
+        disks.refresh_list();
+        disks.refresh();
+        let mut best: Option<(u64, usize)> = None;
+        for disk in disks.iter() {
+            let mount = disk.mount_point();
+            if canonical.starts_with(mount) {
+                let score = mount.as_os_str().to_string_lossy().len();
+                if best.map_or(true, |(_, best_score)| score > best_score) {
+                    best = Some((disk.available_space(), score));
+                }
+            }
+        }
+        best.expect("no disk mount found").0
+    }
 
     #[test]
     fn test_heartbeat_creation() {
@@ -1463,6 +1902,273 @@ mod tests {
     }
 
     #[test]
+    fn stale_valid_resumable_merge_is_preserved_and_claimable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        let archive_a =
+            create_archive_with_meta(&config.in_process_dir(), "archive_a.bin", 10, None);
+        let archive_b =
+            create_archive_with_meta(&config.in_process_dir(), "archive_b.bin", 20, None);
+        touch_heartbeat(archive_a.join("heartbeat").to_str().unwrap()).unwrap();
+        touch_heartbeat(archive_b.join("heartbeat").to_str().unwrap()).unwrap();
+
+        let merge_work = config.in_process_dir().join("merge_4242.work");
+        fs::create_dir_all(&merge_work).unwrap();
+        let merge_heartbeat = create_heartbeat(merge_work.to_str().unwrap()).unwrap();
+
+        let checkpoint = merge_resume::prepare_working_checkpoint(&merge_work, None).unwrap();
+        let mut store =
+            GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8).unwrap();
+        store.push_segments(vec![Ortho::new()]).unwrap();
+        store.flush_all().unwrap();
+
+        let manifest = MergeResumeManifest::new(
+            ResumePhase::Claimed,
+            archive_a.to_string_lossy().to_string(),
+            archive_b.to_string_lossy().to_string(),
+            true,
+            "adjacent_balanced".to_string(),
+            OrthoScore::zero(),
+        );
+        let mut manifest = merge_resume::finalize_checkpoint_commit(
+            &merge_work,
+            manifest,
+            checkpoint,
+            &Ortho::new(),
+        )
+        .unwrap();
+        manifest.phase = ResumePhase::LargerLoaded;
+        merge_resume::write_manifest_atomic(&merge_work, &manifest).unwrap();
+
+        let stale_secs = (HEARTBEAT_GRACE_PERIOD_SECS + 5) as i64;
+        let stale_time =
+            FileTime::from_unix_time(current_timestamp_secs().unwrap() as i64 - stale_secs, 0);
+        set_file_mtime(&merge_heartbeat, stale_time).unwrap();
+        set_file_mtime(archive_a.join("heartbeat"), stale_time).unwrap();
+        set_file_mtime(archive_b.join("heartbeat"), stale_time).unwrap();
+
+        recover_abandoned_files(
+            config.input_dir().to_str().unwrap(),
+            config.in_process_dir().to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            merge_work.exists(),
+            "valid resumable merge should be preserved"
+        );
+        assert!(
+            archive_a.exists(),
+            "claimed archive A should remain in_process"
+        );
+        assert!(
+            archive_b.exists(),
+            "claimed archive B should remain in_process"
+        );
+
+        let claim = claim_resumable_merge_with_config(&config).unwrap().unwrap();
+        assert_eq!(claim.archive_a_path, archive_a.to_string_lossy());
+        assert_eq!(claim.archive_b_path, archive_b.to_string_lossy());
+    }
+
+    #[test]
+    fn stale_invalid_resumable_merge_rewinds_to_input() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        let archive_a =
+            create_archive_with_meta(&config.in_process_dir(), "archive_a.bin", 10, None);
+        let archive_b =
+            create_archive_with_meta(&config.in_process_dir(), "archive_b.bin", 20, None);
+        touch_heartbeat(archive_a.join("heartbeat").to_str().unwrap()).unwrap();
+        touch_heartbeat(archive_b.join("heartbeat").to_str().unwrap()).unwrap();
+
+        let merge_work = config.in_process_dir().join("merge_9898.work");
+        fs::create_dir_all(&merge_work).unwrap();
+        let merge_heartbeat = create_heartbeat(merge_work.to_str().unwrap()).unwrap();
+        fs::write(
+            merge_work.join(merge_resume::MANIFEST_FILENAME),
+            br#"{"schema_version":1,"phase":"LargerLoaded","generation":0,"active_store_dir":"checkpoints/store-9999","archive_a_path":"missing_a","archive_b_path":"missing_b","a_is_smaller":true,"merge_policy":"adjacent_balanced","best_score":{"volume":0,"variance_num":0,"variance_den":1,"fullness":0},"best_ortho_file":null,"archive_temp_path":null,"updated_at":0}"#,
+        )
+        .unwrap();
+
+        let stale_secs = (HEARTBEAT_GRACE_PERIOD_SECS + 5) as i64;
+        let stale_time =
+            FileTime::from_unix_time(current_timestamp_secs().unwrap() as i64 - stale_secs, 0);
+        set_file_mtime(&merge_heartbeat, stale_time).unwrap();
+        set_file_mtime(archive_a.join("heartbeat"), stale_time).unwrap();
+        set_file_mtime(archive_b.join("heartbeat"), stale_time).unwrap();
+
+        recover_abandoned_files(
+            config.input_dir().to_str().unwrap(),
+            config.in_process_dir().to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !merge_work.exists(),
+            "invalid resumable merge should be removed"
+        );
+        assert!(
+            config.input_dir().join("archive_a.bin").exists(),
+            "archive A should be rewound to input"
+        );
+        assert!(
+            config.input_dir().join("archive_b.bin").exists(),
+            "archive B should be rewound to input"
+        );
+    }
+
+    #[test]
+    fn archive_root_artifact_loaders_use_managed_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().join("fold_state"));
+        initialize_with_config(&config).unwrap();
+
+        let archive = config.input_dir().join("archive_a.bin");
+        fs::create_dir_all(archive.join("results")).unwrap();
+
+        let interner = Interner::from_text("foo bar");
+        let optimal = Ortho::new();
+        let planner_meta = PlannerMeta {
+            range_start: 0,
+            range_end_exclusive: 1,
+            leaf_count: 1,
+            merge_level: 0,
+            planner_cost: 10,
+            word_count: 2,
+        };
+
+        fs::write(archive.join("metadata.txt"), "7").unwrap();
+        fs::write(archive.join("lineage.txt"), "\"x\"").unwrap();
+        fs::write(archive.join("text_meta.txt"), "2\npreview").unwrap();
+        fs::write(archive.join("interner.bin"), interner.to_bytes().unwrap()).unwrap();
+        fs::write(archive.join("optimal.bin"), optimal.to_bytes().unwrap()).unwrap();
+        crate::stage_planner::write_planner_meta(&archive, &planner_meta).unwrap();
+
+        let mut cfg = OffloadConfig::with_base_dir(&config.base_dir);
+        cfg.enabled = true;
+        cfg.in_memory_store = true;
+        cfg.cache_dir = config.base_dir.join("offload_cache");
+        let _guard = configure_offload_runtime(&config.base_dir, &cfg)
+            .unwrap()
+            .unwrap();
+
+        for rel in [
+            "metadata.txt",
+            "lineage.txt",
+            "text_meta.txt",
+            "interner.bin",
+            "optimal.bin",
+            crate::stage_planner::PLANNER_META_FILENAME,
+        ] {
+            let path = archive.join(rel);
+            assert!(generation_store::offload_path_if_configured(&path).unwrap());
+            fs::remove_file(&path).unwrap();
+        }
+
+        let archive_str = archive.to_string_lossy().to_string();
+        assert_eq!(load_metadata(&archive_str).unwrap(), 7);
+        assert_eq!(load_lineage(&archive_str).unwrap(), "\"x\"");
+        assert_eq!(
+            load_text_metadata(&archive_str).unwrap(),
+            (2, "preview".to_string())
+        );
+        assert_eq!(
+            load_interner(&archive_str).unwrap().vocabulary(),
+            interner.vocabulary()
+        );
+        assert_eq!(load_optimal_ortho(&archive_str).unwrap(), optimal);
+        assert_eq!(
+            load_archive_planner_meta(&archive_str).unwrap(),
+            planner_meta
+        );
+    }
+
+    #[test]
+    fn reclaim_pressure_keeps_resumable_merge_claimable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().join("fold_state"));
+        initialize_with_config(&config).unwrap();
+
+        let archive_a =
+            create_archive_with_meta(&config.in_process_dir(), "archive_a.bin", 10, None);
+        let archive_b =
+            create_archive_with_meta(&config.in_process_dir(), "archive_b.bin", 20, None);
+        touch_heartbeat(archive_a.join("heartbeat").to_str().unwrap()).unwrap();
+        touch_heartbeat(archive_b.join("heartbeat").to_str().unwrap()).unwrap();
+
+        let reclaimable_spill = archive_a
+            .join("results")
+            .join("spill")
+            .join("b=00")
+            .join("spill-0.dat");
+        fs::create_dir_all(reclaimable_spill.parent().unwrap()).unwrap();
+        const FILE_BYTES: usize = 64 * 1024 * 1024;
+        const RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
+        fs::write(&reclaimable_spill, vec![5u8; FILE_BYTES]).unwrap();
+
+        let merge_work = config.in_process_dir().join("merge_4242.work");
+        fs::create_dir_all(&merge_work).unwrap();
+        let merge_heartbeat = create_heartbeat(merge_work.to_str().unwrap()).unwrap();
+
+        let checkpoint = merge_resume::prepare_working_checkpoint(&merge_work, None).unwrap();
+        let mut store =
+            GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8).unwrap();
+        store.push_segments(vec![Ortho::new()]).unwrap();
+        store.flush_all().unwrap();
+
+        let manifest = MergeResumeManifest::new(
+            ResumePhase::Claimed,
+            archive_a.to_string_lossy().to_string(),
+            archive_b.to_string_lossy().to_string(),
+            true,
+            "adjacent_balanced".to_string(),
+            OrthoScore::zero(),
+        );
+        let mut manifest = merge_resume::finalize_checkpoint_commit(
+            &merge_work,
+            manifest,
+            checkpoint,
+            &Ortho::new(),
+        )
+        .unwrap();
+        manifest.phase = ResumePhase::LargerLoaded;
+        merge_resume::write_manifest_atomic(&merge_work, &manifest).unwrap();
+
+        let free_now = available_space_for_test(&config.base_dir);
+        let mut cfg = OffloadConfig::with_base_dir(&config.base_dir);
+        cfg.enabled = true;
+        cfg.in_memory_store = true;
+        cfg.cache_dir = config.base_dir.join("offload_cache");
+        cfg.disk_hysteresis_margin_bytes = 0;
+        cfg.disk_free_low_water = Some(free_now.saturating_add((FILE_BYTES / 2) as u64));
+        let _guard = configure_offload_runtime(&config.base_dir, &cfg)
+            .unwrap()
+            .unwrap();
+        disk_safety::configure(config.base_dir.clone(), &cfg);
+
+        assert!(disk_safety::maybe_reclaim(RESERVATION_BYTES, "test resumable reclaim").unwrap());
+        assert!(merge_work.join(merge_resume::MANIFEST_FILENAME).exists());
+        assert!(archive_a.join("metadata.txt").exists());
+        assert!(archive_a.join("text_meta.txt").exists());
+
+        let stale_secs = (HEARTBEAT_GRACE_PERIOD_SECS + 5) as i64;
+        let stale_time =
+            FileTime::from_unix_time(current_timestamp_secs().unwrap() as i64 - stale_secs, 0);
+        set_file_mtime(&merge_heartbeat, stale_time).unwrap();
+        set_file_mtime(archive_a.join("heartbeat"), stale_time).unwrap();
+        set_file_mtime(archive_b.join("heartbeat"), stale_time).unwrap();
+
+        let claim = claim_resumable_merge_with_config(&config).unwrap().unwrap();
+        assert_eq!(claim.archive_a_path, archive_a.to_string_lossy());
+        assert_eq!(claim.archive_b_path, archive_b.to_string_lossy());
+    }
+
+    #[test]
     fn mem_claim_create_load_and_cleanup() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = StateConfig::custom(temp_dir.path().to_path_buf());
@@ -1597,5 +2303,104 @@ mod tests {
             select_archive_pair_from_counts(&archives, ArchivePairPolicy::LargestSmallest),
             Some(("archive_small".to_string(), "archive_large".to_string()))
         );
+    }
+
+    fn create_archive_with_meta(
+        root: &Path,
+        name: &str,
+        ortho_count: usize,
+        planner_meta: Option<PlannerMeta>,
+    ) -> PathBuf {
+        let archive = root.join(name);
+        fs::create_dir_all(archive.join("results")).unwrap();
+        fs::write(archive.join("metadata.txt"), ortho_count.to_string()).unwrap();
+        fs::write(archive.join("lineage.txt"), name).unwrap();
+        fs::write(archive.join("text_meta.txt"), "1\nx").unwrap();
+        if let Some(planner_meta) = planner_meta.as_ref() {
+            crate::stage_planner::write_planner_meta(&archive, planner_meta).unwrap();
+        }
+        archive
+    }
+
+    #[test]
+    fn adjacent_balanced_selects_adjacent_pair_by_balance() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        create_archive_with_meta(
+            &config.input_dir(),
+            "archive_a.bin",
+            10,
+            Some(PlannerMeta {
+                range_start: 0,
+                range_end_exclusive: 1,
+                leaf_count: 1,
+                merge_level: 0,
+                planner_cost: 10,
+                word_count: 10,
+            }),
+        );
+        create_archive_with_meta(
+            &config.input_dir(),
+            "archive_b.bin",
+            12,
+            Some(PlannerMeta {
+                range_start: 1,
+                range_end_exclusive: 2,
+                leaf_count: 1,
+                merge_level: 0,
+                planner_cost: 12,
+                word_count: 12,
+            }),
+        );
+        create_archive_with_meta(
+            &config.input_dir(),
+            "archive_c.bin",
+            40,
+            Some(PlannerMeta {
+                range_start: 2,
+                range_end_exclusive: 4,
+                leaf_count: 2,
+                merge_level: 1,
+                planner_cost: 40,
+                word_count: 40,
+            }),
+        );
+
+        let selection =
+            get_archive_pair_selection_with_config(&config, ArchivePairPolicy::AdjacentBalanced)
+                .unwrap();
+        let pair = selection.pair.unwrap();
+        assert_eq!(
+            selection.effective_policy,
+            ArchivePairPolicy::AdjacentBalanced
+        );
+        assert!(selection.warning.is_none());
+        assert!(selection.selection_log.is_some());
+        assert!(pair.0.ends_with("archive_a.bin"));
+        assert!(pair.1.ends_with("archive_b.bin"));
+    }
+
+    #[test]
+    fn adjacent_balanced_falls_back_when_planner_meta_missing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = StateConfig::custom(temp_dir.path().to_path_buf());
+        initialize_with_config(&config).unwrap();
+
+        create_archive_with_meta(&config.input_dir(), "archive_a.bin", 10, None);
+        create_archive_with_meta(&config.input_dir(), "archive_b.bin", 20, None);
+
+        let selection =
+            get_archive_pair_selection_with_config(&config, ArchivePairPolicy::AdjacentBalanced)
+                .unwrap();
+        assert_eq!(
+            selection.effective_policy,
+            ArchivePairPolicy::SmallestSmallest
+        );
+        assert!(selection.warning.is_some());
+        let pair = selection.pair.unwrap();
+        assert!(pair.0.ends_with("archive_a.bin"));
+        assert!(pair.1.ends_with("archive_b.bin"));
     }
 }

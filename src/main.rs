@@ -3,15 +3,17 @@ use fold::{
     completion_pruning::bound_existing_ortho,
     disk_safety,
     file_handler::{self, ArchivePairPolicy, MemClaimGuard, StateConfig},
-    generation_runner::{merge_threads_from_env, run_generation_loop, run_merge_generation_loop},
+    generation_runner::{merge_threads_from_env, run_generation_loop, run_single_merge_generation},
     generation_store::{Config, GenerationStore, Role},
     interner::Interner,
     memory_budget::MemoryBudget,
     memory_safety,
+    merge_resume::{self, MergeResumeManifest, ResumePhase},
     metrics::Metrics,
     offload_config::OffloadConfig,
     offload_runtime::configure_offload_runtime,
     ortho::{Ortho, OrthoScore, payload_to_usize},
+    stage_planner::PlannerMeta,
     tui::Tui,
 };
 use std::any::Any;
@@ -34,6 +36,7 @@ fn role_as_str(role: Role) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MergePolicy {
+    AdjacentBalanced,
     LargestSmallest,
     LargestLargest,
     SmallestSmallest,
@@ -42,6 +45,7 @@ enum MergePolicy {
 impl MergePolicy {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "adjacent_balanced" => Some(Self::AdjacentBalanced),
             "largest_smallest" => Some(Self::LargestSmallest),
             "largest_largest" => Some(Self::LargestLargest),
             "smallest_smallest" => Some(Self::SmallestSmallest),
@@ -51,13 +55,14 @@ impl MergePolicy {
 
     fn default_for_role(role: Role) -> Self {
         match role {
-            Role::Leader => Self::LargestLargest,
+            Role::Leader => Self::AdjacentBalanced,
             Role::Follower => Self::SmallestSmallest,
         }
     }
 
     fn archive_pair_policy(self) -> ArchivePairPolicy {
         match self {
+            Self::AdjacentBalanced => ArchivePairPolicy::AdjacentBalanced,
             Self::LargestSmallest => ArchivePairPolicy::LargestSmallest,
             Self::LargestLargest => ArchivePairPolicy::LargestLargest,
             Self::SmallestSmallest => ArchivePairPolicy::SmallestSmallest,
@@ -66,6 +71,7 @@ impl MergePolicy {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::AdjacentBalanced => "adjacent_balanced",
             Self::LargestSmallest => "largest_smallest",
             Self::LargestLargest => "largest_largest",
             Self::SmallestSmallest => "smallest_smallest",
@@ -73,7 +79,7 @@ impl MergePolicy {
     }
 
     fn leader_prefers_text_first(self) -> bool {
-        matches!(self, Self::SmallestSmallest)
+        matches!(self, Self::AdjacentBalanced | Self::SmallestSmallest)
     }
 }
 
@@ -227,6 +233,31 @@ fn main() -> Result<(), FoldError> {
                     metrics.update_global(|g| g.role = role_as_str(role).to_string());
                 }
 
+                if let Some(resume_claim) =
+                    file_handler::claim_resumable_merge_with_config(&config)?
+                {
+                    metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+                    metrics.clear_chart_history();
+                    metrics.add_log("MODE 1: Resuming merge".to_string());
+                    metrics.add_log(format!(
+                        "Resuming merge: {} + {} phase={:?}",
+                        resume_claim.archive_a_path,
+                        resume_claim.archive_b_path,
+                        resume_claim.manifest.phase
+                    ));
+                    match resume_merge(resume_claim, &config, &metrics, role) {
+                        Ok(()) => continue,
+                        Err(e) if is_concurrent_claim_error(&e) => {
+                            metrics.add_log(format!(
+                                "Lost race to claim resumable merge ({}); retrying selection",
+                                e
+                            ));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
                 // Update the count of distinct running jobs
                 let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
                 let remaining_chunks = file_handler::count_all_chunks_with_config(&config)?;
@@ -274,64 +305,75 @@ fn main() -> Result<(), FoldError> {
                                 }
                                 Err(e) => return Err(e),
                             }
-                        } else if let Some((archive_a, archive_b)) =
-                            file_handler::get_archive_pair_with_config(
+                        } else {
+                            let selection = file_handler::get_archive_pair_selection_with_config(
                                 &config,
                                 merge_policy.archive_pair_policy(),
-                            )?
-                        {
-                            // Mode 1: Merge archives
-                            metrics.update_global(|g| g.mode = "Merging Archives".to_string());
-                            metrics.clear_chart_history();
-                            metrics.add_log("MODE 1: Merging archives".to_string());
-                            metrics.add_log(format!(
-                                "Merging (policy={}): {} + {}",
-                                merge_policy.as_str(),
-                                archive_a,
-                                archive_b
-                            ));
-
-                            match merge_archives(&archive_a, &archive_b, &config, &metrics, role) {
-                                Ok(()) => {}
-                                Err(e) if is_concurrent_claim_error(&e) => {
-                                    metrics.add_log(format!(
-                                        "Lost race to claim archives ({}); retrying selection",
-                                        e
-                                    ));
-                                    continue;
-                                }
-                                Err(e) => return Err(e),
+                            )?;
+                            if let Some(warning) = selection.warning.as_ref() {
+                                metrics.add_log(warning.clone());
                             }
-                        } else {
-                            let txt_file = file_handler::find_txt_file_with_config(&config)?;
-
-                            if txt_file.is_none() {
-                                metrics.add_log("No more files to process".to_string());
-                                metrics.add_log("Processing completed".to_string());
-                                break;
+                            if let Some(selection_log) = selection.selection_log.as_ref() {
+                                metrics.add_log(selection_log.clone());
                             }
+                            let effective_policy = selection.effective_policy;
+                            if let Some((archive_a, archive_b)) = selection.pair {
+                                // Mode 1: Merge archives
+                                metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+                                metrics.clear_chart_history();
+                                metrics.add_log("MODE 1: Merging archives".to_string());
+                                metrics.add_log(format!(
+                                    "Merging (policy={} effective_policy={}): {} + {}",
+                                    merge_policy.as_str(),
+                                    effective_policy.as_str(),
+                                    archive_a,
+                                    archive_b
+                                ));
 
-                            metrics.update_global(|g| g.mode = "Processing Text".to_string());
-                            metrics.clear_chart_history();
-                            metrics.add_log("MODE 2: Processing text file".to_string());
-
-                            let txt_file = txt_file.unwrap();
-                            match process_txt_file(
-                                txt_file.clone(),
-                                &config,
-                                &metrics,
-                                role,
-                                &should_quit,
-                            ) {
-                                Ok(()) => {}
-                                Err(e) if is_concurrent_claim_error(&e) => {
-                                    metrics.add_log(format!(
-                                        "Lost race to claim {}; retrying selection",
-                                        txt_file
-                                    ));
-                                    continue;
+                                match merge_archives(
+                                    &archive_a, &archive_b, &config, &metrics, role,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(e) if is_concurrent_claim_error(&e) => {
+                                        metrics.add_log(format!(
+                                            "Lost race to claim archives ({}); retrying selection",
+                                            e
+                                        ));
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
                                 }
-                                Err(e) => return Err(e),
+                            } else {
+                                let txt_file = file_handler::find_txt_file_with_config(&config)?;
+
+                                if txt_file.is_none() {
+                                    metrics.add_log("No more files to process".to_string());
+                                    metrics.add_log("Processing completed".to_string());
+                                    break;
+                                }
+
+                                metrics.update_global(|g| g.mode = "Processing Text".to_string());
+                                metrics.clear_chart_history();
+                                metrics.add_log("MODE 2: Processing text file".to_string());
+
+                                let txt_file = txt_file.unwrap();
+                                match process_txt_file(
+                                    txt_file.clone(),
+                                    &config,
+                                    &metrics,
+                                    role,
+                                    &should_quit,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(e) if is_concurrent_claim_error(&e) => {
+                                        metrics.add_log(format!(
+                                            "Lost race to claim {}; retrying selection",
+                                            txt_file
+                                        ));
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
                             }
                         }
                     }
@@ -360,38 +402,49 @@ fn main() -> Result<(), FoldError> {
                                 }
                                 Err(e) => return Err(e),
                             }
-                        } else if let Some((archive_a, archive_b)) =
-                            file_handler::get_archive_pair_with_config(
+                        } else {
+                            let selection = file_handler::get_archive_pair_selection_with_config(
                                 &config,
                                 merge_policy.archive_pair_policy(),
-                            )?
-                        {
-                            // Mode 1 for followers: merge archives using the configured policy when no text is free
-                            metrics.update_global(|g| g.mode = "Merging Archives".to_string());
-                            metrics.clear_chart_history();
-                            metrics.add_log("MODE 1: Merging archives".to_string());
-                            metrics.add_log(format!(
-                                "Merging (policy={}): {} + {}",
-                                merge_policy.as_str(),
-                                archive_a,
-                                archive_b
-                            ));
-
-                            match merge_archives(&archive_a, &archive_b, &config, &metrics, role) {
-                                Ok(()) => {}
-                                Err(e) if is_concurrent_claim_error(&e) => {
-                                    metrics.add_log(format!(
-                                        "Lost race to claim archives ({}); retrying selection",
-                                        e
-                                    ));
-                                    continue;
-                                }
-                                Err(e) => return Err(e),
+                            )?;
+                            if let Some(warning) = selection.warning.as_ref() {
+                                metrics.add_log(warning.clone());
                             }
-                        } else {
-                            metrics.add_log("No more files to process".to_string());
-                            metrics.add_log("Processing completed".to_string());
-                            break;
+                            if let Some(selection_log) = selection.selection_log.as_ref() {
+                                metrics.add_log(selection_log.clone());
+                            }
+                            let effective_policy = selection.effective_policy;
+                            if let Some((archive_a, archive_b)) = selection.pair {
+                                // Mode 1 for followers: merge archives using the configured policy when no text is free
+                                metrics.update_global(|g| g.mode = "Merging Archives".to_string());
+                                metrics.clear_chart_history();
+                                metrics.add_log("MODE 1: Merging archives".to_string());
+                                metrics.add_log(format!(
+                                    "Merging (policy={} effective_policy={}): {} + {}",
+                                    merge_policy.as_str(),
+                                    effective_policy.as_str(),
+                                    archive_a,
+                                    archive_b
+                                ));
+
+                                match merge_archives(
+                                    &archive_a, &archive_b, &config, &metrics, role,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(e) if is_concurrent_claim_error(&e) => {
+                                        metrics.add_log(format!(
+                                            "Lost race to claim archives ({}); retrying selection",
+                                            e
+                                        ));
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            } else {
+                                metrics.add_log("No more files to process".to_string());
+                                metrics.add_log("Processing completed".to_string());
+                                break;
+                            }
                         }
                     }
                 }
@@ -622,6 +675,8 @@ fn process_txt_file(
     // Ingest the text file
     let ingestion = file_handler::ingest_txt_file_with_config(&file_path, config)
         .map_err(mark_claim_race_if_applicable)?;
+    let planner_meta =
+        fold::stage_planner::planner_meta_for_chunk(&ingestion.filename, &ingestion.text);
     let remaining_chunks = file_handler::count_all_chunks_with_config(config)?;
     metrics.reset_new_orthos();
 
@@ -856,6 +911,7 @@ fn process_txt_file(
         total_orthos,
         &ingestion.text_preview,
         ingestion.word_count,
+        planner_meta.as_ref(),
     )?;
 
     metrics.add_log(format!("Archive saved: {}", archive_path.display()));
@@ -891,6 +947,30 @@ fn merge_archives(
     metrics: &Metrics,
     role: Role,
 ) -> Result<(), FoldError> {
+    let ingestion =
+        file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)
+            .map_err(mark_claim_race_if_applicable)?;
+    run_merge_with_checkpoints(ingestion, config, metrics, role, None)
+}
+
+fn resume_merge(
+    claim: file_handler::ResumableMergeClaim,
+    config: &StateConfig,
+    metrics: &Metrics,
+    role: Role,
+) -> Result<(), FoldError> {
+    let manifest = claim.manifest.clone();
+    let ingestion = file_handler::resume_archives_with_config(&claim)?;
+    run_merge_with_checkpoints(ingestion, config, metrics, role, Some(manifest))
+}
+
+fn run_merge_with_checkpoints(
+    ingestion: file_handler::ArchiveIngestion,
+    config: &StateConfig,
+    metrics: &Metrics,
+    role: Role,
+    existing_manifest: Option<MergeResumeManifest>,
+) -> Result<(), FoldError> {
     let run_start = Instant::now();
     let merge_policy = merge_policy_for_role(role);
     let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
@@ -899,14 +979,16 @@ fn merge_archives(
     disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
     log_offload_policy(metrics, &offload_cfg);
 
+    let merge_work_dir = PathBuf::from(ingestion.merge_work_folder());
+    merge_resume::cleanup_transient_checkpoints(&merge_work_dir).map_err(FoldError::Io)?;
+
+    let (archive_a_path, archive_b_path) = ingestion.archive_paths();
+
     // Get archive ortho counts for display BEFORE ingest moves them
     let orthos_a = file_handler::load_archive_metadata(archive_a_path).unwrap_or(0);
     let orthos_b = file_handler::load_archive_metadata(archive_b_path).unwrap_or(0);
-
-    // Ingest archives for merging
-    let ingestion =
-        file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)
-            .map_err(mark_claim_race_if_applicable)?;
+    let planner_meta_a = file_handler::load_archive_planner_meta(archive_a_path).ok();
+    let planner_meta_b = file_handler::load_archive_planner_meta(archive_b_path).ok();
 
     metrics.set_operation_status("Loading interners".to_string());
     metrics.reset_prune_counts();
@@ -996,14 +1078,6 @@ fn merge_archives(
     let cfg = Config::from_memory_budget(&memory_budget);
     apply_memory_budget_metrics(metrics, &cfg, &memory_budget);
 
-    // Initialize GenerationStore for merge
-    let store_path = PathBuf::from(ingestion.work_queue_path())
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let mut store = GenerationStore::new_with_config(store_path, 8)?;
-    store.configure(&cfg);
-
     metrics.add_log(format!(
         "[{} merge init] generation_store configured: claim={} MB, arena={} MB, work_cache={} MB, segment_max={} MB, fan_in={}, read_buf={} KB",
         role_as_str(role),
@@ -1041,8 +1115,8 @@ fn merge_archives(
     // Get results paths
     let (results_a_path, results_b_path) = ingestion.get_results_paths();
     // Load per-archive optimal orthos/scores so merge ingest doesn't have to rediscover them.
-    let opt_ortho_a = file_handler::load_optimal_ortho(&results_a_path).ok();
-    let opt_ortho_b = file_handler::load_optimal_ortho(&results_b_path).ok();
+    let opt_ortho_a = file_handler::load_optimal_ortho(archive_a_path).ok();
+    let opt_ortho_b = file_handler::load_optimal_ortho(archive_b_path).ok();
     let opt_score_a = opt_ortho_a
         .as_ref()
         .map(|ortho| ortho.score())
@@ -1053,36 +1127,49 @@ fn merge_archives(
         .unwrap_or(OrthoScore::zero());
     let max_opt_score = std::cmp::max(opt_score_a, opt_score_b);
 
-    // Seed with empty ortho, then lift the merge best from archive-level optima.
     let seed_ortho = Ortho::new();
-    let mut best_ortho = seed_ortho.clone();
-    let mut best_score = best_ortho.score();
+    let mut default_best_ortho = seed_ortho.clone();
+    let mut default_best_score = default_best_ortho.score();
     if let Some(opt) = opt_ortho_a.as_ref() {
-        if opt.score() > best_score {
-            best_ortho = opt.clone();
-            best_score = opt.score();
+        if opt.score() > default_best_score {
+            default_best_ortho = opt.clone();
+            default_best_score = opt.score();
         }
     }
     if let Some(opt) = opt_ortho_b.as_ref() {
-        if opt.score() > best_score {
-            best_ortho = opt.clone();
-            best_score = opt.score();
+        if opt.score() > default_best_score {
+            default_best_ortho = opt.clone();
+            default_best_score = opt.score();
         }
     }
 
-    store.push_segments(vec![seed_ortho])?;
+    let mut manifest = if let Some(manifest) = existing_manifest {
+        if manifest.a_is_smaller != a_is_smaller {
+            return Err(FoldError::Other(
+                "resume manifest interner orientation no longer matches source archives"
+                    .to_string(),
+            ));
+        }
+        manifest
+    } else {
+        let manifest = MergeResumeManifest::new(
+            ResumePhase::Claimed,
+            archive_a_path.to_string(),
+            archive_b_path.to_string(),
+            a_is_smaller,
+            merge_policy.as_str().to_string(),
+            default_best_score,
+        );
+        merge_resume::write_manifest_atomic(&merge_work_dir, &manifest)?;
+        manifest
+    };
 
-    // Initialize metrics with initial merge state
-    metrics.update_global(|g| {
-        g.generation = 0;
-        g.phase = "Idle".to_string();
-        g.work_len = store.work_len();
-        g.seen_len_accepted = store.seen_len_accepted();
-        g.run_budget_bytes = cfg.run_budget_bytes;
-        g.fan_in = cfg.fan_in;
-    });
-    metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
+    let mut best_ortho =
+        merge_resume::load_best_ortho(&merge_work_dir, &manifest)?.unwrap_or(default_best_ortho);
+    let mut best_score = manifest.best_score();
+    if best_ortho.score() > best_score {
+        best_score = best_ortho.score();
+    }
 
     // Set up paths and impacted keys for each archive
     // Note: larger archive orthos don't need remapping, their impacted keys are already in merged space
@@ -1109,206 +1196,14 @@ fn merge_archives(
         )
     };
 
-    // Process larger archive (no remapping needed). Carry forward its history directly and
-    // only decode orthos to discover the impacted subset that needs reseeding.
-    metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
-    let larger_stage_start = Instant::now();
-    let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
-    let larger_history_paths = larger_store.history_run_paths();
-
-    let mut total_from_larger = 0;
-    let mut impacted_from_larger = 0;
-    let mut larger_impacted_scratch = ImpactedScratch::default();
-
-    for bucket in 0..8 {
-        for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
-            let ortho_bytes = result?.bytes;
-            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
-            total_from_larger += 1;
-
-            if is_ortho_impacted_fast(&ortho, larger_impacted_set, &mut larger_impacted_scratch) {
-                let prune_score = std::cmp::max(best_score, max_opt_score);
-                if !bound_existing_ortho(
-                    &ortho,
-                    &merged_interner,
-                    prune_score,
-                    Some(larger_impacted_ref),
-                ) {
-                    store.push_segments(vec![ortho])?;
-                    impacted_from_larger += 1;
-                } else {
-                    metrics.update_merge(|m| {
-                        if a_is_smaller {
-                            m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
-                        } else {
-                            m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
-                        }
-                    });
-                }
-            }
-
-            if total_from_larger % 10000 == 0 {
-                ingestion.touch_heartbeat()?;
-                mem_claim.touch()?;
-                metrics.update_operation(|op| op.progress_current = total_from_larger);
-            }
-        }
-    }
-    store.adopt_history_runs(&larger_history_paths, total_from_larger as u64)?;
-    metrics.update_global(|g| {
-        g.seen_len_accepted = store.seen_len_accepted();
-    });
-
-    metrics.add_log(format!(
-        "Loaded {} orthos from larger archive {} ({} impacted)",
-        total_from_larger, larger_name, impacted_from_larger
-    ));
-    metrics.add_log(format!(
-        "Adopted {} larger-archive orthos directly into merged history",
-        total_from_larger
-    ));
-    log_merge_stage(
-        metrics,
-        "stream_larger",
-        larger_stage_start.elapsed(),
-        &format!(
-            "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
-            larger_name,
-            total_from_larger,
-            impacted_from_larger,
-            impacted_from_larger,
-            stage_rate_per_sec(total_from_larger as u64, larger_stage_start.elapsed())
-        ),
-    );
-
-    // Process smaller archive (needs remapping) - stream and remap into GenerationStore
-    metrics.set_operation_status(format!(
-        "Streaming & Remapping Smaller Archive {}",
-        smaller_name
-    ));
-    let smaller_stage_start = Instant::now();
-
-    let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
-
-    let mut total_from_smaller = 0;
-    let mut impacted_from_smaller = 0;
-    let mut smaller_impacted_scratch = ImpactedScratch::default();
-
-    // Stream all orthos from smaller archive's history, remap, and store
-    for bucket in 0..8 {
-        for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
-            let ortho_bytes = result?.bytes;
-            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
-            total_from_smaller += 1;
-
-            // Remap the ortho to merged vocabulary
-            if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
-                // Record remapped ortho to landing zone
-                store.record_result(&remapped)?;
-
-                let candidate_score = remapped.score();
-                if candidate_score > best_score {
-                    best_ortho = remapped.clone();
-                    best_score = candidate_score;
-                }
-
-                // If impacted, also seed to work queue
-                if is_ortho_impacted_fast(
-                    &remapped,
-                    smaller_impacted_set,
-                    &mut smaller_impacted_scratch,
-                ) {
-                    let prune_score = std::cmp::max(best_score, max_opt_score);
-                    if !bound_existing_ortho(
-                        &remapped,
-                        &merged_interner,
-                        prune_score,
-                        Some(smaller_impacted_ref),
-                    ) {
-                        store.push_segments(vec![remapped])?;
-                        impacted_from_smaller += 1;
-                    } else {
-                        metrics.update_merge(|m| {
-                            if a_is_smaller {
-                                m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
-                            } else {
-                                m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
-                            }
-                        });
-                    }
-                }
-            }
-
-            if total_from_smaller % 10000 == 0 {
-                ingestion.touch_heartbeat()?;
-                mem_claim.touch()?;
-                metrics.update_operation(|op| op.progress_current = total_from_smaller);
-            }
-        }
-    }
-
-    metrics.add_log(format!(
-        "Loaded & remapped {} orthos from smaller archive {} ({} impacted)",
-        total_from_smaller, smaller_name, impacted_from_smaller
-    ));
-    log_merge_stage(
-        metrics,
-        "stream_smaller_remap",
-        smaller_stage_start.elapsed(),
-        &format!(
-            "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
-            smaller_name,
-            total_from_smaller,
-            impacted_from_smaller,
-            impacted_from_smaller,
-            stage_rate_per_sec(total_from_smaller as u64, smaller_stage_start.elapsed())
-        ),
-    );
-
-    // Update metrics with impacted counts from both archives
-    if a_is_smaller {
-        metrics.update_merge(|m| {
-            m.impacted_queued_a = impacted_from_smaller;
-            m.impacted_queued_b = impacted_from_larger;
-        });
-    } else {
-        metrics.update_merge(|m| {
-            m.impacted_queued_a = impacted_from_larger;
-            m.impacted_queued_b = impacted_from_smaller;
-        });
-    }
-
-    metrics.add_log(format!(
-        "Rehydration complete: {} work items ready (A:{} B:{})",
-        store.work_len(),
-        if a_is_smaller {
-            impacted_from_smaller
-        } else {
-            impacted_from_larger
-        },
-        if a_is_smaller {
-            impacted_from_larger
-        } else {
-            impacted_from_smaller
-        }
-    ));
-
-    // Process generations in the shared runner. Merge-only threading stays behind the
-    // coordinator so store mutation and pruning order remain deterministic.
-    let merge_threads = merge_threads_from_env();
-    metrics.add_log(format!(
-        "Merge scheduling: threads={}, policy={}",
-        merge_threads,
-        merge_policy.as_str()
-    ));
-
-    let mut housekeeping = || -> Result<(), FoldError> {
-        print_optimal(&best_ortho, &merged_interner);
-        ingestion.touch_heartbeat()?;
-        mem_claim.touch()?;
-        touch_leader_lock_if_owner(config)?;
-        Ok(())
-    };
+    let mut larger_stage_elapsed = Duration::ZERO;
+    let mut smaller_stage_elapsed = Duration::ZERO;
+    let mut generation_stage_elapsed = Duration::ZERO;
+    let mut prune_stage_elapsed = Duration::ZERO;
+    let archive_stage_elapsed;
+    let mut generation_stats: Vec<fold::metrics::GenerationStat> = Vec::new();
+    let mut impacted_from_larger = 0usize;
+    let mut impacted_from_smaller = 0usize;
 
     let metrics_handle = metrics.clone_handle();
     let progress_factory = move |gen_for_closure: u64| {
@@ -1399,64 +1294,329 @@ fn merge_archives(
         }) as fold::generation_store::ProgressCallback)
     };
 
-    let generation_stage_start = Instant::now();
-    let run_result = run_merge_generation_loop(
-        &merged_interner,
-        &mut store,
-        &cfg,
-        metrics,
-        &mut housekeeping,
-        progress_factory,
-        merge_threads,
-        Some(config),
-    )?;
-    let generation_stage_elapsed = generation_stage_start.elapsed();
-
-    best_ortho = run_result.best_ortho;
-    best_score = run_result.best_score;
-    let optimal_dirty = run_result.optimal_dirty;
-
-    let mut compacted_counts: Option<(u64, u64)> = None;
+    // Process generations in the shared runner. Merge-only threading stays behind the
+    // coordinator so store mutation and pruning order remain deterministic.
+    let merge_threads = merge_threads_from_env();
     metrics.add_log(format!(
-        "Merge completed {} generations, {} total orthos",
-        run_result.generation_stats.len(),
-        store.seen_len_accepted()
+        "Merge scheduling: threads={}, policy={}",
+        merge_threads,
+        merge_policy.as_str()
     ));
-    log_merge_stage(
-        metrics,
-        "generation_loop",
-        generation_stage_elapsed,
-        &format!(
-            "generations={} accepted={} work_remaining={} best_volume={} rate_accepted_per_s={:.1}",
-            run_result.generation_stats.len(),
-            store.seen_len_accepted(),
-            store.work_len(),
-            best_score.volume,
-            stage_rate_per_sec(store.seen_len_accepted(), generation_stage_elapsed)
-        ),
-    );
-
-    let mut prune_stage_elapsed = Duration::ZERO;
-    if optimal_dirty {
-        let prune_stage_start = Instant::now();
-        let score = best_score;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        metrics.update_optimal_ortho(|opt| {
-            opt.volume = score.volume;
-            opt.variance_num = score.variance_num;
-            opt.variance_den = score.variance_den;
-            opt.dims = best_ortho.dims().clone();
-            opt.fullness = score.fullness;
-            opt.capacity = best_ortho.payload().len();
-            opt.payload = best_ortho.payload().clone();
-            opt.vocab = merged_interner.vocabulary().to_vec();
-            opt.last_update_time = now;
+    if manifest.phase == ResumePhase::Claimed {
+        let checkpoint = merge_resume::prepare_working_checkpoint(&merge_work_dir, None)?;
+        let mut store = GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8)?;
+        store.configure(&cfg);
+        store.push_segments(vec![seed_ortho.clone()])?;
+        metrics.update_global(|g| {
+            g.generation = 0;
+            g.phase = "Idle".to_string();
+            g.work_len = store.work_len();
+            g.seen_len_accepted = store.seen_len_accepted();
+            g.run_budget_bytes = cfg.run_budget_bytes;
+            g.fan_in = cfg.fan_in;
         });
+        metrics.record_work_len(store.work_len() as usize);
+        metrics.record_landing_buffer_count(store.total_landing_size());
 
-        // Best changed during merge; run a pruning compaction pass over history before archiving.
+        metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
+        let larger_stage_start = Instant::now();
+        let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
+        let larger_history_paths = larger_store.history_run_paths();
+        let mut total_from_larger = 0usize;
+        let mut larger_impacted_scratch = ImpactedScratch::default();
+
+        for bucket in 0..8 {
+            for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+                let ortho_bytes = result?.bytes;
+                let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
+                total_from_larger = total_from_larger.saturating_add(1);
+
+                if is_ortho_impacted_fast(&ortho, larger_impacted_set, &mut larger_impacted_scratch)
+                {
+                    let prune_score = std::cmp::max(best_score, max_opt_score);
+                    if !bound_existing_ortho(
+                        &ortho,
+                        &merged_interner,
+                        prune_score,
+                        Some(larger_impacted_ref),
+                    ) {
+                        store.push_segments(vec![ortho])?;
+                        impacted_from_larger = impacted_from_larger.saturating_add(1);
+                    } else {
+                        metrics.update_merge(|m| {
+                            if a_is_smaller {
+                                m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
+                            } else {
+                                m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
+                            }
+                        });
+                    }
+                }
+
+                if total_from_larger % 10000 == 0 {
+                    ingestion.touch_heartbeat()?;
+                    mem_claim.touch()?;
+                    metrics.update_operation(|op| op.progress_current = total_from_larger);
+                }
+            }
+        }
+        store.adopt_history_runs(&larger_history_paths, total_from_larger as u64)?;
+        metrics.update_global(|g| g.seen_len_accepted = store.seen_len_accepted());
+        metrics.add_log(format!(
+            "Loaded {} orthos from larger archive {} ({} impacted)",
+            total_from_larger, larger_name, impacted_from_larger
+        ));
+        metrics.add_log(format!(
+            "Adopted {} larger-archive orthos directly into merged history",
+            total_from_larger
+        ));
+        larger_stage_elapsed = larger_stage_start.elapsed();
+        log_merge_stage(
+            metrics,
+            "stream_larger",
+            larger_stage_elapsed,
+            &format!(
+                "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
+                larger_name,
+                total_from_larger,
+                impacted_from_larger,
+                impacted_from_larger,
+                stage_rate_per_sec(total_from_larger as u64, larger_stage_elapsed)
+            ),
+        );
+        if a_is_smaller {
+            metrics.update_merge(|m| m.impacted_queued_b = impacted_from_larger);
+        } else {
+            metrics.update_merge(|m| m.impacted_queued_a = impacted_from_larger);
+        }
+
+        manifest.phase = ResumePhase::LargerLoaded;
+        manifest.generation = 0;
+        manifest.best_score = best_score.into();
+        manifest = commit_merge_checkpoint(
+            &merge_work_dir,
+            manifest,
+            checkpoint,
+            &mut store,
+            &best_ortho,
+        )?;
+    }
+
+    if manifest.phase == ResumePhase::LargerLoaded {
+        let active_store_dir = manifest
+            .active_store_path(&merge_work_dir)
+            .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
+        let checkpoint =
+            merge_resume::prepare_working_checkpoint(&merge_work_dir, Some(&active_store_dir))?;
+        let mut store = GenerationStore::from_existing(checkpoint.working_dir.clone(), 8)?;
+        store.configure(&cfg);
+
+        metrics.set_operation_status(format!(
+            "Streaming & Remapping Smaller Archive {}",
+            smaller_name
+        ));
+        let smaller_stage_start = Instant::now();
+        let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
+        let mut total_from_smaller = 0usize;
+        let mut smaller_impacted_scratch = ImpactedScratch::default();
+
+        for bucket in 0..8 {
+            for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+                let ortho_bytes = result?.bytes;
+                let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
+                total_from_smaller = total_from_smaller.saturating_add(1);
+
+                if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
+                    store.record_result(&remapped)?;
+                    let candidate_score = remapped.score();
+                    if candidate_score > best_score {
+                        best_ortho = remapped.clone();
+                        best_score = candidate_score;
+                    }
+                    if is_ortho_impacted_fast(
+                        &remapped,
+                        smaller_impacted_set,
+                        &mut smaller_impacted_scratch,
+                    ) {
+                        let prune_score = std::cmp::max(best_score, max_opt_score);
+                        if !bound_existing_ortho(
+                            &remapped,
+                            &merged_interner,
+                            prune_score,
+                            Some(smaller_impacted_ref),
+                        ) {
+                            store.push_segments(vec![remapped])?;
+                            impacted_from_smaller = impacted_from_smaller.saturating_add(1);
+                        } else {
+                            metrics.update_merge(|m| {
+                                if a_is_smaller {
+                                    m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
+                                } else {
+                                    m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
+                                }
+                            });
+                        }
+                    }
+                }
+
+                if total_from_smaller % 10000 == 0 {
+                    ingestion.touch_heartbeat()?;
+                    mem_claim.touch()?;
+                    metrics.update_operation(|op| op.progress_current = total_from_smaller);
+                }
+            }
+        }
+
+        smaller_stage_elapsed = smaller_stage_start.elapsed();
+        metrics.add_log(format!(
+            "Loaded & remapped {} orthos from smaller archive {} ({} impacted)",
+            total_from_smaller, smaller_name, impacted_from_smaller
+        ));
+        log_merge_stage(
+            metrics,
+            "stream_smaller_remap",
+            smaller_stage_elapsed,
+            &format!(
+                "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
+                smaller_name,
+                total_from_smaller,
+                impacted_from_smaller,
+                impacted_from_smaller,
+                stage_rate_per_sec(total_from_smaller as u64, smaller_stage_elapsed)
+            ),
+        );
+        if a_is_smaller {
+            metrics.update_merge(|m| {
+                m.impacted_queued_a = impacted_from_smaller;
+            });
+        } else {
+            metrics.update_merge(|m| {
+                m.impacted_queued_b = impacted_from_smaller;
+            });
+        }
+        metrics.add_log(format!(
+            "Rehydration complete: {} work items ready",
+            store.work_len()
+        ));
+
+        manifest.phase = ResumePhase::SmallerLoaded;
+        manifest.generation = 0;
+        manifest.best_score = best_score.into();
+        manifest = commit_merge_checkpoint(
+            &merge_work_dir,
+            manifest,
+            checkpoint,
+            &mut store,
+            &best_ortho,
+        )?;
+    }
+
+    if matches!(
+        manifest.phase,
+        ResumePhase::SmallerLoaded | ResumePhase::GenerationCommitted
+    ) {
+        let mut next_generation = if manifest.phase == ResumePhase::SmallerLoaded {
+            0
+        } else {
+            manifest.generation.saturating_add(1)
+        };
+        loop {
+            let active_store_dir = manifest
+                .active_store_path(&merge_work_dir)
+                .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
+            let checkpoint =
+                merge_resume::prepare_working_checkpoint(&merge_work_dir, Some(&active_store_dir))?;
+            let mut store = GenerationStore::from_existing(checkpoint.working_dir.clone(), 8)?;
+            store.configure(&cfg);
+
+            let generation_step_start = Instant::now();
+            let mut generation_housekeeping = || -> Result<(), FoldError> {
+                print_optimal(&best_ortho, &merged_interner);
+                ingestion.touch_heartbeat()?;
+                mem_claim.touch()?;
+                touch_leader_lock_if_owner(config)?;
+                Ok(())
+            };
+            let step = run_single_merge_generation(
+                &merged_interner,
+                &mut store,
+                &cfg,
+                metrics,
+                &mut generation_housekeeping,
+                progress_factory(next_generation),
+                merge_threads,
+                Some(config),
+                next_generation,
+                best_ortho.clone(),
+                best_score,
+            )?;
+            generation_stage_elapsed += generation_step_start.elapsed();
+            best_ortho = step.best_ortho;
+            best_score = step.best_score;
+            generation_stats.push(step.generation_stat.clone());
+
+            manifest.phase = if step.quiesced {
+                ResumePhase::Quiesced
+            } else {
+                ResumePhase::GenerationCommitted
+            };
+            manifest.generation = step.generation_stat.generation;
+            manifest.best_score = best_score.into();
+            manifest = commit_merge_checkpoint(
+                &merge_work_dir,
+                manifest,
+                checkpoint,
+                &mut store,
+                &best_ortho,
+            )?;
+
+            if step.quiesced {
+                let committed_store =
+                    manifest.active_store_path(&merge_work_dir).ok_or_else(|| {
+                        FoldError::Other("missing committed checkpoint store".to_string())
+                    })?;
+                let committed = GenerationStore::from_existing(committed_store, 8)?;
+                metrics.add_log(format!(
+                    "Merge completed {} generations, {} total orthos",
+                    generation_stats.len(),
+                    committed.seen_len_accepted()
+                ));
+                log_merge_stage(
+                    metrics,
+                    "generation_loop",
+                    generation_stage_elapsed,
+                    &format!(
+                        "generations={} accepted={} work_remaining={} best_volume={} rate_accepted_per_s={:.1}",
+                        generation_stats.len(),
+                        committed.seen_len_accepted(),
+                        committed.work_len(),
+                        best_score.volume,
+                        stage_rate_per_sec(committed.seen_len_accepted(), generation_stage_elapsed)
+                    ),
+                );
+                break;
+            }
+            next_generation = next_generation.saturating_add(1);
+        }
+    }
+
+    let mut total_orthos = {
+        let active_store_dir = manifest
+            .active_store_path(&merge_work_dir)
+            .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
+        let store = GenerationStore::from_existing(active_store_dir, 8)?;
+        store.seen_len_accepted() as usize
+    };
+
+    if manifest.phase == ResumePhase::Quiesced && best_score > max_opt_score {
+        let active_store_dir = manifest
+            .active_store_path(&merge_work_dir)
+            .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
+        let checkpoint =
+            merge_resume::prepare_working_checkpoint(&merge_work_dir, Some(&active_store_dir))?;
+        let mut store = GenerationStore::from_existing(checkpoint.working_dir.clone(), 8)?;
+        store.configure(&cfg);
+        let prune_stage_start = Instant::now();
         metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
         let (kept, pruned) = store.prune_history_with_bound(
             &merged_interner,
@@ -1464,7 +1624,6 @@ fn merge_archives(
             None,
             cfg.read_buf_bytes,
         )?;
-        compacted_counts = Some((kept, pruned));
         metrics.update_merge(|m| {
             m.compaction_kept = kept as usize;
             m.compaction_pruned = pruned as usize;
@@ -1480,7 +1639,17 @@ fn merge_archives(
             prune_stage_elapsed,
             &format!("kept={} pruned={}", kept, pruned),
         );
-    } else {
+        total_orthos = kept as usize;
+        manifest.phase = ResumePhase::Pruned;
+        manifest.best_score = best_score.into();
+        manifest = commit_merge_checkpoint(
+            &merge_work_dir,
+            manifest,
+            checkpoint,
+            &mut store,
+            &best_ortho,
+        )?;
+    } else if manifest.phase == ResumePhase::Quiesced {
         log_merge_stage(
             metrics,
             "prune_history",
@@ -1489,38 +1658,62 @@ fn merge_archives(
         );
     }
 
-    let total_orthos = compacted_counts
-        .map(|(kept, _)| kept as usize)
-        .unwrap_or_else(|| store.seen_len_accepted() as usize);
     metrics.add_log(format!("Archiving merge: {} orthos", total_orthos));
     metrics.increment_new_orthos(total_orthos);
-
     print_optimal(&best_ortho, &merged_interner);
 
-    let archive_stage_start = Instant::now();
-    store.flush_all()?;
+    if manifest.phase == ResumePhase::Archiving {
+        if let Some(temp_path) = manifest.archive_temp_path(&merge_work_dir) {
+            if temp_path.exists() {
+                let _ = fs::remove_dir_all(temp_path);
+            }
+        }
+    }
 
-    let archive_path = build_archive_path(config)?;
+    let (archive_path, archive_temp_path) = if manifest.phase == ResumePhase::Archiving {
+        let temp_path = manifest.archive_temp_path(&merge_work_dir).ok_or_else(|| {
+            FoldError::Other("missing archive temp path in archiving manifest".to_string())
+        })?;
+        (archive_final_path_from_temp(&temp_path)?, temp_path)
+    } else {
+        build_archive_temp_paths(config)?
+    };
+
+    manifest.phase = ResumePhase::Archiving;
+    manifest.archive_temp_path = Some(archive_temp_path.to_string_lossy().to_string());
+    manifest.best_score = best_score.into();
+    merge_resume::write_manifest_atomic(&merge_work_dir, &manifest)?;
+
+    let archive_stage_start = Instant::now();
+    fs::create_dir_all(archive_temp_path.join("results")).map_err(FoldError::Io)?;
     let lineage = format!("({} {})", lineage_a_early, lineage_b_early);
     let text_preview = format!(
         "{} + {}",
         ingestion.text_preview_a, ingestion.text_preview_b
     );
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
-
-    let history_runs = history_run_paths_for_archive(&store)?;
+    let active_store_dir = manifest
+        .active_store_path(&merge_work_dir)
+        .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
+    let history_runs = history_run_paths_for_store_path(&active_store_dir, 8)?;
     let history_run_count: usize = history_runs.iter().map(|(_, runs)| runs.len()).sum();
-    move_history_runs_to_archive(&history_runs, &archive_path)?;
+    link_history_runs_to_archive(&history_runs, &archive_temp_path)?;
+    let merged_planner_meta = match (planner_meta_a.as_ref(), planner_meta_b.as_ref()) {
+        (Some(a), Some(b)) => PlannerMeta::merge(a, b),
+        _ => None,
+    };
     write_archive_artifacts(
-        &archive_path,
+        &archive_temp_path,
         &merged_interner,
         Some(&best_ortho),
         &lineage,
         total_orthos,
         &text_preview,
         word_count,
+        merged_planner_meta.as_ref(),
     )?;
-    let archive_stage_elapsed = archive_stage_start.elapsed();
+    fs::rename(&archive_temp_path, &archive_path).map_err(FoldError::Io)?;
+    archive_stage_elapsed = archive_stage_start.elapsed();
     log_merge_stage(
         metrics,
         "archive_finalize",
@@ -1536,8 +1729,8 @@ fn merge_archives(
         "Merge timing summary: policy={} setup_ms={} larger_ms={} smaller_ms={} generation_ms={} prune_ms={} archive_ms={} total_ms={}",
         merge_policy.as_str(),
         setup_stage_elapsed.as_millis(),
-        larger_stage_start.elapsed().as_millis(),
-        smaller_stage_start.elapsed().as_millis(),
+        larger_stage_elapsed.as_millis(),
+        smaller_stage_elapsed.as_millis(),
         generation_stage_elapsed.as_millis(),
         prune_stage_elapsed.as_millis(),
         archive_stage_elapsed.as_millis(),
@@ -1556,7 +1749,7 @@ fn merge_archives(
     });
 
     metrics.update_global(|g| g.processed_chunks += 1);
-    metrics.set_generation_stats(run_result.generation_stats);
+    metrics.set_generation_stats(generation_stats);
 
     // Update merge metrics on completion
     metrics.update_merge(|m| {
@@ -1564,7 +1757,10 @@ fn merge_archives(
         m.new_orthos_from_merge = total_orthos;
     });
 
-    // Cleanup
+    manifest.phase = ResumePhase::Archived;
+    manifest.archive_temp_path = None;
+    merge_resume::write_manifest_atomic(&merge_work_dir, &manifest)?;
+
     ingestion.cleanup()?;
 
     // Capture final disk usage and write a per-merge history entry
@@ -1574,6 +1770,42 @@ fn merge_archives(
     write_fold_history(config, metrics, run_start.elapsed())?;
 
     Ok(())
+}
+
+fn build_archive_temp_paths(config: &StateConfig) -> Result<(PathBuf, PathBuf), FoldError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FoldError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    let archive_name = format!("archive_{}_{}", now.as_secs(), now.subsec_nanos());
+    let archive_path = config.input_dir().join(format!("{}=.bin", archive_name));
+    let archive_temp_path = config
+        .input_dir()
+        .join(format!("{}=.bin.partial", archive_name));
+    Ok((archive_path, archive_temp_path))
+}
+
+fn commit_merge_checkpoint(
+    merge_work_dir: &Path,
+    manifest: MergeResumeManifest,
+    checkpoint: merge_resume::MergeCheckpointPaths,
+    store: &mut GenerationStore,
+    best_ortho: &Ortho,
+) -> Result<MergeResumeManifest, FoldError> {
+    store.flush_all().map_err(FoldError::Io)?;
+    merge_resume::finalize_checkpoint_commit(merge_work_dir, manifest, checkpoint, best_ortho)
+}
+
+fn archive_final_path_from_temp(temp_path: &Path) -> Result<PathBuf, FoldError> {
+    let temp_str = temp_path.to_string_lossy();
+    let Some(final_str) = temp_str.strip_suffix(".partial") else {
+        return Err(FoldError::Other(format!(
+            "archive temp path missing .partial suffix: {}",
+            temp_path.display()
+        )));
+    };
+    Ok(PathBuf::from(final_str))
 }
 
 // Helper function to build vocabulary mapping
@@ -1731,7 +1963,14 @@ fn build_archive_path(config: &StateConfig) -> Result<PathBuf, FoldError> {
 fn history_run_paths_for_archive(
     store: &GenerationStore,
 ) -> Result<Vec<(usize, Vec<PathBuf>)>, FoldError> {
-    let refreshed = GenerationStore::from_existing(store.base_path().clone(), store.bucket_count())
+    history_run_paths_for_store_path(store.base_path(), store.bucket_count())
+}
+
+fn history_run_paths_for_store_path(
+    store_path: &Path,
+    bucket_count: usize,
+) -> Result<Vec<(usize, Vec<PathBuf>)>, FoldError> {
+    let refreshed = GenerationStore::from_existing(store_path.to_path_buf(), bucket_count)
         .map_err(FoldError::Io)?;
     Ok(refreshed.history_run_paths())
 }
@@ -1756,6 +1995,41 @@ fn move_history_runs_to_archive(
         }
     }
     Ok(())
+}
+
+fn link_history_runs_to_archive(
+    history_runs: &[(usize, Vec<PathBuf>)],
+    archive_path: &Path,
+) -> Result<(), FoldError> {
+    let history_dir = archive_path.join("results").join("history");
+    for (bucket, runs) in history_runs {
+        let bucket_dir = history_dir.join(format!("b={:02}", bucket));
+        fs::create_dir_all(&bucket_dir).map_err(FoldError::Io)?;
+        for run_path in runs {
+            let filename = run_path.file_name().ok_or_else(|| {
+                FoldError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Missing run filename",
+                ))
+            })?;
+            let dest_path = bucket_dir.join(filename);
+            link_or_copy_file(run_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn link_or_copy_file(src: &Path, dest: &Path) -> Result<(), FoldError> {
+    if dest.exists() {
+        fs::remove_file(dest).map_err(FoldError::Io)?;
+    }
+    match fs::hard_link(src, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dest).map_err(FoldError::Io)?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1796,6 +2070,7 @@ fn write_archive_artifacts(
     ortho_count: usize,
     text_preview: &str,
     word_count: usize,
+    planner_meta: Option<&PlannerMeta>,
 ) -> Result<(), FoldError> {
     // Write the interner
     let interner_path = archive_path.join("interner.bin");
@@ -1821,6 +2096,10 @@ fn write_archive_artifacts(
     let text_meta_path = archive_path.join("text_meta.txt");
     let text_metadata = format!("{}\n{}", word_count, text_preview);
     fs::write(text_meta_path, text_metadata).map_err(FoldError::Io)?;
+
+    if let Some(planner_meta) = planner_meta {
+        fold::stage_planner::write_planner_meta(archive_path, planner_meta)?;
+    }
 
     Ok(())
 }
@@ -2417,7 +2696,7 @@ mod tests {
         with_env_override("FOLD_MERGE_POLICY", None, || {
             assert_eq!(
                 merge_policy_for_role(Role::Leader),
-                MergePolicy::LargestLargest
+                MergePolicy::AdjacentBalanced
             );
             assert_eq!(
                 merge_policy_for_role(Role::Follower),
@@ -2435,10 +2714,22 @@ mod tests {
                 MergePolicy::LargestSmallest
             );
         });
+
+        with_env_override("FOLD_MERGE_POLICY", Some("adjacent_balanced"), || {
+            assert_eq!(
+                merge_policy_for_role(Role::Leader),
+                MergePolicy::AdjacentBalanced
+            );
+            assert_eq!(
+                merge_policy_for_role(Role::Follower),
+                MergePolicy::AdjacentBalanced
+            );
+        });
     }
 
     #[test]
-    fn smallest_smallest_policy_makes_leader_text_first() {
+    fn text_first_policies_make_leader_prefer_text() {
+        assert!(MergePolicy::AdjacentBalanced.leader_prefers_text_first());
         assert!(!MergePolicy::LargestLargest.leader_prefers_text_first());
         assert!(!MergePolicy::LargestSmallest.leader_prefers_text_first());
         assert!(MergePolicy::SmallestSmallest.leader_prefers_text_first());
@@ -2488,6 +2779,41 @@ mod tests {
             is_ortho_impacted_fast(&other, &impacted_set, &mut other_scratch),
             legacy_is_ortho_impacted(&other, &impacted)
         );
+    }
+
+    #[test]
+    fn merge_checkpoint_commit_flushes_work_and_landing_state() {
+        let temp = TempDir::new().unwrap();
+        let merge_work_dir = temp.path();
+        let checkpoint = merge_resume::prepare_working_checkpoint(merge_work_dir, None).unwrap();
+        let mut store =
+            GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8).unwrap();
+        store.configure(&archive_generation_config());
+
+        let seed = Ortho::new();
+        let child = seed.add(PayloadVal::try_from(0usize).unwrap())[0].clone();
+        store.push_segments(vec![seed.clone()]).unwrap();
+        store.record_result(&child).unwrap();
+
+        let manifest = MergeResumeManifest::new(
+            ResumePhase::SmallerLoaded,
+            "a".to_string(),
+            "b".to_string(),
+            true,
+            "adjacent_balanced".to_string(),
+            child.score(),
+        );
+
+        let committed =
+            commit_merge_checkpoint(merge_work_dir, manifest, checkpoint, &mut store, &child)
+                .unwrap();
+
+        let reopened =
+            GenerationStore::from_existing(committed.active_store_path(merge_work_dir).unwrap(), 8)
+                .unwrap();
+
+        assert_eq!(reopened.work_len(), 1);
+        assert_eq!(reopened.total_landing_size(), 1);
     }
 
     #[test]
