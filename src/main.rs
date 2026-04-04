@@ -233,31 +233,6 @@ fn main() -> Result<(), FoldError> {
                     metrics.update_global(|g| g.role = role_as_str(role).to_string());
                 }
 
-                if let Some(resume_claim) =
-                    file_handler::claim_resumable_merge_with_config(&config)?
-                {
-                    metrics.update_global(|g| g.mode = "Merging Archives".to_string());
-                    metrics.clear_chart_history();
-                    metrics.add_log("MODE 1: Resuming merge".to_string());
-                    metrics.add_log(format!(
-                        "Resuming merge: {} + {} phase={:?}",
-                        resume_claim.archive_a_path,
-                        resume_claim.archive_b_path,
-                        resume_claim.manifest.phase
-                    ));
-                    match resume_merge(resume_claim, &config, &metrics, role) {
-                        Ok(()) => continue,
-                        Err(e) if is_concurrent_claim_error(&e) => {
-                            metrics.add_log(format!(
-                                "Lost race to claim resumable merge ({}); retrying selection",
-                                e
-                            ));
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-
                 // Update the count of distinct running jobs
                 let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
                 let remaining_chunks = file_handler::count_all_chunks_with_config(&config)?;
@@ -950,9 +925,631 @@ fn merge_archives(
     let ingestion =
         file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)
             .map_err(mark_claim_race_if_applicable)?;
-    run_merge_with_checkpoints(ingestion, config, metrics, role, None)
+    run_merge_simple(ingestion, config, metrics, role)
 }
 
+fn run_merge_simple(
+    ingestion: file_handler::ArchiveIngestion,
+    config: &StateConfig,
+    metrics: &Metrics,
+    role: Role,
+) -> Result<(), FoldError> {
+    let run_start = Instant::now();
+    let merge_policy = merge_policy_for_role(role);
+    let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
+    let _offload_guard =
+        configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
+    disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
+    log_offload_policy(metrics, &offload_cfg);
+
+    let (archive_a_path, archive_b_path) = ingestion.archive_paths();
+    let orthos_a = file_handler::load_archive_metadata(archive_a_path).unwrap_or(0);
+    let orthos_b = file_handler::load_archive_metadata(archive_b_path).unwrap_or(0);
+    let planner_meta_a = file_handler::load_archive_planner_meta(archive_a_path).ok();
+    let planner_meta_b = file_handler::load_archive_planner_meta(archive_b_path).ok();
+
+    metrics.set_operation_status("Loading interners".to_string());
+    metrics.reset_prune_counts();
+
+    let (interner_a, interner_b) = ingestion.load_interners()?;
+    let (lineage_a_early, lineage_b_early) = ingestion.load_lineages()?;
+    let merged_lineage_preview = format!("({} {})", lineage_a_early, lineage_b_early);
+    metrics.update_global(|g| g.current_lineage = merged_lineage_preview);
+
+    let a_is_smaller = interner_a.vocab_size() <= interner_b.vocab_size();
+    let (larger_interner, smaller_interner) = if a_is_smaller {
+        (interner_b, interner_a)
+    } else {
+        (interner_a, interner_b)
+    };
+
+    let merged_interner = larger_interner.merge(&smaller_interner);
+    let impacted_larger = merged_interner.impacted_keys(&larger_interner);
+    let impacted_smaller = merged_interner.impacted_keys(&smaller_interner);
+    let impacted_larger_set = build_impacted_prefix_set(&impacted_larger);
+    let impacted_smaller_set = build_impacted_prefix_set(&impacted_smaller);
+    let vocab_map_smaller =
+        build_vocab_mapping(smaller_interner.vocabulary(), merged_interner.vocabulary());
+
+    metrics.update_merge(|m| {
+        m.current_merge = format!("merge_{}", std::process::id());
+        m.archive_a_orthos = orthos_a;
+        m.archive_b_orthos = orthos_b;
+        m.impacted_a = if a_is_smaller {
+            impacted_smaller.len()
+        } else {
+            impacted_larger.len()
+        };
+        m.impacted_b = if a_is_smaller {
+            impacted_larger.len()
+        } else {
+            impacted_smaller.len()
+        };
+        m.seed_orthos_a = orthos_a;
+        m.seed_orthos_b = orthos_b;
+        m.text_preview_a = ingestion.text_preview_a.clone();
+        m.text_preview_b = ingestion.text_preview_b.clone();
+        m.word_count_a = ingestion.word_count_a;
+        m.word_count_b = ingestion.word_count_b;
+        m.compaction_kept = 0;
+        m.compaction_pruned = 0;
+        m.impacted_pruned_a = 0;
+        m.impacted_pruned_b = 0;
+    });
+    metrics.reset_new_orthos();
+    metrics.update_global(|g| {
+        g.interner_version = merged_interner.version();
+        g.vocab_size = merged_interner.vocabulary().len();
+        g.run_input_words = ingestion
+            .word_count_a
+            .saturating_add(ingestion.word_count_b);
+        g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
+    });
+    metrics.add_log(format!(
+        "Merged interner: v{}, vocab={} (Archive {} is smaller)",
+        merged_interner.version(),
+        merged_interner.vocabulary().len(),
+        if a_is_smaller { "A" } else { "B" }
+    ));
+
+    let memory_budget = memory_budget_for_role(role)?;
+    let mem_claim = acquire_memory_claim_simple(role, config, &memory_budget)?;
+    let _memory_guard = memory_safety::ScopedProcessMemory::new(
+        mem_claim.granted_bytes(),
+        Some(metrics.clone_handle()),
+    );
+    let cfg = Config::from_memory_budget(&memory_budget);
+    apply_memory_budget_metrics(metrics, &cfg, &memory_budget);
+
+    metrics.add_log(format!(
+        "[{} merge init] generation_store configured: claim={} MB, arena={} MB, work_cache={} MB, segment_max={} MB, fan_in={}, read_buf={} KB",
+        role_as_str(role),
+        memory_budget.process_claim_bytes / 1_048_576,
+        cfg.run_budget_bytes / 1_048_576,
+        cfg.work_queue_cache_bytes / 1_048_576,
+        cfg.work_segment_max_bytes / 1_048_576,
+        cfg.fan_in,
+        cfg.read_buf_bytes / 1024
+    ));
+    let setup_stage_elapsed = run_start.elapsed();
+    log_merge_stage(
+        metrics,
+        "setup",
+        setup_stage_elapsed,
+        &format!(
+            "policy={} archive_a_orthos={} archive_b_orthos={} impacted_a={} impacted_b={} merged_vocab={}",
+            merge_policy.as_str(),
+            orthos_a,
+            orthos_b,
+            if a_is_smaller {
+                impacted_smaller.len()
+            } else {
+                impacted_larger.len()
+            },
+            if a_is_smaller {
+                impacted_larger.len()
+            } else {
+                impacted_smaller.len()
+            },
+            merged_interner.vocabulary().len()
+        ),
+    );
+
+    let (results_a_path, results_b_path) = ingestion.get_results_paths();
+    let opt_ortho_a = file_handler::load_optimal_ortho(archive_a_path).ok();
+    let opt_ortho_b = file_handler::load_optimal_ortho(archive_b_path).ok();
+    let opt_score_a = opt_ortho_a
+        .as_ref()
+        .map(|ortho| ortho.score())
+        .unwrap_or(OrthoScore::zero());
+    let opt_score_b = opt_ortho_b
+        .as_ref()
+        .map(|ortho| ortho.score())
+        .unwrap_or(OrthoScore::zero());
+    let max_opt_score = std::cmp::max(opt_score_a, opt_score_b);
+
+    let seed_ortho = Ortho::new();
+    let mut best_ortho = seed_ortho.clone();
+    let mut best_score = best_ortho.score();
+    if let Some(opt) = opt_ortho_a.as_ref() {
+        if opt.score() > best_score {
+            best_ortho = opt.clone();
+            best_score = opt.score();
+        }
+    }
+    if let Some(opt) = opt_ortho_b.as_ref() {
+        if opt.score() > best_score {
+            best_ortho = opt.clone();
+            best_score = opt.score();
+        }
+    }
+
+    let (larger_path, larger_impacted_ref, larger_impacted_set, larger_name) = if a_is_smaller {
+        (&results_b_path, &impacted_larger, &impacted_larger_set, "B")
+    } else {
+        (&results_a_path, &impacted_larger, &impacted_larger_set, "A")
+    };
+    let (smaller_path, smaller_impacted_ref, smaller_impacted_set, smaller_name) = if a_is_smaller {
+        (
+            &results_a_path,
+            &impacted_smaller,
+            &impacted_smaller_set,
+            "A",
+        )
+    } else {
+        (
+            &results_b_path,
+            &impacted_smaller,
+            &impacted_smaller_set,
+            "B",
+        )
+    };
+
+    let merge_store_dir = PathBuf::from(ingestion.merge_work_folder()).join("store");
+    let mut store = GenerationStore::new_with_config(merge_store_dir.clone(), 8)?;
+    store.configure(&cfg);
+    store.push_segments(vec![seed_ortho.clone()])?;
+    metrics.update_global(|g| {
+        g.generation = 0;
+        g.phase = "Idle".to_string();
+        g.work_len = store.work_len();
+        g.seen_len_accepted = store.seen_len_accepted();
+        g.run_budget_bytes = cfg.run_budget_bytes;
+        g.fan_in = cfg.fan_in;
+    });
+    metrics.record_work_len(store.work_len() as usize);
+    metrics.record_landing_buffer_count(store.total_landing_size());
+
+    let larger_stage_elapsed;
+    let smaller_stage_elapsed;
+    let mut generation_stage_elapsed = Duration::ZERO;
+    let mut prune_stage_elapsed = Duration::ZERO;
+    let archive_stage_elapsed;
+    let mut generation_stats: Vec<fold::metrics::GenerationStat> = Vec::new();
+    let mut impacted_from_larger = 0usize;
+    let mut impacted_from_smaller = 0usize;
+
+    metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
+    let larger_stage_start = Instant::now();
+    let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
+    let larger_history_paths = larger_store.history_run_paths();
+    let mut total_from_larger = 0usize;
+    let mut larger_impacted_scratch = ImpactedScratch::default();
+
+    for bucket in 0..8 {
+        for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+            let ortho_bytes = result?.bytes;
+            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
+            total_from_larger = total_from_larger.saturating_add(1);
+
+            if is_ortho_impacted_fast(&ortho, larger_impacted_set, &mut larger_impacted_scratch) {
+                let prune_score = std::cmp::max(best_score, max_opt_score);
+                if !bound_existing_ortho(
+                    &ortho,
+                    &merged_interner,
+                    prune_score,
+                    Some(larger_impacted_ref),
+                ) {
+                    store.push_segments(vec![ortho])?;
+                    impacted_from_larger = impacted_from_larger.saturating_add(1);
+                } else {
+                    metrics.update_merge(|m| {
+                        if a_is_smaller {
+                            m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
+                        } else {
+                            m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
+                        }
+                    });
+                }
+            }
+
+            if total_from_larger % 10000 == 0 {
+                ingestion.touch_heartbeat()?;
+                mem_claim.touch()?;
+                metrics.update_operation(|op| {
+                    op.progress_total = orthos_a.max(orthos_b);
+                    op.progress_current = total_from_larger;
+                });
+            }
+        }
+    }
+    store.adopt_history_runs(&larger_history_paths, total_from_larger as u64)?;
+    metrics.update_global(|g| g.seen_len_accepted = store.seen_len_accepted());
+    metrics.add_log(format!(
+        "Loaded {} orthos from larger archive {} ({} impacted)",
+        total_from_larger, larger_name, impacted_from_larger
+    ));
+    metrics.add_log(format!(
+        "Adopted {} larger-archive orthos directly into merged history",
+        total_from_larger
+    ));
+    larger_stage_elapsed = larger_stage_start.elapsed();
+    log_merge_stage(
+        metrics,
+        "stream_larger",
+        larger_stage_elapsed,
+        &format!(
+            "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
+            larger_name,
+            total_from_larger,
+            impacted_from_larger,
+            impacted_from_larger,
+            stage_rate_per_sec(total_from_larger as u64, larger_stage_elapsed)
+        ),
+    );
+    if a_is_smaller {
+        metrics.update_merge(|m| m.impacted_queued_b = impacted_from_larger);
+    } else {
+        metrics.update_merge(|m| m.impacted_queued_a = impacted_from_larger);
+    }
+
+    metrics.set_operation_status(format!("Streaming & Remapping Smaller Archive {}", smaller_name));
+    let smaller_stage_start = Instant::now();
+    let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
+    let mut total_from_smaller = 0usize;
+    let mut smaller_impacted_scratch = ImpactedScratch::default();
+
+    for bucket in 0..8 {
+        for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
+            let ortho_bytes = result?.bytes;
+            let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
+            total_from_smaller = total_from_smaller.saturating_add(1);
+
+            if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
+                store.record_result(&remapped)?;
+                let candidate_score = remapped.score();
+                if candidate_score > best_score {
+                    best_ortho = remapped.clone();
+                    best_score = candidate_score;
+                }
+                if is_ortho_impacted_fast(
+                    &remapped,
+                    smaller_impacted_set,
+                    &mut smaller_impacted_scratch,
+                ) {
+                    let prune_score = std::cmp::max(best_score, max_opt_score);
+                    if !bound_existing_ortho(
+                        &remapped,
+                        &merged_interner,
+                        prune_score,
+                        Some(smaller_impacted_ref),
+                    ) {
+                        store.push_segments(vec![remapped])?;
+                        impacted_from_smaller = impacted_from_smaller.saturating_add(1);
+                    } else {
+                        metrics.update_merge(|m| {
+                            if a_is_smaller {
+                                m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
+                            } else {
+                                m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
+                            }
+                        });
+                    }
+                }
+            }
+
+            if total_from_smaller % 10000 == 0 {
+                ingestion.touch_heartbeat()?;
+                mem_claim.touch()?;
+                metrics.update_operation(|op| {
+                    op.progress_total = orthos_a.min(orthos_b);
+                    op.progress_current = total_from_smaller;
+                });
+            }
+        }
+    }
+
+    smaller_stage_elapsed = smaller_stage_start.elapsed();
+    metrics.add_log(format!(
+        "Loaded & remapped {} orthos from smaller archive {} ({} impacted)",
+        total_from_smaller, smaller_name, impacted_from_smaller
+    ));
+    log_merge_stage(
+        metrics,
+        "stream_smaller_remap",
+        smaller_stage_elapsed,
+        &format!(
+            "archive={} total_orthos={} impacted={} seeded={} rate_orthos_per_s={:.1}",
+            smaller_name,
+            total_from_smaller,
+            impacted_from_smaller,
+            impacted_from_smaller,
+            stage_rate_per_sec(total_from_smaller as u64, smaller_stage_elapsed)
+        ),
+    );
+    if a_is_smaller {
+        metrics.update_merge(|m| {
+            m.impacted_queued_a = impacted_from_smaller;
+        });
+    } else {
+        metrics.update_merge(|m| {
+            m.impacted_queued_b = impacted_from_smaller;
+        });
+    }
+    metrics.add_log(format!(
+        "Rehydration complete: {} work items ready",
+        store.work_len()
+    ));
+
+    let metrics_handle = metrics.clone_handle();
+    let progress_factory = move |gen_for_closure: u64| {
+        let metrics_clone = metrics_handle.clone_handle();
+        Some(Box::new(move |msg: &str| {
+            if msg.starts_with("TRANSITION_START:") {
+                if let Some(bucket_count_str) = msg.strip_prefix("TRANSITION_START:") {
+                    if let Ok(bucket_count) = bucket_count_str.parse::<usize>() {
+                        let initial_buckets: Vec<_> = (0..bucket_count)
+                            .map(|i| fold::metrics::BucketMetrics {
+                                bucket_id: i,
+                                run_count: 0,
+                                landing_size: 0,
+                                history_size_estimate: 0,
+                                state: fold::metrics::BucketState::Pending,
+                                new_work: 0,
+                            })
+                            .collect();
+                        metrics_clone.update_bucket_metrics(initial_buckets);
+                    }
+                }
+            } else if msg.starts_with("BUCKET_STATE:") {
+                let parts: Vec<&str> = msg
+                    .strip_prefix("BUCKET_STATE:")
+                    .unwrap()
+                    .split(':')
+                    .collect();
+                if parts.len() >= 2 {
+                    if let Ok(bucket_id) = parts[0].parse::<usize>() {
+                        let state_str = parts[1];
+                        let new_work = if parts.len() >= 3 {
+                            parts[2].parse::<usize>().unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let state = match state_str {
+                            "draining" => fold::metrics::BucketState::Draining,
+                            "sorting" => fold::metrics::BucketState::Sorting,
+                            "merging" => fold::metrics::BucketState::Merging,
+                            "antijoining" => fold::metrics::BucketState::AntiJoining,
+                            "compacting" => fold::metrics::BucketState::Compacting,
+                            "complete" => fold::metrics::BucketState::Complete,
+                            "empty" => fold::metrics::BucketState::Empty,
+                            _ => fold::metrics::BucketState::Pending,
+                        };
+                        let snapshot = metrics_clone.snapshot();
+                        let mut updated_buckets = snapshot.bucket_metrics.clone();
+                        if bucket_id < updated_buckets.len() {
+                            updated_buckets[bucket_id].state = state;
+                            updated_buckets[bucket_id].new_work = new_work;
+                            metrics_clone.update_bucket_metrics(updated_buckets);
+                        }
+                    }
+                }
+            } else if msg == "TRANSITION_COMPLETE" {
+                let snapshot = metrics_clone.snapshot();
+                let reset_buckets: Vec<_> = snapshot
+                    .bucket_metrics
+                    .iter()
+                    .map(|b| fold::metrics::BucketMetrics {
+                        bucket_id: b.bucket_id,
+                        run_count: b.run_count,
+                        landing_size: b.landing_size,
+                        history_size_estimate: b.history_size_estimate,
+                        state: fold::metrics::BucketState::Pending,
+                        new_work: 0,
+                    })
+                    .collect();
+                metrics_clone.update_bucket_metrics(reset_buckets);
+            }
+
+            if !msg.starts_with("BUCKET_STATE:")
+                && !msg.starts_with("TRANSITION_START:")
+                && msg != "TRANSITION_COMPLETE"
+            {
+                metrics_clone.update_global(|g| {
+                    g.phase = format!(
+                        "Merge Gen {} → {}: {}",
+                        gen_for_closure,
+                        gen_for_closure + 1,
+                        msg
+                    );
+                });
+                metrics_clone.add_log(format!("Merge Gen {} transition: {}", gen_for_closure, msg));
+            }
+        }) as fold::generation_store::ProgressCallback)
+    };
+
+    let merge_threads = merge_threads_from_env();
+    metrics.add_log(format!(
+        "Merge scheduling: threads={}, policy={}",
+        merge_threads,
+        merge_policy.as_str()
+    ));
+
+    let mut next_generation = 0u64;
+    loop {
+        let generation_step_start = Instant::now();
+        let mut generation_housekeeping = || -> Result<(), FoldError> {
+            print_optimal(&best_ortho, &merged_interner);
+            ingestion.touch_heartbeat()?;
+            mem_claim.touch()?;
+            touch_leader_lock_if_owner(config)?;
+            Ok(())
+        };
+        let step = run_single_merge_generation(
+            &merged_interner,
+            &mut store,
+            &cfg,
+            metrics,
+            &mut generation_housekeeping,
+            progress_factory(next_generation),
+            merge_threads,
+            Some(config),
+            next_generation,
+            best_ortho.clone(),
+            best_score,
+        )?;
+        generation_stage_elapsed += generation_step_start.elapsed();
+        best_ortho = step.best_ortho;
+        best_score = step.best_score;
+        generation_stats.push(step.generation_stat.clone());
+
+        if step.quiesced {
+            metrics.add_log(format!(
+                "Merge completed {} generations, {} total orthos",
+                generation_stats.len(),
+                store.seen_len_accepted()
+            ));
+            log_merge_stage(
+                metrics,
+                "generation_loop",
+                generation_stage_elapsed,
+                &format!(
+                    "generations={} accepted={} work_remaining={} best_volume={} rate_accepted_per_s={:.1}",
+                    generation_stats.len(),
+                    store.seen_len_accepted(),
+                    store.work_len(),
+                    best_score.volume,
+                    stage_rate_per_sec(store.seen_len_accepted(), generation_stage_elapsed)
+                ),
+            );
+            break;
+        }
+        next_generation = next_generation.saturating_add(1);
+    }
+
+    let mut total_orthos = store.seen_len_accepted() as usize;
+    if best_score > max_opt_score {
+        let prune_stage_start = Instant::now();
+        metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
+        let (kept, pruned) = store.prune_history_with_bound(
+            &merged_interner,
+            best_score,
+            None,
+            cfg.read_buf_bytes,
+        )?;
+        metrics.update_merge(|m| {
+            m.compaction_kept = kept as usize;
+            m.compaction_pruned = pruned as usize;
+        });
+        metrics.add_log(format!(
+            "Pruning compaction kept {} orthos, pruned {}",
+            kept, pruned
+        ));
+        prune_stage_elapsed = prune_stage_start.elapsed();
+        log_merge_stage(
+            metrics,
+            "prune_history",
+            prune_stage_elapsed,
+            &format!("kept={} pruned={}", kept, pruned),
+        );
+        total_orthos = kept as usize;
+    } else {
+        log_merge_stage(
+            metrics,
+            "prune_history",
+            prune_stage_elapsed,
+            "skipped=true reason=best_unchanged",
+        );
+    }
+
+    metrics.add_log(format!("Archiving merge: {} orthos", total_orthos));
+    metrics.increment_new_orthos(total_orthos);
+    print_optimal(&best_ortho, &merged_interner);
+    store.flush_all()?;
+
+    let (archive_path, archive_temp_path) = build_archive_temp_paths(config)?;
+    let archive_stage_start = Instant::now();
+    fs::create_dir_all(archive_temp_path.join("results")).map_err(FoldError::Io)?;
+    let lineage = format!("({} {})", lineage_a_early, lineage_b_early);
+    let text_preview = format!("{} + {}", ingestion.text_preview_a, ingestion.text_preview_b);
+    let word_count = ingestion.word_count_a + ingestion.word_count_b;
+    let history_runs = history_run_paths_for_archive(&store)?;
+    let history_run_count: usize = history_runs.iter().map(|(_, runs)| runs.len()).sum();
+    link_history_runs_to_archive(&history_runs, &archive_temp_path)?;
+    let merged_planner_meta = match (planner_meta_a.as_ref(), planner_meta_b.as_ref()) {
+        (Some(a), Some(b)) => PlannerMeta::merge(a, b),
+        _ => None,
+    };
+    write_archive_artifacts(
+        &archive_temp_path,
+        &merged_interner,
+        Some(&best_ortho),
+        &lineage,
+        total_orthos,
+        &text_preview,
+        word_count,
+        merged_planner_meta.as_ref(),
+    )?;
+    fs::rename(&archive_temp_path, &archive_path).map_err(FoldError::Io)?;
+    archive_stage_elapsed = archive_stage_start.elapsed();
+    log_merge_stage(
+        metrics,
+        "archive_finalize",
+        archive_stage_elapsed,
+        &format!(
+            "history_runs={} total_orthos={} archive_path={}",
+            history_run_count,
+            total_orthos,
+            archive_path.display()
+        ),
+    );
+    metrics.add_log(format!(
+        "Merge timing summary: policy={} setup_ms={} larger_ms={} smaller_ms={} generation_ms={} prune_ms={} archive_ms={} total_ms={}",
+        merge_policy.as_str(),
+        setup_stage_elapsed.as_millis(),
+        larger_stage_elapsed.as_millis(),
+        smaller_stage_elapsed.as_millis(),
+        generation_stage_elapsed.as_millis(),
+        prune_stage_elapsed.as_millis(),
+        archive_stage_elapsed.as_millis(),
+        run_start.elapsed().as_millis()
+    ));
+    metrics.add_log(format!("Merged archive saved: {}", archive_path.display()));
+
+    metrics.update_largest_archive(|la| {
+        if total_orthos > la.ortho_count {
+            la.filename = archive_path.to_string_lossy().to_string();
+            la.ortho_count = total_orthos;
+            la.lineage = lineage;
+        }
+    });
+    metrics.update_global(|g| g.processed_chunks += 1);
+    metrics.set_generation_stats(generation_stats);
+    metrics.update_merge(|m| {
+        m.completed_merges += 1;
+        m.new_orthos_from_merge = total_orthos;
+    });
+
+    ingestion.cleanup()?;
+    metrics.update_global(|g| {
+        g.run_disk_bytes = directory_size(&config.base_dir).unwrap_or(0);
+    });
+    write_fold_history(config, metrics, run_start.elapsed())?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn resume_merge(
     claim: file_handler::ResumableMergeClaim,
     config: &StateConfig,
@@ -964,6 +1561,7 @@ fn resume_merge(
     run_merge_with_checkpoints(ingestion, config, metrics, role, Some(manifest))
 }
 
+#[allow(dead_code)]
 fn run_merge_with_checkpoints(
     ingestion: file_handler::ArchiveIngestion,
     config: &StateConfig,
@@ -1786,6 +2384,7 @@ fn build_archive_temp_paths(config: &StateConfig) -> Result<(PathBuf, PathBuf), 
     Ok((archive_path, archive_temp_path))
 }
 
+#[allow(dead_code)]
 fn commit_merge_checkpoint(
     merge_work_dir: &Path,
     manifest: MergeResumeManifest,
@@ -1797,6 +2396,7 @@ fn commit_merge_checkpoint(
     merge_resume::finalize_checkpoint_commit(merge_work_dir, manifest, checkpoint, best_ortho)
 }
 
+#[allow(dead_code)]
 fn archive_final_path_from_temp(temp_path: &Path) -> Result<PathBuf, FoldError> {
     let temp_str = temp_path.to_string_lossy();
     let Some(final_str) = temp_str.strip_suffix(".partial") else {

@@ -146,6 +146,7 @@ pub struct GenerationStore {
     compression_stats: CompressionStats,
     record_write_scratch: AlignedVec,
     record_read_scratch: Vec<u8>,
+    pressure_prepare_in_progress: bool,
 }
 
 /// Placeholder for unsorted drained data
@@ -940,6 +941,7 @@ impl GenerationStore {
             compression_stats: CompressionStats::default(),
             record_write_scratch: AlignedVec::new(),
             record_read_scratch: Vec::new(),
+            pressure_prepare_in_progress: false,
         })
     }
 
@@ -1249,6 +1251,7 @@ impl GenerationStore {
             compression_stats: CompressionStats::default(),
             record_write_scratch: AlignedVec::new(),
             record_read_scratch: Vec::new(),
+            pressure_prepare_in_progress: false,
         }
     }
 
@@ -1299,18 +1302,7 @@ impl GenerationStore {
         // Track buffer size and flush if over threshold
         self.landing_buffer_sizes[bucket] += encoded_len;
         if self.landing_buffer_sizes[bucket] >= flush_threshold {
-            let bytes_needed = self.landing_buffer_sizes[bucket] as u64;
-            self.maybe_reclaim_before_write(
-                bytes_needed,
-                &format!("flush landing bucket {}", bucket),
-            )?;
-            disk_safety::ensure_write_budget(
-                bytes_needed,
-                &format!("flush landing bucket {}", bucket),
-            )?;
-            let writer = self.bucket_writers[bucket].as_mut().unwrap();
-            writer.flush()?;
-            self.landing_buffer_sizes[bucket] = 0;
+            self.flush_bucket_writer(bucket, true)?;
         }
 
         Ok(())
@@ -1319,19 +1311,9 @@ impl GenerationStore {
     /// Drain a bucket by renaming active.log to drain-N.log
     pub fn drain_bucket(&mut self, bucket: usize) -> io::Result<RawStream> {
         // Flush and close any active writer for this bucket
-        if let Some(writer) = self.bucket_writers[bucket].take() {
-            let mut writer = writer;
-            if self.landing_buffer_sizes[bucket] > 0 {
-                self.maybe_reclaim_before_write(
-                    self.landing_buffer_sizes[bucket] as u64,
-                    &format!("flush landing bucket {}", bucket),
-                )?;
-                disk_safety::ensure_write_budget(
-                    self.landing_buffer_sizes[bucket] as u64,
-                    &format!("flush landing bucket {}", bucket),
-                )?;
-            }
-            writer.flush()?;
+        if self.bucket_writers[bucket].is_some() {
+            self.flush_bucket_writer(bucket, true)?;
+            self.bucket_writers[bucket].take();
         }
 
         let active_path = self.active_log_path(bucket);
@@ -1394,23 +1376,75 @@ impl GenerationStore {
 
     /// Flush the work segment batch to disk
     fn flush_work_segment_batch(&mut self) -> io::Result<()> {
+        self.flush_work_segment_batch_with_pressure(true)
+    }
+
+    fn flush_work_segment_batch_with_pressure(
+        &mut self,
+        allow_pressure_handling: bool,
+    ) -> io::Result<()> {
         if self.work_segment_batch.is_empty() {
             return Ok(());
         }
 
-        let count = self.work_segment_batch.len() as u64;
-        let bytes_needed = (self.work_segment_batch_bytes as u64)
+        let batch = std::mem::take(&mut self.work_segment_batch);
+        let batch_bytes = self.work_segment_batch_bytes;
+        let count = batch.len() as u64;
+        let segment_path = if allow_pressure_handling {
+            self.write_segment_file(batch.iter(), batch_bytes, "flush work segment batch")?
+        } else {
+            self.write_segment_file_inner(
+                batch.iter(),
+                batch_bytes,
+                "flush work segment batch",
+                false,
+            )?
+        };
+        self.work_segments.push_back(segment_path);
+        self.total_work_len += count;
+        self.work_segment_batch_bytes = 0;
+        self.best_score_dirty.set(true);
+        self.sync_memory_metrics();
+
+        Ok(())
+    }
+
+    fn write_segment_file<'a, I>(
+        &mut self,
+        items: I,
+        decoded_bytes: usize,
+        reason: &str,
+    ) -> io::Result<PathBuf>
+    where
+        I: IntoIterator<Item = &'a Ortho>,
+    {
+        self.write_segment_file_inner(items, decoded_bytes, reason, true)
+    }
+
+    fn write_segment_file_inner<'a, I>(
+        &mut self,
+        items: I,
+        decoded_bytes: usize,
+        reason: &str,
+        allow_pressure_handling: bool,
+    ) -> io::Result<PathBuf>
+    where
+        I: IntoIterator<Item = &'a Ortho>,
+    {
+        let items: Vec<&Ortho> = items.into_iter().collect();
+        let count = items.len() as u64;
+        let bytes_needed = (decoded_bytes as u64)
             .saturating_mul(2)
             .saturating_add(std::mem::size_of_val(&count) as u64)
             .saturating_add((count as u64).saturating_mul(8));
-        self.maybe_reclaim_before_write(bytes_needed, "flush work segment batch")?;
+        if allow_pressure_handling {
+            self.maybe_reclaim_before_write(bytes_needed, reason)?;
+        }
         memory_safety::ensure_phase_headroom(
-            self.work_segment_batch_bytes
-                .saturating_mul(2)
-                .saturating_add(64 * 1024),
-            "flush work segment batch",
+            decoded_bytes.saturating_mul(2).saturating_add(64 * 1024),
+            reason,
         )?;
-        disk_safety::ensure_write_budget(bytes_needed, "flush work segment batch")?;
+        disk_safety::ensure_write_budget(bytes_needed, reason)?;
 
         let segment_path = self
             .base_path
@@ -1418,24 +1452,51 @@ impl GenerationStore {
             .join(format!("segment-{}.dat", self.work_segment_counter));
         self.work_segment_counter += 1;
 
-        // Write segment file with large buffer
         let mut file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&segment_path)?);
         file.write_all(&count.to_le_bytes())?;
-        for ortho in &self.work_segment_batch {
+        for ortho in items {
             let encoded_len = serialize_ortho_into_scratch(ortho, &mut self.record_write_scratch)?;
             file.write_all(&(encoded_len as u64).to_le_bytes())?;
             file.write_all(&self.record_write_scratch[..encoded_len])?;
         }
         file.flush()?;
+        Ok(segment_path)
+    }
 
-        // Add to work segments and update totals
-        self.work_segments.push_back(segment_path);
-        self.total_work_len += count;
-        self.work_segment_batch.clear();
-        self.work_segment_batch_bytes = 0;
+    fn spill_work_queue_cache_to_disk(&mut self) -> io::Result<bool> {
+        if self.work_queue_cache.is_empty() {
+            return Ok(false);
+        }
+
+        let cache_items: Vec<Ortho> = self.work_queue_cache.iter().cloned().collect();
+        let cache_bytes = self.work_queue_cache_bytes;
+        let segment_path = self.write_segment_file_inner(
+            cache_items.iter(),
+            cache_bytes,
+            "spill work queue cache",
+            false,
+        )?;
+        self.work_segments.push_front(segment_path);
+        self.work_queue_cache.clear();
+        self.work_queue_cache_bytes = 0;
         self.best_score_dirty.set(true);
         self.sync_memory_metrics();
+        Ok(true)
+    }
 
+    fn flush_bucket_writer(&mut self, bucket: usize, allow_pressure_handling: bool) -> io::Result<()> {
+        let bytes_needed = self.landing_buffer_sizes[bucket] as u64;
+        if bytes_needed > 0 {
+            let reason = format!("flush landing bucket {}", bucket);
+            if allow_pressure_handling {
+                self.maybe_reclaim_before_write(bytes_needed, &reason)?;
+            }
+            disk_safety::ensure_write_budget(bytes_needed, &reason)?;
+        }
+        if let Some(writer) = self.bucket_writers[bucket].as_mut() {
+            writer.flush()?;
+        }
+        self.landing_buffer_sizes[bucket] = 0;
         Ok(())
     }
 
@@ -1588,14 +1649,48 @@ impl GenerationStore {
     }
 
     pub fn prepare_for_reclaim(&mut self) -> io::Result<()> {
-        self.sync_memory_metrics();
-        GenerationStore::set_compaction_bytes(0);
-        Ok(())
+        if self.pressure_prepare_in_progress {
+            return Ok(());
+        }
+        self.pressure_prepare_in_progress = true;
+        let result = (|| -> io::Result<()> {
+            self.flush_all_without_pressure()?;
+            let _ = self.spill_work_queue_cache_to_disk()?;
+            self.sync_memory_metrics();
+            GenerationStore::set_compaction_bytes(0);
+            Ok(())
+        })();
+        self.pressure_prepare_in_progress = false;
+        result
     }
 
     fn maybe_reclaim_before_write(&mut self, bytes_needed: u64, reason: &str) -> io::Result<()> {
-        self.prepare_for_reclaim()?;
-        let _ = disk_safety::maybe_reclaim(bytes_needed, reason)?;
+        let mut prepared = false;
+        if memory_safety::should_spill_to_disk() {
+            self.prepare_for_reclaim()?;
+            prepared = true;
+        }
+        if disk_safety::reclaim_required(bytes_needed)?.is_some() {
+            if !prepared {
+                self.prepare_for_reclaim()?;
+            }
+            let _ = disk_safety::maybe_reclaim(bytes_needed, reason)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all_without_pressure(&mut self) -> io::Result<()> {
+        self.flush_without_pressure()?;
+        self.flush_work_segment_batch_with_pressure(false)?;
+        Ok(())
+    }
+
+    fn flush_without_pressure(&mut self) -> io::Result<()> {
+        for bucket in 0..self.bucket_writers.len() {
+            if self.bucket_writers[bucket].is_some() {
+                self.flush_bucket_writer(bucket, false)?;
+            }
+        }
         Ok(())
     }
 
@@ -1968,19 +2063,7 @@ impl GenerationStore {
     pub fn flush(&mut self) -> io::Result<()> {
         for bucket in 0..self.bucket_writers.len() {
             if self.bucket_writers[bucket].is_some() {
-                if self.landing_buffer_sizes[bucket] > 0 {
-                    self.maybe_reclaim_before_write(
-                        self.landing_buffer_sizes[bucket] as u64,
-                        &format!("flush landing bucket {}", bucket),
-                    )?;
-                    disk_safety::ensure_write_budget(
-                        self.landing_buffer_sizes[bucket] as u64,
-                        &format!("flush landing bucket {}", bucket),
-                    )?;
-                }
-                let w = self.bucket_writers[bucket].as_mut().unwrap();
-                w.flush()?;
-                self.landing_buffer_sizes[bucket] = 0;
+                self.flush_bucket_writer(bucket, true)?;
             }
         }
         Ok(())

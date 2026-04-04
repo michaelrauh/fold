@@ -6,6 +6,7 @@ use std::process::Command;
 use std::thread_local;
 
 const PHASE_HEADROOM_RESERVE_BYTES: usize = 256 * 1024 * 1024;
+const RAM_SPILL_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 
 thread_local! {
     static PROCESS_CLAIM_BYTES: Cell<usize> = const { Cell::new(0) };
@@ -53,6 +54,21 @@ pub fn current_process_claim_bytes() -> Option<usize> {
 
 pub fn phase_headroom_reserve_bytes() -> usize {
     PHASE_HEADROOM_RESERVE_BYTES
+}
+
+pub fn ram_spill_reserve_bytes() -> usize {
+    RAM_SPILL_RESERVE_BYTES
+}
+
+pub fn should_spill_to_disk() -> bool {
+    let Some(claim_bytes) = current_process_claim_bytes() else {
+        return false;
+    };
+    let spill_high_water = claim_bytes.saturating_sub(RAM_SPILL_RESERVE_BYTES);
+    if spill_high_water == 0 {
+        return false;
+    }
+    current_process_rss_bytes() >= spill_high_water
 }
 
 pub fn ensure_phase_headroom(bytes_needed: usize, reason: &str) -> io::Result<()> {

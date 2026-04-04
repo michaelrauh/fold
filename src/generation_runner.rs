@@ -73,18 +73,25 @@ fn maybe_run_processing_reclaim_safe_point(
     reason: &str,
 ) -> Result<bool, FoldError> {
     let reservation = store.processing_reclaim_reservation_bytes();
-    let Some(targets) = disk_safety::reclaim_required(reservation)? else {
+    let ram_pressure = memory_safety::should_spill_to_disk();
+    let reclaim_targets = disk_safety::reclaim_required(reservation)?;
+    if !ram_pressure && reclaim_targets.is_none() {
         return Ok(false);
-    };
+    }
     metrics.add_log(format!(
-        "Reclaim pending at safe point: reason={}, reservation_bytes={}, write_target={}, reclaim_target={}",
-        reason, reservation, targets.write_target, targets.reclaim_target
+        "Pressure safe point: reason={}, reservation_bytes={}, ram_pressure={}, disk_pressure={}",
+        reason,
+        reservation,
+        ram_pressure,
+        reclaim_targets.is_some()
     ));
     store.prepare_for_reclaim()?;
-    disk_safety::run_reclaim_to_target(targets, reason)?;
+    if let Some(targets) = reclaim_targets {
+        disk_safety::run_reclaim_to_target(targets, reason)?;
+    }
     metrics.add_log(format!(
-        "Reclaim complete at safe point: reason={}, reservation_bytes={}, write_target={}, reclaim_target={}",
-        reason, reservation, targets.write_target, targets.reclaim_target
+        "Pressure safe point complete: reason={}, reservation_bytes={}",
+        reason, reservation
     ));
     Ok(true)
 }
@@ -991,6 +998,12 @@ where
             metrics.set_compression_bytes(comp.uncompressed_bytes, comp.compressed_bytes);
 
             housekeeping()?;
+
+            let _ = maybe_run_processing_reclaim_safe_point(
+                store,
+                metrics,
+                "merge processing housekeeping",
+            )?;
         }
 
         if total_processed % 50_000 == 0 {

@@ -8,14 +8,11 @@ use sysinfo::Disks;
 
 const ARCHIVE_PAYLOAD_MAGIC: &[u8; 8] = b"FOLDRSLT";
 const ARCHIVE_PAYLOAD_VERSION: u32 = 1;
-const RECLAIM_STOP_GAP_BYTES: u64 = 50 * 1024 * 1024 * 1024;
-
 #[derive(Clone)]
 struct DiskSafetyContext {
     enabled: bool,
     base_dir: PathBuf,
     floor_bytes: Option<u64>,
-    hysteresis_bytes: u64,
     offload_headroom_bytes: usize,
     cache_dir: PathBuf,
     cache_bytes_cap: u64,
@@ -57,21 +54,12 @@ enum BundleStatus {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ActiveReclaimClass {
-    Spill,
-    History,
-    Runs,
-    WorkSegment,
-}
-
 pub fn configure(base_dir: PathBuf, cfg: &OffloadConfig) {
     CTX.with(|slot| {
         *slot.borrow_mut() = Some(DiskSafetyContext {
             enabled: cfg.enabled,
             base_dir,
             floor_bytes: cfg.disk_free_low_water,
-            hysteresis_bytes: cfg.disk_hysteresis_margin_bytes,
             offload_headroom_bytes: cfg.offload_headroom_bytes,
             cache_dir: cfg.cache_dir.clone(),
             cache_bytes_cap: cfg.cache_bytes_cap,
@@ -105,30 +93,39 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
         return Ok(());
     }
 
-    let target_free = write_admission_target(&ctx, bytes_needed);
+    let target_free = disk_target(&ctx, bytes_needed);
     let free_before = available_space_for(&ctx.base_dir)?;
-    if free_before >= target_free {
-        return Ok(());
+    if free_before < target_free {
+        apply_local_cleanup(&ctx)?;
+        let free_after_cleanup = available_space_for(&ctx.base_dir)?;
+        if free_after_cleanup < target_free {
+            let _ = run_reclaim_to_target(
+                ReclaimTargets {
+                    write_target: target_free,
+                    reclaim_target: target_free,
+                },
+                reason,
+            );
+        }
     }
 
-    apply_local_cleanup(&ctx)?;
-    let free_after_cleanup = available_space_for(&ctx.base_dir)?;
-    if free_after_cleanup >= target_free {
+    let free_after = available_space_for(&ctx.base_dir)?;
+    if free_after >= bytes_needed {
         return Ok(());
     }
 
     let rss_before = sync_process_rss_metrics();
     log(format!(
-        "Disk gate denied inline write: reason={}, bytes_needed={}, free_before={}, free_after_cleanup={}, target_free={}, rss_before={}",
-        reason, bytes_needed, free_before, free_after_cleanup, target_free, rss_before
+        "Disk gate denied inline write: reason={}, bytes_needed={}, free_before={}, free_after={}, disk_threshold={}, rss_before={}",
+        reason, bytes_needed, free_before, free_after, target_free, rss_before
     ));
     let rss_after = sync_process_rss_metrics();
     Err(io::Error::other(format!(
-        "disk safety requires reclaim: reason={}, bytes_needed={}, free_before={}, free_after_cleanup={}, target_free={}, floor={}, rss_before={}, rss_after={}",
+        "insufficient local disk for write: reason={}, bytes_needed={}, free_before={}, free_after={}, disk_threshold={}, floor={}, rss_before={}, rss_after={}",
         reason,
         bytes_needed,
         free_before,
-        free_after_cleanup,
+        free_after,
         target_free,
         floor_bytes,
         rss_before,
@@ -150,7 +147,7 @@ pub(crate) fn reclaim_required(bytes_needed: u64) -> io::Result<Option<ReclaimTa
         return Ok(None);
     }
 
-    let write_target = write_admission_target(&ctx, bytes_needed);
+    let write_target = disk_target(&ctx, bytes_needed);
     apply_local_cleanup(&ctx)?;
     let free_now = available_space_for(&ctx.base_dir)?;
     if free_now >= write_target {
@@ -159,7 +156,7 @@ pub(crate) fn reclaim_required(bytes_needed: u64) -> io::Result<Option<ReclaimTa
 
     Ok(Some(ReclaimTargets {
         write_target,
-        reclaim_target: reclaim_stop_target(&ctx, bytes_needed),
+        reclaim_target: write_target,
     }))
 }
 
@@ -182,26 +179,20 @@ pub(crate) fn run_reclaim_to_target(targets: ReclaimTargets, reason: &str) -> io
     let free_before = available_space_for(&ctx.base_dir)?;
     let rss_before = sync_process_rss_metrics();
     log(format!(
-        "Reclaim start: reason={}, free_before={}, write_target={}, reclaim_target={}, rss_before={}",
-        reason, free_before, targets.write_target, targets.reclaim_target, rss_before
+        "Tiering start: reason={}, free_before={}, disk_threshold={}, rss_before={}",
+        reason, free_before, targets.write_target, rss_before
     ));
     reclaim_until(&ctx, targets.reclaim_target, reason)?;
     let free_after = available_space_for(&ctx.base_dir)?;
     let rss_after = sync_process_rss_metrics();
     log(format!(
-        "Reclaim finish: reason={}, free_after={}, write_target={}, reclaim_target={}, rss_after={}",
-        reason, free_after, targets.write_target, targets.reclaim_target, rss_after
+        "Tiering finish: reason={}, free_after={}, disk_threshold={}, rss_after={}",
+        reason, free_after, targets.write_target, rss_after
     ));
     if free_after < targets.write_target {
-        return Err(io::Error::other(format!(
-            "disk reclaim exhausted without satisfying target: reason={}, free_after={}, write_target={}, reclaim_target={}, rss_after={}",
-            reason, free_after, targets.write_target, targets.reclaim_target, rss_after
-        )));
-    }
-    if free_after < targets.reclaim_target {
         log(format!(
-            "Reclaim stop-gap missed but write-safe: reason={}, free_after={}, write_target={}, reclaim_target={}, rss_after={}",
-            reason, free_after, targets.write_target, targets.reclaim_target, rss_after
+            "Disk still below threshold after offload: reason={}, free_after={}, disk_threshold={}, rss_after={}",
+            reason, free_after, targets.write_target, rss_after
         ));
     }
     Ok(())
@@ -268,18 +259,13 @@ fn reclaim_until(ctx: &DiskSafetyContext, target_free: u64, reason: &str) -> io:
         return Ok(());
     }
 
-    reclaim_cold_archives(ctx, target_free)?;
-    if available_space_for(&ctx.base_dir)? >= target_free {
-        return Ok(());
-    }
-
     reclaim_active_store_files(ctx, target_free)?;
     if available_space_for(&ctx.base_dir)? >= target_free {
         return Ok(());
     }
 
     log(format!(
-        "Disk reclaim exhausted without reaching target: reason={}, target_free={}",
+        "Disk offload exhausted without reaching threshold: reason={}, target_free={}",
         reason, target_free
     ));
     Ok(())
@@ -292,122 +278,33 @@ fn apply_local_cleanup(ctx: &DiskSafetyContext) -> io::Result<()> {
     Ok(())
 }
 
-fn reclaim_cold_archives(ctx: &DiskSafetyContext, target_free: u64) -> io::Result<()> {
-    let input_dir = ctx.base_dir.join("input");
-    let mut archives = Vec::new();
-    if input_dir.exists() {
-        for entry in fs::read_dir(&input_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if path.extension().map(|ext| ext == "bin").unwrap_or(false)
-                && archive_results_dir(&path).exists()
-            {
-                archives.push(file_info(&path)?);
-            }
-        }
-    }
-    archives.sort_by_key(|info| info.modified);
-
-    for archive in archives {
-        if available_space_for(&ctx.base_dir)? >= target_free {
-            break;
-        }
-        match pack_and_offload_archive_results(&archive.path) {
-            Ok(reclaimed) if reclaimed > 0 => log(format!(
-                "Reclaimed cold archive results: {} bytes from {}",
-                reclaimed,
-                archive.path.display()
-            )),
-            Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                log(format!(
-                    "Skipped archive reclaim due to insufficient scratch space: {} ({})",
-                    archive.path.display(),
-                    err
-                ));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    Ok(())
-}
-
 fn reclaim_active_store_files(ctx: &DiskSafetyContext, target_free: u64) -> io::Result<()> {
     let mut candidates = Vec::new();
     collect_active_store_candidates(&ctx.base_dir, &ctx.cache_dir, &mut candidates)?;
-    candidates.sort_by(|a, b| {
-        active_reclaim_class(&a.path)
-            .cmp(&active_reclaim_class(&b.path))
-            .then_with(|| {
-                a.modified
-                    .cmp(&b.modified)
-                    .then_with(|| b.size.cmp(&a.size))
-            })
-    });
+    candidates.sort_by(|a, b| a.modified.cmp(&b.modified).then_with(|| b.size.cmp(&a.size)));
 
     for candidate in candidates {
         if available_space_for(&ctx.base_dir)? >= target_free {
             break;
         }
-        if offload_and_delete(&candidate.path)? {
-            log(format!(
-                "Reclaimed active file: {} bytes from {}",
+        match offload_and_delete(&candidate.path) {
+            Ok(true) => log(format!(
+                "Offloaded sealed file: {} bytes from {}",
                 candidate.size,
                 candidate.path.display()
-            ));
+            )),
+            Ok(false) => {}
+            Err(err) => {
+                log(format!(
+                    "Offload failed for sealed file {}: {}",
+                    candidate.path.display(),
+                    err
+                ));
+            }
         }
     }
 
     Ok(())
-}
-
-fn active_reclaim_class(path: &Path) -> Option<ActiveReclaimClass> {
-    let in_results = path
-        .components()
-        .any(|component| component.as_os_str() == "results");
-    if !in_results || path.extension().map(|ext| ext != "dat").unwrap_or(true) {
-        return None;
-    }
-
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "spill")
-    {
-        return Some(ActiveReclaimClass::Spill);
-    }
-
-    if path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .starts_with("history")
-    }) {
-        return Some(ActiveReclaimClass::History);
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let parent_name = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-
-    if parent_name == "runs" && file_name.ends_with(".dat") {
-        return Some(ActiveReclaimClass::Runs);
-    }
-
-    if parent_name == "work" && file_name.starts_with("segment-") && file_name.ends_with(".dat") {
-        return Some(ActiveReclaimClass::WorkSegment);
-    }
-
-    None
 }
 
 fn collect_active_store_candidates(
@@ -438,26 +335,62 @@ fn collect_active_store_candidates(
 }
 
 fn is_active_reclaim_candidate(path: &Path) -> bool {
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "input")
-    {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if matches!(
+        file_name,
+        "heartbeat" | "leader.lock" | "resume_manifest.json" | "source.txt" | "active.log"
+    ) {
         return false;
     }
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "landing")
-    {
-        return false;
-    }
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "checkpoints")
+    if file_name.ends_with(".claim")
+        || file_name.ends_with(".tmp")
+        || file_name.ends_with(".partial")
     {
         return false;
     }
 
-    active_reclaim_class(path).is_some()
+    let under_input = path.components().any(|component| component.as_os_str() == "input");
+    if under_input && path.extension().map(|ext| ext == "txt").unwrap_or(false) {
+        return false;
+    }
+
+    let under_results = path
+        .components()
+        .any(|component| component.as_os_str() == "results");
+    let under_checkpoints = path
+        .components()
+        .any(|component| component.as_os_str() == "checkpoints");
+    let under_merge_work = path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(".work")
+    });
+    let under_in_process_archive = path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(".bin")
+    }) && path.components().any(|component| component.as_os_str() == "in_process");
+
+    if under_in_process_archive {
+        return false;
+    }
+    if under_checkpoints {
+        return false;
+    }
+
+    if under_merge_work {
+        return under_results
+            || path.components().any(|component| {
+                matches!(
+                    component.as_os_str().to_string_lossy().as_ref(),
+                    "history" | "runs" | "work" | "spill" | "landing"
+                )
+            });
+    }
+
+    under_results || path.is_file()
 }
 
 fn prune_cache_to_cap(cache_dir: &Path, cap: u64) -> io::Result<()> {
@@ -648,6 +581,7 @@ fn archive_payload_path(archive_path: &Path) -> PathBuf {
     archive_path.join("results.payload.bin")
 }
 
+#[cfg(test)]
 fn pack_and_offload_archive_results(archive_path: &Path) -> io::Result<u64> {
     let results_dir = archive_results_dir(archive_path);
     if !results_dir.exists() {
@@ -708,19 +642,11 @@ fn pack_and_offload_archive_results(archive_path: &Path) -> io::Result<u64> {
     Ok(total_bytes)
 }
 
-fn write_admission_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
-    ctx.floor_bytes
-        .unwrap_or(0)
-        .saturating_add(bytes_needed)
-        .saturating_add(ctx.hysteresis_bytes)
+fn disk_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
+    ctx.floor_bytes.unwrap_or(0).max(bytes_needed)
 }
 
-fn reclaim_stop_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
-    let floor = ctx.floor_bytes.unwrap_or(0);
-    let phase_gap = bytes_needed.saturating_add(ctx.hysteresis_bytes);
-    floor.saturating_add(RECLAIM_STOP_GAP_BYTES.max(phase_gap))
-}
-
+#[cfg(test)]
 fn collect_archive_entries(
     root: &Path,
     current: &Path,
@@ -906,31 +832,35 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_prioritizes_spill_runs_before_other_active_files() {
+    fn offload_prefers_oldest_sealed_candidate() {
         static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
-        let store_root = base
-            .join("in_process")
+        let cold_archive_path = base
+            .join("input")
             .join("archive_test.bin")
-            .join("results");
-        let spill_path = store_root.join("spill").join("b=00").join("spill-0.dat");
-        let history_path = store_root
+            .join("results")
             .join("history")
             .join("b=00")
             .join("history-0.dat");
-        let run_path = store_root.join("runs").join("unique-0.dat");
-        let segment_path = store_root.join("work").join("segment-0.dat");
+        let merge_segment_path = base
+            .join("in_process")
+            .join("merge_1.work")
+            .join("work")
+            .join("segment-0.dat");
 
         const FILE_BYTES: usize = 32 * 1024 * 1024;
         const RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
 
-        for path in [&spill_path, &history_path, &run_path, &segment_path] {
-            write_test_file(path, FILE_BYTES);
-        }
+        write_test_file(&cold_archive_path, FILE_BYTES);
+        write_test_file(&merge_segment_path, FILE_BYTES);
+        let old_time = filetime::FileTime::from_unix_time(1, 0);
+        let new_time = filetime::FileTime::from_unix_time(2, 0);
+        filetime::set_file_mtime(&cold_archive_path, old_time).unwrap();
+        filetime::set_file_mtime(&merge_segment_path, new_time).unwrap();
 
         let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
@@ -951,36 +881,28 @@ mod tests {
         let first_offload = snapshot
             .logs
             .iter()
-            .find(|log| log.message.contains("Disk reclaim offloaded"))
+            .find(|log| log.message.contains("Disk reclaim offloaded") || log.message.contains("Offloaded sealed file"))
             .expect("expected disk reclaim offload log");
         assert!(
             first_offload
                 .message
-                .contains(&spill_path.display().to_string()),
-            "spill file should be reclaimed before history/run/segment files"
+                .contains(&cold_archive_path.display().to_string()),
+            "oldest sealed file should be offloaded first"
         );
         set_metrics_handle(None);
         drop(prev_cwd);
     }
 
     #[test]
-    fn reclaim_succeeds_when_write_safe_even_if_stop_gap_missed() {
+    fn ensure_write_budget_succeeds_when_actual_write_fits_below_floor() {
         static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
-        let spill_path = base
-            .join("in_process")
-            .join("archive_test.bin")
-            .join("results")
-            .join("spill")
-            .join("b=00")
-            .join("spill-0.dat");
-        const FILE_BYTES: usize = 64 * 1024 * 1024;
-        const RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
-        write_test_file(&spill_path, FILE_BYTES);
+        fs::create_dir_all(&base).unwrap();
+        const WRITE_BYTES: u64 = 8 * 1024 * 1024;
 
         let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
@@ -988,44 +910,23 @@ mod tests {
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add((FILE_BYTES / 2) as u64));
+        cfg.disk_free_low_water = Some(free_now.saturating_add(64 * 1024 * 1024));
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
-
-        let metrics = Metrics::new();
-        set_metrics_handle(Some(metrics.clone_handle()));
-
-        assert!(maybe_reclaim(RESERVATION_BYTES, "test write-safe reclaim").unwrap());
-
-        let snapshot = metrics.snapshot();
-        assert!(snapshot.logs.iter().any(|log| {
-            log.message
-                .contains("Reclaim stop-gap missed but write-safe: reason=test write-safe reclaim")
-        }));
-
-        set_metrics_handle(None);
+        ensure_write_budget(WRITE_BYTES, "test small write below floor").unwrap();
         drop(prev_cwd);
     }
 
     #[test]
-    fn reclaim_fails_when_write_target_cannot_be_met() {
+    fn ensure_write_budget_fails_when_actual_write_cannot_fit() {
         static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
-        let spill_path = base
-            .join("in_process")
-            .join("archive_test.bin")
-            .join("results")
-            .join("spill")
-            .join("b=00")
-            .join("spill-0.dat");
-        const FILE_BYTES: usize = 16 * 1024 * 1024;
-        const RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
-        write_test_file(&spill_path, FILE_BYTES);
+        fs::create_dir_all(&base).unwrap();
 
         let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
@@ -1038,10 +939,14 @@ mod tests {
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
 
-        let err = maybe_reclaim(RESERVATION_BYTES, "test hard reclaim failure").unwrap_err();
+        let err = ensure_write_budget(
+            free_now.saturating_add(512 * 1024 * 1024),
+            "test hard write failure",
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
-                .contains("disk reclaim exhausted without satisfying target")
+                .contains("insufficient local disk for write")
         );
 
         drop(prev_cwd);
@@ -1053,32 +958,24 @@ mod tests {
         let base = temp_dir.path().join("fold_state");
         let cache_dir = base.join("offload_cache");
 
-        let reclaimable_spill = base
-            .join("in_process")
-            .join("archive_a.bin")
-            .join("results")
-            .join("spill")
-            .join("b=00")
-            .join("spill-0.dat");
-        let reclaimable_history = base
-            .join("in_process")
+        let reclaimable_archive_history = base
+            .join("input")
             .join("archive_a.bin")
             .join("results")
             .join("history")
             .join("b=00")
             .join("history-0.dat");
-        let reclaimable_run = base
+        let reclaimable_merge_segment = base
             .join("in_process")
-            .join("archive_a.bin")
-            .join("results")
-            .join("runs")
-            .join("unique-0.dat");
-        let reclaimable_segment = base
-            .join("in_process")
-            .join("archive_a.bin")
-            .join("results")
+            .join("merge_123.work")
             .join("work")
             .join("segment-0.dat");
+        let reclaimable_landing_drain = base
+            .join("in_process")
+            .join("merge_123.work")
+            .join("landing")
+            .join("b=00")
+            .join("drain-0.log");
 
         let protected_manifest = base
             .join("in_process")
@@ -1114,6 +1011,13 @@ mod tests {
             .join("in_process")
             .join("archive_b.bin")
             .join("planner_meta.json");
+        let protected_archive_history = base
+            .join("in_process")
+            .join("archive_b.bin")
+            .join("results")
+            .join("history")
+            .join("b=00")
+            .join("history-0.dat");
         let protected_checkpoint_history = base
             .join("in_process")
             .join("merge_123.work")
@@ -1124,10 +1028,9 @@ mod tests {
             .join("history-0.dat");
 
         for path in [
-            &reclaimable_spill,
-            &reclaimable_history,
-            &reclaimable_run,
-            &reclaimable_segment,
+            &reclaimable_archive_history,
+            &reclaimable_merge_segment,
+            &reclaimable_landing_drain,
             &protected_manifest,
             &protected_heartbeat,
             &protected_lock,
@@ -1138,6 +1041,7 @@ mod tests {
             &protected_interner,
             &protected_optimal,
             &protected_planner,
+            &protected_archive_history,
             &protected_checkpoint_history,
         ] {
             write_test_file(path, 16);
@@ -1148,10 +1052,9 @@ mod tests {
         let candidate_paths: HashSet<PathBuf> =
             candidates.into_iter().map(|info| info.path).collect();
 
-        assert!(candidate_paths.contains(&reclaimable_spill));
-        assert!(candidate_paths.contains(&reclaimable_history));
-        assert!(candidate_paths.contains(&reclaimable_run));
-        assert!(candidate_paths.contains(&reclaimable_segment));
+        assert!(candidate_paths.contains(&reclaimable_archive_history));
+        assert!(candidate_paths.contains(&reclaimable_merge_segment));
+        assert!(candidate_paths.contains(&reclaimable_landing_drain));
 
         for protected in [
             protected_manifest,
@@ -1164,6 +1067,7 @@ mod tests {
             protected_interner,
             protected_optimal,
             protected_planner,
+            protected_archive_history,
             protected_checkpoint_history,
         ] {
             assert!(
