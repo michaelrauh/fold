@@ -1484,7 +1484,11 @@ impl GenerationStore {
         Ok(true)
     }
 
-    fn flush_bucket_writer(&mut self, bucket: usize, allow_pressure_handling: bool) -> io::Result<()> {
+    fn flush_bucket_writer(
+        &mut self,
+        bucket: usize,
+        allow_pressure_handling: bool,
+    ) -> io::Result<()> {
         let bytes_needed = self.landing_buffer_sizes[bucket] as u64;
         if bytes_needed > 0 {
             let reason = format!("flush landing bucket {}", bucket);

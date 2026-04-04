@@ -847,23 +847,6 @@ fn process_txt_file(
             opt.vocab = interner.vocabulary().to_vec();
             opt.last_update_time = now;
         });
-
-        // Prune history runs against the improved best before archiving.
-        metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
-        let (kept, pruned) = store.prune_history_with_bound(
-            &interner,
-            run_result.best_score,
-            None,
-            cfg.read_buf_bytes,
-        )?;
-        metrics.add_log(format!(
-            "Pruning compaction kept {} orthos, pruned {}",
-            kept, pruned
-        ));
-        metrics.update_merge(|m| {
-            m.compaction_kept = kept as usize;
-            m.compaction_pruned = pruned as usize;
-        });
     }
 
     let total_orthos = store.seen_len_accepted() as usize;
@@ -1123,7 +1106,7 @@ fn run_merge_simple(
     let larger_stage_elapsed;
     let smaller_stage_elapsed;
     let mut generation_stage_elapsed = Duration::ZERO;
-    let mut prune_stage_elapsed = Duration::ZERO;
+    let prune_stage_elapsed = Duration::ZERO;
     let archive_stage_elapsed;
     let mut generation_stats: Vec<fold::metrics::GenerationStat> = Vec::new();
     let mut impacted_from_larger = 0usize;
@@ -1203,7 +1186,10 @@ fn run_merge_simple(
         metrics.update_merge(|m| m.impacted_queued_a = impacted_from_larger);
     }
 
-    metrics.set_operation_status(format!("Streaming & Remapping Smaller Archive {}", smaller_name));
+    metrics.set_operation_status(format!(
+        "Streaming & Remapping Smaller Archive {}",
+        smaller_name
+    ));
     let smaller_stage_start = Instant::now();
     let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
     let mut total_from_smaller = 0usize;
@@ -1437,40 +1423,13 @@ fn run_merge_simple(
         next_generation = next_generation.saturating_add(1);
     }
 
-    let mut total_orthos = store.seen_len_accepted() as usize;
-    if best_score > max_opt_score {
-        let prune_stage_start = Instant::now();
-        metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
-        let (kept, pruned) = store.prune_history_with_bound(
-            &merged_interner,
-            best_score,
-            None,
-            cfg.read_buf_bytes,
-        )?;
-        metrics.update_merge(|m| {
-            m.compaction_kept = kept as usize;
-            m.compaction_pruned = pruned as usize;
-        });
-        metrics.add_log(format!(
-            "Pruning compaction kept {} orthos, pruned {}",
-            kept, pruned
-        ));
-        prune_stage_elapsed = prune_stage_start.elapsed();
-        log_merge_stage(
-            metrics,
-            "prune_history",
-            prune_stage_elapsed,
-            &format!("kept={} pruned={}", kept, pruned),
-        );
-        total_orthos = kept as usize;
-    } else {
-        log_merge_stage(
-            metrics,
-            "prune_history",
-            prune_stage_elapsed,
-            "skipped=true reason=best_unchanged",
-        );
-    }
+    let total_orthos = store.seen_len_accepted() as usize;
+    log_merge_stage(
+        metrics,
+        "prune_history",
+        prune_stage_elapsed,
+        "skipped=true reason=disabled",
+    );
 
     metrics.add_log(format!("Archiving merge: {} orthos", total_orthos));
     metrics.increment_new_orthos(total_orthos);
@@ -1481,7 +1440,10 @@ fn run_merge_simple(
     let archive_stage_start = Instant::now();
     fs::create_dir_all(archive_temp_path.join("results")).map_err(FoldError::Io)?;
     let lineage = format!("({} {})", lineage_a_early, lineage_b_early);
-    let text_preview = format!("{} + {}", ingestion.text_preview_a, ingestion.text_preview_b);
+    let text_preview = format!(
+        "{} + {}",
+        ingestion.text_preview_a, ingestion.text_preview_b
+    );
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
     let history_runs = history_run_paths_for_archive(&store)?;
     let history_run_count: usize = history_runs.iter().map(|(_, runs)| runs.len()).sum();
@@ -1797,7 +1759,7 @@ fn run_merge_with_checkpoints(
     let mut larger_stage_elapsed = Duration::ZERO;
     let mut smaller_stage_elapsed = Duration::ZERO;
     let mut generation_stage_elapsed = Duration::ZERO;
-    let mut prune_stage_elapsed = Duration::ZERO;
+    let prune_stage_elapsed = Duration::ZERO;
     let archive_stage_elapsed;
     let mut generation_stats: Vec<fold::metrics::GenerationStat> = Vec::new();
     let mut impacted_from_larger = 0usize;
@@ -2198,7 +2160,7 @@ fn run_merge_with_checkpoints(
         }
     }
 
-    let mut total_orthos = {
+    let total_orthos = {
         let active_store_dir = manifest
             .active_store_path(&merge_work_dir)
             .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
@@ -2206,53 +2168,12 @@ fn run_merge_with_checkpoints(
         store.seen_len_accepted() as usize
     };
 
-    if manifest.phase == ResumePhase::Quiesced && best_score > max_opt_score {
-        let active_store_dir = manifest
-            .active_store_path(&merge_work_dir)
-            .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
-        let checkpoint =
-            merge_resume::prepare_working_checkpoint(&merge_work_dir, Some(&active_store_dir))?;
-        let mut store = GenerationStore::from_existing(checkpoint.working_dir.clone(), 8)?;
-        store.configure(&cfg);
-        let prune_stage_start = Instant::now();
-        metrics.add_log("Best improved; pruning compaction pass before archive".to_string());
-        let (kept, pruned) = store.prune_history_with_bound(
-            &merged_interner,
-            best_score,
-            None,
-            cfg.read_buf_bytes,
-        )?;
-        metrics.update_merge(|m| {
-            m.compaction_kept = kept as usize;
-            m.compaction_pruned = pruned as usize;
-        });
-        metrics.add_log(format!(
-            "Pruning compaction kept {} orthos, pruned {}",
-            kept, pruned
-        ));
-        prune_stage_elapsed = prune_stage_start.elapsed();
+    if manifest.phase == ResumePhase::Quiesced {
         log_merge_stage(
             metrics,
             "prune_history",
             prune_stage_elapsed,
-            &format!("kept={} pruned={}", kept, pruned),
-        );
-        total_orthos = kept as usize;
-        manifest.phase = ResumePhase::Pruned;
-        manifest.best_score = best_score.into();
-        manifest = commit_merge_checkpoint(
-            &merge_work_dir,
-            manifest,
-            checkpoint,
-            &mut store,
-            &best_ortho,
-        )?;
-    } else if manifest.phase == ResumePhase::Quiesced {
-        log_merge_stage(
-            metrics,
-            "prune_history",
-            prune_stage_elapsed,
-            "skipped=true reason=best_unchanged",
+            "skipped=true reason=disabled",
         );
     }
 

@@ -152,9 +152,9 @@ impl Tui {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(10),
-                Constraint::Min(15),
                 Constraint::Length(7),
+                Constraint::Min(15),
+                Constraint::Length(6),
             ])
             .split(f.area());
 
@@ -194,10 +194,14 @@ impl Tui {
             proc_cap_readable
         );
         let line2 = format!(
-            "Mode: {} │ Interner: v{} │ Vocab: {}",
+            "Mode: {} │ Interner: v{} │ Vocab: {} │ Chunks:{} Proc:{} Rem:{} Jobs:{}",
             mode_truncated,
             snapshot.global.interner_version,
-            format_number(snapshot.global.vocab_size)
+            format_number(snapshot.global.vocab_size),
+            format_number(snapshot.global.total_chunks),
+            format_number(snapshot.global.processed_chunks),
+            format_number(snapshot.global.remaining_chunks),
+            format_number(snapshot.global.distinct_jobs_count)
         );
         let pruned = snapshot.operation.pruned_completions;
         let expanded = snapshot.operation.expanded_completions;
@@ -232,62 +236,37 @@ impl Tui {
                 0.0
             };
             let saved = unc.saturating_sub(comp);
-            format!(
-                "Compression: {:.2}× (saved {})",
-                ratio,
-                format_bytes(saved as usize)
-            )
+            format!("{:.2}× saved {}", ratio, format_bytes(saved as usize))
         } else {
-            "Compression: n/a".to_string()
+            "n/a".to_string()
         };
 
         let line3 = format!(
-            "Chunks: {} │ Processed: {} │ Remaining: {} │ Jobs: {} │ New orthos: {}",
-            snapshot.global.total_chunks,
-            snapshot.global.processed_chunks,
-            snapshot.global.remaining_chunks,
-            snapshot.global.distinct_jobs_count,
+            "Gen:{} │ Phase:{} │ Work:{} │ Accepted:{} │ New:{}",
+            snapshot.global.generation,
+            truncate_string(&snapshot.global.phase, 28),
+            format_number(snapshot.global.work_len as usize),
+            format_number(snapshot.global.seen_len_accepted as usize),
             format_number(snapshot.operation.new_orthos)
         );
         let line4 = format!(
-            "Generation: {} │ Phase: {} │ Work: {} │ Accepted: {}",
-            snapshot.global.generation,
-            snapshot.global.phase,
-            format_number(snapshot.global.work_len as usize),
-            format_number(snapshot.global.seen_len_accepted as usize)
-        );
-        let line5 = format!(
-            "Arena: {} │ Work cache: {} / {} │ Fan-in: {} │ Prune%: {:.1}%",
+            "Arena:{} │ Work:{} / {} │ Seg:{} / {} │ Fan-in:{} │ Prune:{:.1}%",
             format_bytes(snapshot.global.compaction_arena_cap_bytes),
             format_bytes(snapshot.global.work_cache_bytes),
             format_bytes(snapshot.global.work_cache_cap_bytes),
+            format_bytes(snapshot.global.segment_batch_bytes),
+            format_bytes(snapshot.global.segment_batch_cap_bytes),
             snapshot.global.fan_in,
             ratio * 100.0
         );
-        let line6 = format!(
-            "{} │ {} │ Segment batch: {} / {}",
+        let line5 = format!(
+            "{} │ Comp:{} │ Off:{} {} │ Dl:{} {} │ Pressure:{}",
             disk_line,
             comp_line,
-            format_bytes(snapshot.global.segment_batch_bytes),
-            format_bytes(snapshot.global.segment_batch_cap_bytes)
-        );
-        let line7 = format!(
-            "Spill: created {} files {} │ pending {} files {} │ consumed {} files {}",
-            format_number(snapshot.global.spill_created_files as usize),
-            format_bytes(snapshot.global.spill_created_bytes as usize),
-            format_number(snapshot.global.spill_pending_files as usize),
-            format_bytes(snapshot.global.spill_pending_bytes as usize),
-            format_number(snapshot.global.spill_consumed_files as usize),
-            format_bytes(snapshot.global.spill_consumed_bytes as usize)
-        );
-        let line8 = format!(
-            "Offload: {} files {} │ Download: {} files {} │ Cache: hit {} miss {} │ Pressure: {}",
             format_number(snapshot.global.offloaded_files as usize),
             format_bytes(snapshot.global.offloaded_bytes as usize),
             format_number(snapshot.global.downloaded_files as usize),
             format_bytes(snapshot.global.downloaded_bytes as usize),
-            format_number(snapshot.global.cache_hits as usize),
-            format_number(snapshot.global.cache_misses as usize),
             format_number(snapshot.global.pressure_triggers as usize)
         );
         let header_lines = vec![
@@ -296,9 +275,6 @@ impl Tui {
             Line::from(truncate_string(&line3, max_width)),
             Line::from(truncate_string(&line4, max_width)),
             Line::from(truncate_string(&line5, max_width)),
-            Line::from(truncate_string(&line6, max_width)),
-            Line::from(truncate_string(&line7, max_width)),
-            Line::from(truncate_string(&line8, max_width)),
         ];
 
         let header = Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL));
@@ -308,7 +284,7 @@ impl Tui {
     fn render_content(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(area);
 
         self.render_left_column(f, content_chunks[0], snapshot);
@@ -316,29 +292,34 @@ impl Tui {
     }
 
     fn render_left_column(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let constraints = if area.height >= 24 {
+            vec![
+                Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Min(5),
+            ]
+        } else {
+            vec![
+                Constraint::Length(9),
+                Constraint::Length(5),
+                Constraint::Length(5),
+                Constraint::Min(2),
+            ]
+        };
+
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(12),
-                Constraint::Percentage(18),
-                Constraint::Percentage(12),
-                Constraint::Percentage(12),
-                Constraint::Percentage(10),
-                Constraint::Min(5),
-            ])
+            .constraints(constraints)
             .split(area);
 
-        self.render_current_operation(f, left_chunks[0], snapshot);
-        self.render_text_preview(f, left_chunks[1], snapshot);
-        self.render_merge_progress(f, left_chunks[2], snapshot);
-        self.render_optimal_ortho(f, left_chunks[3], snapshot);
-        self.render_pruning_info(f, left_chunks[4], snapshot);
-        self.render_largest_archive(f, left_chunks[5], snapshot);
-        self.render_provenance_tree(f, left_chunks[6], snapshot);
+        self.render_current_merge(f, left_chunks[0], snapshot);
+        self.render_optimal_ortho(f, left_chunks[1], snapshot);
+        self.render_pruning_archive(f, left_chunks[2], snapshot);
+        self.render_provenance_summary(f, left_chunks[3], snapshot);
     }
 
-    fn render_current_operation(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_current_merge(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let percent_from_ratio =
             |ratio: f64| -> usize { (ratio.clamp(0.0, 1.0) * 100.0).round() as usize };
 
@@ -385,10 +366,7 @@ impl Tui {
         }
 
         let max_width = area.width.saturating_sub(2) as usize;
-        let label_width = 12; // "Processing: "
-        let available = max_width.saturating_sub(label_width);
-
-        // Calculate elapsed time for current status
+        let available = max_width.saturating_sub(12);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -396,10 +374,16 @@ impl Tui {
         let elapsed = now.saturating_sub(snapshot.operation.status_start_time);
         let elapsed_str = format_elapsed(elapsed);
 
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("Processing: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(truncate_string(&snapshot.operation.current_file, available)),
+                Span::raw(truncate_string(
+                    &format!(
+                        "{} │ {}",
+                        snapshot.operation.current_file, snapshot.merge.current_merge
+                    ),
+                    available,
+                )),
             ]),
             Line::from(vec![
                 Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
@@ -412,17 +396,68 @@ impl Tui {
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
-            Line::from(vec![
-                Span::styled("New orthos: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format_number(snapshot.operation.new_orthos)),
-            ]),
-            Line::from(""),
-            Line::from(vec![Span::raw(progress_text)]),
         ];
+
+        if snapshot.global.mode.contains("Merging") {
+            lines.extend([
+                Line::from(vec![
+                    Span::styled("A: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate_string(
+                        &snapshot.merge.text_preview_a,
+                        max_width.saturating_sub(3),
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled("B: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate_string(
+                        &snapshot.merge.text_preview_b,
+                        max_width.saturating_sub(3),
+                    )),
+                ]),
+                Line::from(truncate_string(
+                    &format!(
+                        "Words A:{} B:{} │ Seeds A:{} B:{}",
+                        format_number(snapshot.merge.word_count_a),
+                        format_number(snapshot.merge.word_count_b),
+                        format_number(snapshot.merge.seed_orthos_a),
+                        format_number(snapshot.merge.seed_orthos_b)
+                    ),
+                    max_width,
+                )),
+                Line::from(truncate_string(
+                    &format!(
+                        "Queued A:{} B:{} │ ΔVoc A:{} B:{}",
+                        format_number(snapshot.merge.impacted_queued_a),
+                        format_number(snapshot.merge.impacted_queued_b),
+                        format_number(snapshot.merge.impacted_a),
+                        format_number(snapshot.merge.impacted_b)
+                    ),
+                    max_width,
+                )),
+            ]);
+        } else {
+            lines.extend([
+                Line::from(vec![
+                    Span::styled("Preview: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate_string(
+                        &snapshot.operation.text_preview,
+                        max_width.saturating_sub(9),
+                    )),
+                ]),
+                Line::from(truncate_string(
+                    &format!(
+                        "Words:{} │ New:{}",
+                        format_number(snapshot.operation.word_count),
+                        format_number(snapshot.operation.new_orthos)
+                    ),
+                    max_width,
+                )),
+            ]);
+        }
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Current Operation");
+            .title("Current Merge");
         let inner_area = block.inner(area);
         f.render_widget(block, area);
 
@@ -444,121 +479,9 @@ impl Tui {
 
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
+            .label(truncate_string(&progress_text, inner_area.width as usize))
             .ratio(progress_ratio.clamp(0.0, 1.0));
         f.render_widget(gauge, gauge_area);
-    }
-
-    fn render_text_preview(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let max_width = area.width.saturating_sub(2) as usize;
-
-        let lines = if snapshot.global.mode.contains("Merging") {
-            // Show merge text preview (first 2 and last 2 words from each side)
-            let preview_width = max_width.saturating_sub(20); // Reserve space for labels and word counts
-            vec![
-                Line::from(vec![
-                    Span::styled("A: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(truncate_string(
-                        &snapshot.merge.text_preview_a,
-                        preview_width,
-                    )),
-                ]),
-                Line::from(vec![
-                    Span::styled("B: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(truncate_string(
-                        &snapshot.merge.text_preview_b,
-                        preview_width,
-                    )),
-                ]),
-                Line::from(vec![
-                    Span::styled("Words: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format!(
-                        "A:{} B:{}",
-                        format_number(snapshot.merge.word_count_a),
-                        format_number(snapshot.merge.word_count_b)
-                    )),
-                ]),
-            ]
-        } else {
-            // Show text blob preview (first 4 and last 4 words)
-            vec![
-                Line::from(vec![
-                    Span::styled("Preview: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(truncate_string(
-                        &snapshot.operation.text_preview,
-                        max_width.saturating_sub(9),
-                    )),
-                ]),
-                Line::from(vec![
-                    Span::styled("Words: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(format_number(snapshot.operation.word_count)),
-                ]),
-            ]
-        };
-
-        let block = Block::default().borders(Borders::ALL).title("Text Preview");
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let paragraph = Paragraph::new(lines);
-        f.render_widget(paragraph, inner);
-    }
-
-    fn render_merge_progress(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let max_width = area.width.saturating_sub(2) as usize;
-
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Completed: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{}", snapshot.merge.completed_merges)),
-            ]),
-            Line::from(vec![
-                Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(truncate_string(
-                    &snapshot.merge.current_merge,
-                    max_width.saturating_sub(9),
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("Seeds: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!(
-                    "A:{} B:{}",
-                    format_number(snapshot.merge.seed_orthos_a),
-                    format_number(snapshot.merge.seed_orthos_b)
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("Queued: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!(
-                    "A:{} B:{}",
-                    format_number(snapshot.merge.impacted_queued_a),
-                    format_number(snapshot.merge.impacted_queued_b)
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("Vocab Δ: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!(
-                    "A:{} B:{}",
-                    format_number(snapshot.merge.impacted_a),
-                    format_number(snapshot.merge.impacted_b)
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("New: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format_number(snapshot.merge.new_orthos_from_merge),
-                    Style::default().fg(Color::Green),
-                ),
-            ]),
-        ];
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title("Merge Progress");
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let paragraph = Paragraph::new(lines);
-        f.render_widget(paragraph, inner);
     }
 
     fn render_optimal_ortho(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
@@ -598,7 +521,7 @@ impl Tui {
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("Volume: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Vol: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format_number(opt.volume), Style::default().fg(Color::Cyan)),
             ]),
             Line::from(vec![
@@ -606,18 +529,18 @@ impl Tui {
                 Span::raw(truncate_string(&dims_str, max_width.saturating_sub(7))),
             ]),
             Line::from(vec![
-                Span::styled("Variance: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Var: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("{variance:.3}")),
             ]),
             Line::from(vec![
-                Span::styled("Filled: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Full: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!(
                     "{}/{} ({}%)",
                     opt.fullness, opt.capacity, fullness_pct
                 )),
             ]),
             Line::from(vec![
-                Span::styled("Updated: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Upd: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("{} ago", time_str)),
             ]),
         ];
@@ -632,7 +555,7 @@ impl Tui {
         f.render_widget(paragraph, inner);
     }
 
-    fn render_pruning_info(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_pruning_archive(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let max_width = area.width.saturating_sub(2) as usize;
         let pruned = snapshot.operation.pruned_completions;
         let expanded = snapshot.operation.expanded_completions;
@@ -676,7 +599,7 @@ impl Tui {
         let comp_kept = snapshot.merge.compaction_kept;
         let comp_pruned = snapshot.merge.compaction_pruned;
         let comp_line = if comp_kept + comp_pruned == 0 {
-            "Compaction: n/a".to_string()
+            "Comp: n/a".to_string()
         } else {
             let pct = if comp_kept + comp_pruned == 0 {
                 0.0
@@ -684,53 +607,44 @@ impl Tui {
                 comp_pruned as f64 / (comp_kept + comp_pruned) as f64
             };
             format!(
-                "Compaction: kept {} pruned {} ({:.1}%)",
+                "Comp: kept {} pruned {} ({:.1}%)",
                 format_number(comp_kept),
                 format_number(comp_pruned),
                 pct * 100.0
             )
         };
 
+        let largest_path = if snapshot.largest_archive.filename.is_empty() {
+            "Largest: n/a".to_string()
+        } else {
+            format!(
+                "Largest: {}",
+                truncate_string(
+                    &snapshot.largest_archive.filename,
+                    max_width.saturating_sub(9),
+                )
+            )
+        };
+        let largest_count = format!(
+            "Count: {}",
+            if snapshot.largest_archive.ortho_count == 0 {
+                "n/a".to_string()
+            } else {
+                format_number(snapshot.largest_archive.ortho_count)
+            }
+        );
+
         let lines = vec![
             Line::from(truncate_string(&current_line, max_width)),
             Line::from(history_line),
             Line::from(truncate_string(&comp_line, max_width)),
-        ];
-
-        let block = Block::default().borders(Borders::ALL).title("Pruning");
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let paragraph = Paragraph::new(lines);
-        f.render_widget(paragraph, inner);
-    }
-
-    fn render_largest_archive(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let max_width = area.width.saturating_sub(2) as usize;
-
-        let ortho_display = if snapshot.largest_archive.ortho_count == 0 {
-            "N/A".to_string()
-        } else {
-            format_number(snapshot.largest_archive.ortho_count)
-        };
-
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("File: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(truncate_string(
-                    &snapshot.largest_archive.filename,
-                    max_width.saturating_sub(6),
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("Orthos: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(ortho_display),
-            ]),
+            Line::from(truncate_string(&largest_path, max_width)),
+            Line::from(truncate_string(&largest_count, max_width)),
         ];
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Largest Archive");
+            .title("Pruning & Archive");
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -738,11 +652,14 @@ impl Tui {
         f.render_widget(paragraph, inner);
     }
 
-    fn render_provenance_tree(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_provenance_summary(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
         let max_width = area.width.saturating_sub(2) as usize;
         let max_height = area.height.saturating_sub(2) as usize;
 
-        let tree_lines = parse_and_render_tree(&snapshot.global.current_lineage, max_width);
+        let tree_lines = parse_and_render_tree(&snapshot.global.current_lineage, max_width)
+            .into_iter()
+            .filter(|line| !line.starts_with("Bottom "))
+            .collect::<Vec<_>>();
 
         let lines: Vec<Line> = tree_lines
             .into_iter()
@@ -752,7 +669,7 @@ impl Tui {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Provenance Tree");
+            .title("Provenance Summary");
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -765,7 +682,7 @@ impl Tui {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(5),
-                Constraint::Length(6),
+                Constraint::Length(5),
                 Constraint::Length(11),
                 Constraint::Min(8),
             ])
@@ -977,121 +894,75 @@ impl Tui {
             let progress_panel = Paragraph::new(bucket_lines);
             f.render_widget(progress_panel, chunks[1]);
         } else {
-            // NORMAL MODE: Activity dashboard with landing bars and health
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2), // Context lines
-                    Constraint::Length(3), // Landing section
-                    Constraint::Length(2), // Health section
-                ])
-                .split(inner);
-
-            // Section 1: Context
-            let context_lines = vec![
-                Line::from(format!(
-                    "Gen: {} │ Phase: {} │ Work: {}",
+            let mut lines = vec![Line::from(truncate_string(
+                &format!(
+                    "Gen:{} │ {} │ Work:{} │ Acc:{}",
                     generation,
-                    truncate_string(phase_str, 20),
-                    format_number(work_len as usize)
-                )),
-                Line::from(format!(
-                    "Accepted: {} │ Arena: {} │ Fan-in: {}",
-                    format_number(seen as usize),
-                    format_bytes(snapshot.global.compaction_arena_cap_bytes),
-                    snapshot.global.fan_in
-                )),
-            ];
-            f.render_widget(Paragraph::new(context_lines), chunks[0]);
+                    phase_str,
+                    format_number(work_len as usize),
+                    format_number(seen as usize)
+                ),
+                inner.width as usize,
+            ))];
 
-            // Section 2: Landing Activity (most dynamic - changes every 100 orthos)
-            if !snapshot.bucket_metrics.is_empty() {
-                let max_landing = snapshot
+            if snapshot.bucket_metrics.is_empty() {
+                lines.push(Line::from("Land: n/a"));
+                lines.push(Line::from("Health: n/a"));
+            } else {
+                let landing = snapshot
                     .bucket_metrics
                     .iter()
-                    .map(|b| b.landing_size)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
+                    .map(|b| format!("B{}:{}", b.bucket_id, format_number(b.landing_size)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                lines.push(Line::from(truncate_string(
+                    &format!("Land: {}", landing),
+                    inner.width as usize,
+                )));
 
-                // Build landing bars for buckets 0-3
-                let mut line1_spans = vec![Span::raw("Landing: ")];
-                for b in snapshot.bucket_metrics.iter().take(4) {
-                    let bar_len = if max_landing > 0 {
-                        ((b.landing_size as f64 / max_landing as f64) * 4.0).ceil() as usize
-                    } else {
-                        0
-                    };
-                    let bar = "█".repeat(bar_len);
-                    let ratio = if max_landing > 0 {
-                        b.landing_size as f64 / max_landing as f64
-                    } else {
-                        0.0
-                    };
-                    let color = match b.landing_size {
-                        0 => Color::DarkGray,
-                        _ if ratio > 0.66 => Color::Yellow,
-                        _ => Color::Green,
-                    };
-                    line1_spans.push(Span::styled(
-                        format!("B{}:{:<4} ", b.bucket_id, bar),
-                        Style::default().fg(color),
-                    ));
-                    line1_spans.push(Span::raw(format!("{} ", format_number(b.landing_size))));
-                }
-
-                // Build landing bars for buckets 4-7
-                let mut line2_spans = vec![Span::raw("         ")];
-                for b in snapshot.bucket_metrics.iter().skip(4).take(4) {
-                    let bar_len = if max_landing > 0 {
-                        ((b.landing_size as f64 / max_landing as f64) * 4.0).ceil() as usize
-                    } else {
-                        0
-                    };
-                    let bar = "█".repeat(bar_len);
-                    let ratio = if max_landing > 0 {
-                        b.landing_size as f64 / max_landing as f64
-                    } else {
-                        0.0
-                    };
-                    let color = match b.landing_size {
-                        0 => Color::DarkGray,
-                        _ if ratio > 0.66 => Color::Yellow,
-                        _ => Color::Green,
-                    };
-                    line2_spans.push(Span::styled(
-                        format!("B{}:{:<4} ", b.bucket_id, bar),
-                        Style::default().fg(color),
-                    ));
-                    line2_spans.push(Span::raw(format!("{} ", format_number(b.landing_size))));
-                }
-
-                let landing_lines = vec![Line::from(line1_spans), Line::from(line2_spans)];
-                f.render_widget(Paragraph::new(landing_lines), chunks[1]);
-
-                // Section 3: Compaction Health (updated at generation boundaries)
-                let mut health_spans = vec![Span::raw("Health:  ")];
-                for b in snapshot.bucket_metrics.iter() {
-                    let (indicator, color) = if b.run_count > 64 {
-                        ("⚡", Color::Red) // Will compact next transition
-                    } else if b.run_count > 10 {
-                        ("‼", Color::Red) // Heavily fragmented
-                    } else if b.run_count > 5 {
-                        ("!", Color::Yellow) // Getting fragmented
-                    } else {
-                        ("✓", Color::Green) // Healthy
-                    };
-                    health_spans.push(Span::raw(format!("B{}[{}]", b.bucket_id, b.run_count)));
-                    health_spans.push(Span::styled(indicator, Style::default().fg(color)));
-                    health_spans.push(Span::raw(" "));
-                }
-
-                let health_line = Line::from(health_spans);
-                f.render_widget(Paragraph::new(vec![health_line]), chunks[2]);
-            } else {
-                let placeholder = Paragraph::new(vec![Line::from("Bucket stats loading...")]);
-                f.render_widget(placeholder, chunks[1]);
+                let health = snapshot
+                    .bucket_metrics
+                    .iter()
+                    .map(|b| {
+                        let indicator = if b.run_count > 64 {
+                            "⚡"
+                        } else if b.run_count > 10 {
+                            "‼"
+                        } else if b.run_count > 5 {
+                            "!"
+                        } else {
+                            "✓"
+                        };
+                        format!("B{}[{}]{}", b.bucket_id, b.run_count, indicator)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                lines.push(Line::from(truncate_string(
+                    &format!("Health: {}", health),
+                    inner.width as usize,
+                )));
             }
+
+            let generation_lines = snapshot
+                .generation_stats
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .map(|stat| {
+                    Line::from(truncate_string(
+                        &format_generation_stat(stat),
+                        inner.width as usize,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if generation_lines.is_empty() {
+                lines.push(Line::from("G: n/a"));
+            } else {
+                lines.extend(generation_lines);
+            }
+
+            f.render_widget(Paragraph::new(lines), inner);
         }
     }
 
@@ -1423,6 +1294,17 @@ fn truncate_string(s: &str, max_len: usize) -> String {
         result.push_str("...");
         result
     }
+}
+
+fn format_generation_stat(stat: &crate::metrics::GenerationStat) -> String {
+    format!(
+        "G{} P{:.1}s T{:.1}s A{} W{}",
+        stat.generation,
+        stat.processing_secs,
+        stat.transition_secs,
+        format_number(stat.accepted as usize),
+        format_number(stat.new_work as usize)
+    )
 }
 
 fn format_number(n: usize) -> String {
@@ -1806,4 +1688,206 @@ fn sample_data(samples: &[MetricSample], max_points: usize) -> Vec<MetricSample>
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{BucketMetrics, BucketState, GenerationStat};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render_screen(metrics: &Metrics, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut tui = Tui::new(
+            metrics.clone_handle(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        terminal.draw(|f| tui.render(f)).unwrap();
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sample_metrics(transition: bool) -> Metrics {
+        let metrics = Metrics::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        metrics.update_global(|g| {
+            g.mode = "Merging Archives".to_string();
+            g.role = "leader".to_string();
+            g.interner_version = 4;
+            g.vocab_size = 550;
+            g.total_chunks = 204;
+            g.processed_chunks = 320;
+            g.remaining_chunks = 88;
+            g.distinct_jobs_count = 0;
+            g.start_time = now.saturating_sub(234);
+            g.process_rss_cap_bytes = 8 * 1024 * 1024 * 1024;
+            g.generation = 12;
+            g.phase = "Idle".to_string();
+            g.work_len = 1;
+            g.seen_len_accepted = 7_900;
+            g.compaction_arena_cap_bytes = 384 * 1024 * 1024;
+            g.work_cache_cap_bytes = 256 * 1024 * 1024;
+            g.segment_batch_cap_bytes = 64 * 1024 * 1024;
+            g.fan_in = 64;
+            g.disk_total_bytes = 983_230_000_000;
+            g.disk_available_bytes = 922_640_000_000;
+            g.compression_uncompressed_bytes = 36_980_000_000;
+            g.compression_compressed_bytes = 4_370_000_000;
+            g.current_lineage = "(((\"a\" \"b\") \"c\") \"d\")".to_string();
+        });
+        metrics.update_operation(|o| {
+            o.current_file = "e_chunk_0136".to_string();
+            o.status = "Streaming & Remapping Smaller Archive B".to_string();
+            o.status_start_time = now;
+            o.progress_current = 1;
+            o.progress_total = 1;
+            o.text_preview = "since it ... the city".to_string();
+            o.word_count = 181;
+        });
+        metrics.update_merge(|m| {
+            m.completed_merges = 116;
+            m.current_merge = "merge_6111".to_string();
+            m.seed_orthos_a = 7_883;
+            m.seed_orthos_b = 17_201;
+            m.impacted_queued_a = 4_386;
+            m.impacted_queued_b = 4_921;
+            m.impacted_a = 1_204;
+            m.impacted_b = 1_875;
+            m.text_preview_a = "since it ... the city".to_string();
+            m.text_preview_b = "and there ... the gates".to_string();
+            m.word_count_a = 900;
+            m.word_count_b = 1_100;
+            m.compaction_kept = 12_000;
+            m.compaction_pruned = 320;
+            m.new_orthos_from_merge = 640;
+        });
+        metrics.update_largest_archive(|a| {
+            a.filename = "./fold_state/input/archive_1775313843_915399592=.bin".to_string();
+            a.ortho_count = 17_201;
+        });
+        metrics.update_optimal_ortho(|o| {
+            o.volume = 4;
+            o.variance_num = 0;
+            o.variance_den = 1;
+            o.dims = vec![3, 3];
+            o.fullness = 8;
+            o.capacity = 9;
+            o.payload = vec![Some(0), Some(1), Some(2), Some(3)];
+            o.vocab = vec![
+                "it".to_string(),
+                "and".to_string(),
+                "was".to_string(),
+                "city".to_string(),
+            ];
+            o.last_update_time = now.saturating_sub(12);
+        });
+        metrics.record_prune_sample(10, 32, 1000, 0, 0);
+        metrics.record_prune_sample(11, 10, 900, 0, 0);
+        metrics.record_work_len(1);
+        metrics.record_work_len(4_000);
+        metrics.record_work_len(1);
+        metrics.reset_seen_size(0);
+        metrics.record_landing_buffer_count(7_900);
+        metrics.record_landing_buffer_count(12_500);
+        metrics.set_generation_stats(vec![
+            GenerationStat {
+                generation: 10,
+                processing_secs: 2.1,
+                transition_secs: 0.4,
+                accepted: 3_400_000,
+                new_work: 1_200_000,
+            },
+            GenerationStat {
+                generation: 11,
+                processing_secs: 1.7,
+                transition_secs: 0.3,
+                accepted: 2_800_000,
+                new_work: 900_000,
+            },
+            GenerationStat {
+                generation: 12,
+                processing_secs: 1.3,
+                transition_secs: 0.2,
+                accepted: 2_100_000,
+                new_work: 650_000,
+            },
+        ]);
+
+        let bucket_metrics = (0..8)
+            .map(|bucket_id| BucketMetrics {
+                bucket_id,
+                run_count: bucket_id,
+                landing_size: bucket_id * 10,
+                history_size_estimate: 0,
+                state: if transition && bucket_id == 0 {
+                    BucketState::Draining
+                } else {
+                    BucketState::Complete
+                },
+                new_work: if transition && bucket_id == 0 {
+                    21_700_000
+                } else {
+                    0
+                },
+            })
+            .collect();
+        metrics.update_bucket_metrics(bucket_metrics);
+        metrics.add_log("Merge stage: stage=setup elapsed_ms=127".to_string());
+        metrics.add_log("Loaded 7883 orthos from larger archive A".to_string());
+        metrics
+    }
+
+    #[test]
+    fn dense_default_screen_combines_merge_panels_and_keeps_both_previews() {
+        let metrics = sample_metrics(false);
+        let screen = render_screen(&metrics, 150, 43);
+
+        assert!(screen.contains("Current Merge"));
+        assert!(screen.contains("A: since it ... the city"));
+        assert!(screen.contains("B: and there ... the gates"));
+        assert!(!screen.contains("Text Preview"));
+        assert!(!screen.contains("Merge Progress"));
+        assert!(!screen.contains("Largest Archive"));
+        assert!(screen.contains("Provenance Summary"));
+        assert!(!screen.contains("Provenance Tree"));
+        assert!(screen.contains("G10 P2.1s T0.4s A3.4M W1.2M"));
+        assert!(screen.contains("Health:"));
+    }
+
+    #[test]
+    fn transition_mode_still_shows_bucket_progress_rows() {
+        let metrics = sample_metrics(true);
+        let screen = render_screen(&metrics, 150, 43);
+
+        assert!(screen.contains("Gen: 12 → 13 transition"));
+        assert!(screen.contains("B0: Draining"));
+        assert!(screen.contains("(+21.7M work)"));
+    }
+
+    #[test]
+    fn small_screen_still_keeps_a_and_b_preview_lines() {
+        let metrics = sample_metrics(false);
+        let screen = render_screen(&metrics, 110, 34);
+
+        assert!(screen.contains("A: since"));
+        assert!(screen.contains("B: and"));
+    }
 }

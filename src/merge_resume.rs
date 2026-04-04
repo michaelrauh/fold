@@ -23,7 +23,6 @@ pub enum ResumePhase {
     SmallerLoaded,
     GenerationCommitted,
     Quiesced,
-    Pruned,
     Archiving,
     Archived,
 }
@@ -270,9 +269,8 @@ pub fn finalize_checkpoint_commit(
     fs::rename(&checkpoint.working_dir, &checkpoint.committed_dir).map_err(FoldError::Io)?;
 
     manifest.active_store_dir = Some(checkpoint.committed_rel);
-    manifest.best_ortho_file = Some(
-        best_ortho_rel.replace(
-            &format!(
+    manifest.best_ortho_file = Some(best_ortho_rel.replace(
+        &format!(
                 "{}/{}",
                 CHECKPOINTS_DIRNAME,
                 checkpoint
@@ -281,9 +279,8 @@ pub fn finalize_checkpoint_commit(
                     .unwrap()
                     .to_string_lossy()
             ),
-            manifest.active_store_dir.as_ref().unwrap(),
-        ),
-    );
+        manifest.active_store_dir.as_ref().unwrap(),
+    ));
     manifest.archive_temp_path = None;
     manifest.updated_at = current_timestamp_secs();
     write_manifest_atomic(merge_work_dir, &manifest)?;

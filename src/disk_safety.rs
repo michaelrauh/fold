@@ -281,7 +281,11 @@ fn apply_local_cleanup(ctx: &DiskSafetyContext) -> io::Result<()> {
 fn reclaim_active_store_files(ctx: &DiskSafetyContext, target_free: u64) -> io::Result<()> {
     let mut candidates = Vec::new();
     collect_active_store_candidates(&ctx.base_dir, &ctx.cache_dir, &mut candidates)?;
-    candidates.sort_by(|a, b| a.modified.cmp(&b.modified).then_with(|| b.size.cmp(&a.size)));
+    candidates.sort_by(|a, b| {
+        a.modified
+            .cmp(&b.modified)
+            .then_with(|| b.size.cmp(&a.size))
+    });
 
     for candidate in candidates {
         if available_space_for(&ctx.base_dir)? >= target_free {
@@ -335,7 +339,10 @@ fn collect_active_store_candidates(
 }
 
 fn is_active_reclaim_candidate(path: &Path) -> bool {
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     if matches!(
         file_name,
         "heartbeat" | "leader.lock" | "resume_manifest.json" | "source.txt" | "active.log"
@@ -349,7 +356,9 @@ fn is_active_reclaim_candidate(path: &Path) -> bool {
         return false;
     }
 
-    let under_input = path.components().any(|component| component.as_os_str() == "input");
+    let under_input = path
+        .components()
+        .any(|component| component.as_os_str() == "input");
     if under_input && path.extension().map(|ext| ext == "txt").unwrap_or(false) {
         return false;
     }
@@ -360,18 +369,15 @@ fn is_active_reclaim_candidate(path: &Path) -> bool {
     let under_checkpoints = path
         .components()
         .any(|component| component.as_os_str() == "checkpoints");
-    let under_merge_work = path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .ends_with(".work")
-    });
-    let under_in_process_archive = path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .ends_with(".bin")
-    }) && path.components().any(|component| component.as_os_str() == "in_process");
+    let under_merge_work = path
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().ends_with(".work"));
+    let under_in_process_archive = path
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().ends_with(".bin"))
+        && path
+            .components()
+            .any(|component| component.as_os_str() == "in_process");
 
     if under_in_process_archive {
         return false;
@@ -881,7 +887,10 @@ mod tests {
         let first_offload = snapshot
             .logs
             .iter()
-            .find(|log| log.message.contains("Disk reclaim offloaded") || log.message.contains("Offloaded sealed file"))
+            .find(|log| {
+                log.message.contains("Disk reclaim offloaded")
+                    || log.message.contains("Offloaded sealed file")
+            })
             .expect("expected disk reclaim offload log");
         assert!(
             first_offload
