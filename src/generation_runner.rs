@@ -12,86 +12,136 @@ use crate::{
 };
 use fixedbitset::FixedBitSet;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::Disks;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const COMPLETION_CHUNK_SIZE: usize = 1_000;
 pub const FANOUT_LOG_THRESHOLD: usize = COMPLETION_CHUNK_SIZE;
-const EST_BYTES_PER_ORTHO: u64 = 200;
+const BUCKET_METRICS_UPDATE_INTERVAL: Duration = Duration::from_secs(15);
+const PRESSURE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const PRESSURE_LANDING_GROWTH_BYTES: u64 = 64 * 1024 * 1024;
+const JOB_COUNT_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
 
-struct PressureWatchdog {
-    landing_bytes_high_water: Option<u64>,
-    enabled: bool,
+#[derive(Clone, Debug)]
+pub struct PressureCheckState {
+    last_full_check: Option<Instant>,
+    last_landing_bytes: u64,
+    force_next: bool,
 }
 
-impl PressureWatchdog {
-    fn from_config(cfg: OffloadConfig) -> Self {
+impl PressureCheckState {
+    pub fn new() -> Self {
         Self {
-            landing_bytes_high_water: cfg.landing_bytes_high_water,
-            enabled: cfg.enabled,
+            last_full_check: None,
+            last_landing_bytes: 0,
+            force_next: false,
         }
     }
 
-    fn should_trigger(&self, landing_bytes: u64) -> bool {
-        if !self.enabled {
-            return false;
+    fn should_run_now(&self, offload_cfg: &OffloadConfig, landing_bytes: u64) -> bool {
+        if self.force_next {
+            return true;
         }
-        self.landing_bytes_high_water
-            .map(|t| landing_bytes >= t)
-            .unwrap_or(false)
+        if landing_pressure_triggered(offload_cfg, landing_bytes) {
+            return true;
+        }
+        if self
+            .last_full_check
+            .map(|instant| instant.elapsed() >= PRESSURE_CHECK_INTERVAL)
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        landing_bytes.abs_diff(self.last_landing_bytes) >= PRESSURE_LANDING_GROWTH_BYTES
     }
 
-    fn maybe_handle(
-        &self,
-        store: &mut GenerationStore,
-        cfg: &Config,
-        metrics: &Metrics,
-    ) -> Result<bool, FoldError> {
-        let landing_est_bytes =
-            (store.total_landing_size() as u64).saturating_mul(EST_BYTES_PER_ORTHO);
-        if !self.should_trigger(landing_est_bytes) {
-            return Ok(false);
-        }
-        metrics.add_log(format!(
-            "Pressure watchdog: landing_est_bytes={}",
-            landing_est_bytes
-        ));
-        metrics.record_pressure_trigger();
-        let stats = store.pressure_spill_to_local_runs(cfg)?;
-        metrics.add_log(format!(
-            "Pressure spill (local): buckets_drained={}, spill_runs_created={}, spill_bytes_created={}",
-            stats.buckets_drained, stats.spill_runs_created, stats.spill_bytes_created
-        ));
-        metrics.record_landing_buffer_count(store.total_landing_size());
-        Ok(true)
+    fn note_full_check_complete(&mut self, landing_bytes: u64) {
+        self.last_full_check = Some(Instant::now());
+        self.last_landing_bytes = landing_bytes;
+        self.force_next = false;
+    }
+
+    fn force_next_check(&mut self) {
+        self.force_next = true;
     }
 }
 
-fn maybe_run_processing_reclaim_safe_point(
+impl Default for PressureCheckState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Default)]
+struct JobCountCache {
+    cached_count: usize,
+    last_refresh: Option<Instant>,
+}
+
+fn landing_pressure_triggered(offload_cfg: &OffloadConfig, landing_bytes: u64) -> bool {
+    offload_cfg.enabled
+        && offload_cfg
+            .landing_bytes_high_water
+            .map(|threshold| landing_bytes >= threshold)
+            .unwrap_or(false)
+}
+
+fn record_landing_metrics(metrics: &Metrics, store: &GenerationStore) {
+    metrics.record_landing_buffer_count(store.total_landing_size());
+    metrics.record_landing_buffer_bytes(store.total_landing_bytes());
+}
+
+pub fn maybe_run_pressure_safe_point(
+    pressure_state: &mut PressureCheckState,
     store: &mut GenerationStore,
     metrics: &Metrics,
+    offload_cfg: &OffloadConfig,
     reason: &str,
 ) -> Result<bool, FoldError> {
-    let reservation = store.processing_reclaim_reservation_bytes();
-    let ram_pressure = memory_safety::should_spill_to_disk();
-    let reclaim_targets = disk_safety::reclaim_required(reservation)?;
-    if !ram_pressure && reclaim_targets.is_none() {
+    let landing_bytes = store.total_landing_bytes();
+    if !pressure_state.should_run_now(offload_cfg, landing_bytes) {
         return Ok(false);
     }
+    let reservation = store.processing_reclaim_reservation_bytes();
+    let landing_pressure = landing_pressure_triggered(offload_cfg, landing_bytes);
+    let ram_pressure = memory_safety::should_spill_to_disk();
+    let reclaim_targets = disk_safety::reclaim_required(reservation)?;
+    if !landing_pressure && !ram_pressure && reclaim_targets.is_none() {
+        pressure_state.note_full_check_complete(landing_bytes);
+        return Ok(false);
+    }
+    metrics.record_pressure_trigger();
     metrics.add_log(format!(
-        "Pressure safe point: reason={}, reservation_bytes={}, ram_pressure={}, disk_pressure={}",
+        "Pressure safe point: reason={}, landing_bytes={}, reservation_bytes={}, landing_pressure={}, ram_pressure={}, disk_pressure={}",
         reason,
+        landing_bytes,
         reservation,
+        landing_pressure,
         ram_pressure,
         reclaim_targets.is_some()
     ));
-    store.prepare_for_reclaim()?;
+    let prepare = store.prepare_for_reclaim()?;
+    metrics.add_log(format!(
+        "Pressure local seal: reason={}, landing_bytes_before={}, landing_bytes_after={}, buckets_drained={}, spill_runs_created={}, spill_bytes_created={}, work_cache_spilled={}",
+        reason,
+        prepare.landing_bytes_before,
+        prepare.landing_bytes_after_local_spill,
+        prepare.buckets_drained,
+        prepare.spill_runs_created,
+        prepare.spill_bytes_created,
+        prepare.work_cache_spilled
+    ));
     if let Some(targets) = reclaim_targets {
         disk_safety::run_reclaim_to_target(targets, reason)?;
     }
+    store.flush_store_metadata(reason)?;
+    record_landing_metrics(metrics, store);
+    update_bucket_metrics(metrics, store);
+    let landing_after = store.total_landing_bytes();
+    pressure_state.note_full_check_complete(landing_after);
+    pressure_state.force_next_check();
     metrics.add_log(format!(
-        "Pressure safe point complete: reason={}, reservation_bytes={}",
-        reason, reservation
+        "Pressure safe point complete: reason={}, landing_bytes={}, reservation_bytes={}",
+        reason, landing_after, reservation
     ));
     Ok(true)
 }
@@ -109,12 +159,25 @@ fn update_bucket_metrics(metrics: &Metrics, store: &GenerationStore) {
             bucket_id: bs.bucket_id,
             run_count: bs.run_count,
             landing_size: bs.landing_size,
+            landing_bytes: bs.landing_bytes,
             history_size_estimate: bs.history_size_estimate,
             state: crate::metrics::BucketState::Pending,
             new_work: 0,
         })
         .collect();
     metrics.update_bucket_metrics(bucket_metrics);
+}
+
+fn update_bucket_metrics_if_due(
+    metrics: &Metrics,
+    store: &GenerationStore,
+    last_bucket_metrics: &mut Instant,
+    force: bool,
+) {
+    if force || last_bucket_metrics.elapsed() >= BUCKET_METRICS_UPDATE_INTERVAL {
+        update_bucket_metrics(metrics, store);
+        *last_bucket_metrics = Instant::now();
+    }
 }
 
 fn update_optimal_metrics(metrics: &Metrics, interner: &Interner, ortho: &Ortho) {
@@ -135,6 +198,53 @@ fn update_optimal_metrics(metrics: &Metrics, interner: &Interner, ortho: &Ortho)
         opt.last_update_time = now;
     });
     metrics.record_optimal_volume(score.volume);
+}
+
+fn cached_jobs_count(state_config: Option<&StateConfig>, cache: &mut JobCountCache) -> usize {
+    let Some(cfg) = state_config else {
+        cache.cached_count = 0;
+        cache.last_refresh = None;
+        return 0;
+    };
+    let needs_refresh = cache
+        .last_refresh
+        .map(|instant| instant.elapsed() >= JOB_COUNT_UPDATE_INTERVAL)
+        .unwrap_or(true);
+    if needs_refresh {
+        cache.cached_count =
+            crate::file_handler::count_running_jobs_with_config(cfg).unwrap_or(cache.cached_count);
+        cache.last_refresh = Some(Instant::now());
+    }
+    cache.cached_count
+}
+
+fn update_global_resource_metrics(
+    metrics: &Metrics,
+    sys: &mut sysinfo::System,
+    state_config: Option<&StateConfig>,
+    jobs_cache: &mut JobCountCache,
+) {
+    sys.refresh_memory();
+    let (used_bytes, total_bytes) = normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
+    let proc_rss_bytes = memory_safety::current_process_rss_bytes();
+    let percent = if total_bytes > 0 {
+        ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
+    } else {
+        0
+    };
+    let jobs_count = cached_jobs_count(state_config, jobs_cache);
+    metrics.update_global(|g| {
+        g.ram_bytes = used_bytes;
+        g.process_rss_bytes = proc_rss_bytes;
+        g.system_memory_percent = percent;
+        g.distinct_jobs_count = jobs_count;
+    });
+
+    if let Some(cfg) = state_config {
+        if let Ok(snapshot) = disk_safety::disk_usage_snapshot_for_metrics(&cfg.base_dir) {
+            metrics.set_disk_usage(snapshot.total_bytes, snapshot.available_bytes);
+        }
+    }
 }
 
 pub fn default_merge_threads() -> usize {
@@ -274,7 +384,7 @@ where
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
+    record_landing_metrics(metrics, store);
 
     // Check cache for initial optimal ortho
     if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
@@ -285,20 +395,13 @@ where
     metrics.reset_prune_counts();
 
     let mut sys = sysinfo::System::new();
-    let mut disks = Disks::new_with_refreshed_list();
-    let disk_base = state_config.map(|cfg| {
-        cfg.base_dir
-            .canonicalize()
-            .unwrap_or_else(|_| cfg.base_dir.clone())
-    });
+    let mut jobs_cache = JobCountCache::default();
     let mut generation = 0u64;
     let mut generation_stats: Vec<GenerationStat> = Vec::new();
     let offload_cfg = state_config
         .map(|cfg| OffloadConfig::from_env_with_base(&cfg.base_dir))
         .unwrap_or_else(OffloadConfig::from_env);
-    let pressure_watchdog = PressureWatchdog::from_config(offload_cfg.clone());
     let mut prev_new_work: Option<u64> = None;
-    let mut reclaim_pending = false;
     crate::generation_store::set_offload_metrics_handle(Some(metrics.clone_handle()));
     store.sync_runtime_metrics();
 
@@ -375,21 +478,7 @@ where
         // Record samples for charts
         metrics.record_work_len(work_len as usize);
         metrics.record_seen_len_accepted(store.seen_len_accepted() as usize);
-
-        // Update bucket metrics
-        let bucket_stats = store.bucket_stats();
-        let bucket_metrics: Vec<_> = bucket_stats
-            .into_iter()
-            .map(|bs| crate::metrics::BucketMetrics {
-                bucket_id: bs.bucket_id,
-                run_count: bs.run_count,
-                landing_size: bs.landing_size,
-                history_size_estimate: bs.history_size_estimate,
-                state: crate::metrics::BucketState::Pending,
-                new_work: 0,
-            })
-            .collect();
-        metrics.update_bucket_metrics(bucket_metrics);
+        record_landing_metrics(metrics, store);
 
         // Low-frequency cache check (once per generation)
         if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
@@ -422,6 +511,9 @@ where
         let gen_start = Instant::now();
         let accepted_before = store.seen_len_accepted();
         last_housekeeping = Instant::now();
+        let mut last_bucket_metrics = Instant::now();
+        let mut pressure_state = PressureCheckState::new();
+        update_bucket_metrics_if_due(metrics, store, &mut last_bucket_metrics, true);
 
         // Process all work in this generation
         while let Some(ortho) = store.pop_work()? {
@@ -469,63 +561,12 @@ where
                     g.seen_len_accepted = store.seen_len_accepted();
                 });
                 metrics.record_work_len(store.work_len() as usize);
-                metrics.record_landing_buffer_count(store.total_landing_size());
+                record_landing_metrics(metrics, store);
 
-                // Update bucket metrics for TUI visualization
-                let bucket_stats = store.bucket_stats();
-                let bucket_metrics: Vec<_> = bucket_stats
-                    .into_iter()
-                    .map(|bs| crate::metrics::BucketMetrics {
-                        bucket_id: bs.bucket_id,
-                        run_count: bs.run_count,
-                        landing_size: bs.landing_size,
-                        history_size_estimate: bs.history_size_estimate,
-                        state: crate::metrics::BucketState::Pending,
-                        new_work: 0,
-                    })
-                    .collect();
-                metrics.update_bucket_metrics(bucket_metrics);
+                update_bucket_metrics_if_due(metrics, store, &mut last_bucket_metrics, false);
 
                 // System metrics (RAM)
-                sys.refresh_memory();
-                let (used_bytes, total_bytes) =
-                    normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-                let proc_rss_bytes = memory_safety::current_process_rss_bytes();
-                let percent = if total_bytes > 0 {
-                    ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
-                } else {
-                    0
-                };
-                let jobs_count = if let Some(cfg) = state_config {
-                    crate::file_handler::count_running_jobs_with_config(cfg).unwrap_or(0)
-                } else {
-                    0
-                };
-                metrics.update_global(|g| {
-                    g.ram_bytes = used_bytes;
-                    g.process_rss_bytes = proc_rss_bytes;
-                    g.system_memory_percent = percent;
-                    g.distinct_jobs_count = jobs_count;
-                });
-
-                // Disk usage for base dir, if known
-                if let Some(base_dir) = &disk_base {
-                    disks.refresh_list();
-                    disks.refresh();
-                    let mut best: Option<(u64, u64, usize)> = None;
-                    for disk in disks.iter() {
-                        let mount = disk.mount_point();
-                        if base_dir.starts_with(mount) {
-                            let score = mount.as_os_str().to_string_lossy().len();
-                            if best.map_or(true, |(_, _, best_len)| score > best_len) {
-                                best = Some((disk.total_space(), disk.available_space(), score));
-                            }
-                        }
-                    }
-                    if let Some((total, available, _)) = best {
-                        metrics.set_disk_usage(total, available);
-                    }
-                }
+                update_global_resource_metrics(metrics, &mut sys, state_config, &mut jobs_cache);
 
                 // Compression stats
                 let comp = store.compression_stats();
@@ -534,20 +575,13 @@ where
                 // Housekeeping hook (heartbeats, mem claim, leader lock)
                 housekeeping()?;
 
-                // Pressure watchdog: drain/compact/offload under landing/disk pressure.
-                let _ = pressure_watchdog.maybe_handle(store, cfg, metrics)?;
-                reclaim_pending =
-                    disk_safety::reclaim_required(store.processing_reclaim_reservation_bytes())?
-                        .is_some();
-                if reclaim_pending
-                    && maybe_run_processing_reclaim_safe_point(
-                        store,
-                        metrics,
-                        "processing housekeeping",
-                    )?
-                {
-                    reclaim_pending = false;
-                }
+                let _ = maybe_run_pressure_safe_point(
+                    &mut pressure_state,
+                    store,
+                    metrics,
+                    &offload_cfg,
+                    "processing housekeeping",
+                )?;
             }
 
             completion_ctx.reset(&ortho);
@@ -575,18 +609,13 @@ where
                 if completion_chunk.len() < COMPLETION_CHUNK_SIZE {
                     continue;
                 }
-                reclaim_pending = reclaim_pending
-                    || disk_safety::reclaim_required(store.processing_reclaim_reservation_bytes())?
-                        .is_some();
-                if reclaim_pending
-                    && maybe_run_processing_reclaim_safe_point(
-                        store,
-                        metrics,
-                        "processing completion chunk",
-                    )?
-                {
-                    reclaim_pending = false;
-                }
+                let _ = maybe_run_pressure_safe_point(
+                    &mut pressure_state,
+                    store,
+                    metrics,
+                    &offload_cfg,
+                    "processing completion chunk",
+                )?;
 
                 for &completion in &completion_chunk {
                     if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
@@ -630,18 +659,13 @@ where
             }
 
             if !completion_chunk.is_empty() {
-                reclaim_pending = reclaim_pending
-                    || disk_safety::reclaim_required(store.processing_reclaim_reservation_bytes())?
-                        .is_some();
-                if reclaim_pending
-                    && maybe_run_processing_reclaim_safe_point(
-                        store,
-                        metrics,
-                        "processing completion chunk",
-                    )?
-                {
-                    reclaim_pending = false;
-                }
+                let _ = maybe_run_pressure_safe_point(
+                    &mut pressure_state,
+                    store,
+                    metrics,
+                    &offload_cfg,
+                    "processing completion chunk",
+                )?;
 
                 for &completion in &completion_chunk {
                     if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
@@ -722,7 +746,7 @@ where
             g.phase = format!("Gen {} complete", generation);
         });
         metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
+        record_landing_metrics(metrics, store);
 
         metrics.add_log(format!(
             "Generation {} complete: processed={}, pop_work_calls={}, accepted_delta={}, new_work={}, work_len_after={}, total_seen={}",
@@ -837,21 +861,20 @@ where
     ));
 
     let mut sys = sysinfo::System::new();
-    let mut disks = Disks::new_with_refreshed_list();
-    let disk_base = state_config.map(|cfg| {
-        cfg.base_dir
-            .canonicalize()
-            .unwrap_or_else(|_| cfg.base_dir.clone())
-    });
+    let mut jobs_cache = JobCountCache::default();
+    let offload_cfg = state_config
+        .map(|cfg| OffloadConfig::from_env_with_base(&cfg.base_dir))
+        .unwrap_or_else(OffloadConfig::from_env);
+    let mut pressure_state = PressureCheckState::new();
 
     metrics.set_operation_status("Processing merge generations".to_string());
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
-    update_bucket_metrics(metrics, store);
+    record_landing_metrics(metrics, store);
 
     let mut last_report_time = Instant::now();
     let mut last_report_count = 0u64;
     let mut last_housekeeping = Instant::now();
+    let mut last_bucket_metrics = Instant::now();
     let work_len = store.work_len();
     if work_len == 0 {
         return Ok(MergeGenerationStepResult {
@@ -884,8 +907,8 @@ where
     });
     metrics.set_operation_status(format!("Processing Merge Gen {}", generation));
     metrics.record_work_len(work_len as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
-    update_bucket_metrics(metrics, store);
+    record_landing_metrics(metrics, store);
+    update_bucket_metrics_if_due(metrics, store, &mut last_bucket_metrics, true);
 
     if let Some(cache_ortho) = store.peek_best_ortho_in_cache() {
         let cache_score = cache_ortho.score();
@@ -947,61 +970,26 @@ where
                 g.seen_len_accepted = store.seen_len_accepted();
             });
             metrics.record_work_len(store.work_len() as usize);
-            metrics.record_landing_buffer_count(store.total_landing_size());
-            update_bucket_metrics(metrics, store);
+            record_landing_metrics(metrics, store);
+            update_bucket_metrics_if_due(metrics, store, &mut last_bucket_metrics, false);
 
             if optimal_dirty {
                 update_optimal_metrics(metrics, interner, &best_ortho);
                 optimal_dirty = false;
             }
 
-            sys.refresh_memory();
-            let (used_bytes, total_bytes) =
-                normalize_sysinfo_mem(sys.total_memory(), sys.used_memory());
-            let proc_rss_bytes = memory_safety::current_process_rss_bytes();
-            let percent = if total_bytes > 0 {
-                ((used_bytes as f64 / total_bytes as f64) * 100.0).round() as usize
-            } else {
-                0
-            };
-            let jobs_count = if let Some(cfg) = state_config {
-                crate::file_handler::count_running_jobs_with_config(cfg).unwrap_or(0)
-            } else {
-                0
-            };
-            metrics.update_global(|g| {
-                g.ram_bytes = used_bytes;
-                g.process_rss_bytes = proc_rss_bytes;
-                g.system_memory_percent = percent;
-                g.distinct_jobs_count = jobs_count;
-            });
-
-            if let Some(base_dir) = &disk_base {
-                disks.refresh_list();
-                disks.refresh();
-                let mut best: Option<(u64, u64, usize)> = None;
-                for disk in disks.iter() {
-                    let mount = disk.mount_point();
-                    if base_dir.starts_with(mount) {
-                        let score = mount.as_os_str().to_string_lossy().len();
-                        if best.map_or(true, |(_, _, best_len)| score > best_len) {
-                            best = Some((disk.total_space(), disk.available_space(), score));
-                        }
-                    }
-                }
-                if let Some((total, available, _)) = best {
-                    metrics.set_disk_usage(total, available);
-                }
-            }
+            update_global_resource_metrics(metrics, &mut sys, state_config, &mut jobs_cache);
 
             let comp = store.compression_stats();
             metrics.set_compression_bytes(comp.uncompressed_bytes, comp.compressed_bytes);
 
             housekeeping()?;
 
-            let _ = maybe_run_processing_reclaim_safe_point(
+            let _ = maybe_run_pressure_safe_point(
+                &mut pressure_state,
                 store,
                 metrics,
+                &offload_cfg,
                 "merge processing housekeeping",
             )?;
         }
@@ -1051,6 +1039,13 @@ where
             materialize_child_batches(&ortho, &completion_batches, thread_pool.as_ref());
 
         for (batch, expanded_children) in completion_batches.iter().zip(child_batches.into_iter()) {
+            let _ = maybe_run_pressure_safe_point(
+                &mut pressure_state,
+                store,
+                metrics,
+                &offload_cfg,
+                "merge completion batch",
+            )?;
             for (&completion, children) in batch.iter().zip(expanded_children.into_iter()) {
                 if bound_completion_ctx(&mut completion_ctx, completion, interner, best_score) {
                     hot_deltas.pruned_completions = hot_deltas.pruned_completions.saturating_add(1);
@@ -1116,7 +1111,7 @@ where
         g.phase = format!("Merge Gen {} complete", generation);
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
+    record_landing_metrics(metrics, store);
 
     metrics.add_log(format!(
         "Merge Generation {} complete: {} new work, {} total seen",
@@ -1183,7 +1178,9 @@ fn normalize_sysinfo_mem(total_raw: u64, used_raw: u64) -> (usize, usize) {
 #[cfg(test)]
 mod pressure_watchdog_tests {
     use super::*;
+    use crate::disk_safety::debug_exact_disk_probe_count;
     use crate::generation_store::{RunOffloader, set_run_offloader};
+    use crate::offload_runtime::configure_offload_runtime;
     use std::io;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -1228,16 +1225,113 @@ mod pressure_watchdog_tests {
         store.record_result(&ortho).unwrap();
         store.flush_all().unwrap();
 
-        let watchdog = PressureWatchdog::from_config(OffloadConfig {
+        let offload_cfg = OffloadConfig {
             enabled: true,
             landing_bytes_high_water: Some(1),
             disk_free_low_water: None,
             ..OffloadConfig::with_base_dir(base_path.clone())
-        });
+        };
         let metrics = Metrics::new();
-        let triggered = watchdog.maybe_handle(&mut store, &cfg, &metrics).unwrap();
+        let mut pressure_state = PressureCheckState::new();
+        let triggered = maybe_run_pressure_safe_point(
+            &mut pressure_state,
+            &mut store,
+            &metrics,
+            &offload_cfg,
+            "test watchdog",
+        )
+        .unwrap();
         assert!(triggered);
         assert_eq!(store.total_landing_size(), 0);
+    }
+
+    #[test]
+    fn no_pressure_safe_point_path_skips_repeated_exact_disk_probes() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let free_now = std::fs::create_dir_all(&base_path)
+            .and_then(|_| crate::disk_safety::disk_usage_snapshot_for_metrics(&base_path))
+            .unwrap()
+            .available_bytes;
+        let mut offload_cfg = OffloadConfig::with_base_dir(base_path.clone());
+        offload_cfg.enabled = true;
+        offload_cfg.in_memory_store = true;
+        offload_cfg.cache_dir = base_path.join("offload_cache");
+        offload_cfg.disk_hysteresis_margin_bytes = 0;
+        offload_cfg.disk_free_low_water = Some(free_now.saturating_sub(512 * 1024 * 1024));
+
+        let _guard = configure_offload_runtime(&base_path, &offload_cfg)
+            .unwrap()
+            .unwrap();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 2).unwrap();
+        store.configure(&Config::test_config(256 * 1024, 8));
+        let metrics = Metrics::new();
+        let mut pressure_state = PressureCheckState::new();
+
+        assert!(
+            !maybe_run_pressure_safe_point(
+                &mut pressure_state,
+                &mut store,
+                &metrics,
+                &offload_cfg,
+                "test no pressure",
+            )
+            .unwrap()
+        );
+        let probes_after_first = debug_exact_disk_probe_count();
+        assert!(
+            !maybe_run_pressure_safe_point(
+                &mut pressure_state,
+                &mut store,
+                &metrics,
+                &offload_cfg,
+                "test no pressure",
+            )
+            .unwrap()
+        );
+        assert_eq!(debug_exact_disk_probe_count(), probes_after_first);
+    }
+}
+
+#[cfg(test)]
+mod pressure_state_tests {
+    use super::*;
+
+    #[test]
+    fn pressure_state_skips_repeated_small_growth_checks() {
+        let mut state = PressureCheckState::new();
+        let offload_cfg = OffloadConfig {
+            enabled: true,
+            landing_bytes_high_water: Some(PRESSURE_LANDING_GROWTH_BYTES.saturating_mul(4)),
+            ..OffloadConfig::default()
+        };
+        state.note_full_check_complete(1024);
+        state.last_full_check = Some(Instant::now());
+
+        assert!(!state.should_run_now(&offload_cfg, 2048));
+    }
+
+    #[test]
+    fn pressure_state_triggers_on_growth_or_high_water() {
+        let mut state = PressureCheckState::new();
+        state.note_full_check_complete(0);
+        state.last_full_check = Some(Instant::now());
+
+        let growth_cfg = OffloadConfig {
+            enabled: true,
+            landing_bytes_high_water: Some(PRESSURE_LANDING_GROWTH_BYTES.saturating_mul(4)),
+            ..OffloadConfig::default()
+        };
+        assert!(state.should_run_now(&growth_cfg, PRESSURE_LANDING_GROWTH_BYTES));
+
+        let high_water_cfg = OffloadConfig {
+            enabled: true,
+            landing_bytes_high_water: Some(1),
+            ..OffloadConfig::default()
+        };
+        state.note_full_check_complete(0);
+        state.last_full_check = Some(Instant::now());
+        assert!(state.should_run_now(&high_water_cfg, 1));
     }
 }
 

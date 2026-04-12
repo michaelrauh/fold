@@ -54,6 +54,7 @@ pub struct GlobalMetrics {
     pub phase: String,
     pub work_len: u64,
     pub seen_len_accepted: u64,
+    pub landing_buffer_bytes: u64,
     pub run_budget_bytes: usize,
     pub compaction_arena_cap_bytes: usize,
     pub compaction_arena_bytes: usize,
@@ -109,6 +110,7 @@ impl Default for GlobalMetrics {
             phase: "Idle".to_string(),
             work_len: 0,
             seen_len_accepted: 0,
+            landing_buffer_bytes: 0,
             run_budget_bytes: 0,
             compaction_arena_cap_bytes: 0,
             compaction_arena_bytes: 0,
@@ -453,6 +455,11 @@ impl Metrics {
         self.record_sample(count, |inner| &mut inner.landing_buffer_samples);
     }
 
+    pub fn record_landing_buffer_bytes(&self, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global.landing_buffer_bytes = bytes;
+    }
+
     pub fn record_seen_len_accepted(&self, len: usize) {
         // Only record to persistent history that survives chunk resets
         self.record_sample(len, |inner| &mut inner.seen_history_samples);
@@ -776,6 +783,7 @@ pub struct BucketMetrics {
     pub run_count: usize,
     // Count of orthos currently pending in landing for this bucket
     pub landing_size: usize,
+    pub landing_bytes: u64,
     pub history_size_estimate: usize,
     pub state: BucketState,
     pub new_work: usize,

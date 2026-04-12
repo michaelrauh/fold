@@ -17,6 +17,7 @@ pub mod ortho;
 pub mod spatial;
 pub mod splitter;
 pub mod stage_planner;
+pub mod tiered_store;
 pub mod tui;
 
 pub use error::*;

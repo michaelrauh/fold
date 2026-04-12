@@ -1,23 +1,51 @@
-use crate::{generation_store, memory_safety, metrics::Metrics, offload_config::OffloadConfig};
+use crate::{
+    generation_store, memory_safety, metrics::Metrics, offload_config::OffloadConfig,
+    tiered_store::TieredStore,
+};
 use std::cell::{Cell, RefCell};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::rc::Rc;
+use std::time::{Duration, Instant, SystemTime};
+#[cfg(not(unix))]
 use sysinfo::Disks;
 
 const ARCHIVE_PAYLOAD_MAGIC: &[u8; 8] = b"FOLDRSLT";
 const ARCHIVE_PAYLOAD_VERSION: u32 = 1;
+const DISK_SNAPSHOT_TTL: Duration = Duration::from_millis(250);
+const RECLAIM_EXACT_REFRESH_INTERVAL: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DiskSpaceSnapshot {
+    pub(crate) total_bytes: u64,
+    pub(crate) available_bytes: u64,
+    sampled_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotFreshness {
+    CachedOk,
+    ForceRefresh,
+}
+
 #[derive(Clone)]
 struct DiskSafetyContext {
     enabled: bool,
     base_dir: PathBuf,
     floor_bytes: Option<u64>,
+    hysteresis_margin_bytes: u64,
     offload_headroom_bytes: usize,
     cache_dir: PathBuf,
     cache_bytes_cap: u64,
     full_runs_dir: PathBuf,
     doubling_runs_dir: PathBuf,
+    disk_snapshot: Rc<RefCell<Option<DiskSpaceSnapshot>>>,
+    exact_probe_count: Rc<Cell<u64>>,
 }
 
 thread_local! {
@@ -41,6 +69,17 @@ struct FileInfo {
     modified: SystemTime,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ReclaimCandidateStats {
+    managed_roots: usize,
+    managed_candidates: usize,
+    skipped_remote: usize,
+    skipped_missing_local: usize,
+    skipped_zero_bytes: usize,
+    offloaded_files: usize,
+    offloaded_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReclaimTargets {
     pub(crate) write_target: u64,
@@ -60,11 +99,14 @@ pub fn configure(base_dir: PathBuf, cfg: &OffloadConfig) {
             enabled: cfg.enabled,
             base_dir,
             floor_bytes: cfg.disk_free_low_water,
+            hysteresis_margin_bytes: cfg.disk_hysteresis_margin_bytes,
             offload_headroom_bytes: cfg.offload_headroom_bytes,
             cache_dir: cfg.cache_dir.clone(),
             cache_bytes_cap: cfg.cache_bytes_cap,
             full_runs_dir: PathBuf::from("fold_history").join("full_runs"),
             doubling_runs_dir: PathBuf::from("fold_history").join("doubling_runs"),
+            disk_snapshot: Rc::new(RefCell::new(None)),
+            exact_probe_count: Rc::new(Cell::new(0)),
         });
     });
 }
@@ -94,10 +136,12 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
     }
 
     let target_free = disk_target(&ctx, bytes_needed);
-    let free_before = available_space_for(&ctx.base_dir)?;
+    let free_before =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::CachedOk)?;
     if free_before < target_free {
         apply_local_cleanup(&ctx)?;
-        let free_after_cleanup = available_space_for(&ctx.base_dir)?;
+        let free_after_cleanup =
+            available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
         if free_after_cleanup < target_free {
             let _ = run_reclaim_to_target(
                 ReclaimTargets {
@@ -109,7 +153,8 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
         }
     }
 
-    let free_after = available_space_for(&ctx.base_dir)?;
+    let free_after =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
     if free_after >= bytes_needed {
         return Ok(());
     }
@@ -148,8 +193,14 @@ pub(crate) fn reclaim_required(bytes_needed: u64) -> io::Result<Option<ReclaimTa
     }
 
     let write_target = disk_target(&ctx, bytes_needed);
+    let free_cached =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::CachedOk)?;
+    if free_cached >= write_target {
+        return Ok(None);
+    }
     apply_local_cleanup(&ctx)?;
-    let free_now = available_space_for(&ctx.base_dir)?;
+    let free_now =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
     if free_now >= write_target {
         return Ok(None);
     }
@@ -176,14 +227,16 @@ pub(crate) fn run_reclaim_to_target(targets: ReclaimTargets, reason: &str) -> io
         return Ok(());
     }
 
-    let free_before = available_space_for(&ctx.base_dir)?;
+    let free_before =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
     let rss_before = sync_process_rss_metrics();
     log(format!(
         "Tiering start: reason={}, free_before={}, disk_threshold={}, rss_before={}",
         reason, free_before, targets.write_target, rss_before
     ));
     reclaim_until(&ctx, targets.reclaim_target, reason)?;
-    let free_after = available_space_for(&ctx.base_dir)?;
+    let free_after =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
     let rss_after = sync_process_rss_metrics();
     log(format!(
         "Tiering finish: reason={}, free_after={}, disk_threshold={}, rss_after={}",
@@ -255,12 +308,14 @@ fn reclaim_until(ctx: &DiskSafetyContext, target_free: u64, reason: &str) -> io:
     let _guard = ReclaimGuard;
 
     apply_local_cleanup(ctx)?;
-    if available_space_for(&ctx.base_dir)? >= target_free {
+    let free_after_cleanup =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
+    if free_after_cleanup >= target_free {
         return Ok(());
     }
 
-    reclaim_active_store_files(ctx, target_free)?;
-    if available_space_for(&ctx.base_dir)? >= target_free {
+    let free_after_reclaim = reclaim_active_store_files(ctx, target_free, free_after_cleanup)?;
+    if free_after_reclaim >= target_free {
         return Ok(());
     }
 
@@ -278,25 +333,37 @@ fn apply_local_cleanup(ctx: &DiskSafetyContext) -> io::Result<()> {
     Ok(())
 }
 
-fn reclaim_active_store_files(ctx: &DiskSafetyContext, target_free: u64) -> io::Result<()> {
+fn reclaim_active_store_files(
+    ctx: &DiskSafetyContext,
+    target_free: u64,
+    mut free_estimate: u64,
+) -> io::Result<u64> {
     let mut candidates = Vec::new();
-    collect_active_store_candidates(&ctx.base_dir, &ctx.cache_dir, &mut candidates)?;
+    let mut stats = ReclaimCandidateStats::default();
+    collect_active_store_candidates(&ctx.base_dir, &ctx.cache_dir, &mut candidates, &mut stats)?;
+    stats.managed_candidates = candidates.len();
     candidates.sort_by(|a, b| {
         a.modified
             .cmp(&b.modified)
             .then_with(|| b.size.cmp(&a.size))
     });
 
+    let mut processed = 0usize;
     for candidate in candidates {
-        if available_space_for(&ctx.base_dir)? >= target_free {
+        if free_estimate >= target_free {
             break;
         }
         match offload_and_delete(&candidate.path) {
-            Ok(true) => log(format!(
-                "Offloaded sealed file: {} bytes from {}",
-                candidate.size,
-                candidate.path.display()
-            )),
+            Ok(true) => {
+                free_estimate = free_estimate.saturating_add(candidate.size);
+                stats.offloaded_files = stats.offloaded_files.saturating_add(1);
+                stats.offloaded_bytes = stats.offloaded_bytes.saturating_add(candidate.size);
+                log(format!(
+                    "Offloaded sealed file: {} bytes from {}",
+                    candidate.size,
+                    candidate.path.display()
+                ));
+            }
             Ok(false) => {}
             Err(err) => {
                 log(format!(
@@ -306,97 +373,80 @@ fn reclaim_active_store_files(ctx: &DiskSafetyContext, target_free: u64) -> io::
                 ));
             }
         }
+        processed = processed.saturating_add(1);
+        if processed % RECLAIM_EXACT_REFRESH_INTERVAL == 0 {
+            free_estimate =
+                available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
+        }
     }
 
-    Ok(())
+    free_estimate =
+        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
+    log(format!(
+        "Catalog reclaim summary: roots={}, candidates={}, offloaded_files={}, offloaded_bytes={}, skipped_remote={}, skipped_missing_local={}, skipped_zero_bytes={}, free_after={}, target_free={}",
+        stats.managed_roots,
+        stats.managed_candidates,
+        stats.offloaded_files,
+        stats.offloaded_bytes,
+        stats.skipped_remote,
+        stats.skipped_missing_local,
+        stats.skipped_zero_bytes,
+        free_estimate,
+        target_free
+    ));
+    Ok(free_estimate)
 }
 
 fn collect_active_store_candidates(
     root: &Path,
     cache_dir: &Path,
     out: &mut Vec<FileInfo>,
+    stats: &mut ReclaimCandidateStats,
 ) -> io::Result<()> {
     if !root.exists() {
+        return Ok(());
+    }
+    if root == cache_dir || root.starts_with(cache_dir) {
+        return Ok(());
+    }
+
+    if is_tiered_store_root(root) {
+        let store = TieredStore::open(root)?;
+        let scan = store.reclaim_candidates_with_summary()?;
+        stats.managed_roots = stats.managed_roots.saturating_add(1);
+        stats.skipped_remote = stats.skipped_remote.saturating_add(scan.skipped_remote);
+        stats.skipped_missing_local = stats
+            .skipped_missing_local
+            .saturating_add(scan.skipped_missing_local);
+        stats.skipped_zero_bytes = stats
+            .skipped_zero_bytes
+            .saturating_add(scan.skipped_zero_bytes);
+        for candidate in scan.candidates {
+            out.push(FileInfo {
+                path: candidate.path,
+                size: candidate.bytes,
+                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(candidate.last_touch_epoch),
+            });
+        }
         return Ok(());
     }
 
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if path == *cache_dir {
+        if path == *cache_dir || path.starts_with(cache_dir) {
             continue;
         }
         if path.is_dir() {
-            collect_active_store_candidates(&path, cache_dir, out)?;
-            continue;
-        }
-        if is_active_reclaim_candidate(&path) {
-            out.push(file_info(&path)?);
+            collect_active_store_candidates(&path, cache_dir, out, stats)?;
         }
     }
 
     Ok(())
 }
 
-fn is_active_reclaim_candidate(path: &Path) -> bool {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if matches!(
-        file_name,
-        "heartbeat" | "leader.lock" | "resume_manifest.json" | "source.txt" | "active.log"
-    ) {
-        return false;
-    }
-    if file_name.ends_with(".claim")
-        || file_name.ends_with(".tmp")
-        || file_name.ends_with(".partial")
-    {
-        return false;
-    }
-
-    let under_input = path
-        .components()
-        .any(|component| component.as_os_str() == "input");
-    if under_input && path.extension().map(|ext| ext == "txt").unwrap_or(false) {
-        return false;
-    }
-
-    let under_results = path
-        .components()
-        .any(|component| component.as_os_str() == "results");
-    let under_checkpoints = path
-        .components()
-        .any(|component| component.as_os_str() == "checkpoints");
-    let under_merge_work = path
-        .components()
-        .any(|component| component.as_os_str().to_string_lossy().ends_with(".work"));
-    let under_in_process_archive = path
-        .components()
-        .any(|component| component.as_os_str().to_string_lossy().ends_with(".bin"))
-        && path
-            .components()
-            .any(|component| component.as_os_str() == "in_process");
-
-    if under_in_process_archive {
-        return false;
-    }
-    if under_checkpoints {
-        return false;
-    }
-
-    if under_merge_work {
-        return under_results
-            || path.components().any(|component| {
-                matches!(
-                    component.as_os_str().to_string_lossy().as_ref(),
-                    "history" | "runs" | "work" | "spill" | "landing"
-                )
-            });
-    }
-
-    under_results || path.is_file()
+fn is_tiered_store_root(path: &Path) -> bool {
+    path.join("catalog.json").is_file() && path.join("segments").is_dir()
 }
 
 fn prune_cache_to_cap(cache_dir: &Path, cap: u64) -> io::Result<()> {
@@ -539,13 +589,13 @@ fn file_info(path: &Path) -> io::Result<FileInfo> {
     let metadata = fs::metadata(path)?;
     Ok(FileInfo {
         path: path.to_path_buf(),
-        size: metadata.len(),
+        size: generation_store::managed_file_size(path).unwrap_or_else(|_| metadata.len()),
         modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
     })
 }
 
 fn offload_and_delete(path: &Path) -> io::Result<bool> {
-    let size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let size = generation_store::managed_file_size(path).unwrap_or(0);
     let offload_headroom = current_ctx()
         .map(|ctx| ctx.offload_headroom_bytes)
         .unwrap_or(16 * 1024 * 1024);
@@ -554,14 +604,8 @@ fn offload_and_delete(path: &Path) -> io::Result<bool> {
         &format!("disk reclaim offload {}", path.display()),
     )?;
     let rss_before = sync_process_rss_metrics();
-    match generation_store::offload_path_if_configured(path)? {
+    match generation_store::offload_managed_path_if_configured(path)? {
         true => {
-            let _ = fs::remove_file(path);
-            METRICS.with(|slot| {
-                if let Some(metrics) = slot.borrow().clone() {
-                    metrics.record_offload(1, size);
-                }
-            });
             let rss_after = sync_process_rss_metrics();
             log(format!(
                 "Disk reclaim offloaded: {} bytes from {} (rss_before={} rss_after={})",
@@ -649,7 +693,10 @@ fn pack_and_offload_archive_results(archive_path: &Path) -> io::Result<u64> {
 }
 
 fn disk_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
-    ctx.floor_bytes.unwrap_or(0).max(bytes_needed)
+    ctx.floor_bytes
+        .unwrap_or(0)
+        .saturating_add(ctx.hysteresis_margin_bytes)
+        .max(bytes_needed)
 }
 
 #[cfg(test)]
@@ -721,29 +768,125 @@ fn current_ctx() -> Option<DiskSafetyContext> {
     CTX.with(|slot| slot.borrow().clone())
 }
 
+#[cfg(test)]
 fn available_space_for(path: &Path) -> io::Result<u64> {
+    available_space_for_with_freshness(path, SnapshotFreshness::CachedOk)
+}
+
+fn available_space_for_with_freshness(
+    path: &Path,
+    freshness: SnapshotFreshness,
+) -> io::Result<u64> {
+    Ok(disk_usage_snapshot_for_path(path, freshness)?.available_bytes)
+}
+
+pub(crate) fn disk_usage_snapshot_for_metrics(path: &Path) -> io::Result<DiskSpaceSnapshot> {
+    disk_usage_snapshot_for_path(path, SnapshotFreshness::CachedOk)
+}
+
+fn disk_usage_snapshot_for_path(
+    path: &Path,
+    freshness: SnapshotFreshness,
+) -> io::Result<DiskSpaceSnapshot> {
+    let ctx = current_ctx().filter(|ctx| path.starts_with(&ctx.base_dir) || ctx.base_dir == path);
+    if let Some(ctx) = ctx {
+        if freshness == SnapshotFreshness::CachedOk {
+            if let Some(snapshot) = *ctx.disk_snapshot.borrow() {
+                if snapshot.sampled_at.elapsed() < DISK_SNAPSHOT_TTL {
+                    return Ok(snapshot);
+                }
+            }
+        }
+
+        let snapshot = exact_disk_usage_snapshot(path)?;
+        ctx.disk_snapshot.borrow_mut().replace(snapshot);
+        ctx.exact_probe_count
+            .set(ctx.exact_probe_count.get().saturating_add(1));
+        return Ok(snapshot);
+    }
+
+    exact_disk_usage_snapshot(path)
+}
+
+fn exact_disk_usage_snapshot(path: &Path) -> io::Result<DiskSpaceSnapshot> {
+    let (total_bytes, available_bytes) = probe_disk_usage(path)?;
+    Ok(DiskSpaceSnapshot {
+        total_bytes,
+        available_bytes,
+        sampled_at: Instant::now(),
+    })
+}
+
+#[cfg(unix)]
+fn probe_disk_usage(path: &Path) -> io::Result<(u64, u64)> {
+    let probe_path = existing_probe_path(path);
+    let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains interior NUL: {}", probe_path.display()),
+        )
+    })?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    let fragment_size = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    } as u64;
+    Ok((
+        (stats.f_blocks as u64).saturating_mul(fragment_size),
+        (stats.f_bavail as u64).saturating_mul(fragment_size),
+    ))
+}
+
+#[cfg(not(unix))]
+fn probe_disk_usage(path: &Path) -> io::Result<(u64, u64)> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mut disks = Disks::new_with_refreshed_list();
     disks.refresh_list();
     disks.refresh();
 
-    let mut best: Option<(u64, usize)> = None;
+    let mut best: Option<(u64, u64, usize)> = None;
     for disk in disks.iter() {
         let mount = disk.mount_point();
         if canonical.starts_with(mount) {
             let score = mount.as_os_str().to_string_lossy().len();
-            if best.map_or(true, |(_, best_score)| score > best_score) {
-                best = Some((disk.available_space(), score));
+            if best.map_or(true, |(_, _, best_score)| score > best_score) {
+                best = Some((disk.total_space(), disk.available_space(), score));
             }
         }
     }
 
-    best.map(|(available, _)| available).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no disk mount found for {}", canonical.display()),
-        )
-    })
+    best.map(|(total, available, _)| (total, available))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no disk mount found for {}", canonical.display()),
+            )
+        })
+}
+
+fn existing_probe_path(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return current;
+        }
+        if !current.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn debug_exact_disk_probe_count() -> u64 {
+    current_ctx()
+        .map(|ctx| ctx.exact_probe_count.get())
+        .unwrap_or(0)
 }
 
 fn remove_empty_dirs_upwards(path: &Path, root: &Path) -> io::Result<()> {
@@ -785,17 +928,8 @@ mod tests {
     use super::*;
     use crate::metrics::Metrics;
     use crate::offload_runtime::configure_offload_runtime;
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    use crate::tiered_store::TieredStore;
     use tempfile::TempDir;
-
-    struct CwdGuard(std::path::PathBuf);
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
 
     fn write_test_file(path: &Path, size: usize) {
         if let Some(parent) = path.parent() {
@@ -831,7 +965,10 @@ mod tests {
         let reclaimed = pack_and_offload_archive_results(&archive).unwrap();
         assert!(reclaimed > 0);
         assert!(!archive.join("results").exists());
-        assert!(!archive_payload_path(&archive).exists());
+        assert!(archive_payload_path(&archive).exists());
+        assert!(generation_store::is_offload_marker(&archive_payload_path(
+            &archive
+        )));
 
         ensure_archive_results_local(&archive).unwrap();
         assert_eq!(fs::read(results_file).unwrap(), b"hello archive");
@@ -839,34 +976,27 @@ mod tests {
 
     #[test]
     fn offload_prefers_oldest_sealed_candidate() {
-        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
-        let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
-        std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
-        let cold_archive_path = base
-            .join("input")
-            .join("archive_test.bin")
-            .join("results")
-            .join("history")
-            .join("b=00")
-            .join("history-0.dat");
-        let merge_segment_path = base
-            .join("in_process")
-            .join("merge_1.work")
-            .join("work")
-            .join("segment-0.dat");
+        let store =
+            TieredStore::open(base.join("in_process").join("merge_1.work").join("store")).unwrap();
 
         const FILE_BYTES: usize = 32 * 1024 * 1024;
         const RESERVATION_BYTES: u64 = 8 * 1024 * 1024;
 
-        write_test_file(&cold_archive_path, FILE_BYTES);
-        write_test_file(&merge_segment_path, FILE_BYTES);
-        let old_time = filetime::FileTime::from_unix_time(1, 0);
-        let new_time = filetime::FileTime::from_unix_time(2, 0);
-        filetime::set_file_mtime(&cold_archive_path, old_time).unwrap();
-        filetime::set_file_mtime(&merge_segment_path, new_time).unwrap();
+        store.begin_epoch(1).unwrap();
+        let cold_segment = store.allocate_segment("history", "zstd", "sorted").unwrap();
+        fs::write(&cold_segment.path, vec![7u8; FILE_BYTES]).unwrap();
+        store
+            .commit_allocated_segment(&cold_segment, FILE_BYTES as u64, 1)
+            .unwrap();
+
+        store.begin_epoch(2).unwrap();
+        let warm_segment = store.allocate_segment("work", "raw", "fifo").unwrap();
+        fs::write(&warm_segment.path, vec![8u8; FILE_BYTES]).unwrap();
+        store
+            .commit_allocated_segment(&warm_segment, FILE_BYTES as u64, 1)
+            .unwrap();
 
         let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
@@ -874,7 +1004,7 @@ mod tests {
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add((3 * FILE_BYTES) as u64));
+        cfg.disk_free_low_water = Some(free_now.saturating_add((FILE_BYTES / 4) as u64));
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -895,20 +1025,94 @@ mod tests {
         assert!(
             first_offload
                 .message
-                .contains(&cold_archive_path.display().to_string()),
+                .contains(&cold_segment.path.display().to_string()),
             "oldest sealed file should be offloaded first"
         );
+        assert!(!cold_segment.path.exists());
         set_metrics_handle(None);
-        drop(prev_cwd);
+    }
+
+    #[test]
+    fn repeated_reclaim_required_without_pressure_uses_cached_probe() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("fold_state");
+        fs::create_dir_all(&base).unwrap();
+
+        let free_now = available_space_for(&base).unwrap();
+        let mut cfg = OffloadConfig::with_base_dir(&base);
+        cfg.enabled = true;
+        cfg.in_memory_store = true;
+        cfg.cache_dir = base.join("offload_cache");
+        cfg.disk_hysteresis_margin_bytes = 0;
+        cfg.disk_free_low_water = Some(free_now.saturating_sub(512 * 1024 * 1024));
+
+        let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
+        configure(base.clone(), &cfg);
+
+        assert!(reclaim_required(64 * 1024).unwrap().is_none());
+        let probes_after_first = debug_exact_disk_probe_count();
+        assert!(reclaim_required(64 * 1024).unwrap().is_none());
+        assert_eq!(debug_exact_disk_probe_count(), probes_after_first);
+    }
+
+    #[test]
+    fn reclaim_required_force_refreshes_when_cached_probe_shows_pressure() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("fold_state");
+        fs::create_dir_all(&base).unwrap();
+
+        let free_now = available_space_for(&base).unwrap();
+        let mut cfg = OffloadConfig::with_base_dir(&base);
+        cfg.enabled = true;
+        cfg.in_memory_store = true;
+        cfg.cache_dir = base.join("offload_cache");
+        cfg.disk_hysteresis_margin_bytes = 0;
+        cfg.disk_free_low_water = Some(free_now.saturating_add(64 * 1024 * 1024));
+
+        let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
+        configure(base.clone(), &cfg);
+
+        assert!(reclaim_required(64 * 1024).unwrap().is_some());
+        let probes_after_first = debug_exact_disk_probe_count();
+        assert!(reclaim_required(64 * 1024).unwrap().is_some());
+        assert!(debug_exact_disk_probe_count() > probes_after_first);
+    }
+
+    #[test]
+    fn ensure_write_budget_force_refreshes_before_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("fold_state");
+        fs::create_dir_all(&base).unwrap();
+
+        let free_now = available_space_for(&base).unwrap();
+        let mut cfg = OffloadConfig::with_base_dir(&base);
+        cfg.enabled = true;
+        cfg.in_memory_store = true;
+        cfg.cache_dir = base.join("offload_cache");
+        cfg.disk_hysteresis_margin_bytes = 0;
+        cfg.disk_free_low_water = Some(free_now.saturating_add(512 * 1024 * 1024));
+
+        let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
+        configure(base.clone(), &cfg);
+
+        let _ = reclaim_required(64 * 1024).unwrap();
+        let probes_before_failure = debug_exact_disk_probe_count();
+
+        let err = ensure_write_budget(
+            free_now.saturating_add(512 * 1024 * 1024),
+            "test force refresh failure",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient local disk for write")
+        );
+        assert!(debug_exact_disk_probe_count() > probes_before_failure);
     }
 
     #[test]
     fn ensure_write_budget_succeeds_when_actual_write_fits_below_floor() {
-        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
-        let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
-        std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
         fs::create_dir_all(&base).unwrap();
         const WRITE_BYTES: u64 = 8 * 1024 * 1024;
@@ -924,16 +1128,11 @@ mod tests {
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
         ensure_write_budget(WRITE_BYTES, "test small write below floor").unwrap();
-        drop(prev_cwd);
     }
 
     #[test]
     fn ensure_write_budget_fails_when_actual_write_cannot_fit() {
-        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _cwd_guard = CWD_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
-        let prev_cwd = CwdGuard(std::env::current_dir().unwrap());
-        std::env::set_current_dir(temp_dir.path()).unwrap();
         let base = temp_dir.path().join("fold_state");
         fs::create_dir_all(&base).unwrap();
 
@@ -957,133 +1156,83 @@ mod tests {
             err.to_string()
                 .contains("insufficient local disk for write")
         );
-
-        drop(prev_cwd);
     }
 
     #[test]
-    fn active_reclaim_candidates_exclude_live_merge_and_archive_control_files() {
+    fn active_reclaim_candidates_are_catalog_segments_not_legacy_paths() {
         let temp_dir = TempDir::new().unwrap();
         let base = temp_dir.path().join("fold_state");
         let cache_dir = base.join("offload_cache");
+        let store_root = base.join("in_process").join("merge_123.work").join("store");
+        let store = TieredStore::open(&store_root).unwrap();
 
-        let reclaimable_archive_history = base
-            .join("input")
-            .join("archive_a.bin")
-            .join("results")
-            .join("history")
-            .join("b=00")
-            .join("history-0.dat");
-        let reclaimable_merge_segment = base
-            .join("in_process")
-            .join("merge_123.work")
-            .join("work")
-            .join("segment-0.dat");
-        let reclaimable_landing_drain = base
-            .join("in_process")
-            .join("merge_123.work")
-            .join("landing")
-            .join("b=00")
-            .join("drain-0.log");
+        let active_work = store.allocate_segment("work", "raw", "fifo").unwrap();
+        fs::write(&active_work.path, b"active work").unwrap();
+        store.commit_allocated_segment(&active_work, 11, 1).unwrap();
 
-        let protected_manifest = base
-            .join("in_process")
-            .join("merge_123.work")
-            .join("resume_manifest.json");
-        let protected_heartbeat = base
-            .join("in_process")
-            .join("merge_123.work")
-            .join("heartbeat");
-        let protected_lock = base.join("in_process").join("leader.lock");
-        let protected_claim = base.join("mem_claims").join("123.claim");
-        let protected_metadata = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("metadata.txt");
-        let protected_text_meta = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("text_meta.txt");
-        let protected_lineage = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("lineage.txt");
-        let protected_interner = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("interner.bin");
-        let protected_optimal = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("optimal.bin");
-        let protected_planner = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("planner_meta.json");
-        let protected_archive_history = base
-            .join("in_process")
-            .join("archive_b.bin")
-            .join("results")
-            .join("history")
-            .join("b=00")
-            .join("history-0.dat");
-        let protected_checkpoint_history = base
-            .join("in_process")
-            .join("merge_123.work")
-            .join("checkpoints")
-            .join("store-0000")
-            .join("history")
-            .join("b=00")
-            .join("history-0.dat");
+        let active_history = store.allocate_segment("history", "zstd", "sorted").unwrap();
+        fs::write(&active_history.path, b"active history").unwrap();
+        store
+            .commit_allocated_segment(&active_history, 14, 1)
+            .unwrap();
 
-        for path in [
-            &reclaimable_archive_history,
-            &reclaimable_merge_segment,
-            &reclaimable_landing_drain,
-            &protected_manifest,
-            &protected_heartbeat,
-            &protected_lock,
-            &protected_claim,
-            &protected_metadata,
-            &protected_text_meta,
-            &protected_lineage,
-            &protected_interner,
-            &protected_optimal,
-            &protected_planner,
-            &protected_archive_history,
-            &protected_checkpoint_history,
-        ] {
-            write_test_file(path, 16);
-        }
+        let already_remote = store.allocate_segment("spill", "zstd", "sorted").unwrap();
+        fs::write(&already_remote.path, b"remote").unwrap();
+        store
+            .commit_allocated_segment(&already_remote, 6, 1)
+            .unwrap();
+        store
+            .set_remote_state_for_path(&already_remote.path, true, Some("remote-key".to_string()))
+            .unwrap();
+
+        let missing_local = store.allocate_segment("chunk", "zstd", "sorted").unwrap();
+        fs::write(&missing_local.path, b"missing").unwrap();
+        store
+            .commit_allocated_segment(&missing_local, 7, 1)
+            .unwrap();
+        fs::remove_file(&missing_local.path).unwrap();
+
+        let _zero_byte_allocation = store.allocate_segment("new-work", "raw", "fifo").unwrap();
+        write_test_file(
+            &store_root
+                .join("heads")
+                .join("default")
+                .join("landing-b=00.head"),
+            16,
+        );
+        write_test_file(
+            &store_root
+                .join("collections")
+                .join("default")
+                .join("work.json"),
+            16,
+        );
+        write_test_file(
+            &store_root.join("blobs").join("default").join("control"),
+            16,
+        );
+        write_test_file(
+            &base
+                .join("in_process")
+                .join("merge_123.work")
+                .join("heartbeat"),
+            16,
+        );
 
         let mut candidates = Vec::new();
-        collect_active_store_candidates(&base, &cache_dir, &mut candidates).unwrap();
-        let candidate_paths: HashSet<PathBuf> =
+        let mut stats = ReclaimCandidateStats::default();
+        collect_active_store_candidates(&base, &cache_dir, &mut candidates, &mut stats).unwrap();
+        let mut candidate_paths: Vec<PathBuf> =
             candidates.into_iter().map(|info| info.path).collect();
+        candidate_paths.sort();
 
-        assert!(candidate_paths.contains(&reclaimable_archive_history));
-        assert!(candidate_paths.contains(&reclaimable_merge_segment));
-        assert!(candidate_paths.contains(&reclaimable_landing_drain));
-
-        for protected in [
-            protected_manifest,
-            protected_heartbeat,
-            protected_lock,
-            protected_claim,
-            protected_metadata,
-            protected_text_meta,
-            protected_lineage,
-            protected_interner,
-            protected_optimal,
-            protected_planner,
-            protected_archive_history,
-            protected_checkpoint_history,
-        ] {
-            assert!(
-                !candidate_paths.contains(&protected),
-                "protected path should not be reclaimable: {}",
-                protected.display()
-            );
-        }
+        assert_eq!(stats.managed_roots, 1);
+        assert_eq!(stats.skipped_remote, 1);
+        assert_eq!(stats.skipped_missing_local, 1);
+        assert_eq!(stats.skipped_zero_bytes, 1);
+        assert_eq!(
+            candidate_paths,
+            vec![active_work.path.clone(), active_history.path.clone()]
+        );
     }
 }

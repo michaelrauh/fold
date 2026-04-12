@@ -2,6 +2,53 @@ use crate::{
     interner::Interner,
     ortho::{Ortho, OrthoScore, payload_to_usize},
 };
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, Default)]
+pub struct ImpactedPrefixIndex {
+    prefix_stats: HashMap<Vec<usize>, usize>,
+}
+
+impl ImpactedPrefixIndex {
+    pub fn new(prefixes: Vec<Vec<usize>>, interner: &Interner) -> Self {
+        let mut prefix_stats = HashMap::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            let max_desc_len = interner.prefix_stats(prefix.as_slice()).unwrap_or_else(|| {
+                panic!(
+                    "[bound][panic] missing prefix stats while building impacted index for {:?}",
+                    prefix
+                )
+            });
+            prefix_stats.insert(prefix, max_desc_len);
+        }
+        Self { prefix_stats }
+    }
+
+    pub fn len(&self) -> usize {
+        self.prefix_stats.len()
+    }
+
+    pub fn matches_required(&self, required_prefixes: &[Vec<usize>]) -> bool {
+        required_prefixes
+            .iter()
+            .any(|req| self.prefix_stats.contains_key(req.as_slice()))
+    }
+
+    pub fn ancestor_axis_totals<'a>(
+        &'a self,
+        filled_prefix: &[usize],
+        out: &'a mut Vec<usize>,
+    ) -> &'a [usize] {
+        out.clear();
+        out.reserve(filled_prefix.len());
+        for len in 1..=filled_prefix.len() {
+            if let Some(max_desc_len) = self.prefix_stats.get(&filled_prefix[..len]) {
+                out.push(*max_desc_len);
+            }
+        }
+        out.as_slice()
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CompletionContext {
@@ -11,9 +58,12 @@ pub struct CompletionContext {
     diagonal_positions: Vec<usize>,
     prefix_with_completion: Vec<Vec<usize>>,
     totals: Vec<usize>,
+    impacted_totals: Vec<usize>,
+    filled_prefix: Vec<usize>,
     dim_count: usize,
     base_volume: usize,
     base_fullness: usize,
+    base_score: OrthoScore,
     is_root: bool,
 }
 
@@ -31,6 +81,14 @@ impl CompletionContext {
             &mut self.prefix_positions,
             &mut self.diagonal_positions,
         );
+        self.filled_prefix.clear();
+        self.filled_prefix.extend(
+            ortho
+                .payload()
+                .iter()
+                .filter_map(|v| *v)
+                .map(payload_to_usize),
+        );
         self.prefix_with_completion.clear();
         self.prefix_with_completion
             .extend(self.required_usize.iter().map(|prefix| {
@@ -40,9 +98,12 @@ impl CompletionContext {
             }));
         self.totals.clear();
         self.totals.reserve(self.required_usize.len());
+        self.impacted_totals.clear();
+        self.impacted_totals.reserve(self.filled_prefix.len());
         self.dim_count = ortho.dims().len();
-        self.base_volume = ortho.volume();
-        self.base_fullness = ortho.fullness();
+        self.base_score = ortho.score();
+        self.base_volume = self.base_score.volume;
+        self.base_fullness = self.base_score.fullness;
         self.is_root = self.required_usize.is_empty();
     }
 
@@ -56,6 +117,10 @@ impl CompletionContext {
 
     pub fn is_root(&self) -> bool {
         self.is_root
+    }
+
+    pub fn filled_prefix(&self) -> &[usize] {
+        &self.filled_prefix
     }
 }
 
@@ -191,6 +256,62 @@ pub fn bound_existing_ortho(
     potential_score <= best_score
 }
 
+pub fn bound_existing_ortho_ctx(
+    ctx: &mut CompletionContext,
+    interner: &Interner,
+    best_score: OrthoScore,
+    impacted_index: Option<&ImpactedPrefixIndex>,
+) -> bool {
+    if best_score == OrthoScore::zero() {
+        return false;
+    }
+    if best_score <= ctx.base_score {
+        return false;
+    }
+    if ctx.is_root() {
+        return false;
+    }
+
+    let required_prefixes = &ctx.required_usize;
+    let totals = &mut ctx.totals;
+    totals.clear();
+    for prefix in required_prefixes {
+        match interner.prefix_stats(prefix.as_slice()) {
+            Some(max_desc_len) => totals.push(max_desc_len),
+            None => {
+                panic!(
+                    "[bound][panic] missing prefix stats for impacted prefix {:?}",
+                    prefix
+                );
+            }
+        }
+    }
+
+    let axis_totals = if let Some(index) = impacted_index {
+        let filled_prefix = &ctx.filled_prefix;
+        let impacted_totals_buf = &mut ctx.impacted_totals;
+        let impacted_totals = index.ancestor_axis_totals(filled_prefix, impacted_totals_buf);
+        if impacted_totals.is_empty() {
+            ctx.totals.as_slice()
+        } else {
+            impacted_totals
+        }
+    } else {
+        ctx.totals.as_slice()
+    };
+
+    let fallback_total = interner.max_prefix_len().max(2);
+    let potential_score = upper_bound_score(
+        axis_totals,
+        ctx.base_volume,
+        ctx.base_fullness,
+        ctx.dim_count,
+        fallback_total,
+    );
+
+    potential_score <= best_score
+}
+
 /// Compute an upper-bound (volume, fullness) given per-prefix max lengths, dim count, and score floors.
 /// Missing axes (no prefix yet) are filled with a `fallback_total`, so the bound remains optimistic.
 /// Volume upper is the saturated product of (axis total - 1) across axes up to `dim_count`,
@@ -245,6 +366,27 @@ mod tests {
             .iter()
             .position(|w| w == word)
             .expect("word not found in vocab")
+    }
+
+    fn legacy_impacted_totals(
+        ortho: &Ortho,
+        impacted: &[Vec<usize>],
+        interner: &Interner,
+    ) -> Vec<usize> {
+        let filled_prefix: Vec<usize> = ortho
+            .payload()
+            .iter()
+            .filter_map(|v| *v)
+            .map(payload_to_usize)
+            .collect();
+        impacted
+            .iter()
+            .filter(|imp| {
+                imp.len() <= filled_prefix.len()
+                    && filled_prefix.iter().zip(imp.iter()).all(|(a, b)| a == b)
+            })
+            .map(|imp| interner.prefix_stats(imp.as_slice()).unwrap())
+            .collect()
     }
 
     #[test]
@@ -478,6 +620,100 @@ mod tests {
             bound_completion(&ortho, c_idx, &interner, best_score),
             bound_completion_ctx(&mut ctx, c_idx, &interner, best_score),
             "context path should preserve pruning behavior"
+        );
+    }
+
+    #[test]
+    fn impacted_index_ancestor_totals_match_legacy_scan() {
+        let interner = Interner::from_text("foo bar baz\nfoo bar qux\nfoo zap");
+        let foo = PayloadVal::try_from(vocab_index(&interner, "foo")).unwrap();
+        let bar = PayloadVal::try_from(vocab_index(&interner, "bar")).unwrap();
+        let ortho = Ortho::new().add(foo)[0].clone().add(bar)[0].clone();
+        let impacted = vec![
+            vec![payload_to_usize(foo)],
+            vec![payload_to_usize(foo), payload_to_usize(bar)],
+        ];
+        let index = ImpactedPrefixIndex::new(impacted.clone(), &interner);
+        let mut totals = Vec::new();
+        let filled_prefix: Vec<usize> = ortho
+            .payload()
+            .iter()
+            .filter_map(|v| *v)
+            .map(payload_to_usize)
+            .collect();
+        let mut indexed = index
+            .ancestor_axis_totals(&filled_prefix, &mut totals)
+            .to_vec();
+        let mut legacy = legacy_impacted_totals(&ortho, &impacted, &interner);
+        indexed.sort_unstable();
+        legacy.sort_unstable();
+
+        assert_eq!(indexed, legacy);
+    }
+
+    #[test]
+    fn impacted_index_membership_matches_legacy_required_scan() {
+        let interner = Interner::from_text("foo bar baz");
+        let foo = PayloadVal::try_from(vocab_index(&interner, "foo")).unwrap();
+        let bar = PayloadVal::try_from(vocab_index(&interner, "bar")).unwrap();
+        let baz = PayloadVal::try_from(vocab_index(&interner, "baz")).unwrap();
+        let impacted = vec![vec![payload_to_usize(foo), payload_to_usize(bar)]];
+        let index = ImpactedPrefixIndex::new(impacted.clone(), &interner);
+
+        let ortho = Ortho::new().add(foo)[0].clone().add(bar)[0].clone();
+        let mut ctx = CompletionContext::default();
+        ctx.reset(&ortho);
+        let legacy_hit = ortho
+            .get_requirement_phrases()
+            .iter()
+            .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect::<Vec<_>>())
+            .any(|req| impacted.contains(&req));
+        assert_eq!(index.matches_required(ctx.required_usize()), legacy_hit);
+
+        let other = Ortho::new().add(foo)[0].clone().add(baz)[0].clone();
+        ctx.reset(&other);
+        let legacy_miss = other
+            .get_requirement_phrases()
+            .iter()
+            .map(|req| req.iter().map(|v| payload_to_usize(*v)).collect::<Vec<_>>())
+            .any(|req| impacted.contains(&req));
+        assert_eq!(index.matches_required(ctx.required_usize()), legacy_miss);
+    }
+
+    #[test]
+    fn bound_existing_ctx_matches_legacy_scan() {
+        let interner = Interner::from_text("foo bar baz\nfoo bar qux\nfoo zap");
+        let foo = PayloadVal::try_from(vocab_index(&interner, "foo")).unwrap();
+        let bar = PayloadVal::try_from(vocab_index(&interner, "bar")).unwrap();
+        let baz = PayloadVal::try_from(vocab_index(&interner, "baz")).unwrap();
+        let impacted = vec![
+            vec![payload_to_usize(foo)],
+            vec![payload_to_usize(foo), payload_to_usize(bar)],
+            vec![payload_to_usize(baz)],
+        ];
+        let index = ImpactedPrefixIndex::new(impacted.clone(), &interner);
+        let best_score = OrthoScore::optimistic_bound(32, 64);
+        let cases = [
+            Ortho::new().add(foo)[0].clone(),
+            Ortho::new().add(foo)[0].clone().add(bar)[0].clone(),
+            Ortho::new().add(foo)[0].clone().add(baz)[0].clone(),
+            Ortho::new(),
+        ];
+
+        for ortho in cases {
+            let legacy = bound_existing_ortho(&ortho, &interner, best_score, Some(&impacted));
+            let mut ctx = CompletionContext::default();
+            ctx.reset(&ortho);
+            let indexed = bound_existing_ortho_ctx(&mut ctx, &interner, best_score, Some(&index));
+            assert_eq!(indexed, legacy);
+        }
+
+        let mut ctx = CompletionContext::default();
+        let ortho = Ortho::new().add(foo)[0].clone();
+        ctx.reset(&ortho);
+        assert_eq!(
+            bound_existing_ortho_ctx(&mut ctx, &interner, OrthoScore::zero(), Some(&index)),
+            bound_existing_ortho(&ortho, &interner, OrthoScore::zero(), Some(&impacted))
         );
     }
 }

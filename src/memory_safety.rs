@@ -4,13 +4,32 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::process::Command;
 use std::thread_local;
+use std::time::{Duration, Instant};
 
 const PHASE_HEADROOM_RESERVE_BYTES: usize = 256 * 1024 * 1024;
 const RAM_SPILL_RESERVE_BYTES: usize = 512 * 1024 * 1024;
+const RSS_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy)]
+struct RssSnapshot {
+    bytes: usize,
+    sampled_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RssFreshness {
+    CachedOk,
+    ForceRefresh,
+}
 
 thread_local! {
     static PROCESS_CLAIM_BYTES: Cell<usize> = const { Cell::new(0) };
     static METRICS_HANDLE: RefCell<Option<Metrics>> = const { RefCell::new(None) };
+    static RSS_CACHE: RefCell<Option<RssSnapshot>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static RSS_SAMPLE_COUNT: Cell<u64> = const { Cell::new(0) };
+    #[cfg(test)]
+    static TEST_RSS_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 pub struct ScopedProcessMemory {
@@ -80,6 +99,10 @@ pub fn ensure_phase_headroom(bytes_needed: usize, reason: &str) -> io::Result<()
     if rss_bytes.saturating_add(bytes_needed) <= effective_limit {
         return Ok(());
     }
+    let rss_bytes = current_process_rss_bytes_with_freshness(RssFreshness::ForceRefresh);
+    if rss_bytes.saturating_add(bytes_needed) <= effective_limit {
+        return Ok(());
+    }
 
     let message = format!(
         "{} reason={} rss_bytes={} bytes_needed={} claim_bytes={} reserve_bytes={}",
@@ -131,6 +154,36 @@ fn read_linux_total_ram_bytes() -> Option<usize> {
 }
 
 pub fn current_process_rss_bytes() -> usize {
+    current_process_rss_bytes_with_freshness(RssFreshness::CachedOk)
+}
+
+fn current_process_rss_bytes_with_freshness(freshness: RssFreshness) -> usize {
+    if freshness == RssFreshness::CachedOk {
+        if let Some(snapshot) = RSS_CACHE.with(|slot| *slot.borrow()) {
+            if snapshot.sampled_at.elapsed() < RSS_CACHE_TTL {
+                return snapshot.bytes;
+            }
+        }
+    }
+
+    let bytes = read_current_process_rss_bytes_uncached();
+    RSS_CACHE.with(|slot| {
+        *slot.borrow_mut() = Some(RssSnapshot {
+            bytes,
+            sampled_at: Instant::now(),
+        });
+    });
+    #[cfg(test)]
+    RSS_SAMPLE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+    bytes
+}
+
+fn read_current_process_rss_bytes_uncached() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_RSS_BYTES.with(|slot| slot.get()) {
+        return bytes;
+    }
+
     #[cfg(target_os = "linux")]
     if let Some(bytes) = read_linux_process_rss_bytes() {
         return bytes;
@@ -188,6 +241,17 @@ pub fn total_system_ram_bytes() -> usize {
 }
 
 #[cfg(test)]
+fn set_test_rss_bytes(bytes: Option<usize>) {
+    TEST_RSS_BYTES.with(|slot| slot.set(bytes));
+    RSS_CACHE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn debug_rss_sample_count() -> u64 {
+    RSS_SAMPLE_COUNT.with(|count| count.get())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -195,5 +259,39 @@ mod tests {
     fn parse_linux_status_rss_bytes_reads_kib_value() {
         let fixture = "Name:\tfold\nVmRSS:\t  123456 kB\nThreads:\t1\n";
         assert_eq!(parse_linux_status_rss_bytes(fixture), Some(123_456 * 1024));
+    }
+
+    #[test]
+    fn repeated_cached_rss_reads_only_sample_once() {
+        let previous = current_process_claim_bytes();
+        set_test_rss_bytes(Some(123));
+        PROCESS_CLAIM_BYTES.with(|slot| slot.set(RAM_SPILL_RESERVE_BYTES.saturating_add(1024)));
+        RSS_SAMPLE_COUNT.with(|count| count.set(0));
+
+        assert!(!should_spill_to_disk());
+        assert!(!should_spill_to_disk());
+        assert_eq!(debug_rss_sample_count(), 1);
+
+        set_test_rss_bytes(None);
+        PROCESS_CLAIM_BYTES.with(|slot| slot.set(previous.unwrap_or(0)));
+    }
+
+    #[test]
+    fn ensure_phase_headroom_force_refreshes_before_failing() {
+        let previous = current_process_claim_bytes();
+        PROCESS_CLAIM_BYTES
+            .with(|slot| slot.set(PHASE_HEADROOM_RESERVE_BYTES.saturating_add(1024)));
+        RSS_SAMPLE_COUNT.with(|count| count.set(0));
+
+        set_test_rss_bytes(Some(900));
+        assert_eq!(current_process_rss_bytes(), 900);
+        assert_eq!(debug_rss_sample_count(), 1);
+
+        let err = ensure_phase_headroom(200, "test force refresh").unwrap_err();
+        assert!(err.to_string().contains("reason=test force refresh"));
+        assert!(debug_rss_sample_count() >= 2);
+
+        set_test_rss_bytes(None);
+        PROCESS_CLAIM_BYTES.with(|slot| slot.set(previous.unwrap_or(0)));
     }
 }

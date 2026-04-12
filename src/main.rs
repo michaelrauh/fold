@@ -1,10 +1,12 @@
 use fold::{
     FoldError,
-    completion_pruning::bound_existing_ortho,
-    disk_safety,
+    completion_pruning::{CompletionContext, ImpactedPrefixIndex, bound_existing_ortho_ctx},
     file_handler::{self, ArchivePairPolicy, MemClaimGuard, StateConfig},
-    generation_runner::{merge_threads_from_env, run_generation_loop, run_single_merge_generation},
-    generation_store::{Config, GenerationStore, Role},
+    generation_runner::{
+        PressureCheckState, maybe_run_pressure_safe_point, merge_threads_from_env,
+        run_generation_loop, run_single_merge_generation,
+    },
+    generation_store::{Config, GenerationStore, Role, set_offload_metrics_handle},
     interner::Interner,
     memory_budget::MemoryBudget,
     memory_safety,
@@ -14,10 +16,10 @@ use fold::{
     offload_runtime::configure_offload_runtime,
     ortho::{Ortho, OrthoScore, payload_to_usize},
     stage_planner::PlannerMeta,
+    tiered_store::{DEFAULT_NAMESPACE, TieredStore},
     tui::Tui,
 };
 use std::any::Any;
-use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,24 @@ fn role_as_str(role: Role) -> &'static str {
         Role::Leader => "leader",
         Role::Follower => "follower",
     }
+}
+
+fn record_landing_metrics(metrics: &Metrics, store: &GenerationStore) {
+    metrics.record_landing_buffer_count(store.total_landing_size());
+    metrics.record_landing_buffer_bytes(store.total_landing_bytes());
+}
+
+fn maybe_handle_merge_ingest_pressure(
+    pressure_state: &mut PressureCheckState,
+    store: &mut GenerationStore,
+    metrics: &Metrics,
+    offload_cfg: &OffloadConfig,
+    reason: &str,
+) -> Result<(), FoldError> {
+    if maybe_run_pressure_safe_point(pressure_state, store, metrics, offload_cfg, reason)? {
+        record_landing_metrics(metrics, store);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -644,7 +664,7 @@ fn process_txt_file(
     let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
     let _offload_guard =
         configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
-    disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
+    set_offload_metrics_handle(Some(metrics.clone_handle()));
     log_offload_policy(metrics, &offload_cfg);
 
     // Ingest the text file
@@ -738,6 +758,7 @@ fn process_txt_file(
                                 bucket_id: i,
                                 run_count: 0,
                                 landing_size: 0,
+                                landing_bytes: 0,
                                 history_size_estimate: 0,
                                 state: fold::metrics::BucketState::Pending,
                                 new_work: 0,
@@ -790,6 +811,7 @@ fn process_txt_file(
                         bucket_id: b.bucket_id,
                         run_count: b.run_count,
                         landing_size: b.landing_size,
+                        landing_bytes: b.landing_bytes,
                         history_size_estimate: b.history_size_estimate,
                         state: fold::metrics::BucketState::Pending,
                         new_work: 0,
@@ -859,8 +881,7 @@ fn process_txt_file(
 
     let archive_path = build_archive_path(config)?;
     let lineage = format!("\"{}\"", ingestion.filename);
-    let history_runs = history_run_paths_for_archive(&store)?;
-    move_history_runs_to_archive(&history_runs, &archive_path)?;
+    export_store_namespace_to_archive(store.base_path(), store.namespace(), &archive_path)?;
     write_archive_artifacts(
         &archive_path,
         &interner,
@@ -922,7 +943,7 @@ fn run_merge_simple(
     let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
     let _offload_guard =
         configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
-    disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
+    set_offload_metrics_handle(Some(metrics.clone_handle()));
     log_offload_policy(metrics, &offload_cfg);
 
     let (archive_a_path, archive_b_path) = ingestion.archive_paths();
@@ -947,10 +968,14 @@ fn run_merge_simple(
     };
 
     let merged_interner = larger_interner.merge(&smaller_interner);
-    let impacted_larger = merged_interner.impacted_keys(&larger_interner);
-    let impacted_smaller = merged_interner.impacted_keys(&smaller_interner);
-    let impacted_larger_set = build_impacted_prefix_set(&impacted_larger);
-    let impacted_smaller_set = build_impacted_prefix_set(&impacted_smaller);
+    let impacted_larger = ImpactedPrefixIndex::new(
+        merged_interner.impacted_keys(&larger_interner),
+        &merged_interner,
+    );
+    let impacted_smaller = ImpactedPrefixIndex::new(
+        merged_interner.impacted_keys(&smaller_interner),
+        &merged_interner,
+    );
     let vocab_map_smaller =
         build_vocab_mapping(smaller_interner.vocabulary(), merged_interner.vocabulary());
 
@@ -1067,25 +1092,15 @@ fn run_merge_simple(
         }
     }
 
-    let (larger_path, larger_impacted_ref, larger_impacted_set, larger_name) = if a_is_smaller {
-        (&results_b_path, &impacted_larger, &impacted_larger_set, "B")
+    let (larger_path, larger_impacted_index, larger_name) = if a_is_smaller {
+        (&results_b_path, &impacted_larger, "B")
     } else {
-        (&results_a_path, &impacted_larger, &impacted_larger_set, "A")
+        (&results_a_path, &impacted_larger, "A")
     };
-    let (smaller_path, smaller_impacted_ref, smaller_impacted_set, smaller_name) = if a_is_smaller {
-        (
-            &results_a_path,
-            &impacted_smaller,
-            &impacted_smaller_set,
-            "A",
-        )
+    let (smaller_path, smaller_impacted_index, smaller_name) = if a_is_smaller {
+        (&results_a_path, &impacted_smaller, "A")
     } else {
-        (
-            &results_b_path,
-            &impacted_smaller,
-            &impacted_smaller_set,
-            "B",
-        )
+        (&results_b_path, &impacted_smaller, "B")
     };
 
     let merge_store_dir = PathBuf::from(ingestion.merge_work_folder()).join("store");
@@ -1101,7 +1116,7 @@ fn run_merge_simple(
         g.fan_in = cfg.fan_in;
     });
     metrics.record_work_len(store.work_len() as usize);
-    metrics.record_landing_buffer_count(store.total_landing_size());
+    record_landing_metrics(metrics, &store);
 
     let larger_stage_elapsed;
     let smaller_stage_elapsed;
@@ -1117,7 +1132,7 @@ fn run_merge_simple(
     let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
     let larger_history_paths = larger_store.history_run_paths();
     let mut total_from_larger = 0usize;
-    let mut larger_impacted_scratch = ImpactedScratch::default();
+    let mut larger_prune_ctx = CompletionContext::default();
 
     for bucket in 0..8 {
         for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
@@ -1125,17 +1140,20 @@ fn run_merge_simple(
             let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
             total_from_larger = total_from_larger.saturating_add(1);
 
-            if is_ortho_impacted_fast(&ortho, larger_impacted_set, &mut larger_impacted_scratch) {
-                let prune_score = std::cmp::max(best_score, max_opt_score);
-                if !bound_existing_ortho(
-                    &ortho,
-                    &merged_interner,
-                    prune_score,
-                    Some(larger_impacted_ref),
-                ) {
+            match impacted_seed_decision(
+                &ortho,
+                &mut larger_prune_ctx,
+                larger_impacted_index,
+                &merged_interner,
+                best_score,
+                max_opt_score,
+            ) {
+                ImpactedSeedDecision::NotImpacted => {}
+                ImpactedSeedDecision::Seed => {
                     store.push_segments(vec![ortho])?;
                     impacted_from_larger = impacted_from_larger.saturating_add(1);
-                } else {
+                }
+                ImpactedSeedDecision::Pruned => {
                     metrics.update_merge(|m| {
                         if a_is_smaller {
                             m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
@@ -1193,7 +1211,8 @@ fn run_merge_simple(
     let smaller_stage_start = Instant::now();
     let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
     let mut total_from_smaller = 0usize;
-    let mut smaller_impacted_scratch = ImpactedScratch::default();
+    let mut smaller_prune_ctx = CompletionContext::default();
+    let mut ingest_pressure = PressureCheckState::new();
 
     for bucket in 0..8 {
         for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
@@ -1203,26 +1222,32 @@ fn run_merge_simple(
 
             if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
                 store.record_result(&remapped)?;
+                maybe_handle_merge_ingest_pressure(
+                    &mut ingest_pressure,
+                    &mut store,
+                    metrics,
+                    &offload_cfg,
+                    "merge smaller remap ingest",
+                )?;
                 let candidate_score = remapped.score();
                 if candidate_score > best_score {
                     best_ortho = remapped.clone();
                     best_score = candidate_score;
                 }
-                if is_ortho_impacted_fast(
+                match impacted_seed_decision(
                     &remapped,
-                    smaller_impacted_set,
-                    &mut smaller_impacted_scratch,
+                    &mut smaller_prune_ctx,
+                    smaller_impacted_index,
+                    &merged_interner,
+                    best_score,
+                    max_opt_score,
                 ) {
-                    let prune_score = std::cmp::max(best_score, max_opt_score);
-                    if !bound_existing_ortho(
-                        &remapped,
-                        &merged_interner,
-                        prune_score,
-                        Some(smaller_impacted_ref),
-                    ) {
+                    ImpactedSeedDecision::NotImpacted => {}
+                    ImpactedSeedDecision::Seed => {
                         store.push_segments(vec![remapped])?;
                         impacted_from_smaller = impacted_from_smaller.saturating_add(1);
-                    } else {
+                    }
+                    ImpactedSeedDecision::Pruned => {
                         metrics.update_merge(|m| {
                             if a_is_smaller {
                                 m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
@@ -1289,6 +1314,7 @@ fn run_merge_simple(
                                 bucket_id: i,
                                 run_count: 0,
                                 landing_size: 0,
+                                landing_bytes: 0,
                                 history_size_estimate: 0,
                                 state: fold::metrics::BucketState::Pending,
                                 new_work: 0,
@@ -1339,6 +1365,7 @@ fn run_merge_simple(
                         bucket_id: b.bucket_id,
                         run_count: b.run_count,
                         landing_size: b.landing_size,
+                        landing_bytes: b.landing_bytes,
                         history_size_estimate: b.history_size_estimate,
                         state: fold::metrics::BucketState::Pending,
                         new_work: 0,
@@ -1447,7 +1474,7 @@ fn run_merge_simple(
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
     let history_runs = history_run_paths_for_archive(&store)?;
     let history_run_count: usize = history_runs.iter().map(|(_, runs)| runs.len()).sum();
-    link_history_runs_to_archive(&history_runs, &archive_temp_path)?;
+    export_store_namespace_to_archive(store.base_path(), store.namespace(), &archive_temp_path)?;
     let merged_planner_meta = match (planner_meta_a.as_ref(), planner_meta_b.as_ref()) {
         (Some(a), Some(b)) => PlannerMeta::merge(a, b),
         _ => None,
@@ -1536,7 +1563,7 @@ fn run_merge_with_checkpoints(
     let offload_cfg = OffloadConfig::from_env_with_base(&config.base_dir);
     let _offload_guard =
         configure_offload_runtime(&config.base_dir, &offload_cfg).map_err(FoldError::Io)?;
-    disk_safety::set_metrics_handle(Some(metrics.clone_handle()));
+    set_offload_metrics_handle(Some(metrics.clone_handle()));
     log_offload_policy(metrics, &offload_cfg);
 
     let merge_work_dir = PathBuf::from(ingestion.merge_work_folder());
@@ -1575,10 +1602,14 @@ fn run_merge_with_checkpoints(
 
     // Now calculate impacted keys by comparing merged against originals
     // Both impacted_larger and impacted_smaller are returned in MERGED vocabulary space
-    let impacted_larger = merged_interner.impacted_keys(&larger_interner);
-    let impacted_smaller = merged_interner.impacted_keys(&smaller_interner);
-    let impacted_larger_set = build_impacted_prefix_set(&impacted_larger);
-    let impacted_smaller_set = build_impacted_prefix_set(&impacted_smaller);
+    let impacted_larger = ImpactedPrefixIndex::new(
+        merged_interner.impacted_keys(&larger_interner),
+        &merged_interner,
+    );
+    let impacted_smaller = ImpactedPrefixIndex::new(
+        merged_interner.impacted_keys(&smaller_interner),
+        &merged_interner,
+    );
 
     // Build vocab mapping for remapping orthos (not keys) from smaller to merged
     let vocab_map_smaller =
@@ -1734,26 +1765,16 @@ fn run_merge_with_checkpoints(
     // Set up paths and impacted keys for each archive
     // Note: larger archive orthos don't need remapping, their impacted keys are already in merged space
     // smaller archive orthos need remapping, and we use the remapped impacted keys
-    let (larger_path, larger_impacted_ref, larger_impacted_set, larger_name) = if a_is_smaller {
-        (&results_b_path, &impacted_larger, &impacted_larger_set, "B")
+    let (larger_path, larger_impacted_index, larger_name) = if a_is_smaller {
+        (&results_b_path, &impacted_larger, "B")
     } else {
-        (&results_a_path, &impacted_larger, &impacted_larger_set, "A")
+        (&results_a_path, &impacted_larger, "A")
     };
 
-    let (smaller_path, smaller_impacted_ref, smaller_impacted_set, smaller_name) = if a_is_smaller {
-        (
-            &results_a_path,
-            &impacted_smaller,
-            &impacted_smaller_set,
-            "A",
-        )
+    let (smaller_path, smaller_impacted_index, smaller_name) = if a_is_smaller {
+        (&results_a_path, &impacted_smaller, "A")
     } else {
-        (
-            &results_b_path,
-            &impacted_smaller,
-            &impacted_smaller_set,
-            "B",
-        )
+        (&results_b_path, &impacted_smaller, "B")
     };
 
     let mut larger_stage_elapsed = Duration::ZERO;
@@ -1777,6 +1798,7 @@ fn run_merge_with_checkpoints(
                                 bucket_id: i,
                                 run_count: 0,
                                 landing_size: 0,
+                                landing_bytes: 0,
                                 history_size_estimate: 0,
                                 state: fold::metrics::BucketState::Pending,
                                 new_work: 0,
@@ -1829,6 +1851,7 @@ fn run_merge_with_checkpoints(
                         bucket_id: b.bucket_id,
                         run_count: b.run_count,
                         landing_size: b.landing_size,
+                        landing_bytes: b.landing_bytes,
                         history_size_estimate: b.history_size_estimate,
                         state: fold::metrics::BucketState::Pending,
                         new_work: 0,
@@ -1864,7 +1887,11 @@ fn run_merge_with_checkpoints(
     ));
     if manifest.phase == ResumePhase::Claimed {
         let checkpoint = merge_resume::prepare_working_checkpoint(&merge_work_dir, None)?;
-        let mut store = GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8)?;
+        let mut store = GenerationStore::new_with_namespace(
+            checkpoint.store_root.clone(),
+            checkpoint.working_namespace.clone(),
+            8,
+        )?;
         store.configure(&cfg);
         store.push_segments(vec![seed_ortho.clone()])?;
         metrics.update_global(|g| {
@@ -1876,14 +1903,14 @@ fn run_merge_with_checkpoints(
             g.fan_in = cfg.fan_in;
         });
         metrics.record_work_len(store.work_len() as usize);
-        metrics.record_landing_buffer_count(store.total_landing_size());
+        record_landing_metrics(metrics, &store);
 
         metrics.set_operation_status(format!("Streaming Larger Archive {}", larger_name));
         let larger_stage_start = Instant::now();
         let larger_store = GenerationStore::from_existing(PathBuf::from(larger_path), 8)?;
         let larger_history_paths = larger_store.history_run_paths();
         let mut total_from_larger = 0usize;
-        let mut larger_impacted_scratch = ImpactedScratch::default();
+        let mut larger_prune_ctx = CompletionContext::default();
 
         for bucket in 0..8 {
             for result in larger_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
@@ -1891,18 +1918,20 @@ fn run_merge_with_checkpoints(
                 let ortho = Ortho::from_bytes(ortho_bytes.as_ref())?;
                 total_from_larger = total_from_larger.saturating_add(1);
 
-                if is_ortho_impacted_fast(&ortho, larger_impacted_set, &mut larger_impacted_scratch)
-                {
-                    let prune_score = std::cmp::max(best_score, max_opt_score);
-                    if !bound_existing_ortho(
-                        &ortho,
-                        &merged_interner,
-                        prune_score,
-                        Some(larger_impacted_ref),
-                    ) {
+                match impacted_seed_decision(
+                    &ortho,
+                    &mut larger_prune_ctx,
+                    larger_impacted_index,
+                    &merged_interner,
+                    best_score,
+                    max_opt_score,
+                ) {
+                    ImpactedSeedDecision::NotImpacted => {}
+                    ImpactedSeedDecision::Seed => {
                         store.push_segments(vec![ortho])?;
                         impacted_from_larger = impacted_from_larger.saturating_add(1);
-                    } else {
+                    }
+                    ImpactedSeedDecision::Pruned => {
                         metrics.update_merge(|m| {
                             if a_is_smaller {
                                 m.impacted_pruned_b = m.impacted_pruned_b.saturating_add(1);
@@ -1963,12 +1992,18 @@ fn run_merge_with_checkpoints(
     }
 
     if manifest.phase == ResumePhase::LargerLoaded {
-        let active_store_dir = manifest
-            .active_store_path(&merge_work_dir)
+        let active_store_namespace = manifest
+            .active_store_namespace()
             .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
-        let checkpoint =
-            merge_resume::prepare_working_checkpoint(&merge_work_dir, Some(&active_store_dir))?;
-        let mut store = GenerationStore::from_existing(checkpoint.working_dir.clone(), 8)?;
+        let checkpoint = merge_resume::prepare_working_checkpoint(
+            &merge_work_dir,
+            Some(active_store_namespace),
+        )?;
+        let mut store = GenerationStore::from_existing_with_namespace(
+            checkpoint.store_root.clone(),
+            checkpoint.working_namespace.clone(),
+            8,
+        )?;
         store.configure(&cfg);
 
         metrics.set_operation_status(format!(
@@ -1978,7 +2013,8 @@ fn run_merge_with_checkpoints(
         let smaller_stage_start = Instant::now();
         let smaller_store = GenerationStore::from_existing(PathBuf::from(smaller_path), 8)?;
         let mut total_from_smaller = 0usize;
-        let mut smaller_impacted_scratch = ImpactedScratch::default();
+        let mut smaller_prune_ctx = CompletionContext::default();
+        let mut ingest_pressure = PressureCheckState::new();
 
         for bucket in 0..8 {
             for result in smaller_store.history_iter_with_buffer(bucket, cfg.read_buf_bytes)? {
@@ -1988,26 +2024,32 @@ fn run_merge_with_checkpoints(
 
                 if let Some(remapped) = ortho.remap(&vocab_map_smaller) {
                     store.record_result(&remapped)?;
+                    maybe_handle_merge_ingest_pressure(
+                        &mut ingest_pressure,
+                        &mut store,
+                        metrics,
+                        &offload_cfg,
+                        "checkpoint merge smaller remap ingest",
+                    )?;
                     let candidate_score = remapped.score();
                     if candidate_score > best_score {
                         best_ortho = remapped.clone();
                         best_score = candidate_score;
                     }
-                    if is_ortho_impacted_fast(
+                    match impacted_seed_decision(
                         &remapped,
-                        smaller_impacted_set,
-                        &mut smaller_impacted_scratch,
+                        &mut smaller_prune_ctx,
+                        smaller_impacted_index,
+                        &merged_interner,
+                        best_score,
+                        max_opt_score,
                     ) {
-                        let prune_score = std::cmp::max(best_score, max_opt_score);
-                        if !bound_existing_ortho(
-                            &remapped,
-                            &merged_interner,
-                            prune_score,
-                            Some(smaller_impacted_ref),
-                        ) {
+                        ImpactedSeedDecision::NotImpacted => {}
+                        ImpactedSeedDecision::Seed => {
                             store.push_segments(vec![remapped])?;
                             impacted_from_smaller = impacted_from_smaller.saturating_add(1);
-                        } else {
+                        }
+                        ImpactedSeedDecision::Pruned => {
                             metrics.update_merge(|m| {
                                 if a_is_smaller {
                                     m.impacted_pruned_a = m.impacted_pruned_a.saturating_add(1);
@@ -2081,12 +2123,18 @@ fn run_merge_with_checkpoints(
             manifest.generation.saturating_add(1)
         };
         loop {
-            let active_store_dir = manifest
-                .active_store_path(&merge_work_dir)
+            let active_store_namespace = manifest
+                .active_store_namespace()
                 .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
-            let checkpoint =
-                merge_resume::prepare_working_checkpoint(&merge_work_dir, Some(&active_store_dir))?;
-            let mut store = GenerationStore::from_existing(checkpoint.working_dir.clone(), 8)?;
+            let checkpoint = merge_resume::prepare_working_checkpoint(
+                &merge_work_dir,
+                Some(active_store_namespace),
+            )?;
+            let mut store = GenerationStore::from_existing_with_namespace(
+                checkpoint.store_root.clone(),
+                checkpoint.working_namespace.clone(),
+                8,
+            )?;
             store.configure(&cfg);
 
             let generation_step_start = Instant::now();
@@ -2131,11 +2179,14 @@ fn run_merge_with_checkpoints(
             )?;
 
             if step.quiesced {
-                let committed_store =
-                    manifest.active_store_path(&merge_work_dir).ok_or_else(|| {
-                        FoldError::Other("missing committed checkpoint store".to_string())
-                    })?;
-                let committed = GenerationStore::from_existing(committed_store, 8)?;
+                let committed_namespace = manifest.active_store_namespace().ok_or_else(|| {
+                    FoldError::Other("missing committed checkpoint store".to_string())
+                })?;
+                let committed = GenerationStore::from_existing_with_namespace(
+                    merge_resume::checkpoints_dir(&merge_work_dir),
+                    committed_namespace.to_string(),
+                    8,
+                )?;
                 metrics.add_log(format!(
                     "Merge completed {} generations, {} total orthos",
                     generation_stats.len(),
@@ -2161,10 +2212,14 @@ fn run_merge_with_checkpoints(
     }
 
     let total_orthos = {
-        let active_store_dir = manifest
-            .active_store_path(&merge_work_dir)
+        let active_store_namespace = manifest
+            .active_store_namespace()
             .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
-        let store = GenerationStore::from_existing(active_store_dir, 8)?;
+        let store = GenerationStore::from_existing_with_namespace(
+            merge_resume::checkpoints_dir(&merge_work_dir),
+            active_store_namespace.to_string(),
+            8,
+        )?;
         store.seen_len_accepted() as usize
     };
 
@@ -2211,12 +2266,18 @@ fn run_merge_with_checkpoints(
         ingestion.text_preview_a, ingestion.text_preview_b
     );
     let word_count = ingestion.word_count_a + ingestion.word_count_b;
-    let active_store_dir = manifest
-        .active_store_path(&merge_work_dir)
+    let active_store_namespace = manifest
+        .active_store_namespace()
         .ok_or_else(|| FoldError::Other("missing active checkpoint store".to_string()))?;
-    let history_runs = history_run_paths_for_store_path(&active_store_dir, 8)?;
+    let checkpoint_store_root = merge_resume::checkpoints_dir(&merge_work_dir);
+    let history_runs =
+        history_run_paths_for_store_namespace(&checkpoint_store_root, active_store_namespace, 8)?;
     let history_run_count: usize = history_runs.iter().map(|(_, runs)| runs.len()).sum();
-    link_history_runs_to_archive(&history_runs, &archive_temp_path)?;
+    export_store_namespace_to_archive(
+        &checkpoint_store_root,
+        active_store_namespace,
+        &archive_temp_path,
+    )?;
     let merged_planner_meta = match (planner_meta_a.as_ref(), planner_meta_b.as_ref()) {
         (Some(a), Some(b)) => PlannerMeta::merge(a, b),
         _ => None,
@@ -2340,34 +2401,30 @@ fn build_vocab_mapping(old_vocab: &[String], new_vocab: &[String]) -> Vec<usize>
     mapping
 }
 
-#[derive(Default)]
-struct ImpactedScratch {
-    forbidden: Vec<usize>,
-    required: Vec<Vec<usize>>,
-    prefix_positions: Vec<Vec<usize>>,
-    diagonal_positions: Vec<usize>,
+enum ImpactedSeedDecision {
+    NotImpacted,
+    Seed,
+    Pruned,
 }
 
-fn build_impacted_prefix_set(prefixes: &[Vec<usize>]) -> HashSet<Vec<usize>> {
-    prefixes.iter().cloned().collect()
-}
-
-// Helper function to check if ortho is impacted by checking if any requirement matches impacted prefixes
-fn is_ortho_impacted_fast(
+fn impacted_seed_decision(
     ortho: &Ortho,
-    impacted_prefixes: &HashSet<Vec<usize>>,
-    scratch: &mut ImpactedScratch,
-) -> bool {
-    ortho.fill_requirements_usize(
-        &mut scratch.forbidden,
-        &mut scratch.required,
-        &mut scratch.prefix_positions,
-        &mut scratch.diagonal_positions,
-    );
-    scratch
-        .required
-        .iter()
-        .any(|req| impacted_prefixes.contains(req))
+    prune_ctx: &mut CompletionContext,
+    impacted_index: &ImpactedPrefixIndex,
+    interner: &Interner,
+    best_score: OrthoScore,
+    max_opt_score: OrthoScore,
+) -> ImpactedSeedDecision {
+    prune_ctx.reset(ortho);
+    if !impacted_index.matches_required(prune_ctx.required_usize()) {
+        return ImpactedSeedDecision::NotImpacted;
+    }
+    let prune_score = std::cmp::max(best_score, max_opt_score);
+    if bound_existing_ortho_ctx(prune_ctx, interner, prune_score, Some(impacted_index)) {
+        ImpactedSeedDecision::Pruned
+    } else {
+        ImpactedSeedDecision::Seed
+    }
 }
 
 #[allow(dead_code)]
@@ -2484,18 +2541,39 @@ fn build_archive_path(config: &StateConfig) -> Result<PathBuf, FoldError> {
 fn history_run_paths_for_archive(
     store: &GenerationStore,
 ) -> Result<Vec<(usize, Vec<PathBuf>)>, FoldError> {
-    history_run_paths_for_store_path(store.base_path(), store.bucket_count())
+    history_run_paths_for_store_namespace(
+        store.base_path(),
+        store.namespace(),
+        store.bucket_count(),
+    )
 }
 
-fn history_run_paths_for_store_path(
-    store_path: &Path,
+fn history_run_paths_for_store_namespace(
+    store_root: &Path,
+    namespace: &str,
     bucket_count: usize,
 ) -> Result<Vec<(usize, Vec<PathBuf>)>, FoldError> {
-    let refreshed = GenerationStore::from_existing(store_path.to_path_buf(), bucket_count)
-        .map_err(FoldError::Io)?;
+    let refreshed = GenerationStore::from_existing_with_namespace(
+        store_root.to_path_buf(),
+        namespace.to_string(),
+        bucket_count,
+    )
+    .map_err(FoldError::Io)?;
     Ok(refreshed.history_run_paths())
 }
 
+fn export_store_namespace_to_archive(
+    store_root: &Path,
+    namespace: &str,
+    archive_path: &Path,
+) -> Result<(), FoldError> {
+    let store = TieredStore::open(store_root.to_path_buf()).map_err(FoldError::Io)?;
+    store
+        .export_namespace_to_root(namespace, archive_path.join("results"), DEFAULT_NAMESPACE)
+        .map_err(FoldError::Io)
+}
+
+#[allow(dead_code)]
 fn move_history_runs_to_archive(
     history_runs: &[(usize, Vec<PathBuf>)],
     archive_path: &PathBuf,
@@ -2518,6 +2596,7 @@ fn move_history_runs_to_archive(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn link_history_runs_to_archive(
     history_runs: &[(usize, Vec<PathBuf>)],
     archive_path: &Path,
@@ -2578,6 +2657,7 @@ fn offload_archive_dir(path: &Path, metrics: &Metrics) -> Result<Option<u64>, Fo
     if walk_and_offload(path, &mut uploaded_bytes)? {
         fs::remove_dir_all(path).map_err(FoldError::Io)?;
         metrics.record_landing_buffer_count(0); // reuse metric for quick visibility
+        metrics.record_landing_buffer_bytes(0);
         return Ok(Some(uploaded_bytes));
     }
     Ok(None)
@@ -3286,18 +3366,20 @@ mod tests {
 
         let ortho = Ortho::new().add(foo)[0].clone().add(bar)[0].clone();
         let impacted = vec![vec![payload_to_usize(foo), payload_to_usize(bar)]];
-        let impacted_set = build_impacted_prefix_set(&impacted);
-        let mut scratch = ImpactedScratch::default();
+        let impacted_index = ImpactedPrefixIndex::new(impacted.clone(), &interner);
+        let mut ctx = CompletionContext::default();
+        ctx.reset(&ortho);
 
         assert_eq!(
-            is_ortho_impacted_fast(&ortho, &impacted_set, &mut scratch),
+            impacted_index.matches_required(ctx.required_usize()),
             legacy_is_ortho_impacted(&ortho, &impacted)
         );
 
         let other = Ortho::new().add(foo)[0].clone().add(baz)[0].clone();
-        let mut other_scratch = ImpactedScratch::default();
+        let mut other_ctx = CompletionContext::default();
+        other_ctx.reset(&other);
         assert_eq!(
-            is_ortho_impacted_fast(&other, &impacted_set, &mut other_scratch),
+            impacted_index.matches_required(other_ctx.required_usize()),
             legacy_is_ortho_impacted(&other, &impacted)
         );
     }
@@ -3307,8 +3389,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let merge_work_dir = temp.path();
         let checkpoint = merge_resume::prepare_working_checkpoint(merge_work_dir, None).unwrap();
-        let mut store =
-            GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8).unwrap();
+        let mut store = GenerationStore::new_with_namespace(
+            checkpoint.store_root.clone(),
+            checkpoint.working_namespace.clone(),
+            8,
+        )
+        .unwrap();
         store.configure(&archive_generation_config());
 
         let seed = Ortho::new();
@@ -3329,16 +3415,19 @@ mod tests {
             commit_merge_checkpoint(merge_work_dir, manifest, checkpoint, &mut store, &child)
                 .unwrap();
 
-        let reopened =
-            GenerationStore::from_existing(committed.active_store_path(merge_work_dir).unwrap(), 8)
-                .unwrap();
+        let reopened = GenerationStore::from_existing_with_namespace(
+            merge_resume::checkpoints_dir(merge_work_dir),
+            committed.active_store_namespace().unwrap().to_string(),
+            8,
+        )
+        .unwrap();
 
         assert_eq!(reopened.work_len(), 1);
         assert_eq!(reopened.total_landing_size(), 1);
     }
 
     #[test]
-    fn archive_history_rescan_ignores_stale_in_memory_paths() {
+    fn archive_export_reopens_from_namespace_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         let cfg = archive_generation_config();
         let state = StateConfig::custom(temp_dir.path().join("state"));
@@ -3352,34 +3441,18 @@ mod tests {
         let _ = store.on_generation_end(&cfg, None).unwrap();
         store.flush_all().unwrap();
 
-        let stale_paths = store.history_run_paths();
-        let (bucket, old_path) = stale_paths
-            .iter()
-            .find_map(|(bucket, paths)| paths.first().map(|path| (*bucket, path.clone())))
-            .expect("history run should exist");
-        let new_path = old_path.with_file_name("history-999.dat");
-        fs::rename(&old_path, &new_path).unwrap();
-
-        let rescanned = history_run_paths_for_archive(&store).unwrap();
-        assert!(
-            rescanned[bucket].1.contains(&new_path),
-            "rescanned archive paths should reflect the on-disk rename"
-        );
-        assert!(
-            !rescanned[bucket].1.contains(&old_path),
-            "rescanned archive paths should not keep stale in-memory entries"
-        );
-
         let archive_path = build_archive_path(&state).unwrap();
-        move_history_runs_to_archive(&rescanned, &archive_path).unwrap();
+        export_store_namespace_to_archive(store.base_path(), store.namespace(), &archive_path)
+            .unwrap();
 
+        let reopened = GenerationStore::from_existing(archive_path.join("results"), 8).unwrap();
         assert!(
-            archive_path
-                .join("results")
-                .join(format!("history/b={:02}/history-999.dat", bucket))
-                .exists()
+            reopened
+                .history_run_paths()
+                .iter()
+                .any(|(_, runs)| !runs.is_empty()),
+            "archive snapshot should reopen with history runs intact"
         );
-        assert!(!new_path.exists());
     }
 
     #[test]

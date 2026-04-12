@@ -2,6 +2,7 @@ use crate::{
     FoldError,
     generation_store::GenerationStore,
     ortho::{Ortho, OrthoScore},
+    tiered_store::TieredStore,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -9,12 +10,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const RESUME_SCHEMA_VERSION: u32 = 1;
+pub const RESUME_SCHEMA_VERSION: u32 = 2;
 pub const MANIFEST_FILENAME: &str = "resume_manifest.json";
 pub const CHECKPOINTS_DIRNAME: &str = "checkpoints";
 pub const CHECKPOINT_PREFIX: &str = "store-";
 pub const WORKING_SUFFIX: &str = "-working";
 pub const BEST_ORTHO_FILENAME: &str = "best_ortho.bin";
+const CONTROL_BLOBS: &str = "control";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumePhase {
@@ -102,16 +104,8 @@ impl MergeResumeManifest {
         self.best_score.into()
     }
 
-    pub fn active_store_path(&self, merge_work_dir: &Path) -> Option<PathBuf> {
-        self.active_store_dir
-            .as_ref()
-            .map(|rel| merge_work_dir.join(rel))
-    }
-
-    pub fn best_ortho_path(&self, merge_work_dir: &Path) -> Option<PathBuf> {
-        self.best_ortho_file
-            .as_ref()
-            .map(|rel| merge_work_dir.join(rel))
+    pub fn active_store_namespace(&self) -> Option<&str> {
+        self.active_store_dir.as_deref()
     }
 
     pub fn archive_temp_path(&self, merge_work_dir: &Path) -> Option<PathBuf> {
@@ -123,10 +117,10 @@ impl MergeResumeManifest {
 
 #[derive(Clone, Debug)]
 pub struct MergeCheckpointPaths {
-    pub working_dir: PathBuf,
-    pub committed_dir: PathBuf,
-    pub committed_rel: String,
-    pub previous_committed_dir: Option<PathBuf>,
+    pub store_root: PathBuf,
+    pub working_namespace: String,
+    pub committed_namespace: String,
+    pub previous_committed_namespace: Option<String>,
 }
 
 pub fn manifest_path(merge_work_dir: &Path) -> PathBuf {
@@ -157,23 +151,49 @@ pub fn write_manifest_atomic(
     Ok(())
 }
 
-pub fn write_best_ortho(store_dir: &Path, ortho: &Ortho) -> Result<String, FoldError> {
-    let path = store_dir.join(BEST_ORTHO_FILENAME);
-    let tmp_path = path.with_extension("bin.tmp");
+pub fn write_best_ortho(
+    checkpoint_store_root: &Path,
+    namespace: &str,
+    ortho: &Ortho,
+) -> Result<String, FoldError> {
+    let store = TieredStore::open(checkpoint_store_root.to_path_buf()).map_err(FoldError::Io)?;
+    if !store.has_namespace(namespace).map_err(FoldError::Io)? {
+        return Err(FoldError::Other(format!(
+            "missing checkpoint namespace {}",
+            namespace
+        )));
+    }
+    let blobs = store
+        .open_blob(namespace, CONTROL_BLOBS)
+        .map_err(FoldError::Io)?;
     let bytes = ortho.to_bytes()?;
-    fs::write(&tmp_path, bytes).map_err(FoldError::Io)?;
-    fs::rename(&tmp_path, &path).map_err(FoldError::Io)?;
-    Ok(relative_store_entry(store_dir, BEST_ORTHO_FILENAME))
+    blobs
+        .write_atomic(BEST_ORTHO_FILENAME, &bytes)
+        .map_err(FoldError::Io)?;
+    Ok(BEST_ORTHO_FILENAME.to_string())
 }
 
 pub fn load_best_ortho(
     merge_work_dir: &Path,
     manifest: &MergeResumeManifest,
 ) -> Result<Option<Ortho>, FoldError> {
-    let Some(path) = manifest.best_ortho_path(merge_work_dir) else {
+    let Some(namespace) = manifest.active_store_namespace() else {
         return Ok(None);
     };
-    let bytes = fs::read(path).map_err(FoldError::Io)?;
+    let store = TieredStore::open(checkpoints_dir(merge_work_dir)).map_err(FoldError::Io)?;
+    if !store.has_namespace(namespace).map_err(FoldError::Io)? {
+        return Ok(None);
+    }
+    let blobs = store
+        .open_blob(namespace, CONTROL_BLOBS)
+        .map_err(FoldError::Io)?;
+    let key = manifest
+        .best_ortho_file
+        .as_deref()
+        .unwrap_or(BEST_ORTHO_FILENAME);
+    let Some(bytes) = blobs.read(key).map_err(FoldError::Io)? else {
+        return Ok(None);
+    };
     Ok(Some(Ortho::from_bytes(&bytes)?))
 }
 
@@ -182,12 +202,10 @@ pub fn cleanup_transient_checkpoints(merge_work_dir: &Path) -> io::Result<()> {
     if !checkpoints.exists() {
         return Ok(());
     }
-    for entry in fs::read_dir(&checkpoints)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.is_dir() && name.starts_with(CHECKPOINT_PREFIX) && name.ends_with(WORKING_SUFFIX) {
-            fs::remove_dir_all(path)?;
+    let store = TieredStore::open(checkpoints)?;
+    for namespace in store.namespaces()? {
+        if namespace.starts_with(CHECKPOINT_PREFIX) && namespace.ends_with(WORKING_SUFFIX) {
+            store.delete_namespace(&namespace)?;
         }
     }
     Ok(())
@@ -211,48 +229,69 @@ pub fn validate_manifest(
             "resume manifest references missing source archives".to_string(),
         ));
     }
-    if let Some(active_store) = manifest.active_store_path(merge_work_dir) {
-        if !active_store.exists() {
+    if let Some(namespace) = manifest.active_store_namespace() {
+        let checkpoint_root = checkpoints_dir(merge_work_dir);
+        if !checkpoint_root.exists() {
             return Err(FoldError::Other(format!(
-                "resume manifest points at missing checkpoint {}",
-                active_store.display()
+                "resume manifest points at missing checkpoint store {}",
+                checkpoint_root.display()
             )));
         }
-        GenerationStore::from_existing(active_store, bucket_count)
-            .map_err(FoldError::Io)
-            .map(|_| ())?;
+        let store = TieredStore::open(checkpoint_root.clone()).map_err(FoldError::Io)?;
+        if !store.has_namespace(namespace).map_err(FoldError::Io)? {
+            return Err(FoldError::Other(format!(
+                "resume manifest points at missing checkpoint namespace {}",
+                namespace
+            )));
+        }
+        GenerationStore::from_existing_with_namespace(
+            checkpoint_root,
+            namespace.to_string(),
+            bucket_count,
+        )
+        .map_err(FoldError::Io)
+        .map(|_| ())?;
     }
     Ok(())
 }
 
 pub fn prepare_working_checkpoint(
     merge_work_dir: &Path,
-    active_store_dir: Option<&Path>,
+    active_store_namespace: Option<&str>,
 ) -> Result<MergeCheckpointPaths, FoldError> {
-    fs::create_dir_all(checkpoints_dir(merge_work_dir)).map_err(FoldError::Io)?;
     cleanup_transient_checkpoints(merge_work_dir).map_err(FoldError::Io)?;
-
+    let store_root = checkpoints_dir(merge_work_dir);
+    let store = TieredStore::open(store_root.clone()).map_err(FoldError::Io)?;
     let next_id = next_checkpoint_id(merge_work_dir).map_err(FoldError::Io)?;
     let committed_name = format!("{}{:04}", CHECKPOINT_PREFIX, next_id);
     let working_name = format!("{}{}", committed_name, WORKING_SUFFIX);
-    let checkpoints = checkpoints_dir(merge_work_dir);
-    let committed_dir = checkpoints.join(&committed_name);
-    let working_dir = checkpoints.join(&working_name);
-
-    if working_dir.exists() {
-        fs::remove_dir_all(&working_dir).map_err(FoldError::Io)?;
+    if let Some(active_namespace) = active_store_namespace {
+        if !store
+            .has_namespace(active_namespace)
+            .map_err(FoldError::Io)?
+        {
+            return Err(FoldError::Other(format!(
+                "missing active checkpoint namespace {}",
+                active_namespace
+            )));
+        }
+        store
+            .snapshot_namespace(active_namespace, &working_name)
+            .map_err(FoldError::Io)?;
+    } else {
+        store
+            .delete_namespace(&working_name)
+            .map_err(FoldError::Io)?;
+        store
+            .ensure_namespace(&working_name)
+            .map_err(FoldError::Io)?;
     }
 
-    if let Some(active) = active_store_dir {
-        clone_dir_hardlinked(active, &working_dir).map_err(FoldError::Io)?;
-    }
-
-    let committed_rel = format!("{}/{}", CHECKPOINTS_DIRNAME, committed_name);
     Ok(MergeCheckpointPaths {
-        working_dir,
-        committed_dir,
-        committed_rel,
-        previous_committed_dir: active_store_dir.map(|path| path.to_path_buf()),
+        store_root,
+        working_namespace: working_name,
+        committed_namespace: committed_name,
+        previous_committed_namespace: active_store_namespace.map(|name| name.to_string()),
     })
 }
 
@@ -262,32 +301,30 @@ pub fn finalize_checkpoint_commit(
     checkpoint: MergeCheckpointPaths,
     best_ortho: &Ortho,
 ) -> Result<MergeResumeManifest, FoldError> {
-    let best_ortho_rel = write_best_ortho(&checkpoint.working_dir, best_ortho)?;
-    if checkpoint.committed_dir.exists() {
-        fs::remove_dir_all(&checkpoint.committed_dir).map_err(FoldError::Io)?;
-    }
-    fs::rename(&checkpoint.working_dir, &checkpoint.committed_dir).map_err(FoldError::Io)?;
+    let best_ortho_key = write_best_ortho(
+        &checkpoint.store_root,
+        &checkpoint.working_namespace,
+        best_ortho,
+    )?;
+    let store = TieredStore::open(checkpoint.store_root.clone()).map_err(FoldError::Io)?;
+    store
+        .promote_namespace(
+            &checkpoint.working_namespace,
+            &checkpoint.committed_namespace,
+        )
+        .map_err(FoldError::Io)?;
 
-    manifest.active_store_dir = Some(checkpoint.committed_rel);
-    manifest.best_ortho_file = Some(best_ortho_rel.replace(
-        &format!(
-                "{}/{}",
-                CHECKPOINTS_DIRNAME,
-                checkpoint
-                    .working_dir
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-            ),
-        manifest.active_store_dir.as_ref().unwrap(),
-    ));
+    manifest.active_store_dir = Some(checkpoint.committed_namespace.clone());
+    manifest.best_ortho_file = Some(best_ortho_key);
     manifest.archive_temp_path = None;
     manifest.updated_at = current_timestamp_secs();
     write_manifest_atomic(merge_work_dir, &manifest)?;
 
-    if let Some(previous) = checkpoint.previous_committed_dir {
-        if previous.exists() {
-            fs::remove_dir_all(previous).map_err(FoldError::Io)?;
+    if let Some(previous) = checkpoint.previous_committed_namespace {
+        if previous != checkpoint.committed_namespace
+            && store.has_namespace(&previous).map_err(FoldError::Io)?
+        {
+            store.delete_namespace(&previous).map_err(FoldError::Io)?;
         }
     }
     cleanup_transient_checkpoints(merge_work_dir).map_err(FoldError::Io)?;
@@ -301,26 +338,14 @@ pub fn current_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-pub fn checkpoint_relative_path(merge_work_dir: &Path, path: &Path) -> Result<String, FoldError> {
-    let relative = path.strip_prefix(merge_work_dir).map_err(|err| {
-        FoldError::Other(format!("checkpoint path not under merge work dir: {}", err))
-    })?;
-    Ok(relative.to_string_lossy().to_string())
-}
-
 fn next_checkpoint_id(merge_work_dir: &Path) -> io::Result<usize> {
     let checkpoints = checkpoints_dir(merge_work_dir);
     if !checkpoints.exists() {
         return Ok(0);
     }
+    let store = TieredStore::open(checkpoints)?;
     let mut next_id = 0usize;
-    for entry in fs::read_dir(&checkpoints)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for name in store.namespaces()? {
         if !name.starts_with(CHECKPOINT_PREFIX) || name.ends_with(WORKING_SUFFIX) {
             continue;
         }
@@ -334,93 +359,31 @@ fn next_checkpoint_id(merge_work_dir: &Path) -> io::Result<usize> {
     Ok(next_id)
 }
 
-fn clone_dir_hardlinked(src: &Path, dst: &Path) -> io::Result<()> {
-    if dst.exists() {
-        fs::remove_dir_all(dst)?;
-    }
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            clone_dir_hardlinked(&src_path, &dst_path)?;
-        } else if file_type.is_file() {
-            clone_file_for_checkpoint(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn clone_file_for_checkpoint(src: &Path, dst: &Path) -> io::Result<()> {
-    if is_mutable_checkpoint_file(src) {
-        let _ = fs::copy(src, dst)?;
-        return Ok(());
-    }
-    match fs::hard_link(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let _ = fs::copy(src, dst)?;
-            Ok(())
-        }
-    }
-}
-
-fn is_mutable_checkpoint_file(path: &Path) -> bool {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if file_name == "active.log" || file_name == "manifest.txt" || file_name == BEST_ORTHO_FILENAME
-    {
-        return true;
-    }
-    path.components()
-        .any(|component| component.as_os_str() == "landing")
-}
-
-fn relative_store_entry(store_dir: &Path, filename: &str) -> String {
-    let checkpoints_root = store_dir
-        .parent()
-        .and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| CHECKPOINTS_DIRNAME.to_string());
-    let store_name = store_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| CHECKPOINT_PREFIX.to_string());
-    format!("{}/{}/{}", checkpoints_root, store_name, filename)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     #[test]
-    fn checkpoint_clone_copies_mutable_landing_files() {
+    fn checkpoint_namespace_snapshot_is_isolated() {
         let temp = TempDir::new().unwrap();
-        let src = temp.path().join("src");
-        let dst = temp.path().join("dst");
-        fs::create_dir_all(src.join("landing").join("b=00")).unwrap();
-        fs::create_dir_all(src.join("history").join("b=00")).unwrap();
-        let landing = src.join("landing").join("b=00").join("active.log");
-        let history = src.join("history").join("b=00").join("history-0.dat");
-        fs::write(&landing, b"landing").unwrap();
-        fs::write(&history, b"history").unwrap();
+        let store = TieredStore::open(checkpoints_dir(temp.path())).unwrap();
+        store.ensure_namespace("store-0000").unwrap();
+        let blobs = store.open_blob("store-0000", CONTROL_BLOBS).unwrap();
+        blobs.write_atomic(BEST_ORTHO_FILENAME, b"alpha").unwrap();
 
-        clone_dir_hardlinked(&src, &dst).unwrap();
-        fs::write(
-            &dst.join("landing").join("b=00").join("active.log"),
-            b"changed",
-        )
-        .unwrap();
+        let checkpoint = prepare_working_checkpoint(temp.path(), Some("store-0000")).unwrap();
+        let working_blobs = store
+            .open_blob(&checkpoint.working_namespace, CONTROL_BLOBS)
+            .unwrap();
+        working_blobs
+            .write_atomic(BEST_ORTHO_FILENAME, b"beta")
+            .unwrap();
 
-        assert_eq!(fs::read(&landing).unwrap(), b"landing");
+        let original = store.open_blob("store-0000", CONTROL_BLOBS).unwrap();
         assert_eq!(
-            fs::read(dst.join("history").join("b=00").join("history-0.dat")).unwrap(),
-            b"history"
+            original.read(BEST_ORTHO_FILENAME).unwrap().unwrap(),
+            b"alpha"
         );
     }
 

@@ -912,7 +912,14 @@ impl Tui {
                 let landing = snapshot
                     .bucket_metrics
                     .iter()
-                    .map(|b| format!("B{}:{}", b.bucket_id, format_number(b.landing_size)))
+                    .map(|b| {
+                        format!(
+                            "B{}:{}/{}",
+                            b.bucket_id,
+                            format_number(b.landing_size),
+                            format_bytes(b.landing_bytes as usize)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 lines.push(Line::from(truncate_string(
@@ -1070,7 +1077,7 @@ impl Tui {
         let max_width = area.width.saturating_sub(2) as usize;
         let max_height = area.height.saturating_sub(2) as usize;
 
-        // If no ortho data, show placeholder
+        // If no ortho data, show fallback text
         if opt.dims.is_empty() || opt.payload.is_empty() {
             let lines = vec![Line::from("No optimal ortho yet")];
             let block = Block::default()
@@ -1629,6 +1636,10 @@ fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
         format_number(snapshot.global.spill_consumed_files as usize),
         format_bytes(snapshot.global.spill_consumed_bytes as usize)
     ));
+    lines.push(format!(
+        "Landing Bytes: {}",
+        format_bytes(snapshot.global.landing_buffer_bytes as usize)
+    ));
 
     let offload_line = format!(
         "Offload: {} files {} | Download: {} files {} | Cache hit/miss: {}/{} | Pressure triggers: {}",
@@ -1807,6 +1818,7 @@ mod tests {
         metrics.reset_seen_size(0);
         metrics.record_landing_buffer_count(7_900);
         metrics.record_landing_buffer_count(12_500);
+        metrics.record_landing_buffer_bytes(12_500 * 1024);
         metrics.set_generation_stats(vec![
             GenerationStat {
                 generation: 10,
@@ -1836,6 +1848,7 @@ mod tests {
                 bucket_id,
                 run_count: bucket_id,
                 landing_size: bucket_id * 10,
+                landing_bytes: (bucket_id as u64) * 1024,
                 history_size_estimate: 0,
                 state: if transition && bucket_id == 0 {
                     BucketState::Draining

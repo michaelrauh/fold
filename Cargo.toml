@@ -27,6 +27,7 @@ lru = "0.12"
 rust-s3 = { version = "0.35", features = ["blocking"] }
 tokio = { version = "1", features = ["fs", "io-util"] }
 rayon = "1.10"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -647,6 +647,7 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.14.5",
  "itertools 0.12.1",
+ "libc",
  "lru",
  "nohash-hasher",
  "ratatui",

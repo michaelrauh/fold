@@ -20,7 +20,7 @@
 - Prune counts in the failing run (gens 2–4: 9–13%) aren’t high enough to empty the queue; rather, the bound drives `new_work` to zero by declaring most branches hopeless.
 
 ## Recommended fix direction
-- When `axis_totals.len() < dim_count`, include placeholders for the missing axes instead of ignoring them. Options, from most context-sensitive to most optimistic:
+- When `axis_totals.len() < dim_count`, include explicit missing-axis fillers instead of ignoring them. Options, from most context-sensitive to most optimistic:
   1) **Use the candidate token’s own depth for missing axes (preferred):** for each missing axis, set its total to `interner.prefix_stats(&[completion])` (the max_desc_len of the single-token prefix). This is optimistic but tied to the actual token, not the whole corpus.
   2) Use current `dims[i]` for missing axes (safe but pessimistic).
   3) Use a corpus-wide `max_desc_len` (very optimistic; can add work).

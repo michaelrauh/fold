@@ -1873,8 +1873,12 @@ mod tests {
         let merge_heartbeat = create_heartbeat(merge_work.to_str().unwrap()).unwrap();
 
         let checkpoint = merge_resume::prepare_working_checkpoint(&merge_work, None).unwrap();
-        let mut store =
-            GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8).unwrap();
+        let mut store = GenerationStore::new_with_namespace(
+            checkpoint.store_root.clone(),
+            checkpoint.working_namespace.clone(),
+            8,
+        )
+        .unwrap();
         store.push_segments(vec![Ortho::new()]).unwrap();
         store.flush_all().unwrap();
 
@@ -2063,8 +2067,12 @@ mod tests {
         let merge_heartbeat = create_heartbeat(merge_work.to_str().unwrap()).unwrap();
 
         let checkpoint = merge_resume::prepare_working_checkpoint(&merge_work, None).unwrap();
-        let mut store =
-            GenerationStore::new_with_config(checkpoint.working_dir.clone(), 8).unwrap();
+        let mut store = GenerationStore::new_with_namespace(
+            checkpoint.store_root.clone(),
+            checkpoint.working_namespace.clone(),
+            8,
+        )
+        .unwrap();
         store.push_segments(vec![Ortho::new()]).unwrap();
         store.flush_all().unwrap();
 

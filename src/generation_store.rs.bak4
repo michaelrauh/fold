@@ -176,7 +176,7 @@ pub struct GenerationStore {
     seen_len_accepted: u64, // Monotonic count of accepted items across all generations
 }
 
-/// Placeholder for unsorted drained data
+/// Container for unsorted drained data
 pub struct RawStream {
     files: Vec<PathBuf>,
 }
@@ -1696,4 +1696,3 @@ mod tests {
                  processed, new_work_gen1, store.seen_len_accepted());
     }
 }
-

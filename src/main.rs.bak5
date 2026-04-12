@@ -1176,8 +1176,8 @@ fn acquire_memory_claim_simple(
     _interner_bytes: usize,
 ) -> Result<MemClaimGuard, FoldError> {
     // GenerationStore manages its own memory via Config::compute_config
-    // This just creates a placeholder claim to participate in coordination
-    let granted_bytes = 100 * 1024 * 1024; // 100MB placeholder
+    // This just creates a provisional claim to participate in coordination
+    let granted_bytes = 100 * 1024 * 1024; // 100MB provisional value
     file_handler::create_mem_claim(config, role_as_str(role), granted_bytes, granted_bytes)
 }
 

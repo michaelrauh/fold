@@ -5,6 +5,10 @@ use crate::{
     memory_budget::MemoryBudget,
     memory_safety,
     ortho::{Ortho, OrthoId, OrthoScore},
+    tiered_store::{
+        AllocatedSegment, DEFAULT_NAMESPACE, LogCollection, QueueCollection, RunSetCollection,
+        TieredStore,
+    },
 };
 use rkyv::{
     AlignedVec,
@@ -17,7 +21,7 @@ use rkyv::{
     },
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
@@ -99,6 +103,7 @@ pub struct BucketStats {
     pub run_count: usize,
     // Count of orthos currently in landing (in-memory + active log)
     pub landing_size: usize,
+    pub landing_bytes: u64,
     pub history_size_estimate: usize,
 }
 
@@ -116,14 +121,20 @@ pub struct GenerationStats {
 /// Main generational store structure (opaque for now)
 pub struct GenerationStore {
     base_path: PathBuf,
+    tiered_store: TieredStore,
+    namespace: String,
+    work_collection: QueueCollection,
+    spill_collections: Vec<QueueCollection>,
+    history_collections: Vec<RunSetCollection>,
+    landing_collections: Vec<LogCollection>,
     bucket_count: usize,
     bucket_writers: Vec<Option<BufWriter<File>>>,
     drain_counter: Vec<usize>,
     landing_buffer_sizes: Vec<usize>, // Track bytes written to each bucket writer
     landing_counts: Vec<usize>,       // Track ortho counts in landing per bucket
+    landing_file_bytes: Vec<u64>,     // Exact bytes currently resident in landing files
     // Work queue state
     work_segments: VecDeque<PathBuf>,
-    work_segment_counter: usize,
     total_work_len: u64,
     work_queue_cache: VecDeque<Ortho>, // In-memory cache of work items
     work_queue_cache_bytes: usize,     // Current decoded bytes in the work queue cache
@@ -137,10 +148,13 @@ pub struct GenerationStore {
     bufwriter_capacity: usize,         // Buffer capacity for bucket writers
     landing_flush_threshold: usize,    // Threshold for flushing landing writes
     compaction_arena_cap_bytes: usize, // Max streamed bytes allowed in compaction
+    read_buf_bytes: usize,             // Read buffer size used when compacting spilled landing
     spill_runs: Vec<Vec<TrackedSpillRun>>, // Per-bucket pending spill runs for the current generation
     // History state
     history_runs: Vec<Vec<PathBuf>>, // Per-bucket list of history run files
-    seen_len_accepted: u64,          // Monotonic count of accepted items across all generations
+    history_run_counts: Vec<usize>,
+    history_run_bytes: Vec<u64>,
+    seen_len_accepted: u64, // Monotonic count of accepted items across all generations
     #[allow(dead_code)]
     history_cache: std::collections::HashMap<PathBuf, Vec<u8>>, // Cached history run contents (future optimization)
     compression_stats: CompressionStats,
@@ -149,7 +163,7 @@ pub struct GenerationStore {
     pressure_prepare_in_progress: bool,
 }
 
-/// Placeholder for unsorted drained data
+/// Container for unsorted drained data
 pub struct RawStream {
     files: Vec<PathBuf>,
 }
@@ -170,6 +184,16 @@ pub struct PressureSpillStats {
     pub buckets_drained: usize,
     pub spill_runs_created: usize,
     pub spill_bytes_created: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PressurePrepareStats {
+    pub landing_bytes_before: u64,
+    pub landing_bytes_after_local_spill: u64,
+    pub buckets_drained: usize,
+    pub spill_runs_created: usize,
+    pub spill_bytes_created: u64,
+    pub work_cache_spilled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -208,6 +232,14 @@ thread_local! {
 }
 thread_local! {
     static METRICS_HANDLE: RefCell<Option<crate::metrics::Metrics>> = RefCell::new(None);
+}
+
+const OFFLOAD_MARKER_MAGIC: &[u8; 8] = b"FOLDOFF1";
+const OFFLOAD_MARKER_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OffloadMarker {
+    original_size: u64,
 }
 
 /// Set or clear the global run offloader hook (used by pressure-mode/offload tests).
@@ -255,6 +287,68 @@ fn metrics_handle() -> Option<crate::metrics::Metrics> {
     METRICS_HANDLE.with(|slot| slot.borrow().clone())
 }
 
+fn write_offload_marker(path: &Path, original_size: u64) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(OFFLOAD_MARKER_MAGIC)?;
+    file.write_all(&OFFLOAD_MARKER_VERSION.to_le_bytes())?;
+    file.write_all(&original_size.to_le_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn read_offload_marker(path: &Path) -> io::Result<Option<OffloadMarker>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    let mut magic = [0u8; 8];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    if &magic != OFFLOAD_MARKER_MAGIC {
+        return Ok(None);
+    }
+
+    let mut version = [0u8; 4];
+    file.read_exact(&mut version)?;
+    if u32::from_le_bytes(version) != OFFLOAD_MARKER_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported offload marker version for {}", path.display()),
+        ));
+    }
+
+    let mut size = [0u8; 8];
+    file.read_exact(&mut size)?;
+    Ok(Some(OffloadMarker {
+        original_size: u64::from_le_bytes(size),
+    }))
+}
+
+fn replace_with_offload_marker(path: &Path, original_size: u64) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("managed");
+    let tmp_path = path.with_file_name(format!("{}.offtmp", file_name));
+    fs::rename(path, &tmp_path)?;
+    match write_offload_marker(path, original_size) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp_path);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = fs::remove_file(path);
+            let _ = fs::rename(&tmp_path, path);
+            Err(err)
+        }
+    }
+}
+
 /// Offload a path if a RunOffloader is configured. Returns true if offloaded.
 pub fn offload_path_if_configured(path: &Path) -> io::Result<bool> {
     if let Some(offloader) = current_offloader() {
@@ -265,6 +359,35 @@ pub fn offload_path_if_configured(path: &Path) -> io::Result<bool> {
 }
 
 fn offload_and_delete_if_configured(path: &Path) -> io::Result<bool> {
+    if let Some(store) = TieredStore::from_managed_path(path)? {
+        if store.segment_ref_for_path(path)?.is_some() {
+            if let Some(offloader) = current_offloader() {
+                let size = store.managed_file_size(path)?.unwrap_or(0);
+                match offloader.offload(path) {
+                    Ok(true) => {
+                        let key = current_downloader()
+                            .and_then(|ctx| run_object_key(&ctx.base_path, path).ok())
+                            .or_else(|| {
+                                run_object_key(store.root(), path)
+                                    .ok()
+                                    .filter(|key| !key.is_empty())
+                            });
+                        store.set_remote_state_for_path(path, true, key)?;
+                        store.set_disk_state_for_path(path, false)?;
+                        let _ = fs::remove_file(path);
+                        if let Some(m) = metrics_handle() {
+                            m.record_offload(1, size);
+                        }
+                        return Ok(true);
+                    }
+                    Ok(false) => return Ok(false),
+                    Err(err) => return Err(err),
+                }
+            }
+            return Ok(false);
+        }
+    }
+
     match fs::metadata(path) {
         Ok(metadata) => {
             let size = metadata.len();
@@ -273,7 +396,7 @@ fn offload_and_delete_if_configured(path: &Path) -> io::Result<bool> {
                     if let Some(m) = metrics_handle() {
                         m.record_offload(1, size);
                     }
-                    let _ = fs::remove_file(path);
+                    replace_with_offload_marker(path, size)?;
                     return Ok(true);
                 }
                 Ok(false) => {}
@@ -287,7 +410,7 @@ fn offload_and_delete_if_configured(path: &Path) -> io::Result<bool> {
         }
         Err(_) => {
             if offload_path_if_configured(path)? {
-                let _ = fs::remove_file(path);
+                replace_with_offload_marker(path, 0)?;
                 return Ok(true);
             }
         }
@@ -298,6 +421,10 @@ fn offload_and_delete_if_configured(path: &Path) -> io::Result<bool> {
 fn maybe_offload_and_delete(path: &Path) -> io::Result<()> {
     let _ = offload_and_delete_if_configured(path)?;
     Ok(())
+}
+
+pub fn offload_managed_path_if_configured(path: &Path) -> io::Result<bool> {
+    offload_and_delete_if_configured(path)
 }
 
 fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
@@ -336,8 +463,50 @@ fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
 }
 
 pub fn resolve_managed_path(path: &Path) -> io::Result<PathBuf> {
-    if path.exists() {
+    if path.exists() && !is_offload_marker(path) {
         return Ok(path.to_path_buf());
+    }
+    if let Some(store) = TieredStore::from_managed_path(path)? {
+        if store.segment_ref_for_path(path)?.is_some() {
+            if let Some(local) = store.ensure_local(path)? {
+                return Ok(local);
+            }
+            let Some(ctx) = current_downloader() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "managed segment missing locally and no downloader configured: {:?}",
+                        path
+                    ),
+                ));
+            };
+            let key = run_object_key(&ctx.base_path, path)?;
+            let cached = if let Some(hit) = ctx.downloader.cache_lookup(&key) {
+                if let Some(m) = metrics_handle() {
+                    m.record_cache_hit();
+                }
+                hit
+            } else {
+                if let Some(m) = metrics_handle() {
+                    m.record_cache_miss();
+                }
+                ctx.downloader.download_to_cache(&key)?
+            };
+            let canonical = path.to_path_buf();
+            if let Some(parent) = canonical.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&cached, &canonical)?;
+            store.set_disk_state_for_path(path, true)?;
+            if let Some(m) = metrics_handle() {
+                if let Ok(bytes) = fs::metadata(&canonical) {
+                    m.record_download(1, bytes.len() as u64);
+                } else {
+                    m.record_download(1, 0);
+                }
+            }
+            return Ok(canonical);
+        }
     }
     let Some(ctx) = current_downloader() else {
         return Err(io::Error::new(
@@ -370,6 +539,38 @@ fn resolve_run_path(path: &Path) -> io::Result<PathBuf> {
     resolve_managed_path(path)
 }
 
+pub fn offload_marker_size(path: &Path) -> io::Result<Option<u64>> {
+    if let Some(store) = TieredStore::from_managed_path(path)? {
+        if store.is_managed_remote_only(path)? {
+            return store.managed_file_size(path);
+        }
+    }
+    read_offload_marker(path).map(|marker| marker.map(|info| info.original_size))
+}
+
+pub fn is_offload_marker(path: &Path) -> bool {
+    if let Ok(Some(store)) = TieredStore::from_managed_path(path) {
+        if store.is_managed_remote_only(path).unwrap_or(false) {
+            return true;
+        }
+    }
+    read_offload_marker(path)
+        .map(|marker| marker.is_some())
+        .unwrap_or(false)
+}
+
+pub fn managed_file_size(path: &Path) -> io::Result<u64> {
+    if let Some(store) = TieredStore::from_managed_path(path)? {
+        if let Some(size) = store.managed_file_size(path)? {
+            return Ok(size);
+        }
+    }
+    if let Some(original_size) = offload_marker_size(path)? {
+        return Ok(original_size);
+    }
+    Ok(fs::metadata(path)?.len())
+}
+
 fn estimate_streamed_run_bytes(arena: &[StreamedOrtho]) -> u64 {
     arena
         .iter()
@@ -378,7 +579,20 @@ fn estimate_streamed_run_bytes(arena: &[StreamedOrtho]) -> u64 {
 }
 
 fn file_size_or_zero(path: &Path) -> u64 {
-    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    managed_file_size(path).unwrap_or(0)
+}
+
+fn delete_managed_or_local(path: &Path) -> io::Result<()> {
+    if let Some(store) = TieredStore::from_managed_path(path)? {
+        if store.segment_ref_for_path(path)?.is_some() {
+            return store.delete_segment_if_unreferenced(path);
+        }
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn estimate_compressed_run_set_bytes(runs: &[Run]) -> io::Result<u64> {
@@ -548,7 +762,8 @@ fn count_ortho_records_in_file(
     read_buf_bytes: usize,
     compressed: bool,
 ) -> io::Result<usize> {
-    let file = File::open(path)?;
+    let resolved_path = resolve_managed_path(path)?;
+    let file = File::open(&resolved_path)?;
     let reader = BufReader::with_capacity(read_buf_bytes, file);
     let boxed_reader: Box<dyn Read> = if compressed {
         Box::new(
@@ -776,6 +991,45 @@ impl UniqueRun {
     }
 }
 
+struct RunOutputTarget {
+    path: PathBuf,
+    managed: Option<(TieredStore, AllocatedSegment)>,
+}
+
+impl RunOutputTarget {
+    fn new(
+        managed_store: Option<&TieredStore>,
+        base_path: &Path,
+        fallback_name: String,
+        kind: &str,
+        ordering: &str,
+    ) -> io::Result<Self> {
+        if let Some(store) = managed_store {
+            let allocated = store.allocate_segment(kind, "zstd", ordering)?;
+            return Ok(Self {
+                path: allocated.path.clone(),
+                managed: Some((store.clone(), allocated)),
+            });
+        }
+        Ok(Self {
+            path: base_path.join("runs").join(fallback_name),
+            managed: None,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(self, bytes: u64, record_count: u64) -> io::Result<PathBuf> {
+        if let Some((store, allocated)) = self.managed {
+            store.commit_allocated_segment(&allocated, bytes, record_count)?;
+            return Ok(allocated.path);
+        }
+        Ok(self.path)
+    }
+}
+
 /// Iterator over history runs for a bucket
 /// Streams orthos from all history run files in order
 pub struct HistoryIterator {
@@ -836,6 +1090,73 @@ impl Iterator for HistoryIterator {
 }
 
 impl GenerationStore {
+    fn open_with_namespace(
+        base_path: PathBuf,
+        namespace: impl Into<String>,
+        bucket_count: usize,
+    ) -> io::Result<Self> {
+        assert!(
+            bucket_count.is_power_of_two(),
+            "bucket_count must be power of two"
+        );
+        let namespace = namespace.into();
+        let tiered_store = TieredStore::open(base_path.clone())?;
+        tiered_store.ensure_namespace(&namespace)?;
+        let mut landing_collections = Vec::with_capacity(bucket_count);
+        let mut spill_collections = Vec::with_capacity(bucket_count);
+        let mut history_collections = Vec::with_capacity(bucket_count);
+        for bucket in 0..bucket_count {
+            landing_collections
+                .push(tiered_store.open_log(&namespace, format!("landing-b={:02}", bucket))?);
+            spill_collections
+                .push(tiered_store.open_queue(&namespace, format!("spill-b={:02}", bucket))?);
+            history_collections
+                .push(tiered_store.open_runset(&namespace, format!("history-b={:02}", bucket))?);
+        }
+        let work_collection = tiered_store.open_queue(&namespace, "work")?;
+
+        Ok(Self {
+            base_path,
+            tiered_store,
+            namespace,
+            work_collection,
+            spill_collections,
+            history_collections,
+            landing_collections,
+            bucket_count,
+            bucket_writers: (0..bucket_count).map(|_| None).collect(),
+            drain_counter: vec![0; bucket_count],
+            landing_buffer_sizes: vec![0; bucket_count],
+            landing_counts: vec![0; bucket_count],
+            landing_file_bytes: vec![0; bucket_count],
+            work_segments: VecDeque::new(),
+            total_work_len: 0,
+            work_queue_cache: VecDeque::new(),
+            work_queue_cache_bytes: 0,
+            work_queue_cache_max_bytes: 1024 * 1024,
+            work_segment_batch: Vec::new(),
+            work_segment_batch_bytes: 0,
+            work_segment_batch_max_bytes: 256 * 1024,
+            cached_best_score: Cell::new(None),
+            cached_best_ortho: RefCell::new(None),
+            best_score_dirty: Cell::new(false),
+            bufwriter_capacity: 16 * 1024 * 1024,
+            landing_flush_threshold: 10 * 1024 * 1024,
+            compaction_arena_cap_bytes: 256 * 1024 * 1024,
+            read_buf_bytes: 64 * 1024,
+            spill_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
+            history_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
+            history_run_counts: vec![0; bucket_count],
+            history_run_bytes: vec![0; bucket_count],
+            seen_len_accepted: 0,
+            history_cache: std::collections::HashMap::new(),
+            compression_stats: CompressionStats::default(),
+            record_write_scratch: AlignedVec::new(),
+            record_read_scratch: Vec::new(),
+            pressure_prepare_in_progress: false,
+        })
+    }
+
     fn sync_memory_metrics(&self) {
         if let Some(metrics) = metrics_handle() {
             metrics.update_global(|g| {
@@ -866,6 +1187,10 @@ impl GenerationStore {
         self.sync_spill_metrics();
     }
 
+    pub fn flush_store_metadata(&self, reason: &str) -> io::Result<()> {
+        self.tiered_store.flush_metadata(reason)
+    }
+
     fn set_compaction_bytes(bytes: usize) {
         if let Some(metrics) = metrics_handle() {
             metrics.update_global(|g| {
@@ -874,80 +1199,53 @@ impl GenerationStore {
         }
     }
 
+    fn path_size_bytes(&self, path: &Path) -> u64 {
+        fs::metadata(path)
+            .map(|meta| meta.len())
+            .ok()
+            .or_else(|| self.tiered_store.managed_file_size(path).ok().flatten())
+            .unwrap_or(0)
+    }
+
+    fn path_record_count(&self, path: &Path, compressed: bool) -> io::Result<u64> {
+        if let Some(segment) = self.tiered_store.segment_ref_for_path(path)? {
+            return Ok(segment.record_count);
+        }
+        Ok(count_ortho_records_in_file(path, self.read_buf_bytes, compressed)? as u64)
+    }
+
+    fn refresh_history_bucket_stats(&mut self, bucket: usize) {
+        self.history_run_counts[bucket] = self.history_runs[bucket].len();
+        self.history_run_bytes[bucket] = self.history_runs[bucket]
+            .iter()
+            .map(|path| self.path_size_bytes(path))
+            .sum();
+    }
+
     /// Create a new generation store with specified base path and bucket count
     pub fn new_with_config(base_path: PathBuf, bucket_count: usize) -> io::Result<Self> {
-        // Bucket count must be a power of two
-        assert!(
-            bucket_count.is_power_of_two(),
-            "bucket_count must be power of two"
-        );
+        Self::open_with_namespace(base_path, DEFAULT_NAMESPACE.to_string(), bucket_count)
+    }
 
-        // Create landing directory structure
-        for bucket in 0..bucket_count {
-            let bucket_dir = base_path.join("landing").join(format!("b={:02}", bucket));
-            fs::create_dir_all(&bucket_dir)?;
-        }
-
-        // Create work directory
-        let work_dir = base_path.join("work");
-        fs::create_dir_all(&work_dir)?;
-
-        // Create runs directory
-        let runs_dir = base_path.join("runs");
-        fs::create_dir_all(&runs_dir)?;
-
-        // Create spill directory
-        let spill_dir = base_path.join("spill");
-        fs::create_dir_all(&spill_dir)?;
-        for bucket in 0..bucket_count {
-            let bucket_spill_dir = spill_dir.join(format!("b={:02}", bucket));
-            fs::create_dir_all(&bucket_spill_dir)?;
-        }
-
-        // Create history directory
-        let history_dir = base_path.join("history");
-        fs::create_dir_all(&history_dir)?;
-        for bucket in 0..bucket_count {
-            let bucket_history_dir = history_dir.join(format!("b={:02}", bucket));
-            fs::create_dir_all(&bucket_history_dir)?;
-        }
-
-        Ok(Self {
-            base_path,
-            bucket_count,
-            bucket_writers: (0..bucket_count).map(|_| None).collect(),
-            drain_counter: vec![0; bucket_count],
-            landing_buffer_sizes: vec![0; bucket_count],
-            landing_counts: vec![0; bucket_count],
-            work_segments: VecDeque::new(),
-            work_segment_counter: 0,
-            total_work_len: 0,
-            work_queue_cache: VecDeque::new(),
-            work_queue_cache_bytes: 0,
-            work_queue_cache_max_bytes: 1024 * 1024, // Default, will be updated with config
-            work_segment_batch: Vec::new(),
-            work_segment_batch_bytes: 0,
-            work_segment_batch_max_bytes: 256 * 1024, // Default, will be updated with config
-            cached_best_score: Cell::new(None),
-            cached_best_ortho: RefCell::new(None),
-            best_score_dirty: Cell::new(false),
-            bufwriter_capacity: 16 * 1024 * 1024, // Default 16MB
-            landing_flush_threshold: 10 * 1024 * 1024, // Default 10MB
-            compaction_arena_cap_bytes: 256 * 1024 * 1024,
-            spill_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
-            history_runs: (0..bucket_count).map(|_| Vec::new()).collect(),
-            seen_len_accepted: 0,
-            history_cache: std::collections::HashMap::new(),
-            compression_stats: CompressionStats::default(),
-            record_write_scratch: AlignedVec::new(),
-            record_read_scratch: Vec::new(),
-            pressure_prepare_in_progress: false,
-        })
+    pub fn new_with_namespace(
+        base_path: PathBuf,
+        namespace: impl Into<String>,
+        bucket_count: usize,
+    ) -> io::Result<Self> {
+        Self::open_with_namespace(base_path, namespace, bucket_count)
     }
 
     /// Open an existing store for reading history runs from disk
     pub fn from_existing(base_path: PathBuf, bucket_count: usize) -> io::Result<Self> {
-        let mut store = Self::new_with_config(base_path, bucket_count)?;
+        Self::from_existing_with_namespace(base_path, DEFAULT_NAMESPACE.to_string(), bucket_count)
+    }
+
+    pub fn from_existing_with_namespace(
+        base_path: PathBuf,
+        namespace: impl Into<String>,
+        bucket_count: usize,
+    ) -> io::Result<Self> {
+        let mut store = Self::open_with_namespace(base_path, namespace, bucket_count)?;
         store.load_history_runs_from_disk()?;
         store.load_spill_runs_from_disk()?;
         store.load_work_segments_from_disk()?;
@@ -957,49 +1255,29 @@ impl GenerationStore {
 
     fn load_history_runs_from_disk(&mut self) -> io::Result<()> {
         self.history_runs = (0..self.bucket_count).map(|_| Vec::new()).collect();
+        self.history_run_counts = vec![0; self.bucket_count];
+        self.history_run_bytes = vec![0; self.bucket_count];
         self.seen_len_accepted = 0;
 
         for bucket in 0..self.bucket_count {
-            let history_dir = self
-                .base_path
-                .join("history")
-                .join(format!("b={:02}", bucket));
-            if !history_dir.exists() {
-                continue;
-            }
-
-            let mut entries: Vec<PathBuf> = fs::read_dir(&history_dir)?
-                .filter_map(|res| res.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file())
-                .collect();
+            let mut entries = self.history_collection(bucket)?.segment_paths()?;
             entries.sort();
 
             for path in &entries {
-                let mut reader = OrthoStreamReader::new(path, 64 * 1024)?;
-                while let Some(result) = reader.next() {
-                    result.map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Failed to decode ortho in {:?}: {}", path, e),
-                        )
-                    })?;
-                    self.seen_len_accepted += 1;
-                }
+                self.seen_len_accepted = self
+                    .seen_len_accepted
+                    .saturating_add(self.path_record_count(path, true)?);
             }
 
             self.history_runs[bucket] = entries;
+            self.refresh_history_bucket_stats(bucket);
         }
 
         Ok(())
     }
 
     fn spill_root(&self) -> PathBuf {
-        self.base_path.join("spill")
-    }
-
-    fn spill_dir(&self, bucket: usize) -> PathBuf {
-        self.spill_root().join(format!("b={:02}", bucket))
+        self.base_path.join("spill").join(&self.namespace)
     }
 
     fn spill_manifest_path(&self) -> PathBuf {
@@ -1040,59 +1318,13 @@ impl GenerationStore {
 
     fn load_spill_runs_from_disk(&mut self) -> io::Result<()> {
         self.spill_runs = (0..self.bucket_count).map(|_| Vec::new()).collect();
-        let mut per_bucket: Vec<BTreeMap<PathBuf, u64>> =
-            (0..self.bucket_count).map(|_| BTreeMap::new()).collect();
-
-        let manifest_path = self.spill_manifest_path();
-        if let Ok(contents) = fs::read_to_string(&manifest_path) {
-            for line in contents.lines() {
-                let mut parts = line.splitn(3, '\t');
-                let Some(bucket_str) = parts.next() else {
-                    continue;
-                };
-                let Some(path_str) = parts.next() else {
-                    continue;
-                };
-                let size_bytes = parts
-                    .next()
-                    .and_then(|part| part.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let Ok(bucket) = bucket_str.parse::<usize>() else {
-                    continue;
-                };
-                if bucket >= self.bucket_count {
-                    continue;
-                }
-                let path = PathBuf::from(path_str);
-                let full_path = if path.is_absolute() {
-                    path
-                } else {
-                    self.base_path.join(path)
-                };
-                let size = if size_bytes > 0 {
-                    size_bytes
-                } else {
-                    fs::metadata(&full_path).map(|meta| meta.len()).unwrap_or(0)
-                };
-                per_bucket[bucket].insert(full_path, size);
-            }
-        }
 
         for bucket in 0..self.bucket_count {
-            let spill_dir = self.spill_dir(bucket);
-            if spill_dir.exists() {
-                for entry in fs::read_dir(&spill_dir)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_file() {
-                        let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-                        per_bucket[bucket].insert(path, size);
-                    }
-                }
-            }
-            self.spill_runs[bucket] = per_bucket[bucket]
-                .iter()
-                .map(|(path, size_bytes)| TrackedSpillRun::new(path.clone(), *size_bytes))
+            self.spill_runs[bucket] = self
+                .spill_collection(bucket)?
+                .segment_paths()?
+                .into_iter()
+                .map(|path| TrackedSpillRun::new(path.clone(), self.path_size_bytes(&path)))
                 .collect();
         }
 
@@ -1102,45 +1334,13 @@ impl GenerationStore {
     fn load_work_segments_from_disk(&mut self) -> io::Result<()> {
         self.work_segments.clear();
         self.total_work_len = 0;
-        self.work_segment_counter = 0;
-
-        let work_dir = self.base_path.join("work");
-        if !work_dir.exists() {
-            return Ok(());
-        }
-
-        let mut entries: Vec<(usize, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&work_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let file_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            let Some(segment_id) = file_name
-                .strip_prefix("segment-")
-                .and_then(|rest| rest.strip_suffix(".dat"))
-                .and_then(|rest| rest.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            entries.push((segment_id, path));
-        }
-
-        entries.sort_by_key(|(segment_id, _)| *segment_id);
-        for (segment_id, path) in entries {
-            let resolved_path = resolve_managed_path(&path)?;
-            let mut file = File::open(&resolved_path)?;
-            let mut count_bytes = [0u8; 8];
-            if file.read_exact(&mut count_bytes).is_err() {
-                continue;
-            }
-            let count = u64::from_le_bytes(count_bytes);
+        for path in self.work_collection()?.segment_paths()? {
+            let count = self
+                .tiered_store
+                .segment_ref_for_path(&path)?
+                .map(|segment| segment.record_count)
+                .unwrap_or(0);
             self.total_work_len = self.total_work_len.saturating_add(count);
-            self.work_segment_counter = self.work_segment_counter.max(segment_id.saturating_add(1));
             self.work_segments.push_back(path);
         }
 
@@ -1150,49 +1350,38 @@ impl GenerationStore {
     fn load_landing_state_from_disk(&mut self) -> io::Result<()> {
         self.landing_counts = vec![0; self.bucket_count];
         self.landing_buffer_sizes = vec![0; self.bucket_count];
+        self.landing_file_bytes = vec![0; self.bucket_count];
         self.drain_counter = vec![0; self.bucket_count];
 
         for bucket in 0..self.bucket_count {
-            let landing_dir = self
-                .base_path
-                .join("landing")
-                .join(format!("b={:02}", bucket));
-            if !landing_dir.exists() {
-                continue;
-            }
-
-            let mut next_drain_id = 0usize;
+            let landing = self.landing_collection(bucket)?;
+            let sealed = landing.sealed_paths()?;
             let mut total_count = 0usize;
-
-            let mut entries: Vec<PathBuf> = fs::read_dir(&landing_dir)?
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|path| path.is_file())
-                .collect();
-            entries.sort();
-
-            for path in entries {
-                let file_name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                if let Some(drain_id) = file_name
-                    .strip_prefix("drain-")
-                    .and_then(|rest| rest.strip_suffix(".log"))
-                    .and_then(|rest| rest.parse::<usize>().ok())
-                {
-                    next_drain_id = next_drain_id.max(drain_id.saturating_add(1));
+            let mut total_bytes = 0u64;
+            for path in sealed {
+                if let Some(segment) = self.tiered_store.segment_ref_for_path(&path)? {
+                    total_count = total_count.saturating_add(segment.record_count as usize);
+                    total_bytes = total_bytes.saturating_add(segment.bytes);
+                } else {
+                    total_count = total_count.saturating_add(count_ortho_records_in_file(
+                        &path,
+                        64 * 1024,
+                        true,
+                    )?);
+                    total_bytes = total_bytes.saturating_add(file_size_or_zero(&path));
                 }
-
-                let compressed = file_name != "active.log";
-                total_count = total_count.saturating_add(count_ortho_records_in_file(
-                    &path,
-                    64 * 1024,
-                    compressed,
-                )?);
             }
-
-            self.drain_counter[bucket] = next_drain_id;
+            let head_path = landing.head_path()?;
+            if head_path.exists() {
+                total_count = total_count.saturating_add(count_ortho_records_in_file(
+                    &head_path,
+                    64 * 1024,
+                    false,
+                )?);
+                total_bytes = total_bytes.saturating_add(file_size_or_zero(&head_path));
+            }
             self.landing_counts[bucket] = total_count;
+            self.landing_file_bytes[bucket] = total_bytes;
         }
 
         Ok(())
@@ -1203,8 +1392,12 @@ impl GenerationStore {
     }
 
     fn clear_spill_runs_for_bucket(&mut self, bucket: usize) -> io::Result<()> {
+        let removed = self.spill_collection(bucket)?.clear()?;
         self.spill_runs[bucket].clear();
         self.persist_spill_manifest()?;
+        for path in removed {
+            self.tiered_store.delete_segment_if_unreferenced(&path)?;
+        }
         self.sync_spill_metrics();
         Ok(())
     }
@@ -1213,7 +1406,12 @@ impl GenerationStore {
     where
         I: IntoIterator<Item = TrackedSpillRun>,
     {
-        self.spill_runs[bucket].extend(paths);
+        let spill_collection = self.spill_collection(bucket)?;
+        let collected: Vec<TrackedSpillRun> = paths.into_iter().collect();
+        for run in &collected {
+            spill_collection.push_back_path(&run.path)?;
+        }
+        self.spill_runs[bucket].extend(collected);
         self.spill_runs[bucket].sort();
         self.persist_spill_manifest()?;
         self.sync_spill_metrics();
@@ -1222,53 +1420,41 @@ impl GenerationStore {
 
     /// Create a new empty generation store
     pub fn new() -> Self {
-        Self {
-            base_path: PathBuf::from("fold_state"),
-            bucket_count: 8,
-            bucket_writers: (0..8).map(|_| None).collect(),
-            drain_counter: vec![0; 8],
-            landing_buffer_sizes: vec![0; 8],
-            landing_counts: vec![0; 8],
-            work_segments: VecDeque::new(),
-            work_segment_counter: 0,
-            total_work_len: 0,
-            work_queue_cache: VecDeque::new(),
-            work_queue_cache_bytes: 0,
-            work_queue_cache_max_bytes: 1024 * 1024,
-            work_segment_batch: Vec::new(),
-            work_segment_batch_bytes: 0,
-            work_segment_batch_max_bytes: 256 * 1024,
-            cached_best_score: Cell::new(None),
-            cached_best_ortho: RefCell::new(None),
-            best_score_dirty: Cell::new(false),
-            bufwriter_capacity: 16 * 1024 * 1024,
-            landing_flush_threshold: 10 * 1024 * 1024,
-            compaction_arena_cap_bytes: 256 * 1024 * 1024,
-            spill_runs: (0..8).map(|_| Vec::new()).collect(),
-            history_runs: (0..8).map(|_| Vec::new()).collect(),
-            seen_len_accepted: 0,
-            history_cache: std::collections::HashMap::new(),
-            compression_stats: CompressionStats::default(),
-            record_write_scratch: AlignedVec::new(),
-            record_read_scratch: Vec::new(),
-            pressure_prepare_in_progress: false,
-        }
+        Self::new_with_config(PathBuf::from("fold_state"), 8).expect("default generation store")
+    }
+
+    fn work_collection(&self) -> io::Result<QueueCollection> {
+        Ok(self.work_collection.clone())
+    }
+
+    fn spill_collection(&self, bucket: usize) -> io::Result<QueueCollection> {
+        Ok(self.spill_collections[bucket].clone())
+    }
+
+    fn history_collection(&self, bucket: usize) -> io::Result<RunSetCollection> {
+        Ok(self.history_collections[bucket].clone())
+    }
+
+    fn landing_collection(&self, bucket: usize) -> io::Result<crate::tiered_store::LogCollection> {
+        Ok(self.landing_collections[bucket].clone())
     }
 
     /// Get path to active log for a bucket
     fn active_log_path(&self, bucket: usize) -> PathBuf {
-        self.base_path
-            .join("landing")
-            .join(format!("b={:02}", bucket))
-            .join("active.log")
+        self.landing_collection(bucket)
+            .and_then(|landing| landing.head_path())
+            .unwrap_or_else(|_| {
+                self.base_path
+                    .join("heads")
+                    .join(&self.namespace)
+                    .join(format!("landing-b={:02}.head", bucket))
+            })
     }
 
-    /// Get path to drain log for a bucket
-    fn drain_log_path(&self, bucket: usize, drain_id: usize) -> PathBuf {
-        self.base_path
-            .join("landing")
-            .join(format!("b={:02}", bucket))
-            .join(format!("drain-{}.log", drain_id))
+    fn clear_landing_bucket(&mut self, bucket: usize) {
+        self.landing_counts[bucket] = 0;
+        self.landing_buffer_sizes[bucket] = 0;
+        self.landing_file_bytes[bucket] = 0;
     }
 
     /// Record a result to the landing zone
@@ -1316,28 +1502,46 @@ impl GenerationStore {
             self.bucket_writers[bucket].take();
         }
 
+        let landing = self.landing_collection(bucket)?;
         let active_path = self.active_log_path(bucket);
+        if active_path.exists() {
+            let drain_id = self.drain_counter[bucket];
+            self.drain_counter[bucket] += 1;
+            let temp_path = self
+                .base_path
+                .join("heads")
+                .join(&self.namespace)
+                .join(format!("landing-{:02}-drain-{}.tmp", bucket, drain_id));
+            if let Some(parent) = temp_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
 
-        // Check if active log exists
-        if !active_path.exists() {
-            return Ok(RawStream::new(vec![]));
+            fs::rename(&active_path, &temp_path)?;
+            if temp_path.exists() {
+                let (unc, comp) = compress_file(&temp_path, 3)?;
+                self.compression_stats.record(unc, comp);
+                let record_count =
+                    count_ortho_records_in_file(&temp_path, self.read_buf_bytes, true)? as u64;
+                let sealed_path = self.tiered_store.import_file_as_segment(
+                    &temp_path,
+                    "landing",
+                    "zstd",
+                    "unsorted",
+                    record_count,
+                    true,
+                )?;
+                landing.append_sealed_path(&sealed_path)?;
+            }
         }
 
-        // Rename to drain file
-        let drain_id = self.drain_counter[bucket];
-        self.drain_counter[bucket] += 1;
-        let drain_path = self.drain_log_path(bucket, drain_id);
-
-        fs::rename(&active_path, &drain_path)?;
-        if drain_path.exists() {
-            let (unc, comp) = compress_file(&drain_path, 3)?;
-            self.compression_stats.record(unc, comp);
-        }
-        // Landing for this bucket has been drained; reset counters.
-        self.landing_counts[bucket] = 0;
         self.landing_buffer_sizes[bucket] = 0;
+        let mut files = landing.take_sealed_paths()?;
+        files.sort();
+        if files.is_empty() {
+            self.clear_landing_bucket(bucket);
+        }
 
-        Ok(RawStream::new(vec![drain_path]))
+        Ok(RawStream::new(files))
     }
 
     /// Push a segment of work items to the work queue
@@ -1400,6 +1604,7 @@ impl GenerationStore {
                 false,
             )?
         };
+        self.work_collection()?.push_back_path(&segment_path)?;
         self.work_segments.push_back(segment_path);
         self.total_work_len += count;
         self.work_segment_batch_bytes = 0;
@@ -1446,13 +1651,8 @@ impl GenerationStore {
         )?;
         disk_safety::ensure_write_budget(bytes_needed, reason)?;
 
-        let segment_path = self
-            .base_path
-            .join("work")
-            .join(format!("segment-{}.dat", self.work_segment_counter));
-        self.work_segment_counter += 1;
-
-        let mut file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&segment_path)?);
+        let allocated = self.tiered_store.allocate_segment("work", "raw", "fifo")?;
+        let mut file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&allocated.path)?);
         file.write_all(&count.to_le_bytes())?;
         for ortho in items {
             let encoded_len = serialize_ortho_into_scratch(ortho, &mut self.record_write_scratch)?;
@@ -1460,7 +1660,10 @@ impl GenerationStore {
             file.write_all(&self.record_write_scratch[..encoded_len])?;
         }
         file.flush()?;
-        Ok(segment_path)
+        let bytes = fs::metadata(&allocated.path)?.len();
+        self.tiered_store
+            .commit_allocated_segment(&allocated, bytes, count)?;
+        Ok(allocated.path)
     }
 
     fn spill_work_queue_cache_to_disk(&mut self) -> io::Result<bool> {
@@ -1476,6 +1679,7 @@ impl GenerationStore {
             "spill work queue cache",
             false,
         )?;
+        self.work_collection()?.push_front_path(&segment_path)?;
         self.work_segments.push_front(segment_path);
         self.work_queue_cache.clear();
         self.work_queue_cache_bytes = 0;
@@ -1500,6 +1704,8 @@ impl GenerationStore {
         if let Some(writer) = self.bucket_writers[bucket].as_mut() {
             writer.flush()?;
         }
+        self.landing_file_bytes[bucket] = self.landing_file_bytes[bucket]
+            .saturating_add(self.landing_buffer_sizes[bucket] as u64);
         self.landing_buffer_sizes[bucket] = 0;
         Ok(())
     }
@@ -1574,11 +1780,14 @@ impl GenerationStore {
 
             if count == 0 {
                 drop(file);
+                let _ = self.work_collection()?.pop_front_path()?;
                 match fs::remove_file(&segment_path) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
                 }
+                self.tiered_store
+                    .delete_segment_if_unreferenced(&segment_path)?;
                 continue;
             }
 
@@ -1621,11 +1830,14 @@ impl GenerationStore {
             self.sync_memory_metrics();
 
             drop(file);
+            let _ = self.work_collection()?.pop_front_path()?;
             match fs::remove_file(&segment_path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
+            self.tiered_store
+                .delete_segment_if_unreferenced(&segment_path)?;
         }
 
         Ok(())
@@ -1638,6 +1850,7 @@ impl GenerationStore {
         self.bufwriter_capacity = cfg.bufwriter_capacity;
         self.landing_flush_threshold = cfg.landing_flush_threshold;
         self.compaction_arena_cap_bytes = cfg.run_budget_bytes;
+        self.read_buf_bytes = cfg.read_buf_bytes.max(64 * 1024);
         self.sync_runtime_metrics();
     }
 
@@ -1652,17 +1865,43 @@ impl GenerationStore {
         landing_flush.max(work_flush)
     }
 
-    pub fn prepare_for_reclaim(&mut self) -> io::Result<()> {
+    fn pressure_spill_to_local_runs_with_current_config(
+        &mut self,
+    ) -> io::Result<PressureSpillStats> {
+        let cfg = Config {
+            run_budget_bytes: self.compaction_arena_cap_bytes,
+            fan_in: 8,
+            read_buf_bytes: self.read_buf_bytes,
+            allow_compaction: false,
+            work_queue_cache_bytes: self.work_queue_cache_max_bytes,
+            bufwriter_capacity: self.bufwriter_capacity,
+            work_segment_max_bytes: self.work_segment_batch_max_bytes,
+            history_cache_bytes: 0,
+            landing_flush_threshold: self.landing_flush_threshold,
+        };
+        self.pressure_spill_to_local_runs(&cfg)
+    }
+
+    pub fn prepare_for_reclaim(&mut self) -> io::Result<PressurePrepareStats> {
         if self.pressure_prepare_in_progress {
-            return Ok(());
+            return Ok(PressurePrepareStats::default());
         }
         self.pressure_prepare_in_progress = true;
-        let result = (|| -> io::Result<()> {
+        let result = (|| -> io::Result<PressurePrepareStats> {
+            let landing_bytes_before = self.total_landing_bytes();
             self.flush_all_without_pressure()?;
-            let _ = self.spill_work_queue_cache_to_disk()?;
+            let spill_stats = self.pressure_spill_to_local_runs_with_current_config()?;
+            let work_cache_spilled = self.spill_work_queue_cache_to_disk()?;
             self.sync_memory_metrics();
             GenerationStore::set_compaction_bytes(0);
-            Ok(())
+            Ok(PressurePrepareStats {
+                landing_bytes_before,
+                landing_bytes_after_local_spill: self.total_landing_bytes(),
+                buckets_drained: spill_stats.buckets_drained,
+                spill_runs_created: spill_stats.spill_runs_created,
+                spill_bytes_created: spill_stats.spill_bytes_created,
+                work_cache_spilled,
+            })
         })();
         self.pressure_prepare_in_progress = false;
         result
@@ -1671,12 +1910,12 @@ impl GenerationStore {
     fn maybe_reclaim_before_write(&mut self, bytes_needed: u64, reason: &str) -> io::Result<()> {
         let mut prepared = false;
         if memory_safety::should_spill_to_disk() {
-            self.prepare_for_reclaim()?;
+            let _ = self.prepare_for_reclaim()?;
             prepared = true;
         }
         if disk_safety::reclaim_required(bytes_needed)?.is_some() {
             if !prepared {
-                self.prepare_for_reclaim()?;
+                let _ = self.prepare_for_reclaim()?;
             }
             let _ = disk_safety::maybe_reclaim(bytes_needed, reason)?;
         }
@@ -1774,8 +2013,26 @@ impl GenerationStore {
         &self.base_path
     }
 
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
     pub fn bucket_count(&self) -> usize {
         self.bucket_count
+    }
+
+    fn own_or_import_segment(
+        &self,
+        path: &Path,
+        kind: &str,
+        ordering: &str,
+        record_count: u64,
+    ) -> io::Result<PathBuf> {
+        if self.tiered_store.segment_ref_for_path(path)?.is_some() {
+            return Ok(path.to_path_buf());
+        }
+        self.tiered_store
+            .import_file_as_segment(path, kind, "zstd", ordering, record_count, true)
     }
 
     /// Prune history runs using the optimistic bound; returns (kept, pruned) counts.
@@ -1818,6 +2075,7 @@ impl GenerationStore {
                 fs::create_dir_all(&tmp_parent)?;
                 let mut writer = BufWriter::new(File::create(&tmp_path)?);
                 let mut wrote_any = false;
+                let mut kept_in_run = 0u64;
 
                 while let Some(item) = reader.next() {
                     let streamed = item?;
@@ -1829,6 +2087,7 @@ impl GenerationStore {
                     }
                     write_ortho_record(&mut writer, &ortho, Some(&mut self.compression_stats))?;
                     kept = kept.saturating_add(1);
+                    kept_in_run = kept_in_run.saturating_add(1);
                     wrote_any = true;
                 }
                 writer.flush()?;
@@ -1839,13 +2098,20 @@ impl GenerationStore {
 
                 if wrote_any {
                     fs::rename(&tmp_path, &run_path)?;
+                    let refreshed_bytes = self.path_size_bytes(&run_path);
+                    self.tiered_store.update_segment_stats_for_path(
+                        &run_path,
+                        refreshed_bytes,
+                        kept_in_run,
+                    )?;
                     new_runs.push(run_path);
                 } else {
-                    let _ = fs::remove_file(&run_path);
+                    let _ = delete_managed_or_local(&run_path);
                     let _ = fs::remove_file(&tmp_path);
                 }
             }
             self.history_runs[bucket] = new_runs;
+            self.refresh_history_bucket_stats(bucket);
         }
 
         Ok((kept, pruned))
@@ -1855,20 +2121,13 @@ impl GenerationStore {
     /// The run is moved to the history directory and tracked
     pub fn add_history_run(&mut self, bucket: usize, run: Run, accepted: u64) -> io::Result<()> {
         assert!(bucket < self.bucket_count, "Invalid bucket index");
-
-        // Move run file to history directory with unique name
-        let history_dir = self
-            .base_path
-            .join("history")
-            .join(format!("b={:02}", bucket));
-        let run_id = self.history_runs[bucket].len();
-        let dest_path = history_dir.join(format!("history-{}.dat", run_id));
-
-        // Move the run file to history
-        fs::rename(run.path(), &dest_path)?;
-
-        // Track the history run
+        let record_count =
+            count_ortho_records_in_file(run.path(), self.read_buf_bytes, true)? as u64;
+        let dest_path =
+            self.own_or_import_segment(run.path(), "history", "sorted", record_count)?;
+        self.history_collection(bucket)?.append_path(&dest_path)?;
         self.history_runs[bucket].push(dest_path);
+        self.refresh_history_bucket_stats(bucket);
 
         // Update accepted count (monotonic)
         self.seen_len_accepted += accepted;
@@ -1885,18 +2144,15 @@ impl GenerationStore {
     ) -> io::Result<()> {
         for (bucket, runs) in runs_by_bucket {
             assert!(*bucket < self.bucket_count, "Invalid bucket index");
-            let history_dir = self
-                .base_path
-                .join("history")
-                .join(format!("b={:02}", bucket));
-            fs::create_dir_all(&history_dir)?;
-
             for run_path in runs {
-                let run_id = self.history_runs[*bucket].len();
-                let dest_path = history_dir.join(format!("history-{}.dat", run_id));
-                fs::rename(run_path, &dest_path)?;
+                let record_count =
+                    count_ortho_records_in_file(run_path, self.read_buf_bytes, true)? as u64;
+                let dest_path =
+                    self.own_or_import_segment(run_path, "history", "sorted", record_count)?;
+                self.history_collection(*bucket)?.append_path(&dest_path)?;
                 self.history_runs[*bucket].push(dest_path);
             }
+            self.refresh_history_bucket_stats(*bucket);
         }
 
         self.seen_len_accepted = self.seen_len_accepted.saturating_add(accepted);
@@ -1925,7 +2181,7 @@ impl GenerationStore {
         }
 
         // Best-effort cleanup of the consumed run file
-        let _ = fs::remove_file(run.path());
+        let _ = delete_managed_or_local(run.path());
 
         Ok(count)
     }
@@ -1940,27 +2196,31 @@ impl GenerationStore {
         self.landing_counts.iter().sum()
     }
 
+    pub fn total_landing_bytes(&self) -> u64 {
+        self.landing_file_bytes
+            .iter()
+            .zip(self.landing_buffer_sizes.iter())
+            .map(|(file_bytes, buffered_bytes)| file_bytes.saturating_add(*buffered_bytes as u64))
+            .sum()
+    }
+
     /// Get per-bucket statistics for TUI visualization
     pub fn bucket_stats(&self) -> Vec<BucketStats> {
         (0..self.bucket_count)
             .map(|bucket| {
-                let run_count = self.history_runs[bucket].len();
+                let run_count = self.history_run_counts[bucket];
 
                 // Landing count represents orthos pending acceptance (buffer + active log)
                 let landing_size = self.landing_counts[bucket];
-
-                // Estimate history size from run files
-                let history_size_estimate = self.history_runs[bucket]
-                    .iter()
-                    .filter_map(|path| std::fs::metadata(path).ok())
-                    .map(|m| m.len() as usize)
-                    .sum();
+                let landing_bytes = self.landing_file_bytes[bucket]
+                    .saturating_add(self.landing_buffer_sizes[bucket] as u64);
 
                 BucketStats {
                     bucket_id: bucket,
                     run_count,
                     landing_size,
-                    history_size_estimate,
+                    landing_bytes,
+                    history_size_estimate: self.history_run_bytes[bucket] as usize,
                 }
             })
             .collect()
@@ -1980,25 +2240,18 @@ impl GenerationStore {
                 bucket,
                 raw,
                 cfg,
+                Some(&self.tiered_store),
                 &self.base_path,
                 false,
                 Some(&mut self.compression_stats),
             )?;
             let mut tracked_paths = Vec::with_capacity(runs.len());
             for run in runs {
-                let file_name = run
-                    .path()
-                    .file_name()
-                    .map(|name| name.to_owned())
-                    .unwrap_or_else(|| std::ffi::OsString::from("spill-run.dat"));
-                let spill_path = self.spill_dir(bucket).join(file_name);
-                if let Some(parent) = spill_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(run.path(), &spill_path)?;
-                let size_bytes = fs::metadata(&spill_path)
-                    .map(|meta| meta.len())
-                    .unwrap_or(0);
+                let record_count =
+                    count_ortho_records_in_file(run.path(), self.read_buf_bytes, true)? as u64;
+                let spill_path =
+                    self.own_or_import_segment(run.path(), "spill", "sorted", record_count)?;
+                let size_bytes = file_size_or_zero(&spill_path);
                 tracked_paths.push(TrackedSpillRun::new(spill_path, size_bytes));
             }
             stats.spill_runs_created += tracked_paths.len();
@@ -2006,6 +2259,7 @@ impl GenerationStore {
                 .spill_bytes_created
                 .saturating_add(tracked_paths.iter().map(|run| run.size_bytes).sum::<u64>());
             self.extend_spill_runs(bucket, tracked_paths)?;
+            self.clear_landing_bucket(bucket);
         }
         if let Some(metrics) = metrics_handle() {
             metrics
@@ -2171,10 +2425,12 @@ impl GenerationStore {
                 bucket,
                 raw,
                 cfg,
+                Some(&self.tiered_store),
                 &self.base_path,
                 false,
                 Some(&mut self.compression_stats),
             )?;
+            self.clear_landing_bucket(bucket);
             runs.extend(raw_runs);
 
             if runs.is_empty() {
@@ -2213,6 +2469,7 @@ impl GenerationStore {
             let unique_run = merge_unique(
                 runs,
                 cfg,
+                Some(&self.tiered_store),
                 &self.base_path,
                 Some(&mut self.compression_stats),
             )?;
@@ -2236,6 +2493,7 @@ impl GenerationStore {
             let (new_work_run, seen_run, accepted) = anti_join_orthos(
                 unique_run,
                 history_iter,
+                Some(&self.tiered_store),
                 &self.base_path,
                 cfg.read_buf_bytes,
                 Some(&mut self.compression_stats),
@@ -2359,27 +2617,24 @@ impl GenerationStore {
         let merged = merge_unique(
             runs_to_merge,
             cfg,
+            Some(&self.tiered_store),
             &self.base_path,
             Some(&mut self.compression_stats),
         )?;
-
-        // Move merged run to history with next available ID
-        let history_dir = self
-            .base_path
-            .join("history")
-            .join(format!("b={:02}", bucket));
-        let new_run_id = self.history_runs[bucket].len();
-        let dest_path = history_dir.join(format!("history-{}.dat", new_run_id));
-        fs::rename(merged.path(), &dest_path)?;
-
-        // Remove old runs from tracking and delete their files
-        let old_runs: Vec<PathBuf> = self.history_runs[bucket].drain(..merge_count).collect();
+        let record_count =
+            count_ortho_records_in_file(merged.path(), self.read_buf_bytes, true)? as u64;
+        let dest_path =
+            self.own_or_import_segment(merged.path(), "history", "sorted", record_count)?;
+        let mut remaining = self.history_runs[bucket][merge_count..].to_vec();
+        remaining.push(dest_path.clone());
+        let old_runs = self.history_collection(bucket)?.replace_paths(&remaining)?;
         for old_path in old_runs {
-            let _ = fs::remove_file(&old_path); // Best effort deletion
+            let _ = delete_managed_or_local(&old_path);
+            self.tiered_store
+                .delete_segment_if_unreferenced(&old_path)?;
         }
-
-        // Add merged run to tracking
-        self.history_runs[bucket].push(dest_path);
+        self.history_runs[bucket] = remaining;
+        self.refresh_history_bucket_stats(bucket);
 
         Ok(())
     }
@@ -2392,6 +2647,7 @@ pub fn compact_landing(
     bucket: usize,
     raw: RawStream,
     cfg: &Config,
+    managed_store: Option<&TieredStore>,
     base_path: &PathBuf,
     offload_after_write: bool,
     mut stats: Option<&mut CompressionStats>,
@@ -2413,7 +2669,8 @@ pub fn compact_landing(
 
     // Read all drain files with bounded buffering
     for file_path in raw.files() {
-        let mut reader = OrthoStreamReader::new(file_path, cfg.read_buf_bytes)?;
+        let resolved_path = resolve_managed_path(file_path)?;
+        let mut reader = OrthoStreamReader::new(&resolved_path, cfg.read_buf_bytes)?;
         while let Some(result) = reader.next() {
             let streamed = result.map_err(|e| {
                 io::Error::new(
@@ -2426,11 +2683,15 @@ pub fn compact_landing(
                 // Flush before adding this item to keep arena under budget.
                 arena.sort_unstable_by_key(|o| o.id);
                 let run_id = RUN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-                let run_path = base_path
-                    .join("runs")
-                    .join(format!("b={:02}-run-{}.dat", bucket, run_id));
-
-                write_streamed_run(&arena, &run_path, offload_after_write, stats.as_deref_mut())?;
+                let output = RunOutputTarget::new(
+                    managed_store,
+                    base_path,
+                    format!("b={:02}-run-{}.dat", bucket, run_id),
+                    "run",
+                    "sorted",
+                )?;
+                let run_path =
+                    write_streamed_run(&arena, output, offload_after_write, stats.as_deref_mut())?;
                 runs.push(Run::new(run_path));
 
                 arena.clear();
@@ -2449,11 +2710,15 @@ pub fn compact_landing(
     if !arena.is_empty() {
         arena.sort_unstable_by_key(|o| o.id);
         let run_id = RUN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-        let run_path = base_path
-            .join("runs")
-            .join(format!("b={:02}-run-{}.dat", bucket, run_id));
-
-        write_streamed_run(&arena, &run_path, offload_after_write, stats.as_deref_mut())?;
+        let output = RunOutputTarget::new(
+            managed_store,
+            base_path,
+            format!("b={:02}-run-{}.dat", bucket, run_id),
+            "run",
+            "sorted",
+        )?;
+        let run_path =
+            write_streamed_run(&arena, output, offload_after_write, stats.as_deref_mut())?;
         runs.push(Run::new(run_path));
         arena.clear();
         arena.shrink_to_fit();
@@ -2462,7 +2727,7 @@ pub fn compact_landing(
 
     // Best-effort cleanup of drained landing files now that they are incorporated.
     for file_path in raw.files() {
-        let _ = fs::remove_file(file_path);
+        let _ = delete_managed_or_local(file_path);
     }
 
     Ok(runs)
@@ -2470,11 +2735,11 @@ pub fn compact_landing(
 
 fn write_streamed_run(
     arena: &[StreamedOrtho],
-    path: &PathBuf,
+    output: RunOutputTarget,
     offload_after_write: bool,
     mut stats: Option<&mut CompressionStats>,
-) -> io::Result<()> {
-    // Ensure parent directory exists
+) -> io::Result<PathBuf> {
+    let path = output.path().to_path_buf();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2487,7 +2752,7 @@ fn write_streamed_run(
         &format!("write run {}", path.display()),
     )?;
 
-    let mut writer = create_compressed_writer(path, 3, 64 * 1024)?;
+    let mut writer = create_compressed_writer(&path, 3, 64 * 1024)?;
     let mut uncompressed_bytes = 0u64;
     for streamed in arena {
         uncompressed_bytes = uncompressed_bytes.saturating_add(write_ortho_record_bytes(
@@ -2497,14 +2762,15 @@ fn write_streamed_run(
             None,
         )? as u64);
     }
-    let (unc, comp) = finish_compressed_writer(path, writer, uncompressed_bytes)?;
+    let (unc, comp) = finish_compressed_writer(&path, writer, uncompressed_bytes)?;
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
+    let final_path = output.commit(comp, arena.len() as u64)?;
     if offload_after_write {
-        maybe_offload_and_delete(path)?;
+        maybe_offload_and_delete(&final_path)?;
     }
-    Ok(())
+    Ok(final_path)
 }
 
 /// K-way merge with deduplication
@@ -2514,6 +2780,7 @@ fn write_streamed_run(
 pub fn merge_unique(
     mut runs: Vec<Run>,
     cfg: &Config,
+    managed_store: Option<&TieredStore>,
     base_path: &PathBuf,
     mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<UniqueRun> {
@@ -2529,7 +2796,7 @@ pub fn merge_unique(
 
     let cleanup_runs = |paths: &[Run]| {
         for r in paths {
-            let _ = fs::remove_file(r.path());
+            let _ = delete_managed_or_local(r.path());
         }
     };
 
@@ -2540,7 +2807,8 @@ pub fn merge_unique(
         let mut next_pass_runs = Vec::new();
 
         for chunk in runs.chunks(cfg.fan_in) {
-            let merged = merge_ortho_chunk(chunk, cfg, base_path, stats.as_deref_mut())?;
+            let merged =
+                merge_ortho_chunk(chunk, cfg, managed_store, base_path, stats.as_deref_mut())?;
             cleanup_runs(chunk);
             next_pass_runs.push(merged);
         }
@@ -2550,9 +2818,14 @@ pub fn merge_unique(
 
     // Final pass - merge all remaining runs into a UniqueRun
     let merge_id = MERGE_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-    let unique_path = base_path
-        .join("runs")
-        .join(format!("unique-{}.dat", merge_id));
+    let output = RunOutputTarget::new(
+        managed_store,
+        base_path,
+        format!("unique-{}.dat", merge_id),
+        "unique",
+        "sorted",
+    )?;
+    let unique_path = output.path().to_path_buf();
     let merge_memory_budget = runs
         .len()
         .saturating_mul(cfg.read_buf_bytes)
@@ -2612,6 +2885,7 @@ pub fn merge_unique(
 
     let mut last_written: Option<StreamedOrtho> = None;
     let mut uncompressed_bytes = 0u64;
+    let mut unique_record_count = 0u64;
 
     // K-way merge with deduplication by id + equality
     while let Some(item) = heap.pop() {
@@ -2629,6 +2903,7 @@ pub fn merge_unique(
                 streamed.decoded_size_est,
                 None,
             )? as u64);
+            unique_record_count = unique_record_count.saturating_add(1);
             last_written = Some(streamed);
         } else {
             // Keep last_written so adjacent duplicates continue to collapse correctly
@@ -2651,6 +2926,7 @@ pub fn merge_unique(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
+    let unique_path = output.commit(comp, unique_record_count)?;
     cleanup_runs(&runs);
 
     Ok(UniqueRun::new(unique_path))
@@ -2660,6 +2936,7 @@ pub fn merge_unique(
 fn merge_ortho_chunk(
     runs: &[Run],
     cfg: &Config,
+    managed_store: Option<&TieredStore>,
     base_path: &PathBuf,
     mut stats: Option<&mut CompressionStats>,
 ) -> io::Result<Run> {
@@ -2669,9 +2946,14 @@ fn merge_ortho_chunk(
     static CHUNK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let chunk_id = CHUNK_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
-    let chunk_path = base_path
-        .join("runs")
-        .join(format!("chunk-{}.dat", chunk_id));
+    let output = RunOutputTarget::new(
+        managed_store,
+        base_path,
+        format!("chunk-{}.dat", chunk_id),
+        "chunk",
+        "sorted",
+    )?;
+    let chunk_path = output.path().to_path_buf();
     let merge_memory_budget = runs
         .len()
         .saturating_mul(cfg.read_buf_bytes)
@@ -2728,6 +3010,7 @@ fn merge_ortho_chunk(
 
     // No deduplication in intermediate passes - just merge
     let mut uncompressed_bytes = 0u64;
+    let mut chunk_record_count = 0u64;
     while let Some(item) = heap.pop() {
         let streamed = current_orthos[item.run_idx].take().unwrap();
         uncompressed_bytes = uncompressed_bytes.saturating_add(write_ortho_record_bytes(
@@ -2736,6 +3019,7 @@ fn merge_ortho_chunk(
             streamed.decoded_size_est,
             None,
         )? as u64);
+        chunk_record_count = chunk_record_count.saturating_add(1);
 
         if let Some(result) = iterators[item.run_idx].next() {
             let streamed = result?;
@@ -2752,7 +3036,7 @@ fn merge_ortho_chunk(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    Ok(Run::new(chunk_path))
+    Ok(Run::new(output.commit(comp, chunk_record_count)?))
 }
 
 /// Anti-join: streaming merge that emits orthos from gen that are NOT in history
@@ -2769,6 +3053,7 @@ fn merge_ortho_chunk(
 pub fn anti_join_orthos(
     unique_gen: UniqueRun,
     mut history: impl Iterator<Item = io::Result<StreamedOrtho>>,
+    managed_store: Option<&TieredStore>,
     base_path: &PathBuf,
     read_buf_bytes: usize,
     mut stats: Option<&mut CompressionStats>,
@@ -2792,20 +3077,32 @@ pub fn anti_join_orthos(
             &format!("anti join {}", anti_join_id),
         )?;
     }
-    let seen_run_path = base_path
-        .join("runs")
-        .join(format!("seen-{}.dat", anti_join_id));
+    let seen_output = RunOutputTarget::new(
+        managed_store,
+        base_path,
+        format!("seen-{}.dat", anti_join_id),
+        "seen",
+        "sorted",
+    )?;
+    let seen_run_path = seen_output.path().to_path_buf();
     let mut seen_writer = create_compressed_writer(&seen_run_path, 3, 64 * 1024)?;
 
-    let new_work_path = base_path
-        .join("runs")
-        .join(format!("new-work-{}.dat", anti_join_id));
+    let new_work_output = RunOutputTarget::new(
+        managed_store,
+        base_path,
+        format!("new-work-{}.dat", anti_join_id),
+        "new-work",
+        "sorted",
+    )?;
+    let new_work_path = new_work_output.path().to_path_buf();
     let mut new_work_writer = create_compressed_writer(&new_work_path, 3, 64 * 1024)?;
 
     let mut gen_iter = unique_gen.iter(read_buf_bytes)?;
     let mut accepted_count = 0u64;
     let mut seen_uncompressed_bytes = 0u64;
     let mut new_work_uncompressed_bytes = 0u64;
+    let mut seen_record_count = 0u64;
+    let mut new_work_record_count = 0u64;
 
     // Current values from each stream
     let mut gen_val = gen_iter.next().transpose()?;
@@ -2821,6 +3118,7 @@ pub fn anti_join_orthos(
                     write_ortho_record_bytes(&mut seen_writer, &g.bytes, g.decoded_size_est, None)?
                         as u64,
                 );
+                seen_record_count = seen_record_count.saturating_add(1);
                 new_work_uncompressed_bytes =
                     new_work_uncompressed_bytes.saturating_add(write_ortho_record_bytes(
                         &mut new_work_writer,
@@ -2828,6 +3126,7 @@ pub fn anti_join_orthos(
                         g.decoded_size_est,
                         None,
                     )? as u64);
+                new_work_record_count = new_work_record_count.saturating_add(1);
                 accepted_count += 1;
                 gen_val = gen_iter.next().transpose()?;
             }
@@ -2846,6 +3145,7 @@ pub fn anti_join_orthos(
                                 None,
                             )? as u64,
                         );
+                        seen_record_count = seen_record_count.saturating_add(1);
                         new_work_uncompressed_bytes = new_work_uncompressed_bytes.saturating_add(
                             write_ortho_record_bytes(
                                 &mut new_work_writer,
@@ -2854,6 +3154,7 @@ pub fn anti_join_orthos(
                                 None,
                             )? as u64,
                         );
+                        new_work_record_count = new_work_record_count.saturating_add(1);
                         accepted_count += 1;
                         gen_val = gen_iter.next().transpose()?;
                     }
@@ -2869,6 +3170,7 @@ pub fn anti_join_orthos(
                                     None,
                                 )? as u64,
                             );
+                            seen_record_count = seen_record_count.saturating_add(1);
                         } else {
                             // ID collision with different structure - treat as new
                             // Note: This is extremely rare and indicates hash collision
@@ -2880,6 +3182,7 @@ pub fn anti_join_orthos(
                                     None,
                                 )? as u64,
                             );
+                            seen_record_count = seen_record_count.saturating_add(1);
                             new_work_uncompressed_bytes = new_work_uncompressed_bytes
                                 .saturating_add(write_ortho_record_bytes(
                                     &mut new_work_writer,
@@ -2887,6 +3190,7 @@ pub fn anti_join_orthos(
                                     g.decoded_size_est,
                                     None,
                                 )? as u64);
+                            new_work_record_count = new_work_record_count.saturating_add(1);
                             accepted_count += 1;
                         }
                         gen_val = gen_iter.next().transpose()?;
@@ -2909,6 +3213,8 @@ pub fn anti_join_orthos(
         s.record(seen_unc, seen_comp);
         s.record(new_work_unc, new_work_comp);
     }
+    let seen_run_path = seen_output.commit(seen_comp, seen_record_count)?;
+    let new_work_path = new_work_output.commit(new_work_comp, new_work_record_count)?;
     Ok((
         Run::new(new_work_path),
         Run::new(seen_run_path),
@@ -2918,7 +3224,7 @@ pub fn anti_join_orthos(
 
 impl Drop for UniqueRun {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = delete_managed_or_local(&self.path);
     }
 }
 
@@ -2964,6 +3270,15 @@ mod tests {
         buf
     }
 
+    fn first_history_path(store: &GenerationStore) -> (usize, PathBuf) {
+        store
+            .history_runs
+            .iter()
+            .enumerate()
+            .find_map(|(bucket, runs)| runs.first().cloned().map(|path| (bucket, path)))
+            .expect("expected at least one history run")
+    }
+
     fn count_history_orthos(store: &GenerationStore, read_buf_bytes: usize) -> usize {
         let mut count = 0usize;
         for bucket in 0..store.bucket_count {
@@ -2976,6 +3291,22 @@ mod tests {
             }
         }
         count
+    }
+
+    fn write_managed_sorted_segment(store: &TieredStore, kind: &str, orthos: &[Ortho]) -> PathBuf {
+        let segment = store.allocate_segment(kind, "zstd", "sorted").unwrap();
+        let mut writer = create_compressed_writer(&segment.path, 3, 64 * 1024).unwrap();
+        let mut uncompressed_bytes = 0u64;
+        for ortho in orthos {
+            uncompressed_bytes = uncompressed_bytes
+                .saturating_add(write_ortho_record(&mut writer, ortho, None).unwrap() as u64);
+        }
+        let (_, compressed_bytes) =
+            finish_compressed_writer(&segment.path, writer, uncompressed_bytes).unwrap();
+        store
+            .commit_allocated_segment(&segment, compressed_bytes, orthos.len() as u64)
+            .unwrap();
+        segment.path
     }
 
     #[test]
@@ -3015,7 +3346,8 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, false, Some(&mut stats)).unwrap();
+        let runs =
+            compact_landing(bucket, raw, &cfg, None, &base_path, false, Some(&mut stats)).unwrap();
 
         assert_eq!(runs.len(), 1);
 
@@ -3071,7 +3403,8 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, false, Some(&mut stats)).unwrap();
+        let runs =
+            compact_landing(bucket, raw, &cfg, None, &base_path, false, Some(&mut stats)).unwrap();
 
         // Should produce multiple runs due to small budget
         assert!(runs.len() >= 1);
@@ -3183,9 +3516,10 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, true, Some(&mut stats)).unwrap();
+        let runs =
+            compact_landing(bucket, raw, &cfg, None, &base_path, true, Some(&mut stats)).unwrap();
 
-        // Offloader should have copied and runs should be deleted locally.
+        // Offloader should have copied and the original run paths should become markers.
         let uploaded = uploads.lock().unwrap();
         assert!(
             uploaded.len() >= runs.len(),
@@ -3194,7 +3528,8 @@ mod tests {
             uploaded.len()
         );
         for run in &runs {
-            assert!(!run.path().exists());
+            assert!(run.path().exists());
+            assert!(is_offload_marker(run.path()));
         }
         for dest in uploaded.iter() {
             assert!(dest.exists());
@@ -3505,7 +3840,8 @@ mod tests {
         fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let mut stats = CompressionStats::default();
-        let runs = compact_landing(bucket, raw, &cfg, &base_path, false, Some(&mut stats)).unwrap();
+        let runs =
+            compact_landing(bucket, raw, &cfg, None, &base_path, false, Some(&mut stats)).unwrap();
 
         // Collect and verify count
         let mut total = 0;
@@ -3556,6 +3892,186 @@ mod tests {
             }
         }
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn from_existing_restores_cached_bucket_stats() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+        store.record_result(&Ortho::new()).unwrap();
+        store
+            .record_result(&Ortho::new().add(1)[0].clone())
+            .unwrap();
+        store.on_generation_end(&cfg, None).unwrap();
+        drop(store);
+
+        let reopened = GenerationStore::from_existing(base_path, 8).unwrap();
+        let stats = reopened.bucket_stats();
+        assert_eq!(
+            stats.iter().map(|bucket| bucket.run_count).sum::<usize>(),
+            2
+        );
+        assert!(
+            stats
+                .iter()
+                .map(|bucket| bucket.history_size_estimate)
+                .sum::<usize>()
+                > 0
+        );
+        assert_eq!(reopened.seen_len_accepted(), 2);
+    }
+
+    #[test]
+    fn bucket_stats_use_cached_history_bytes_without_store_io() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        let store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        drop(store);
+
+        let tiered = TieredStore::open(base_path.clone()).unwrap();
+        for bucket in 0..8 {
+            let history = tiered
+                .open_runset(DEFAULT_NAMESPACE, format!("history-b={:02}", bucket))
+                .unwrap();
+            for idx in 0..50 {
+                let segment = tiered
+                    .allocate_segment("history", "zstd", "sorted")
+                    .unwrap();
+                let bytes = format!("bucket-{bucket}-segment-{idx}").into_bytes();
+                fs::write(&segment.path, &bytes).unwrap();
+                tiered
+                    .commit_allocated_segment(&segment, bytes.len() as u64, 1)
+                    .unwrap();
+                history.append_path(&segment.path).unwrap();
+            }
+        }
+
+        let reopened = GenerationStore::from_existing(base_path, 8).unwrap();
+        let before = reopened.tiered_store.debug_counters();
+        let stats = reopened.bucket_stats();
+        for _ in 0..100 {
+            let _ = reopened.bucket_stats();
+        }
+        let after = reopened.tiered_store.debug_counters();
+
+        assert_eq!(
+            stats.iter().map(|bucket| bucket.run_count).sum::<usize>(),
+            400
+        );
+        assert!(stats.iter().all(|bucket| bucket.history_size_estimate > 0));
+        assert_eq!(after.catalog_loads, before.catalog_loads);
+        assert_eq!(after.segment_id_lookups, before.segment_id_lookups);
+    }
+
+    #[test]
+    fn remote_only_history_segments_keep_bucket_bytes_and_rehydrate() {
+        use crate::offload_runtime::configure_offload_runtime;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let local_store = temp_dir.path().join("store");
+        let mut offload_cfg = crate::offload_config::OffloadConfig::with_base_dir(&base_path);
+        offload_cfg.enabled = true;
+        offload_cfg.local_store_dir = Some(local_store);
+        offload_cfg.cache_dir = base_path.join("offload_cache");
+        offload_cfg.disk_free_low_water = Some(0);
+        offload_cfg.disk_hysteresis_margin_bytes = 0;
+        let _guard = configure_offload_runtime(&base_path, &offload_cfg)
+            .unwrap()
+            .expect("offload runtime");
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+        store.record_result(&Ortho::new()).unwrap();
+        store.on_generation_end(&cfg, None).unwrap();
+
+        let (bucket, history_path) = first_history_path(&store);
+        let original_bytes = store.bucket_stats()[bucket].history_size_estimate;
+        assert!(offload_managed_path_if_configured(&history_path).unwrap());
+        assert!(!history_path.exists());
+
+        let reopened = GenerationStore::from_existing(base_path, 8).unwrap();
+        let reopened_stats = reopened.bucket_stats();
+        assert_eq!(reopened_stats[bucket].history_size_estimate, original_bytes);
+        assert_eq!(count_history_orthos(&reopened, cfg.read_buf_bytes), 1);
+    }
+
+    #[test]
+    fn managed_rehydrate_uses_runtime_base_key_for_nested_store() {
+        use crate::offload_runtime::configure_offload_runtime;
+
+        let temp_dir = TempDir::new().unwrap();
+        let state_base = temp_dir.path().join("fold_state");
+        let store_base = state_base
+            .join("in_process")
+            .join("merge_1.work")
+            .join("store");
+        let local_store = temp_dir.path().join("object_store");
+        let mut offload_cfg = crate::offload_config::OffloadConfig::with_base_dir(&state_base);
+        offload_cfg.enabled = true;
+        offload_cfg.local_store_dir = Some(local_store);
+        offload_cfg.cache_dir = state_base.join("offload_cache");
+        offload_cfg.disk_free_low_water = Some(0);
+        offload_cfg.disk_hysteresis_margin_bytes = 0;
+        let _guard = configure_offload_runtime(&state_base, &offload_cfg)
+            .unwrap()
+            .expect("offload runtime");
+
+        let mut store = GenerationStore::new_with_config(store_base.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+        store.record_result(&Ortho::new()).unwrap();
+        store.on_generation_end(&cfg, None).unwrap();
+
+        let (bucket, history_path) = first_history_path(&store);
+        assert!(offload_managed_path_if_configured(&history_path).unwrap());
+        assert!(!history_path.exists());
+
+        let reopened = GenerationStore::from_existing(store_base, 8).unwrap();
+        assert_eq!(count_history_orthos(&reopened, cfg.read_buf_bytes), 1);
+        assert_eq!(reopened.bucket_stats()[bucket].run_count, 1);
+    }
+
+    #[test]
+    fn offloading_managed_segments_flushes_metadata_before_delete() {
+        use crate::offload_runtime::configure_offload_runtime;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let local_store = temp_dir.path().join("store");
+        let mut offload_cfg = crate::offload_config::OffloadConfig::with_base_dir(&base_path);
+        offload_cfg.enabled = true;
+        offload_cfg.local_store_dir = Some(local_store);
+        offload_cfg.cache_dir = base_path.join("offload_cache");
+        offload_cfg.disk_free_low_water = Some(0);
+        offload_cfg.disk_hysteresis_margin_bytes = 0;
+        let _guard = configure_offload_runtime(&base_path, &offload_cfg)
+            .unwrap()
+            .expect("offload runtime");
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+        store.record_result(&Ortho::new()).unwrap();
+        store.on_generation_end(&cfg, None).unwrap();
+
+        let (_bucket, history_path) = first_history_path(&store);
+        let original_size = store.path_size_bytes(&history_path);
+        assert!(offload_managed_path_if_configured(&history_path).unwrap());
+        assert!(!history_path.exists());
+
+        let disk_view = TieredStore::open(base_path).unwrap();
+        assert!(disk_view.is_managed_remote_only(&history_path).unwrap());
+        assert_eq!(
+            disk_view.managed_file_size(&history_path).unwrap(),
+            Some(original_size)
+        );
     }
 
     #[test]
@@ -3613,25 +4129,18 @@ mod tests {
         let cfg = Config::test_config(256 * 1024, 8);
         let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
         store.configure(&cfg);
-        fs::create_dir_all(base_path.join("runs")).unwrap();
 
         let ortho1 = Ortho::new().add(1)[0].clone();
         let ortho2 = Ortho::new().add(2)[0].clone();
-        let gen_path = base_path.join("runs").join("gen.dat");
-        let gen_raw = BufWriter::new(File::create(&gen_path).unwrap());
-        let mut gen_file = ZstdEncoder::new(gen_raw, 3).unwrap();
         let mut gen_items = vec![ortho1.clone(), ortho2.clone()];
         gen_items.sort_by_key(|o| o.id());
-        for ortho in &gen_items {
-            write_ortho_record(&mut gen_file, ortho, None).unwrap();
-        }
-        let mut gen_file = gen_file.finish().unwrap();
-        gen_file.flush().unwrap();
+        let gen_path = write_managed_sorted_segment(&store.tiered_store, "unique", &gen_items);
 
         let history_iter = std::iter::empty::<io::Result<StreamedOrtho>>();
         let (new_work_run, seen_run, accepted) = anti_join_orthos(
             UniqueRun::new(gen_path),
             history_iter,
+            Some(&store.tiered_store),
             &base_path,
             64 * 1024,
             None,
@@ -3654,6 +4163,101 @@ mod tests {
             .unwrap();
         assert_eq!(enqueued, 2);
         assert_eq!(store.work_len(), enqueued as u64);
+    }
+
+    #[test]
+    fn managed_transient_segments_are_not_reused_by_work_allocations() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        let orthos = vec![Ortho::new(), Ortho::new().add(1)[0].clone()];
+        let output = RunOutputTarget::new(
+            Some(&store.tiered_store),
+            &base_path,
+            "transient-new-work.dat".to_string(),
+            "new-work",
+            "sorted",
+        )
+        .unwrap();
+        let transient_path = output.path().to_path_buf();
+
+        let mut writer = create_compressed_writer(&transient_path, 3, 64 * 1024).unwrap();
+        let mut uncompressed_bytes = 0u64;
+        for ortho in &orthos {
+            uncompressed_bytes = uncompressed_bytes
+                .saturating_add(write_ortho_record(&mut writer, ortho, None).unwrap() as u64);
+        }
+        let (_, compressed_bytes) =
+            finish_compressed_writer(&transient_path, writer, uncompressed_bytes).unwrap();
+        let transient_path = output
+            .commit(compressed_bytes, orthos.len() as u64)
+            .unwrap();
+        let transient_before = store
+            .tiered_store
+            .segment_ref_for_path(&transient_path)
+            .unwrap()
+            .expect("transient segment");
+
+        store
+            .push_segments(vec![Ortho::new().add(2)[0].clone()])
+            .unwrap();
+        store.flush_work_segment_batch().unwrap();
+
+        let work_segment_path = store.work_segments.back().cloned().expect("work segment");
+        assert_ne!(transient_path, work_segment_path);
+        assert_eq!(read_magic(&transient_path), ZSTD_MAGIC);
+        assert_eq!(
+            collect_run(&Run::new(transient_path.clone()), cfg.read_buf_bytes),
+            orthos
+        );
+
+        let transient_after = store
+            .tiered_store
+            .segment_ref_for_path(&transient_path)
+            .unwrap()
+            .expect("transient segment after work flush");
+        assert_eq!(transient_before.id, transient_after.id);
+    }
+
+    #[test]
+    fn managed_generation_transition_keeps_history_segments_readable() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        let orthos = vec![
+            Ortho::new(),
+            Ortho::new().add(1)[0].clone(),
+            Ortho::new().add(2)[0].clone(),
+        ];
+        for ortho in &orthos {
+            store.record_result(ortho).unwrap();
+        }
+
+        let new_work = store.on_generation_end(&cfg, None).unwrap();
+        assert_eq!(new_work as usize, orthos.len());
+        assert_eq!(store.seen_len_accepted(), orthos.len() as u64);
+        assert_eq!(
+            count_history_orthos(&store, cfg.read_buf_bytes),
+            orthos.len()
+        );
+
+        for path in store.history_runs.iter().flatten() {
+            assert_eq!(read_magic(path), ZSTD_MAGIC);
+            let run = Run::new(path.clone());
+            assert!(!collect_run(&run, cfg.read_buf_bytes).is_empty());
+        }
+
+        let reopened = GenerationStore::from_existing(base_path, 8).unwrap();
+        assert_eq!(
+            count_history_orthos(&reopened, cfg.read_buf_bytes),
+            orthos.len()
+        );
     }
 
     #[test]
@@ -3865,7 +4469,7 @@ mod tests {
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
         let (work_run, seen_run, accepted) =
-            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
+            anti_join_orthos(unique_gen, history_iter, None, &base_path, 64 * 1024, None).unwrap();
 
         // ortho3 is already in history, so only ortho2, ortho4, ortho5 should be in work
         let mut work = collect_run(&work_run, 64 * 1024);
@@ -3903,7 +4507,7 @@ mod tests {
         let history_iter = std::iter::empty::<io::Result<StreamedOrtho>>();
 
         let (work_run, _seen_run, accepted) =
-            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
+            anti_join_orthos(unique_gen, history_iter, None, &base_path, 64 * 1024, None).unwrap();
 
         let mut work = collect_run(&work_run, 64 * 1024);
         work.sort_by_key(|o| o.id());
@@ -3947,7 +4551,7 @@ mod tests {
         let history_iter = history_run.iter(64 * 1024).unwrap();
 
         let (work_run, _seen_run, accepted) =
-            anti_join_orthos(unique_gen, history_iter, &base_path, 64 * 1024, None).unwrap();
+            anti_join_orthos(unique_gen, history_iter, None, &base_path, 64 * 1024, None).unwrap();
 
         let work = collect_run(&work_run, 64 * 1024);
         assert_eq!(work.len(), 0);

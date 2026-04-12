@@ -1,5 +1,7 @@
 use crate::disk_safety;
-use crate::generation_store::{RunDownloader, RunOffloader, set_run_downloader, set_run_offloader};
+use crate::generation_store::{
+    RunDownloader, RunOffloader, set_offload_metrics_handle, set_run_downloader, set_run_offloader,
+};
 use crate::offload_cache::OffloadCache;
 use crate::offload_config::OffloadConfig;
 use crate::offloader::{
@@ -26,6 +28,14 @@ fn object_key(base_path: &Path, path: &Path) -> io::Result<String> {
         .unwrap_or_else(|| "store".to_string());
     let rel = path
         .strip_prefix(base_path)
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let base_canon = base_path
+                .canonicalize()
+                .unwrap_or_else(|_| base_path.to_path_buf());
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            path_canon.strip_prefix(&base_canon).map(PathBuf::from)
+        })
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path not under base_path"))?;
     let key = rel
         .iter()
@@ -88,6 +98,7 @@ pub struct OffloadRuntimeGuard;
 
 impl Drop for OffloadRuntimeGuard {
     fn drop(&mut self) {
+        set_offload_metrics_handle(None);
         set_run_offloader(None);
         set_run_downloader(None);
         disk_safety::clear();
@@ -188,7 +199,8 @@ mod tests {
             .unwrap()
             .expect("offload guard");
         test_maybe_offload_and_delete(&run_path).unwrap();
-        assert!(!run_path.exists());
+        assert!(run_path.exists());
+        assert!(crate::generation_store::is_offload_marker(&run_path));
 
         let expected = local_store
             .join("local-offload")

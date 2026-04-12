@@ -77,7 +77,7 @@ Constraints
 * No logic
 Deliverable
 * Code compiles
-* TUI renders placeholder stats
+* TUI renders fallback stats
 STOP WHEN
 * App builds.
 
@@ -369,4 +369,3 @@ STOP WHEN
 FINAL AGENT REMINDER
 Only work on the first unchecked task.Check it off.STOP.
 If you want, next I can compress this to a literal 1-page system prompt for an autonomous executor.
-
