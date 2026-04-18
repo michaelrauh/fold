@@ -1640,25 +1640,6 @@ mod tests {
     };
     use filetime::{FileTime, set_file_mtime};
     use std::sync::{Arc, Barrier};
-    use sysinfo::Disks;
-
-    fn available_space_for_test(path: &Path) -> u64 {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let mut disks = Disks::new_with_refreshed_list();
-        disks.refresh_list();
-        disks.refresh();
-        let mut best: Option<(u64, usize)> = None;
-        for disk in disks.iter() {
-            let mount = disk.mount_point();
-            if canonical.starts_with(mount) {
-                let score = mount.as_os_str().to_string_lossy().len();
-                if best.map_or(true, |(_, best_score)| score > best_score) {
-                    best = Some((disk.available_space(), score));
-                }
-            }
-        }
-        best.expect("no disk mount found").0
-    }
 
     #[test]
     fn test_heartbeat_creation() {
@@ -2094,13 +2075,14 @@ mod tests {
         manifest.phase = ResumePhase::LargerLoaded;
         merge_resume::write_manifest_atomic(&merge_work, &manifest).unwrap();
 
-        let free_now = available_space_for_test(&config.base_dir);
         let mut cfg = OffloadConfig::with_base_dir(&config.base_dir);
         cfg.enabled = true;
         cfg.in_memory_store = true;
         cfg.cache_dir = config.base_dir.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add((FILE_BYTES / 2) as u64));
+        cfg.disk_high_water_used_pct = 1;
+        cfg.disk_reclaim_target_used_pct = 1;
+        cfg.min_free_reserve_bytes = RESERVATION_BYTES;
         let _guard = configure_offload_runtime(&config.base_dir, &cfg)
             .unwrap()
             .unwrap();

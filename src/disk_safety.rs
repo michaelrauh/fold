@@ -39,9 +39,11 @@ struct DiskSafetyContext {
     base_dir: PathBuf,
     floor_bytes: Option<u64>,
     hysteresis_margin_bytes: u64,
+    disk_high_water_used_pct: u8,
+    disk_reclaim_target_used_pct: u8,
+    min_free_reserve_bytes: u64,
     offload_headroom_bytes: usize,
     cache_dir: PathBuf,
-    cache_bytes_cap: u64,
     full_runs_dir: PathBuf,
     doubling_runs_dir: PathBuf,
     disk_snapshot: Rc<RefCell<Option<DiskSpaceSnapshot>>>,
@@ -76,6 +78,8 @@ struct ReclaimCandidateStats {
     skipped_remote: usize,
     skipped_missing_local: usize,
     skipped_zero_bytes: usize,
+    skipped_pinned: usize,
+    skipped_pinned_bytes: u64,
     offloaded_files: usize,
     offloaded_bytes: u64,
 }
@@ -94,15 +98,20 @@ enum BundleStatus {
 }
 
 pub fn configure(base_dir: PathBuf, cfg: &OffloadConfig) {
+    if cfg.enabled {
+        let _ = prune_cache_to_cap(&cfg.cache_dir, 0);
+    }
     CTX.with(|slot| {
         *slot.borrow_mut() = Some(DiskSafetyContext {
             enabled: cfg.enabled,
             base_dir,
             floor_bytes: cfg.disk_free_low_water,
             hysteresis_margin_bytes: cfg.disk_hysteresis_margin_bytes,
+            disk_high_water_used_pct: cfg.disk_high_water_used_pct,
+            disk_reclaim_target_used_pct: cfg.disk_reclaim_target_used_pct,
+            min_free_reserve_bytes: cfg.min_free_reserve_bytes,
             offload_headroom_bytes: cfg.offload_headroom_bytes,
             cache_dir: cfg.cache_dir.clone(),
-            cache_bytes_cap: cfg.cache_bytes_cap,
             full_runs_dir: PathBuf::from("fold_history").join("full_runs"),
             doubling_runs_dir: PathBuf::from("fold_history").join("doubling_runs"),
             disk_snapshot: Rc::new(RefCell::new(None)),
@@ -128,16 +137,14 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
     if !ctx.enabled || bytes_needed == 0 {
         return Ok(());
     }
-    let Some(floor_bytes) = ctx.floor_bytes else {
-        return Ok(());
-    };
-    if floor_bytes == 0 || IN_RECLAIM.with(|flag| flag.get()) {
+    if IN_RECLAIM.with(|flag| flag.get()) {
         return Ok(());
     }
 
-    let target_free = disk_target(&ctx, bytes_needed);
-    let free_before =
-        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::CachedOk)?;
+    let snapshot_before = disk_usage_snapshot_for_path(&ctx.base_dir, SnapshotFreshness::CachedOk)?;
+    let targets = disk_targets(&ctx, bytes_needed, snapshot_before);
+    let target_free = targets.write_target;
+    let free_before = snapshot_before.available_bytes;
     if free_before < target_free {
         apply_local_cleanup(&ctx)?;
         let free_after_cleanup =
@@ -146,7 +153,7 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
             let _ = run_reclaim_to_target(
                 ReclaimTargets {
                     write_target: target_free,
-                    reclaim_target: target_free,
+                    reclaim_target: targets.reclaim_target,
                 },
                 reason,
             );
@@ -166,13 +173,13 @@ pub fn ensure_write_budget(bytes_needed: u64, reason: &str) -> io::Result<()> {
     ));
     let rss_after = sync_process_rss_metrics();
     Err(io::Error::other(format!(
-        "insufficient local disk for write: reason={}, bytes_needed={}, free_before={}, free_after={}, disk_threshold={}, floor={}, rss_before={}, rss_after={}",
+        "insufficient local disk for write: reason={}, bytes_needed={}, free_before={}, free_after={}, disk_threshold={}, floor={:?}, rss_before={}, rss_after={}",
         reason,
         bytes_needed,
         free_before,
         free_after,
         target_free,
-        floor_bytes,
+        ctx.floor_bytes,
         rss_before,
         rss_after
     )))
@@ -185,30 +192,26 @@ pub(crate) fn reclaim_required(bytes_needed: u64) -> io::Result<Option<ReclaimTa
     if !ctx.enabled || bytes_needed == 0 {
         return Ok(None);
     }
-    let Some(floor_bytes) = ctx.floor_bytes else {
-        return Ok(None);
-    };
-    if floor_bytes == 0 || IN_RECLAIM.with(|flag| flag.get()) {
+    if IN_RECLAIM.with(|flag| flag.get()) {
         return Ok(None);
     }
 
-    let write_target = disk_target(&ctx, bytes_needed);
-    let free_cached =
-        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::CachedOk)?;
+    let cached_snapshot = disk_usage_snapshot_for_path(&ctx.base_dir, SnapshotFreshness::CachedOk)?;
+    let cached_targets = disk_targets(&ctx, bytes_needed, cached_snapshot);
+    let write_target = cached_targets.write_target;
+    let free_cached = cached_snapshot.available_bytes;
     if free_cached >= write_target {
         return Ok(None);
     }
     apply_local_cleanup(&ctx)?;
-    let free_now =
-        available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
-    if free_now >= write_target {
+    let now_snapshot =
+        disk_usage_snapshot_for_path(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
+    let targets = disk_targets(&ctx, bytes_needed, now_snapshot);
+    if now_snapshot.available_bytes >= targets.write_target {
         return Ok(None);
     }
 
-    Ok(Some(ReclaimTargets {
-        write_target,
-        reclaim_target: write_target,
-    }))
+    Ok(Some(targets))
 }
 
 pub fn maybe_reclaim(bytes_needed: u64, reason: &str) -> io::Result<bool> {
@@ -327,7 +330,8 @@ fn reclaim_until(ctx: &DiskSafetyContext, target_free: u64, reason: &str) -> io:
 }
 
 fn apply_local_cleanup(ctx: &DiskSafetyContext) -> io::Result<()> {
-    prune_cache_to_cap(&ctx.cache_dir, ctx.cache_bytes_cap)?;
+    // Cache files are disposable scratch; canonical store segments are the true disk tier.
+    prune_cache_to_cap(&ctx.cache_dir, 0)?;
     prune_bundle_root(&ctx.full_runs_dir)?;
     prune_bundle_root(&ctx.doubling_runs_dir)?;
     Ok(())
@@ -383,7 +387,7 @@ fn reclaim_active_store_files(
     free_estimate =
         available_space_for_with_freshness(&ctx.base_dir, SnapshotFreshness::ForceRefresh)?;
     log(format!(
-        "Catalog reclaim summary: roots={}, candidates={}, offloaded_files={}, offloaded_bytes={}, skipped_remote={}, skipped_missing_local={}, skipped_zero_bytes={}, free_after={}, target_free={}",
+        "Catalog reclaim summary: roots={}, candidates={}, offloaded_files={}, offloaded_bytes={}, skipped_remote={}, skipped_missing_local={}, skipped_zero_bytes={}, skipped_pinned={}, skipped_pinned_bytes={}, free_after={}, target_free={}",
         stats.managed_roots,
         stats.managed_candidates,
         stats.offloaded_files,
@@ -391,6 +395,8 @@ fn reclaim_active_store_files(
         stats.skipped_remote,
         stats.skipped_missing_local,
         stats.skipped_zero_bytes,
+        stats.skipped_pinned,
+        stats.skipped_pinned_bytes,
         free_estimate,
         target_free
     ));
@@ -421,6 +427,10 @@ fn collect_active_store_candidates(
         stats.skipped_zero_bytes = stats
             .skipped_zero_bytes
             .saturating_add(scan.skipped_zero_bytes);
+        stats.skipped_pinned = stats.skipped_pinned.saturating_add(scan.skipped_pinned);
+        stats.skipped_pinned_bytes = stats
+            .skipped_pinned_bytes
+            .saturating_add(scan.skipped_pinned_bytes);
         for candidate in scan.candidates {
             out.push(FileInfo {
                 path: candidate.path,
@@ -692,11 +702,32 @@ fn pack_and_offload_archive_results(archive_path: &Path) -> io::Result<u64> {
     Ok(total_bytes)
 }
 
-fn disk_target(ctx: &DiskSafetyContext, bytes_needed: u64) -> u64 {
-    ctx.floor_bytes
-        .unwrap_or(0)
-        .saturating_add(ctx.hysteresis_margin_bytes)
-        .max(bytes_needed)
+fn disk_targets(
+    ctx: &DiskSafetyContext,
+    bytes_needed: u64,
+    snapshot: DiskSpaceSnapshot,
+) -> ReclaimTargets {
+    let total = snapshot.total_bytes.max(1);
+    let high_pct = ctx.disk_high_water_used_pct.min(99) as u64;
+    let target_pct = ctx
+        .disk_reclaim_target_used_pct
+        .min(ctx.disk_high_water_used_pct)
+        .min(99) as u64;
+    let high_free = total.saturating_mul(100u64.saturating_sub(high_pct)) / 100;
+    let target_free = total.saturating_mul(100u64.saturating_sub(target_pct)) / 100;
+    let reserve = ctx
+        .min_free_reserve_bytes
+        .max(bytes_needed.saturating_mul(2))
+        .max(bytes_needed);
+    let legacy_floor = ctx.floor_bytes.unwrap_or(0);
+    let write_target = high_free.max(reserve).max(legacy_floor.min(high_free));
+    let reclaim_target = target_free
+        .max(write_target)
+        .saturating_add(ctx.hysteresis_margin_bytes.min(total / 20));
+    ReclaimTargets {
+        write_target,
+        reclaim_target: reclaim_target.min(total),
+    }
 }
 
 #[cfg(test)]
@@ -998,13 +1029,14 @@ mod tests {
             .commit_allocated_segment(&warm_segment, FILE_BYTES as u64, 1)
             .unwrap();
 
-        let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
         cfg.enabled = true;
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add((FILE_BYTES / 4) as u64));
+        cfg.disk_high_water_used_pct = 1;
+        cfg.disk_reclaim_target_used_pct = 1;
+        cfg.min_free_reserve_bytes = RESERVATION_BYTES;
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -1038,13 +1070,14 @@ mod tests {
         let base = temp_dir.path().join("fold_state");
         fs::create_dir_all(&base).unwrap();
 
-        let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
         cfg.enabled = true;
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_sub(512 * 1024 * 1024));
+        cfg.disk_high_water_used_pct = 99;
+        cfg.disk_reclaim_target_used_pct = 95;
+        cfg.min_free_reserve_bytes = 64 * 1024;
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -1061,13 +1094,14 @@ mod tests {
         let base = temp_dir.path().join("fold_state");
         fs::create_dir_all(&base).unwrap();
 
-        let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
         cfg.enabled = true;
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add(64 * 1024 * 1024));
+        cfg.disk_high_water_used_pct = 1;
+        cfg.disk_reclaim_target_used_pct = 1;
+        cfg.min_free_reserve_bytes = 64 * 1024;
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -1090,7 +1124,9 @@ mod tests {
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add(512 * 1024 * 1024));
+        cfg.disk_high_water_used_pct = 1;
+        cfg.disk_reclaim_target_used_pct = 1;
+        cfg.min_free_reserve_bytes = 64 * 1024;
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -1117,13 +1153,14 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         const WRITE_BYTES: u64 = 8 * 1024 * 1024;
 
-        let free_now = available_space_for(&base).unwrap();
         let mut cfg = OffloadConfig::with_base_dir(&base);
         cfg.enabled = true;
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add(64 * 1024 * 1024));
+        cfg.disk_high_water_used_pct = 1;
+        cfg.disk_reclaim_target_used_pct = 1;
+        cfg.min_free_reserve_bytes = WRITE_BYTES;
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -1142,7 +1179,9 @@ mod tests {
         cfg.in_memory_store = true;
         cfg.cache_dir = base.join("offload_cache");
         cfg.disk_hysteresis_margin_bytes = 0;
-        cfg.disk_free_low_water = Some(free_now.saturating_add(512 * 1024 * 1024));
+        cfg.disk_high_water_used_pct = 1;
+        cfg.disk_reclaim_target_used_pct = 1;
+        cfg.min_free_reserve_bytes = 64 * 1024;
 
         let _guard = configure_offload_runtime(&base, &cfg).unwrap().unwrap();
         configure(base.clone(), &cfg);
@@ -1227,12 +1266,16 @@ mod tests {
         candidate_paths.sort();
 
         assert_eq!(stats.managed_roots, 1);
-        assert_eq!(stats.skipped_remote, 1);
+        assert_eq!(stats.skipped_remote, 0);
         assert_eq!(stats.skipped_missing_local, 1);
         assert_eq!(stats.skipped_zero_bytes, 1);
         assert_eq!(
             candidate_paths,
-            vec![active_work.path.clone(), active_history.path.clone()]
+            vec![
+                active_work.path.clone(),
+                active_history.path.clone(),
+                already_remote.path.clone()
+            ]
         );
     }
 }

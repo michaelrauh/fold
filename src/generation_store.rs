@@ -7,7 +7,7 @@ use crate::{
     ortho::{Ortho, OrthoId, OrthoScore},
     tiered_store::{
         AllocatedSegment, DEFAULT_NAMESPACE, LogCollection, QueueCollection, RunSetCollection,
-        TieredStore,
+        SegmentPinGuard, TieredStore,
     },
 };
 use rkyv::{
@@ -26,7 +26,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use std::thread_local;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -236,6 +239,7 @@ thread_local! {
 
 const OFFLOAD_MARKER_MAGIC: &[u8; 8] = b"FOLDOFF1";
 const OFFLOAD_MARKER_VERSION: u32 = 1;
+static SLOW_DECODE_COUNT_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OffloadMarker {
@@ -361,27 +365,19 @@ pub fn offload_path_if_configured(path: &Path) -> io::Result<bool> {
 fn offload_and_delete_if_configured(path: &Path) -> io::Result<bool> {
     if let Some(store) = TieredStore::from_managed_path(path)? {
         if store.segment_ref_for_path(path)?.is_some() {
-            if let Some(offloader) = current_offloader() {
-                let size = store.managed_file_size(path)?.unwrap_or(0);
-                match offloader.offload(path) {
-                    Ok(true) => {
-                        let key = current_downloader()
-                            .and_then(|ctx| run_object_key(&ctx.base_path, path).ok())
-                            .or_else(|| {
-                                run_object_key(store.root(), path)
-                                    .ok()
-                                    .filter(|key| !key.is_empty())
-                            });
-                        store.set_remote_state_for_path(path, true, key)?;
-                        store.set_disk_state_for_path(path, false)?;
-                        let _ = fs::remove_file(path);
-                        if let Some(m) = metrics_handle() {
-                            m.record_offload(1, size);
-                        }
-                        return Ok(true);
+            let size = store.managed_file_size(path)?.unwrap_or(0);
+            match store.offload_segment_for_path(path, "managed offload")? {
+                Some(bytes) if bytes > 0 => {
+                    if let Some(m) = metrics_handle() {
+                        m.record_offload(1, bytes);
                     }
-                    Ok(false) => return Ok(false),
-                    Err(err) => return Err(err),
+                    return Ok(true);
+                }
+                Some(_) => return Ok(false),
+                None => {
+                    if size == 0 {
+                        return Ok(false);
+                    }
                 }
             }
             return Ok(false);
@@ -442,7 +438,8 @@ fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
             let base_canon = base_path
                 .canonicalize()
                 .unwrap_or_else(|_| base_path.to_path_buf());
-            let path_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let path_canon =
+                canonicalize_existing_prefix(path).unwrap_or_else(|_| path.to_path_buf());
             path_canon.strip_prefix(&base_canon).map(PathBuf::from)
         })
         .unwrap_or_else(|_| {
@@ -460,6 +457,29 @@ fn run_object_key(base_path: &Path, path: &Path) -> io::Result<String> {
     } else {
         Ok(format!("{}/{}", namespace, key))
     }
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+    if let Ok(canon) = path.canonicalize() {
+        return Ok(canon);
+    }
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        let Some(name) = current.file_name() else {
+            return Ok(path.to_path_buf());
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = current.parent() else {
+            return Ok(path.to_path_buf());
+        };
+        current = parent;
+    }
+    let mut out = current.canonicalize()?;
+    for name in missing.iter().rev() {
+        out.push(name);
+    }
+    Ok(out)
 }
 
 pub fn resolve_managed_path(path: &Path) -> io::Result<PathBuf> {
@@ -604,6 +624,18 @@ fn estimate_compressed_run_set_bytes(runs: &[Run]) -> io::Result<u64> {
     Ok(total)
 }
 
+fn pin_runs_for_merge(runs: &[Run], reason: &str) -> io::Result<Vec<SegmentPinGuard>> {
+    let mut guards = Vec::new();
+    for run in runs {
+        if let Some(store) = TieredStore::from_managed_path(run.path())? {
+            if let Some(guard) = store.pin_path(run.path(), reason)? {
+                guards.push(guard);
+            }
+        }
+    }
+    Ok(guards)
+}
+
 #[cfg(test)]
 pub fn test_maybe_offload_and_delete(path: &Path) -> io::Result<()> {
     maybe_offload_and_delete(path)
@@ -622,6 +654,19 @@ impl Run {
 
     /// Iterate over orthos in this run with bounded buffering
     pub fn iter(&self, read_buf_bytes: usize) -> io::Result<OrthoStreamReader> {
+        if let Some(store) = TieredStore::from_managed_path(&self.path)? {
+            if let Some(id) = store.segment_id_for_managed_path(&self.path)? {
+                let pin = store.pin_segment(&id, "run iterator")?;
+                let path = match store.ensure_local_segment(&id, "run iterator") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        drop(pin);
+                        return Err(err);
+                    }
+                };
+                return OrthoStreamReader::new_with_pin(&path, read_buf_bytes, Some(pin));
+            }
+        }
         let path = resolve_run_path(&self.path)?;
         OrthoStreamReader::new(&path, read_buf_bytes)
     }
@@ -737,10 +782,19 @@ impl OrthoRunIterator {
 /// Streaming ortho reader backed by a bounded buffer
 pub struct OrthoStreamReader {
     inner: OrthoRunIterator,
+    _pin: Option<SegmentPinGuard>,
 }
 
 impl OrthoStreamReader {
     fn new(path: &Path, read_buf_bytes: usize) -> io::Result<Self> {
+        Self::new_with_pin(path, read_buf_bytes, None)
+    }
+
+    fn new_with_pin(
+        path: &Path,
+        read_buf_bytes: usize,
+        pin: Option<SegmentPinGuard>,
+    ) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::with_capacity(read_buf_bytes, file);
         let decoder = ZstdDecoder::new(reader)
@@ -753,6 +807,7 @@ impl OrthoStreamReader {
                 offset: 0,
                 read_buf_bytes,
             },
+            _pin: pin,
         })
     }
 }
@@ -762,6 +817,7 @@ fn count_ortho_records_in_file(
     read_buf_bytes: usize,
     compressed: bool,
 ) -> io::Result<usize> {
+    SLOW_DECODE_COUNT_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
     let resolved_path = resolve_managed_path(path)?;
     let file = File::open(&resolved_path)?;
     let reader = BufReader::with_capacity(read_buf_bytes, file);
@@ -986,6 +1042,19 @@ impl UniqueRun {
 
     /// Iterate over orthos in this unique run with bounded buffering
     pub fn iter(&self, read_buf_bytes: usize) -> io::Result<OrthoStreamReader> {
+        if let Some(store) = TieredStore::from_managed_path(&self.path)? {
+            if let Some(id) = store.segment_id_for_managed_path(&self.path)? {
+                let pin = store.pin_segment(&id, "run iterator")?;
+                let path = match store.ensure_local_segment(&id, "run iterator") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        drop(pin);
+                        return Err(err);
+                    }
+                };
+                return OrthoStreamReader::new_with_pin(&path, read_buf_bytes, Some(pin));
+            }
+        }
         let path = resolve_run_path(&self.path)?;
         OrthoStreamReader::new(&path, read_buf_bytes)
     }
@@ -1021,9 +1090,22 @@ impl RunOutputTarget {
         &self.path
     }
 
-    fn commit(self, bytes: u64, record_count: u64) -> io::Result<PathBuf> {
+    fn commit(
+        self,
+        bytes: u64,
+        record_count: u64,
+        uncompressed_bytes: u64,
+        codec_level: i32,
+    ) -> io::Result<PathBuf> {
         if let Some((store, allocated)) = self.managed {
-            store.commit_allocated_segment(&allocated, bytes, record_count)?;
+            store.commit_allocated_segment_with_meta(
+                &allocated,
+                bytes,
+                record_count,
+                uncompressed_bytes,
+                codec_level,
+                None,
+            )?;
             return Ok(allocated.path);
         }
         Ok(self.path)
@@ -1210,6 +1292,11 @@ impl GenerationStore {
     fn path_record_count(&self, path: &Path, compressed: bool) -> io::Result<u64> {
         if let Some(segment) = self.tiered_store.segment_ref_for_path(path)? {
             return Ok(segment.record_count);
+        }
+        if let Some(store) = TieredStore::from_managed_path(path)? {
+            if let Some(segment) = store.segment_ref_for_path(path)? {
+                return Ok(segment.record_count);
+            }
         }
         Ok(count_ortho_records_in_file(path, self.read_buf_bytes, compressed)? as u64)
     }
@@ -1518,16 +1605,17 @@ impl GenerationStore {
 
             fs::rename(&active_path, &temp_path)?;
             if temp_path.exists() {
+                let record_count = self.landing_counts[bucket] as u64;
                 let (unc, comp) = compress_file(&temp_path, 3)?;
                 self.compression_stats.record(unc, comp);
-                let record_count =
-                    count_ortho_records_in_file(&temp_path, self.read_buf_bytes, true)? as u64;
-                let sealed_path = self.tiered_store.import_file_as_segment(
+                let sealed_path = self.tiered_store.import_file_as_segment_with_meta(
                     &temp_path,
                     "landing",
                     "zstd",
                     "unsorted",
                     record_count,
+                    unc,
+                    3,
                     true,
                 )?;
                 landing.append_sealed_path(&sealed_path)?;
@@ -1661,8 +1749,14 @@ impl GenerationStore {
         }
         file.flush()?;
         let bytes = fs::metadata(&allocated.path)?.len();
-        self.tiered_store
-            .commit_allocated_segment(&allocated, bytes, count)?;
+        self.tiered_store.commit_allocated_segment_with_meta(
+            &allocated,
+            bytes,
+            count,
+            decoded_bytes as u64,
+            0,
+            None,
+        )?;
         Ok(allocated.path)
     }
 
@@ -2091,18 +2185,23 @@ impl GenerationStore {
                     wrote_any = true;
                 }
                 writer.flush()?;
+                let mut rewritten_uncompressed = 0u64;
                 if wrote_any {
                     let (unc, comp) = compress_file(&tmp_path, 3)?;
+                    rewritten_uncompressed = unc;
                     self.compression_stats.record(unc, comp);
                 }
 
                 if wrote_any {
                     fs::rename(&tmp_path, &run_path)?;
                     let refreshed_bytes = self.path_size_bytes(&run_path);
-                    self.tiered_store.update_segment_stats_for_path(
+                    self.tiered_store.update_segment_stats_for_path_with_meta(
                         &run_path,
                         refreshed_bytes,
                         kept_in_run,
+                        rewritten_uncompressed,
+                        3,
+                        None,
                     )?;
                     new_runs.push(run_path);
                 } else {
@@ -2121,8 +2220,7 @@ impl GenerationStore {
     /// The run is moved to the history directory and tracked
     pub fn add_history_run(&mut self, bucket: usize, run: Run, accepted: u64) -> io::Result<()> {
         assert!(bucket < self.bucket_count, "Invalid bucket index");
-        let record_count =
-            count_ortho_records_in_file(run.path(), self.read_buf_bytes, true)? as u64;
+        let record_count = self.path_record_count(run.path(), true)?;
         let dest_path =
             self.own_or_import_segment(run.path(), "history", "sorted", record_count)?;
         self.history_collection(bucket)?.append_path(&dest_path)?;
@@ -2145,8 +2243,7 @@ impl GenerationStore {
         for (bucket, runs) in runs_by_bucket {
             assert!(*bucket < self.bucket_count, "Invalid bucket index");
             for run_path in runs {
-                let record_count =
-                    count_ortho_records_in_file(run_path, self.read_buf_bytes, true)? as u64;
+                let record_count = self.path_record_count(run_path, true)?;
                 let dest_path =
                     self.own_or_import_segment(run_path, "history", "sorted", record_count)?;
                 self.history_collection(*bucket)?.append_path(&dest_path)?;
@@ -2247,8 +2344,7 @@ impl GenerationStore {
             )?;
             let mut tracked_paths = Vec::with_capacity(runs.len());
             for run in runs {
-                let record_count =
-                    count_ortho_records_in_file(run.path(), self.read_buf_bytes, true)? as u64;
+                let record_count = self.path_record_count(run.path(), true)?;
                 let spill_path =
                     self.own_or_import_segment(run.path(), "spill", "sorted", record_count)?;
                 let size_bytes = file_size_or_zero(&spill_path);
@@ -2621,8 +2717,7 @@ impl GenerationStore {
             &self.base_path,
             Some(&mut self.compression_stats),
         )?;
-        let record_count =
-            count_ortho_records_in_file(merged.path(), self.read_buf_bytes, true)? as u64;
+        let record_count = self.path_record_count(merged.path(), true)?;
         let dest_path =
             self.own_or_import_segment(merged.path(), "history", "sorted", record_count)?;
         let mut remaining = self.history_runs[bucket][merge_count..].to_vec();
@@ -2766,7 +2861,7 @@ fn write_streamed_run(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    let final_path = output.commit(comp, arena.len() as u64)?;
+    let final_path = output.commit(comp, arena.len() as u64, unc, 3)?;
     if offload_after_write {
         maybe_offload_and_delete(&final_path)?;
     }
@@ -2826,6 +2921,8 @@ pub fn merge_unique(
         "sorted",
     )?;
     let unique_path = output.path().to_path_buf();
+    let _input_pins =
+        pin_runs_for_merge(&runs, &format!("merge unique {}", unique_path.display()))?;
     let merge_memory_budget = runs
         .len()
         .saturating_mul(cfg.read_buf_bytes)
@@ -2926,7 +3023,7 @@ pub fn merge_unique(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    let unique_path = output.commit(comp, unique_record_count)?;
+    let unique_path = output.commit(comp, unique_record_count, unc, 3)?;
     cleanup_runs(&runs);
 
     Ok(UniqueRun::new(unique_path))
@@ -2954,6 +3051,7 @@ fn merge_ortho_chunk(
         "sorted",
     )?;
     let chunk_path = output.path().to_path_buf();
+    let _input_pins = pin_runs_for_merge(runs, &format!("merge chunk {}", chunk_path.display()))?;
     let merge_memory_budget = runs
         .len()
         .saturating_mul(cfg.read_buf_bytes)
@@ -3036,7 +3134,7 @@ fn merge_ortho_chunk(
     if let Some(s) = stats.as_deref_mut() {
         s.record(unc, comp);
     }
-    Ok(Run::new(output.commit(comp, chunk_record_count)?))
+    Ok(Run::new(output.commit(comp, chunk_record_count, unc, 3)?))
 }
 
 /// Anti-join: streaming merge that emits orthos from gen that are NOT in history
@@ -3063,6 +3161,11 @@ pub fn anti_join_orthos(
     static ANTI_JOIN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let anti_join_id = ANTI_JOIN_COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
+    let _unique_pin = if let Some(store) = TieredStore::from_managed_path(unique_gen.path())? {
+        store.pin_path(unique_gen.path(), &format!("anti join {}", anti_join_id))?
+    } else {
+        None
+    };
     memory_safety::ensure_phase_headroom(
         read_buf_bytes.saturating_mul(4).saturating_add(256 * 1024),
         &format!("anti join {}", anti_join_id),
@@ -3213,8 +3316,9 @@ pub fn anti_join_orthos(
         s.record(seen_unc, seen_comp);
         s.record(new_work_unc, new_work_comp);
     }
-    let seen_run_path = seen_output.commit(seen_comp, seen_record_count)?;
-    let new_work_path = new_work_output.commit(new_work_comp, new_work_record_count)?;
+    let seen_run_path = seen_output.commit(seen_comp, seen_record_count, seen_unc, 3)?;
+    let new_work_path =
+        new_work_output.commit(new_work_comp, new_work_record_count, new_work_unc, 3)?;
     Ok((
         Run::new(new_work_path),
         Run::new(seen_run_path),
@@ -3291,6 +3395,31 @@ mod tests {
             }
         }
         count
+    }
+
+    fn write_managed_test_run(
+        store: &TieredStore,
+        base_path: &PathBuf,
+        name: &str,
+        orthos: &[Ortho],
+    ) -> Run {
+        let output =
+            RunOutputTarget::new(Some(store), base_path, name.to_string(), "run", "sorted")
+                .unwrap();
+        let path = output.path().to_path_buf();
+        let mut writer = create_compressed_writer(&path, 3, 64 * 1024).unwrap();
+        let mut uncompressed_bytes = 0u64;
+        for ortho in orthos {
+            uncompressed_bytes = uncompressed_bytes
+                .saturating_add(write_ortho_record(&mut writer, ortho, None).unwrap() as u64);
+        }
+        let (_, compressed_bytes) =
+            finish_compressed_writer(&path, writer, uncompressed_bytes).unwrap();
+        Run::new(
+            output
+                .commit(compressed_bytes, orthos.len() as u64, uncompressed_bytes, 3)
+                .unwrap(),
+        )
     }
 
     fn write_managed_sorted_segment(store: &TieredStore, kind: &str, orthos: &[Ortho]) -> PathBuf {
@@ -3785,8 +3914,7 @@ mod tests {
         assert_eq!(store.work_segments.len(), 1);
 
         let segment_path = store.work_segments[0].clone();
-        assert!(offload_path_if_configured(&segment_path).unwrap());
-        fs::remove_file(&segment_path).unwrap();
+        assert!(offload_managed_path_if_configured(&segment_path).unwrap());
 
         let first = store.pop_work().unwrap().unwrap();
         let second = store.pop_work().unwrap().unwrap();
@@ -4039,6 +4167,56 @@ mod tests {
     }
 
     #[test]
+    fn offloaded_live_transient_chunk_rehydrates_for_final_merge() {
+        use crate::offload_runtime::configure_offload_runtime;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().join("fold_state");
+        let local_store = temp_dir.path().join("object_store");
+        let mut offload_cfg = crate::offload_config::OffloadConfig::with_base_dir(&base_path);
+        offload_cfg.enabled = true;
+        offload_cfg.local_store_dir = Some(local_store);
+        offload_cfg.cache_dir = base_path.join("offload_cache");
+        let _guard = configure_offload_runtime(&base_path, &offload_cfg)
+            .unwrap()
+            .expect("offload runtime");
+
+        let tiered = TieredStore::open(base_path.join("store")).unwrap();
+        let mut cfg = Config::test_config(256 * 1024, 2);
+        cfg.fan_in = 2;
+
+        let a = Ortho::new();
+        let b = Ortho::new().add(1)[0].clone();
+        let c = Ortho::new().add(2)[0].clone();
+        let first = write_managed_test_run(&tiered, &base_path, "first.dat", &[a.clone()]);
+        let second = write_managed_test_run(&tiered, &base_path, "second.dat", &[b.clone()]);
+        let third = write_managed_test_run(&tiered, &base_path, "third.dat", &[c.clone()]);
+
+        let chunk = merge_ortho_chunk(
+            &[first.clone(), second.clone()],
+            &cfg,
+            Some(&tiered),
+            &base_path,
+            None,
+        )
+        .unwrap();
+        assert!(offload_managed_path_if_configured(chunk.path()).unwrap());
+        assert!(!chunk.path().exists());
+
+        let unique =
+            merge_unique(vec![chunk, third], &cfg, Some(&tiered), &base_path, None).unwrap();
+        let mut ids: Vec<_> = UniqueRun::new(unique.path().clone())
+            .iter(cfg.read_buf_bytes)
+            .unwrap()
+            .map(|item| item.unwrap().id)
+            .collect();
+        ids.sort_unstable();
+        let mut expected = vec![a.id(), b.id(), c.id()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
     fn offloading_managed_segments_flushes_metadata_before_delete() {
         use crate::offload_runtime::configure_offload_runtime;
 
@@ -4193,7 +4371,7 @@ mod tests {
         let (_, compressed_bytes) =
             finish_compressed_writer(&transient_path, writer, uncompressed_bytes).unwrap();
         let transient_path = output
-            .commit(compressed_bytes, orthos.len() as u64)
+            .commit(compressed_bytes, orthos.len() as u64, uncompressed_bytes, 3)
             .unwrap();
         let transient_before = store
             .tiered_store

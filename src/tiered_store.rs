@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -34,7 +35,13 @@ pub struct SegmentMeta {
     pub codec: String,
     pub ordering: String,
     pub bytes: u64,
+    #[serde(default)]
+    pub uncompressed_bytes: u64,
     pub record_count: u64,
+    #[serde(default)]
+    pub codec_level: i32,
+    #[serde(default)]
+    pub checksum: Option<String>,
     pub created_epoch: u64,
     pub last_touch_epoch: u64,
     pub ref_count: u64,
@@ -55,7 +62,10 @@ impl SegmentMeta {
             codec: codec.into(),
             ordering: ordering.into(),
             bytes: 0,
+            uncompressed_bytes: 0,
             record_count: 0,
+            codec_level: 0,
+            checksum: None,
             created_epoch,
             last_touch_epoch: created_epoch,
             ref_count: 0,
@@ -128,6 +138,7 @@ pub struct SegmentRef {
     pub id: String,
     pub path: PathBuf,
     pub bytes: u64,
+    pub uncompressed_bytes: u64,
     pub record_count: u64,
 }
 
@@ -149,6 +160,13 @@ pub struct TieredStoreReclaimScan {
     pub skipped_remote: usize,
     pub skipped_missing_local: usize,
     pub skipped_zero_bytes: usize,
+    pub skipped_pinned: usize,
+    pub skipped_pinned_bytes: u64,
+}
+
+pub trait SegmentRemote: Send + Sync {
+    fn upload_segment(&self, path: &Path) -> io::Result<String>;
+    fn download_segment(&self, remote_key: &str, dest_path: &Path) -> io::Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -200,12 +218,41 @@ impl CatalogState {
 struct TieredStoreInner {
     root: PathBuf,
     catalog: RwLock<CatalogState>,
+    pins: Mutex<BTreeMap<String, u64>>,
     counters: TieredStoreCounters,
 }
 
 #[derive(Clone, Debug)]
 pub struct TieredStore {
     inner: Arc<TieredStoreInner>,
+}
+
+#[derive(Debug)]
+pub struct SegmentPinGuard {
+    store: TieredStore,
+    id: String,
+    active: bool,
+}
+
+impl Drop for SegmentPinGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.store.unpin_segment(&self.id, "drop");
+            self.active = false;
+        }
+    }
+}
+
+thread_local! {
+    static SEGMENT_REMOTE: RefCell<Option<Arc<dyn SegmentRemote>>> = const { RefCell::new(None) };
+}
+
+pub fn configure_segment_remote(remote: Option<Arc<dyn SegmentRemote>>) {
+    SEGMENT_REMOTE.with(|slot| *slot.borrow_mut() = remote);
+}
+
+fn current_segment_remote() -> Option<Arc<dyn SegmentRemote>> {
+    SEGMENT_REMOTE.with(|slot| slot.borrow().clone())
 }
 
 impl TieredStore {
@@ -243,10 +290,13 @@ impl TieredStore {
         let inner = Arc::new(TieredStoreInner {
             root: root.clone(),
             catalog: RwLock::new(CatalogState::new(catalog)),
+            pins: Mutex::new(BTreeMap::new()),
             counters,
         });
-        registry.insert(root, Arc::downgrade(&inner));
-        Ok(Self { inner })
+        let store = Self { inner };
+        store.cleanup_crashed_transients()?;
+        registry.insert(root, Arc::downgrade(&store.inner));
+        Ok(store)
     }
 
     pub fn from_managed_path(path: &Path) -> io::Result<Option<Self>> {
@@ -370,12 +420,14 @@ impl TieredStore {
                     scan.skipped_zero_bytes = scan.skipped_zero_bytes.saturating_add(1);
                     continue;
                 }
-                if meta.tiers.remote {
-                    scan.skipped_remote = scan.skipped_remote.saturating_add(1);
-                    continue;
-                }
                 if !meta.tiers.disk {
                     scan.skipped_missing_local = scan.skipped_missing_local.saturating_add(1);
+                    continue;
+                }
+                if self.is_segment_pinned(id)? {
+                    scan.skipped_pinned = scan.skipped_pinned.saturating_add(1);
+                    scan.skipped_pinned_bytes =
+                        scan.skipped_pinned_bytes.saturating_add(meta.bytes);
                     continue;
                 }
 
@@ -645,6 +697,18 @@ impl TieredStore {
         bytes: u64,
         record_count: u64,
     ) -> io::Result<PathBuf> {
+        self.commit_allocated_segment_with_meta(segment, bytes, record_count, 0, 0, None)
+    }
+
+    pub fn commit_allocated_segment_with_meta(
+        &self,
+        segment: &AllocatedSegment,
+        bytes: u64,
+        record_count: u64,
+        uncompressed_bytes: u64,
+        codec_level: i32,
+        checksum: Option<String>,
+    ) -> io::Result<PathBuf> {
         self.with_catalog_mut(true, |catalog| {
             let meta = catalog.segments.get_mut(&segment.id).ok_or_else(|| {
                 io::Error::new(
@@ -653,7 +717,10 @@ impl TieredStore {
                 )
             })?;
             meta.bytes = bytes;
+            meta.uncompressed_bytes = uncompressed_bytes;
             meta.record_count = record_count;
+            meta.codec_level = codec_level;
+            meta.checksum = checksum;
             meta.last_touch_epoch = catalog.current_epoch;
             meta.pinned_until_epoch = meta
                 .pinned_until_epoch
@@ -686,6 +753,37 @@ impl TieredStore {
         self.commit_allocated_segment(&allocated, bytes, record_count)
     }
 
+    pub fn import_file_as_segment_with_meta(
+        &self,
+        src_path: &Path,
+        kind: &str,
+        codec: &str,
+        ordering: &str,
+        record_count: u64,
+        uncompressed_bytes: u64,
+        codec_level: i32,
+        move_file: bool,
+    ) -> io::Result<PathBuf> {
+        let allocated = self.allocate_segment(kind, codec, ordering)?;
+        if let Some(parent) = allocated.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if move_file {
+            fs::rename(src_path, &allocated.path)?;
+        } else {
+            fs::copy(src_path, &allocated.path)?;
+        }
+        let bytes = fs::metadata(&allocated.path)?.len();
+        self.commit_allocated_segment_with_meta(
+            &allocated,
+            bytes,
+            record_count,
+            uncompressed_bytes,
+            codec_level,
+            None,
+        )
+    }
+
     pub fn segment_ref_for_path(&self, path: &Path) -> io::Result<Option<SegmentRef>> {
         let Some(id) = self.segment_id_for_path(path)? else {
             return Ok(None);
@@ -698,6 +796,7 @@ impl TieredStore {
                 id: id.clone(),
                 path: self.segment_path_for_id(&id),
                 bytes: meta.bytes,
+                uncompressed_bytes: meta.uncompressed_bytes,
                 record_count: meta.record_count,
             }))
         })
@@ -714,11 +813,148 @@ impl TieredStore {
         let Some(id) = self.segment_id_for_path(path)? else {
             return Ok(None);
         };
-        let canonical = self.segment_path_for_id(&id);
+        self.ensure_local_segment(&id, "ensure_local").map(Some)
+    }
+
+    pub fn ensure_local_segment(&self, id: &str, reason: &str) -> io::Result<PathBuf> {
+        let canonical = self.segment_path_for_id(id);
         if canonical.exists() {
-            return Ok(Some(canonical));
+            self.touch_segment(id, reason)?;
+            return Ok(canonical);
         }
-        Ok(None)
+
+        let remote_key = self.with_catalog(|catalog| {
+            let meta = catalog.segments.get(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
+            })?;
+            if !meta.tiers.remote {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "segment {} missing locally and is not marked remote: {}",
+                        id,
+                        canonical.display()
+                    ),
+                ));
+            }
+            meta.remote_key.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("segment {} missing locally and has no remote key", id),
+                )
+            })
+        })?;
+
+        let remote = current_segment_remote().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "segment {} missing locally and no segment remote configured",
+                    id
+                ),
+            )
+        })?;
+
+        if let Some(parent) = canonical.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = canonical.with_extension("download_tmp");
+        let _ = fs::remove_file(&tmp);
+        remote.download_segment(&remote_key, &tmp)?;
+        File::open(&tmp)?.sync_all()?;
+        fs::rename(&tmp, &canonical)?;
+        self.set_disk_state_for_id(id, true)?;
+        self.touch_segment(id, reason)?;
+        Ok(canonical)
+    }
+
+    pub fn open_segment_reader(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> io::Result<(File, SegmentPinGuard)> {
+        let guard = self.pin_segment(id, reason)?;
+        let path = self.ensure_local_segment(id, reason)?;
+        match File::open(&path) {
+            Ok(file) => Ok((file, guard)),
+            Err(err) => {
+                drop(guard);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn pin_segment(&self, id: &str, reason: &str) -> io::Result<SegmentPinGuard> {
+        self.with_catalog_mut(false, |catalog| {
+            let current_epoch = catalog.current_epoch;
+            let meta = catalog.segments.get_mut(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
+            })?;
+            meta.last_touch_epoch = current_epoch;
+            meta.pinned_until_epoch = meta.pinned_until_epoch.max(current_epoch.saturating_add(1));
+            Ok(())
+        })?;
+        {
+            let mut pins = self
+                .inner
+                .pins
+                .lock()
+                .map_err(|_| io::Error::other("tiered store pin lock poisoned"))?;
+            *pins.entry(id.to_string()).or_insert(0) += 1;
+        }
+        let _ = reason;
+        Ok(SegmentPinGuard {
+            store: self.clone(),
+            id: id.to_string(),
+            active: true,
+        })
+    }
+
+    pub fn pin_path(&self, path: &Path, reason: &str) -> io::Result<Option<SegmentPinGuard>> {
+        let Some(id) = self.segment_id_for_path(path)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.pin_segment(&id, reason)?))
+    }
+
+    pub fn unpin_segment(&self, id: &str, _reason: &str) -> io::Result<()> {
+        let mut pins = self
+            .inner
+            .pins
+            .lock()
+            .map_err(|_| io::Error::other("tiered store pin lock poisoned"))?;
+        if let Some(count) = pins.get_mut(id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pins.remove(id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn segment_id_for_managed_path(&self, path: &Path) -> io::Result<Option<String>> {
+        self.segment_id_for_path(path)
+    }
+
+    fn is_segment_pinned(&self, id: &str) -> io::Result<bool> {
+        let pins = self
+            .inner
+            .pins
+            .lock()
+            .map_err(|_| io::Error::other("tiered store pin lock poisoned"))?;
+        Ok(pins.get(id).copied().unwrap_or(0) > 0)
+    }
+
+    fn touch_segment(&self, id: &str, _reason: &str) -> io::Result<()> {
+        self.with_catalog_mut(false, |catalog| {
+            let current_epoch = catalog.current_epoch;
+            let meta = catalog.segments.get_mut(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
+            })?;
+            meta.last_touch_epoch = current_epoch;
+            meta.pinned_until_epoch = meta.pinned_until_epoch.max(current_epoch.saturating_add(1));
+            Ok(())
+        })
     }
 
     pub fn set_remote_state_for_path(
@@ -744,8 +980,12 @@ impl TieredStore {
         let Some(id) = self.segment_id_for_path(path)? else {
             return Ok(());
         };
+        self.set_disk_state_for_id(&id, disk)
+    }
+
+    fn set_disk_state_for_id(&self, id: &str, disk: bool) -> io::Result<()> {
         self.with_catalog_mut(true, |catalog| {
-            let meta = catalog.segments.get_mut(&id).ok_or_else(|| {
+            let meta = catalog.segments.get_mut(id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
             })?;
             meta.tiers.disk = disk;
@@ -753,11 +993,60 @@ impl TieredStore {
         })
     }
 
+    pub fn offload_segment_for_path(&self, path: &Path, reason: &str) -> io::Result<Option<u64>> {
+        let Some(id) = self.segment_id_for_path(path)? else {
+            return Ok(None);
+        };
+        self.offload_segment(&id, reason).map(Some)
+    }
+
+    pub fn offload_segment(&self, id: &str, reason: &str) -> io::Result<u64> {
+        if self.is_segment_pinned(id)? {
+            return Ok(0);
+        }
+
+        let path = self.segment_path_for_id(id);
+        let (bytes, already_remote) = self.with_catalog(|catalog| {
+            let meta = catalog.segments.get(id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
+            })?;
+            Ok((meta.bytes, meta.tiers.remote))
+        })?;
+        if bytes == 0 || !path.exists() {
+            return Ok(0);
+        }
+
+        if !already_remote {
+            let remote = current_segment_remote()
+                .ok_or_else(|| io::Error::other("no segment remote configured"))?;
+            let remote_key = remote.upload_segment(&path)?;
+            self.set_remote_state_for_path(&path, true, Some(remote_key))?;
+        }
+
+        // The metadata flush happens inside set_remote_state/set_disk_state before local deletion.
+        self.set_disk_state_for_id(id, false)?;
+        fs::remove_file(&path)?;
+        let _ = reason;
+        Ok(bytes)
+    }
+
     pub fn update_segment_stats_for_path(
         &self,
         path: &Path,
         bytes: u64,
         record_count: u64,
+    ) -> io::Result<()> {
+        self.update_segment_stats_for_path_with_meta(path, bytes, record_count, 0, 0, None)
+    }
+
+    pub fn update_segment_stats_for_path_with_meta(
+        &self,
+        path: &Path,
+        bytes: u64,
+        record_count: u64,
+        uncompressed_bytes: u64,
+        codec_level: i32,
+        checksum: Option<String>,
     ) -> io::Result<()> {
         let Some(id) = self.segment_id_for_path(path)? else {
             return Ok(());
@@ -768,7 +1057,10 @@ impl TieredStore {
                 io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
             })?;
             meta.bytes = bytes;
+            meta.uncompressed_bytes = uncompressed_bytes;
             meta.record_count = record_count;
+            meta.codec_level = codec_level;
+            meta.checksum = checksum;
             meta.last_touch_epoch = current_epoch;
             meta.pinned_until_epoch = meta.pinned_until_epoch.max(current_epoch.saturating_add(1));
             Ok(())
@@ -849,6 +1141,37 @@ impl TieredStore {
         })?;
         self.flush_metadata("gc_unreferenced_segments")?;
         Ok(())
+    }
+
+    fn cleanup_crashed_transients(&self) -> io::Result<()> {
+        let stale: Vec<String> = self.with_catalog(|catalog| {
+            Ok(catalog
+                .segments
+                .iter()
+                .filter(|(_, meta)| {
+                    if meta.bytes == 0 {
+                        return true;
+                    }
+                    meta.ref_count == 0
+                        && matches!(meta.kind.as_str(), "chunk" | "unique" | "seen" | "new-work")
+                })
+                .map(|(id, _)| id.clone())
+                .collect())
+        })?;
+        if stale.is_empty() {
+            return Ok(());
+        }
+        for id in &stale {
+            let path = self.segment_path_for_id(id);
+            let _ = fs::remove_file(path);
+        }
+        self.with_catalog_mut(false, |catalog| {
+            for id in &stale {
+                catalog.segments.remove(id);
+            }
+            Ok(())
+        })?;
+        self.flush_metadata("cleanup_crashed_transients")
     }
 
     fn collections_dir(&self) -> PathBuf {
@@ -1721,11 +2044,85 @@ mod tests {
         let _uncommitted = store.allocate_segment("new-work", "raw", "fifo").unwrap();
 
         let scan = store.reclaim_candidates_with_summary().unwrap();
-        assert_eq!(scan.candidates.len(), 1);
-        assert_eq!(scan.candidates[0].id, local.id);
-        assert_eq!(scan.candidates[0].path, local.path);
-        assert_eq!(scan.skipped_remote, 1);
+        let mut ids: Vec<_> = scan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![local.id.clone(), remote.id.clone()]);
+        assert_eq!(scan.skipped_remote, 0);
         assert_eq!(scan.skipped_missing_local, 1);
         assert_eq!(scan.skipped_zero_bytes, 1);
+    }
+
+    #[test]
+    fn pinned_segments_are_not_reclaim_candidates() {
+        let temp = tempdir().unwrap();
+        let store = TieredStore::open(temp.path()).unwrap();
+        let pinned = write_segment(&store, "chunk", b"pinned", 1);
+        let unpinned = write_segment(&store, "history", b"unpinned", 1);
+
+        let _guard = store.pin_segment(&pinned.id, "test").unwrap();
+        let scan = store.reclaim_candidates_with_summary().unwrap();
+
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(scan.candidates[0].id, unpinned.id);
+        assert_eq!(scan.skipped_pinned, 1);
+        assert_eq!(scan.skipped_pinned_bytes, 6);
+    }
+
+    #[derive(Default)]
+    struct MemoryRemote {
+        objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl SegmentRemote for MemoryRemote {
+        fn upload_segment(&self, path: &Path) -> io::Result<String> {
+            let key = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("segment")
+                .to_string();
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.clone(), fs::read(path)?);
+            Ok(key)
+        }
+
+        fn download_segment(&self, remote_key: &str, dest_path: &Path) -> io::Result<()> {
+            let bytes = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(remote_key)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing remote object"))?;
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(dest_path, bytes)
+        }
+    }
+
+    #[test]
+    fn remote_only_segment_rehydrates_to_canonical_path() {
+        let temp = tempdir().unwrap();
+        let store = TieredStore::open(temp.path()).unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        configure_segment_remote(Some(remote));
+
+        let segment = write_segment(&store, "chunk", b"payload", 1);
+        let bytes = store.offload_segment(&segment.id, "test").unwrap();
+        assert_eq!(bytes, 7);
+        assert!(!segment.path.exists());
+
+        let local = store.ensure_local_segment(&segment.id, "test").unwrap();
+        assert_eq!(local, segment.path);
+        assert_eq!(fs::read(local).unwrap(), b"payload");
+        assert!(!store.is_managed_remote_only(&segment.path).unwrap());
+
+        configure_segment_remote(None);
     }
 }

@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 
 const GIB_U64: u64 = 1024 * 1024 * 1024;
 const MIB_USIZE: usize = 1024 * 1024;
-const DEFAULT_DISK_FREE_LOW_WATER_BYTES: u64 = 500 * GIB_U64;
 const DEFAULT_DISK_HYSTERESIS_MARGIN_BYTES: u64 = 16 * GIB_U64;
+const DEFAULT_DISK_HIGH_WATER_USED_PCT: u8 = 85;
+const DEFAULT_DISK_RECLAIM_TARGET_USED_PCT: u8 = 75;
+const DEFAULT_MIN_FREE_RESERVE_BYTES: u64 = 64 * GIB_U64;
 const DEFAULT_OFFLOAD_PART_BYTES: usize = 8 * MIB_USIZE;
 const DEFAULT_OFFLOAD_HEADROOM_BYTES: usize = 512 * MIB_USIZE;
 
@@ -24,6 +26,9 @@ pub struct OffloadConfig {
     pub landing_bytes_high_water: Option<u64>,
     pub disk_free_low_water: Option<u64>,
     pub disk_hysteresis_margin_bytes: u64,
+    pub disk_high_water_used_pct: u8,
+    pub disk_reclaim_target_used_pct: u8,
+    pub min_free_reserve_bytes: u64,
     pub offload_part_bytes: usize,
     pub offload_headroom_bytes: usize,
     pub cache_dir: PathBuf,
@@ -53,8 +58,11 @@ impl OffloadConfig {
             min_offload_bytes: None,
             batch_offload_bytes: None,
             landing_bytes_high_water: None,
-            disk_free_low_water: Some(DEFAULT_DISK_FREE_LOW_WATER_BYTES),
+            disk_free_low_water: None,
             disk_hysteresis_margin_bytes: DEFAULT_DISK_HYSTERESIS_MARGIN_BYTES,
+            disk_high_water_used_pct: DEFAULT_DISK_HIGH_WATER_USED_PCT,
+            disk_reclaim_target_used_pct: DEFAULT_DISK_RECLAIM_TARGET_USED_PCT,
+            min_free_reserve_bytes: DEFAULT_MIN_FREE_RESERVE_BYTES,
             offload_part_bytes: DEFAULT_OFFLOAD_PART_BYTES,
             offload_headroom_bytes: DEFAULT_OFFLOAD_HEADROOM_BYTES,
             cache_dir: base_dir.join("offload_cache"),
@@ -101,6 +109,15 @@ impl OffloadConfig {
             env_u64("FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER").or(cfg.landing_bytes_high_water);
         cfg.disk_free_low_water =
             env_u64("FOLD_OFFLOAD_DISK_FREE_LOW_WATER").or(cfg.disk_free_low_water);
+        if let Some(pct) = env_u8("FOLD_OFFLOAD_DISK_HIGH_WATER_USED_PCT") {
+            cfg.disk_high_water_used_pct = pct.min(99);
+        }
+        if let Some(pct) = env_u8("FOLD_OFFLOAD_DISK_RECLAIM_TARGET_USED_PCT") {
+            cfg.disk_reclaim_target_used_pct = pct.min(cfg.disk_high_water_used_pct);
+        }
+        if let Some(bytes) = env_u64("FOLD_OFFLOAD_MIN_FREE_RESERVE_BYTES") {
+            cfg.min_free_reserve_bytes = bytes;
+        }
         if let Some(bytes) = env_u64("FOLD_OFFLOAD_DISK_HYSTERESIS_MARGIN_BYTES") {
             cfg.disk_hysteresis_margin_bytes = bytes;
         }
@@ -136,8 +153,11 @@ impl OffloadConfig {
             .unwrap_or_else(|| "disabled".to_string());
 
         let mut messages = vec![format!(
-            "Offload policy: landing_high_water={} => local spill only; disk_free_low_water={} => remote reclaim only; hysteresis={}; part_bytes={}; offload_headroom={}; cache_cap={}",
+            "Offload policy: landing_high_water={} => local spill only; disk_high_water_used_pct={} disk_reclaim_target_used_pct={} min_free_reserve={} legacy_disk_free_low_water={} hysteresis={}; part_bytes={}; offload_headroom={}; cache_cap={}",
             landing,
+            self.disk_high_water_used_pct,
+            self.disk_reclaim_target_used_pct,
+            self.min_free_reserve_bytes,
             disk,
             self.disk_hysteresis_margin_bytes,
             self.offload_part_bytes,
@@ -184,6 +204,12 @@ fn env_u64(var: &str) -> Option<u64> {
         .and_then(|v| v.replace('_', "").parse::<u64>().ok())
 }
 
+fn env_u8(var: &str) -> Option<u8> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+}
+
 fn env_usize(var: &str) -> Option<usize> {
     std::env::var(var)
         .ok()
@@ -213,6 +239,9 @@ mod tests {
         "FOLD_OFFLOAD_BATCH_BYTES",
         "FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER",
         "FOLD_OFFLOAD_DISK_FREE_LOW_WATER",
+        "FOLD_OFFLOAD_DISK_HIGH_WATER_USED_PCT",
+        "FOLD_OFFLOAD_DISK_RECLAIM_TARGET_USED_PCT",
+        "FOLD_OFFLOAD_MIN_FREE_RESERVE_BYTES",
         "FOLD_OFFLOAD_DISK_HYSTERESIS_MARGIN_BYTES",
         "FOLD_OFFLOAD_PART_BYTES",
         "FOLD_OFFLOAD_HEADROOM_BYTES",
@@ -280,10 +309,16 @@ mod tests {
         assert_eq!(cfg.min_offload_bytes, None);
         assert_eq!(cfg.batch_offload_bytes, None);
         assert_eq!(cfg.landing_bytes_high_water, None);
+        assert_eq!(cfg.disk_free_low_water, None);
         assert_eq!(
-            cfg.disk_free_low_water,
-            Some(DEFAULT_DISK_FREE_LOW_WATER_BYTES)
+            cfg.disk_high_water_used_pct,
+            DEFAULT_DISK_HIGH_WATER_USED_PCT
         );
+        assert_eq!(
+            cfg.disk_reclaim_target_used_pct,
+            DEFAULT_DISK_RECLAIM_TARGET_USED_PCT
+        );
+        assert_eq!(cfg.min_free_reserve_bytes, DEFAULT_MIN_FREE_RESERVE_BYTES);
         assert_eq!(
             cfg.disk_hysteresis_margin_bytes,
             DEFAULT_DISK_HYSTERESIS_MARGIN_BYTES
@@ -316,6 +351,9 @@ mod tests {
         set_env("FOLD_OFFLOAD_BATCH_BYTES", "107374182400");
         set_env("FOLD_OFFLOAD_LANDING_BYTES_HIGH_WATER", "1048576");
         set_env("FOLD_OFFLOAD_DISK_FREE_LOW_WATER", "2097152");
+        set_env("FOLD_OFFLOAD_DISK_HIGH_WATER_USED_PCT", "88");
+        set_env("FOLD_OFFLOAD_DISK_RECLAIM_TARGET_USED_PCT", "72");
+        set_env("FOLD_OFFLOAD_MIN_FREE_RESERVE_BYTES", "123456789");
         set_env("FOLD_OFFLOAD_DISK_HYSTERESIS_MARGIN_BYTES", "3145728");
         set_env("FOLD_OFFLOAD_PART_BYTES", "8388608");
         set_env("FOLD_OFFLOAD_HEADROOM_BYTES", "268435456");
@@ -340,6 +378,9 @@ mod tests {
         assert_eq!(cfg.batch_offload_bytes, Some(107_374_182_400));
         assert_eq!(cfg.landing_bytes_high_water, Some(1_048_576));
         assert_eq!(cfg.disk_free_low_water, Some(2_097_152));
+        assert_eq!(cfg.disk_high_water_used_pct, 88);
+        assert_eq!(cfg.disk_reclaim_target_used_pct, 72);
+        assert_eq!(cfg.min_free_reserve_bytes, 123_456_789);
         assert_eq!(cfg.disk_hysteresis_margin_bytes, 3_145_728);
         assert_eq!(cfg.offload_part_bytes, 8_388_608);
         assert_eq!(cfg.offload_headroom_bytes, 268_435_456);
@@ -375,7 +416,11 @@ mod tests {
 
         let messages = cfg.startup_messages();
         assert!(messages.iter().any(|m| m.contains("local spill only")));
-        assert!(messages.iter().any(|m| m.contains("remote reclaim only")));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("disk_high_water_used_pct"))
+        );
         assert!(messages.iter().any(|m| m.contains("hysteresis=789")));
         assert!(messages.iter().any(|m| m.contains("part_bytes=1024")));
         assert!(messages.iter().any(|m| m.contains("offload_headroom=2048")));

@@ -7,6 +7,7 @@ use crate::offload_config::OffloadConfig;
 use crate::offloader::{
     LocalDiskObjectStore, MockObjectStore, OffloadClient, OffloadError, SpacesObjectStore,
 };
+use crate::tiered_store::{SegmentRemote, configure_segment_remote};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -71,6 +72,30 @@ struct ClientRunDownloader {
     temp_root: PathBuf,
 }
 
+#[derive(Clone)]
+struct ClientSegmentRemote {
+    client: OffloadClient,
+    base_path: PathBuf,
+}
+
+impl SegmentRemote for ClientSegmentRemote {
+    fn upload_segment(&self, path: &Path) -> io::Result<String> {
+        let key = object_key(&self.base_path, path)?;
+        let rel = Path::new(&key);
+        self.client
+            .upload_file(path, rel)
+            .map_err(offload_err_to_io)?;
+        Ok(key)
+    }
+
+    fn download_segment(&self, remote_key: &str, dest_path: &Path) -> io::Result<()> {
+        let object_key = self.client.object_key(Path::new(remote_key));
+        self.client
+            .download_file(&object_key, dest_path)
+            .map_err(offload_err_to_io)
+    }
+}
+
 impl RunDownloader for ClientRunDownloader {
     fn cache_lookup(&self, key: &str) -> Option<PathBuf> {
         self.cache.lock().unwrap().get(key)
@@ -101,6 +126,7 @@ impl Drop for OffloadRuntimeGuard {
         set_offload_metrics_handle(None);
         set_run_offloader(None);
         set_run_downloader(None);
+        configure_segment_remote(None);
         disk_safety::clear();
     }
 }
@@ -114,6 +140,10 @@ pub fn configure_offload_runtime(
     if !cfg.enabled {
         return Ok(None);
     }
+    std::fs::create_dir_all(base_path)?;
+    let runtime_base_path = base_path
+        .canonicalize()
+        .unwrap_or_else(|_| base_path.to_path_buf());
 
     let bucket = cfg
         .spaces_bucket
@@ -164,12 +194,17 @@ pub fn configure_offload_runtime(
         temp_root: cfg.cache_dir.clone(),
     };
     let offloader = ClientRunOffloader {
+        client: client.clone(),
+        base_path: runtime_base_path.clone(),
+    };
+    let segment_remote = ClientSegmentRemote {
         client,
-        base_path: base_path.to_path_buf(),
+        base_path: runtime_base_path.clone(),
     };
 
     set_run_offloader(Some(Arc::new(offloader)));
-    set_run_downloader(Some((base_path.to_path_buf(), Arc::new(downloader))));
+    set_run_downloader(Some((runtime_base_path, Arc::new(downloader))));
+    configure_segment_remote(Some(Arc::new(segment_remote)));
     disk_safety::configure(base_path.to_path_buf(), cfg);
 
     Ok(Some(OffloadRuntimeGuard))

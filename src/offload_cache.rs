@@ -48,13 +48,17 @@ impl OffloadCache {
         }
         fs::copy(src, &dest)?;
 
-        self.entries.put(
+        if let Some((_, evicted)) = self.entries.push(
             key.to_string(),
             CacheEntry {
                 path: dest.clone(),
                 size,
             },
-        );
+        ) {
+            self.current_bytes = self.current_bytes.saturating_sub(evicted.size);
+            let _ = fs::remove_file(&evicted.path);
+            Self::remove_empty_dirs_upwards(&evicted.path, &self.cache_dir)?;
+        }
         self.current_bytes = self.current_bytes.saturating_add(size);
         self.evict_if_needed()?;
         Ok(dest)
@@ -87,6 +91,9 @@ impl OffloadCache {
 
     fn evict_if_needed(&mut self) -> Result<(), OffloadError> {
         while self.current_bytes > self.max_bytes {
+            if self.entries.len() <= 1 {
+                break;
+            }
             if let Some((_, entry)) = self.entries.pop_lru() {
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size);
                 let _ = fs::remove_file(&entry.path);
@@ -171,5 +178,17 @@ mod tests {
         fs::remove_file(&cached_path).unwrap();
         assert!(cache.get("runs/x").is_none());
         assert_eq!(cache.current_bytes(), 0);
+    }
+
+    #[test]
+    fn oversized_insert_does_not_return_deleted_path() {
+        let tmp = tempdir().unwrap();
+        let mut cache = OffloadCache::new(tmp.path().join("cache"), 5).unwrap();
+        let src = write_file(tmp.path(), "big.bin", b"0123456789");
+
+        let cached_path = cache.insert_copy("runs/big", &src).unwrap();
+
+        assert!(cached_path.exists());
+        assert_eq!(fs::read(cached_path).unwrap(), b"0123456789");
     }
 }
