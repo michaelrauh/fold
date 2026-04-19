@@ -271,6 +271,7 @@ pub fn set_run_downloader(ctx: Option<(PathBuf, Arc<dyn RunDownloader>)>) {
 /// Set or clear a metrics handle for offload/download counters.
 pub fn set_offload_metrics_handle(handle: Option<crate::metrics::Metrics>) {
     crate::disk_safety::set_metrics_handle(handle.clone());
+    crate::tiered_store::set_segment_metrics_handle(handle.clone());
     METRICS_HANDLE.with(|slot| *slot.borrow_mut() = handle);
 }
 
@@ -3923,6 +3924,111 @@ mod tests {
         let mut expected = vec![seed.id(), child.id()];
         expected.sort_unstable();
         assert_eq!(ids, expected);
+    }
+
+    #[derive(Default)]
+    struct FlakySegmentRemote {
+        objects: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        fail_downloads: Mutex<std::collections::BTreeMap<String, usize>>,
+    }
+
+    impl FlakySegmentRemote {
+        fn fail_downloads(&self, key: &str, times: usize) {
+            self.fail_downloads
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), times);
+        }
+    }
+
+    impl crate::tiered_store::SegmentRemote for FlakySegmentRemote {
+        fn upload_segment(&self, path: &Path) -> io::Result<String> {
+            let key = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("segment")
+                .to_string();
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.clone(), fs::read(path)?);
+            Ok(key)
+        }
+
+        fn download_segment(&self, remote_key: &str, dest_path: &Path) -> io::Result<()> {
+            let mut failures = self.fail_downloads.lock().unwrap();
+            if let Some(remaining) = failures.get_mut(remote_key) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "injected transient body EOF",
+                    ));
+                }
+            }
+            drop(failures);
+            let bytes = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(remote_key)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing remote object"))?;
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(dest_path, bytes)
+        }
+    }
+
+    #[test]
+    fn pop_work_retries_remote_only_segment_download_after_transient_eof() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let remote = Arc::new(FlakySegmentRemote::default());
+        crate::tiered_store::configure_segment_remote(Some(remote.clone()));
+        let metrics = Metrics::new();
+        set_offload_metrics_handle(Some(metrics.clone_handle()));
+
+        let mut store = GenerationStore::new_with_config(base_path.clone(), 8).unwrap();
+        let cfg = Config::test_config(256 * 1024, 8);
+        store.configure(&cfg);
+
+        let seed = Ortho::new();
+        let child = seed.add(1)[0].clone();
+        store
+            .push_segments(vec![seed.clone(), child.clone()])
+            .unwrap();
+        store.flush_all().unwrap();
+        let segment_path = store.work_segments[0].clone();
+        assert!(offload_managed_path_if_configured(&segment_path).unwrap());
+        let remote_key = segment_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_string();
+        remote.fail_downloads(&remote_key, 1);
+
+        let first = store.pop_work().unwrap().unwrap();
+        let second = store.pop_work().unwrap().unwrap();
+        let mut ids = vec![first.id(), second.id()];
+        ids.sort_unstable();
+        let mut expected = vec![seed.id(), child.id()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.global.downloaded_files, 1);
+        assert!(snapshot.global.downloaded_bytes > 0);
+        assert!(
+            snapshot
+                .logs
+                .iter()
+                .any(|entry| entry.message.contains("Segment rehydrate retry"))
+        );
+
+        set_offload_metrics_handle(None);
+        crate::tiered_store::configure_segment_remote(None);
     }
 
     #[test]

@@ -253,6 +253,17 @@ fn main() -> Result<(), FoldError> {
                     metrics.update_global(|g| g.role = role_as_str(role).to_string());
                 }
 
+                if let Some(claim) = file_handler::claim_resumable_merge_with_config(&config)? {
+                    metrics.update_global(|g| g.mode = "Resuming Merge".to_string());
+                    metrics.clear_chart_history();
+                    metrics.add_log(format!(
+                        "Resuming checkpointed merge: {}",
+                        claim.merge_work_folder
+                    ));
+                    resume_merge(claim, &config, &metrics, role)?;
+                    continue;
+                }
+
                 // Update the count of distinct running jobs
                 let jobs_count = file_handler::count_running_jobs_with_config(&config)?;
                 let remaining_chunks = file_handler::count_all_chunks_with_config(&config)?;
@@ -929,9 +940,10 @@ fn merge_archives(
     let ingestion =
         file_handler::ingest_archives_with_config(archive_a_path, archive_b_path, config)
             .map_err(mark_claim_race_if_applicable)?;
-    run_merge_simple(ingestion, config, metrics, role)
+    run_merge_with_checkpoints(ingestion, config, metrics, role, None)
 }
 
+#[allow(dead_code)]
 fn run_merge_simple(
     ingestion: file_handler::ArchiveIngestion,
     config: &StateConfig,
@@ -2538,6 +2550,7 @@ fn build_archive_path(config: &StateConfig) -> Result<PathBuf, FoldError> {
     Ok(archive_path)
 }
 
+#[allow(dead_code)]
 fn history_run_paths_for_archive(
     store: &GenerationStore,
 ) -> Result<Vec<(usize, Vec<PathBuf>)>, FoldError> {

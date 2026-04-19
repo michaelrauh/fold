@@ -8,9 +8,15 @@ use std::sync::{
     Arc, Mutex, OnceLock, RwLock, Weak,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_NAMESPACE: &str = "default";
+const SEGMENT_REHYDRATE_RETRIES: usize = 3;
+#[cfg(not(test))]
+const SEGMENT_REHYDRATE_BACKOFF_BASE: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const SEGMENT_REHYDRATE_BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TierPresence {
@@ -245,14 +251,29 @@ impl Drop for SegmentPinGuard {
 
 thread_local! {
     static SEGMENT_REMOTE: RefCell<Option<Arc<dyn SegmentRemote>>> = const { RefCell::new(None) };
+    static SEGMENT_METRICS_HANDLE: RefCell<Option<crate::metrics::Metrics>> = const { RefCell::new(None) };
 }
 
 pub fn configure_segment_remote(remote: Option<Arc<dyn SegmentRemote>>) {
     SEGMENT_REMOTE.with(|slot| *slot.borrow_mut() = remote);
 }
 
+pub fn set_segment_metrics_handle(handle: Option<crate::metrics::Metrics>) {
+    SEGMENT_METRICS_HANDLE.with(|slot| *slot.borrow_mut() = handle);
+}
+
 fn current_segment_remote() -> Option<Arc<dyn SegmentRemote>> {
     SEGMENT_REMOTE.with(|slot| slot.borrow().clone())
+}
+
+fn segment_metrics_handle() -> Option<crate::metrics::Metrics> {
+    SEGMENT_METRICS_HANDLE.with(|slot| slot.borrow().clone())
+}
+
+fn log_segment_event(message: impl Into<String>) {
+    if let Some(metrics) = segment_metrics_handle() {
+        metrics.add_log(message.into());
+    }
 }
 
 impl TieredStore {
@@ -823,7 +844,7 @@ impl TieredStore {
             return Ok(canonical);
         }
 
-        let remote_key = self.with_catalog(|catalog| {
+        let (remote_key, expected_bytes) = self.with_catalog(|catalog| {
             let meta = catalog.segments.get(id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("unknown segment {}", id))
             })?;
@@ -837,12 +858,13 @@ impl TieredStore {
                     ),
                 ));
             }
-            meta.remote_key.clone().ok_or_else(|| {
+            let remote_key = meta.remote_key.clone().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("segment {} missing locally and has no remote key", id),
                 )
-            })
+            })?;
+            Ok((remote_key, meta.bytes))
         })?;
 
         let remote = current_segment_remote().ok_or_else(|| {
@@ -859,13 +881,85 @@ impl TieredStore {
             fs::create_dir_all(parent)?;
         }
         let tmp = canonical.with_extension("download_tmp");
+        log_segment_event(format!(
+            "Segment rehydrate start: segment_id={}, remote_key={}, expected_bytes={}, reason={}",
+            id, remote_key, expected_bytes, reason
+        ));
+
+        let mut last_error = None;
+        for attempt in 0..=SEGMENT_REHYDRATE_RETRIES {
+            let _ = fs::remove_file(&tmp);
+            let result = remote
+                .download_segment(&remote_key, &tmp)
+                .and_then(|_| verify_downloaded_segment(id, &remote_key, &tmp, expected_bytes));
+            match result {
+                Ok(actual_bytes) => {
+                    File::open(&tmp)?.sync_all()?;
+                    fs::rename(&tmp, &canonical)?;
+                    self.set_disk_state_for_id(id, true)?;
+                    self.touch_segment(id, reason)?;
+                    if let Some(metrics) = segment_metrics_handle() {
+                        metrics.record_download(1, actual_bytes);
+                        metrics.add_log(format!(
+                            "Segment rehydrate success: segment_id={}, remote_key={}, bytes={}, attempts={}",
+                            id,
+                            remote_key,
+                            actual_bytes,
+                            attempt.saturating_add(1)
+                        ));
+                    }
+                    return Ok(canonical);
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    let actual_bytes = file_size_or_zero(&tmp);
+                    let _ = fs::remove_file(&tmp);
+                    log_segment_event(format!(
+                        "Segment rehydrate final failure: kind=missing_remote_object, segment_id={}, remote_key={}, expected_bytes={}, actual_bytes={}, attempts={}, error={}",
+                        id,
+                        remote_key,
+                        expected_bytes,
+                        actual_bytes,
+                        attempt.saturating_add(1),
+                        err
+                    ));
+                    return Err(err);
+                }
+                Err(err) => {
+                    let actual_bytes = file_size_or_zero(&tmp);
+                    let message = err.to_string();
+                    let _ = fs::remove_file(&tmp);
+                    last_error = Some(message.clone());
+                    if attempt == SEGMENT_REHYDRATE_RETRIES {
+                        break;
+                    }
+                    log_segment_event(format!(
+                        "Segment rehydrate retry: segment_id={}, remote_key={}, expected_bytes={}, actual_bytes={}, attempt={}, error={}",
+                        id,
+                        remote_key,
+                        expected_bytes,
+                        actual_bytes,
+                        attempt.saturating_add(1),
+                        message
+                    ));
+                    let delay = segment_rehydrate_delay(attempt, &remote_key);
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
+
         let _ = fs::remove_file(&tmp);
-        remote.download_segment(&remote_key, &tmp)?;
-        File::open(&tmp)?.sync_all()?;
-        fs::rename(&tmp, &canonical)?;
-        self.set_disk_state_for_id(id, true)?;
-        self.touch_segment(id, reason)?;
-        Ok(canonical)
+        let message = format!(
+            "remote_download_exhausted: segment_id={}, remote_key={}, expected_bytes={}, attempts={}, last_error={}",
+            id,
+            remote_key,
+            expected_bytes,
+            SEGMENT_REHYDRATE_RETRIES.saturating_add(1),
+            last_error.unwrap_or_else(|| "unknown".to_string())
+        );
+        log_segment_event(format!("Segment rehydrate final failure: {}", message));
+        Err(io::Error::other(message))
     }
 
     pub fn open_segment_reader(
@@ -1144,6 +1238,7 @@ impl TieredStore {
     }
 
     fn cleanup_crashed_transients(&self) -> io::Result<()> {
+        self.cleanup_download_temps()?;
         let stale: Vec<String> = self.with_catalog(|catalog| {
             Ok(catalog
                 .segments
@@ -1174,8 +1269,39 @@ impl TieredStore {
         self.flush_metadata("cleanup_crashed_transients")
     }
 
+    fn cleanup_download_temps(&self) -> io::Result<usize> {
+        let segments = self.segments_dir();
+        if !segments.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for entry in fs::read_dir(segments)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("download_tmp") {
+                match fs::remove_file(&path) {
+                    Ok(()) => removed = removed.saturating_add(1),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        if removed > 0 {
+            log_segment_event(format!(
+                "TieredStore startup scrub removed {} stale download temp files from {}",
+                removed,
+                self.root().display()
+            ));
+        }
+        Ok(removed)
+    }
+
     fn collections_dir(&self) -> PathBuf {
         self.root().join("collections")
+    }
+
+    fn segments_dir(&self) -> PathBuf {
+        self.root().join("segments")
     }
 
     fn heads_dir(&self) -> PathBuf {
@@ -1748,6 +1874,54 @@ fn ensure_root_layout(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn verify_downloaded_segment(
+    id: &str,
+    remote_key: &str,
+    tmp: &Path,
+    expected_bytes: u64,
+) -> io::Result<u64> {
+    let actual_bytes = fs::metadata(tmp)?.len();
+    if actual_bytes != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "remote_download_size_mismatch: segment_id={}, remote_key={}, expected_bytes={}, actual_bytes={}",
+                id, remote_key, expected_bytes, actual_bytes
+            ),
+        ));
+    }
+    Ok(actual_bytes)
+}
+
+fn file_size_or_zero(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn segment_rehydrate_delay(attempt: usize, remote_key: &str) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = (attempt, remote_key);
+        Duration::ZERO
+    }
+    #[cfg(not(test))]
+    {
+        if SEGMENT_REHYDRATE_BACKOFF_BASE.is_zero() || SEGMENT_REHYDRATE_BACKOFF_CAP.is_zero() {
+            return Duration::ZERO;
+        }
+        let shift = attempt.min(8) as u32;
+        let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let base_ms = SEGMENT_REHYDRATE_BACKOFF_BASE.as_millis() as u64;
+        let capped_ms = base_ms
+            .saturating_mul(multiplier as u64)
+            .min(SEGMENT_REHYDRATE_BACKOFF_CAP.as_millis() as u64);
+        let jitter_ms = ((remote_key.len() as u64)
+            .saturating_mul(41)
+            .saturating_add((attempt as u64).saturating_mul(97)))
+            % 250;
+        Duration::from_millis(capped_ms.saturating_add(jitter_ms))
+    }
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2075,6 +2249,35 @@ mod tests {
     #[derive(Default)]
     struct MemoryRemote {
         objects: Mutex<BTreeMap<String, Vec<u8>>>,
+        download_failures: Mutex<BTreeMap<String, usize>>,
+        short_downloads: Mutex<BTreeMap<String, usize>>,
+    }
+
+    impl MemoryRemote {
+        fn fail_downloads(&self, key: &str, times: usize) {
+            self.download_failures
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), times);
+        }
+
+        fn short_downloads(&self, key: &str, times: usize) {
+            self.short_downloads
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), times);
+        }
+
+        fn decrement(map: &Mutex<BTreeMap<String, usize>>, key: &str) -> bool {
+            let mut guard = map.lock().unwrap();
+            if let Some(remaining) = guard.get_mut(key) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return true;
+                }
+            }
+            false
+        }
     }
 
     impl SegmentRemote for MemoryRemote {
@@ -2092,6 +2295,12 @@ mod tests {
         }
 
         fn download_segment(&self, remote_key: &str, dest_path: &Path) -> io::Result<()> {
+            if Self::decrement(&self.download_failures, remote_key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "injected transient body EOF",
+                ));
+            }
             let bytes = self
                 .objects
                 .lock()
@@ -2101,6 +2310,9 @@ mod tests {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing remote object"))?;
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)?;
+            }
+            if Self::decrement(&self.short_downloads, remote_key) {
+                return fs::write(dest_path, &bytes[..bytes.len().saturating_div(2)]);
             }
             fs::write(dest_path, bytes)
         }
@@ -2124,5 +2336,90 @@ mod tests {
         assert!(!store.is_managed_remote_only(&segment.path).unwrap());
 
         configure_segment_remote(None);
+    }
+
+    #[test]
+    fn remote_only_segment_retries_failed_download_and_records_metrics() {
+        let temp = tempdir().unwrap();
+        let store = TieredStore::open(temp.path()).unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        configure_segment_remote(Some(remote.clone()));
+        let metrics = crate::metrics::Metrics::new();
+        set_segment_metrics_handle(Some(metrics.clone_handle()));
+
+        let segment = write_segment(&store, "work", b"payload", 1);
+        store.offload_segment(&segment.id, "test").unwrap();
+        let remote_key = segment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_string();
+        remote.fail_downloads(&remote_key, 1);
+
+        let local = store.ensure_local_segment(&segment.id, "test").unwrap();
+        assert_eq!(local, segment.path);
+        assert_eq!(fs::read(local).unwrap(), b"payload");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.global.downloaded_files, 1);
+        assert_eq!(snapshot.global.downloaded_bytes, 7);
+        assert!(
+            snapshot
+                .logs
+                .iter()
+                .any(|entry| entry.message.contains("Segment rehydrate retry"))
+        );
+        assert!(
+            snapshot
+                .logs
+                .iter()
+                .any(|entry| entry.message.contains("Segment rehydrate success"))
+        );
+
+        set_segment_metrics_handle(None);
+        configure_segment_remote(None);
+    }
+
+    #[test]
+    fn exhausted_rehydrate_deletes_temp_and_leaves_segment_remote_only() {
+        let temp = tempdir().unwrap();
+        let store = TieredStore::open(temp.path()).unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        configure_segment_remote(Some(remote.clone()));
+
+        let segment = write_segment(&store, "work", b"payload", 1);
+        store.offload_segment(&segment.id, "test").unwrap();
+        let remote_key = segment
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_string();
+        remote.short_downloads(&remote_key, SEGMENT_REHYDRATE_RETRIES + 1);
+
+        let err = store.ensure_local_segment(&segment.id, "test").unwrap_err();
+        assert!(err.to_string().contains("remote_download_exhausted"));
+        assert!(!segment.path.exists());
+        assert!(!segment.path.with_extension("download_tmp").exists());
+        assert!(store.is_managed_remote_only(&segment.path).unwrap());
+
+        configure_segment_remote(None);
+    }
+
+    #[test]
+    fn open_scrubs_stale_download_temp_files() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("store");
+        let tmp = {
+            let store = TieredStore::open(&root).unwrap();
+            let tmp = store.segments_dir().join("0000000000000000.download_tmp");
+            fs::write(&tmp, b"partial").unwrap();
+            tmp
+        };
+
+        assert!(tmp.exists());
+        let _reopened = TieredStore::open(&root).unwrap();
+        assert!(!tmp.exists());
     }
 }

@@ -15,9 +15,11 @@ use std::sync::{Arc, Mutex};
 fn offload_err_to_io(err: OffloadError) -> io::Error {
     match err {
         OffloadError::Io(e) => e,
-        OffloadError::Missing(msg) | OffloadError::Other(msg) => {
-            io::Error::new(io::ErrorKind::Other, msg)
-        }
+        OffloadError::Missing(msg) => io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing_remote_object: {msg}"),
+        ),
+        OffloadError::Other(msg) => io::Error::new(io::ErrorKind::Other, msg),
     }
 }
 

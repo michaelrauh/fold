@@ -113,8 +113,38 @@ fn load_valid_resume_manifest(merge_work_path: &Path) -> Option<merge_resume::Me
 }
 
 fn protected_archive_paths_for_resumable_merges(in_process_path: &Path) -> HashSet<PathBuf> {
-    let _ = in_process_path;
-    HashSet::new()
+    let mut protected = HashSet::new();
+    let Ok(entries) = fs::read_dir(in_process_path) else {
+        return protected;
+    };
+
+    for entry in entries.flatten() {
+        let merge_work_path = entry.path();
+        if !merge_work_path.is_dir() {
+            continue;
+        }
+        let name = merge_work_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !name.starts_with("merge_") || !name.ends_with(".work") {
+            continue;
+        }
+        let Some(manifest) = load_valid_resume_manifest(&merge_work_path) else {
+            continue;
+        };
+        if manifest.phase == merge_resume::ResumePhase::Archived {
+            continue;
+        }
+        protected.insert(normalize_existing_path(Path::new(&manifest.archive_a_path)));
+        protected.insert(normalize_existing_path(Path::new(&manifest.archive_b_path)));
+    }
+
+    protected
+}
+
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), FoldError> {
@@ -181,6 +211,11 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                     let folder_name_str = folder_name.to_str().unwrap_or("");
                     // If it's a merge_*.work folder with stale heartbeat, recover the merge
                     if folder_name_str.starts_with("merge_") && folder_name_str.ends_with(".work") {
+                        if let Some(manifest) = load_valid_resume_manifest(&entry_path) {
+                            if manifest.phase != merge_resume::ResumePhase::Archived {
+                                continue;
+                            }
+                        }
                         // Extract PID to find related archives and results
                         if let Some(pid_str) = folder_name_str
                             .strip_prefix("merge_")
@@ -198,7 +233,9 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                                                 .map(|e| e == "bin")
                                                 .unwrap_or(false)
                                         {
-                                            if protected_archives.contains(&bin_path) {
+                                            if protected_archives
+                                                .contains(&normalize_existing_path(&bin_path))
+                                            {
                                                 continue;
                                             }
                                             // Remove heartbeat from archive
@@ -242,7 +279,7 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                     }
                     // If it's an archive folder with stale heartbeat (orphaned from failed merge recovery), move it back
                     else if entry_path.to_string_lossy().ends_with(".bin") {
-                        if protected_archives.contains(&entry_path) {
+                        if protected_archives.contains(&normalize_existing_path(&entry_path)) {
                             continue;
                         }
                         // Remove the heartbeat before moving to input
@@ -276,7 +313,7 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
             if entry_path.is_dir() {
                 if let Some(ext) = entry_path.extension() {
                     if ext == "bin" {
-                        if protected_archives.contains(&entry_path) {
+                        if protected_archives.contains(&normalize_existing_path(&entry_path)) {
                             continue;
                         }
                         let heartbeat = entry_path.join("heartbeat");
@@ -320,7 +357,12 @@ fn recover_abandoned_files(input_dir: &str, in_process_dir: &str) -> Result<(), 
                             // Only delete if merge work doesn't exist or has stale heartbeat
                             let should_delete = !merge_work_path.exists()
                                 || !merge_heartbeat.exists()
-                                || is_heartbeat_stale(&merge_heartbeat).unwrap_or(true);
+                                || (is_heartbeat_stale(&merge_heartbeat).unwrap_or(true)
+                                    && load_valid_resume_manifest(&merge_work_path)
+                                        .map(|manifest| {
+                                            manifest.phase == merge_resume::ResumePhase::Archived
+                                        })
+                                        .unwrap_or(true));
 
                             if should_delete {
                                 // println!("[fold] Removing orphaned results directory: {}", folder_name_str);
@@ -1837,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_merge_rewinds_to_input_even_with_valid_resume_manifest() {
+    fn stale_merge_with_valid_resume_manifest_is_preserved_for_resume_claim() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = StateConfig::custom(temp_dir.path().to_path_buf());
         initialize_with_config(&config).unwrap();
@@ -1894,15 +1936,23 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!merge_work.exists(), "stale merge work should be removed");
         assert!(
-            config.input_dir().join("archive_a.bin").exists(),
-            "archive A should be rewound to input"
+            merge_work.exists(),
+            "resumable merge work should be preserved"
         );
         assert!(
-            config.input_dir().join("archive_b.bin").exists(),
-            "archive B should be rewound to input"
+            archive_a.exists(),
+            "archive A should stay in process for resume"
         );
+        assert!(
+            archive_b.exists(),
+            "archive B should stay in process for resume"
+        );
+        let claim = claim_resumable_merge_with_config(&config)
+            .unwrap()
+            .expect("valid stale merge should be claimable");
+        assert_eq!(claim.merge_work_folder, merge_work.to_string_lossy());
+        assert_eq!(claim.manifest.phase, ResumePhase::LargerLoaded);
     }
 
     #[test]
@@ -2105,14 +2155,17 @@ mod tests {
             config.in_process_dir().to_str().unwrap(),
         )
         .unwrap();
-        assert!(!merge_work.exists(), "stale merge work should be removed");
         assert!(
-            config.input_dir().join("archive_a.bin").exists(),
-            "archive A should be rewound to input after reclaim pressure"
+            merge_work.exists(),
+            "resumable merge work should be preserved"
         );
         assert!(
-            config.input_dir().join("archive_b.bin").exists(),
-            "archive B should be rewound to input after reclaim pressure"
+            archive_a.exists(),
+            "archive A should stay in process after reclaim pressure"
+        );
+        assert!(
+            archive_b.exists(),
+            "archive B should stay in process after reclaim pressure"
         );
     }
 

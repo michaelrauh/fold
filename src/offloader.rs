@@ -14,6 +14,12 @@ use std::{
 
 const MULTIPART_MIN_PART_BYTES: usize = 5 * 1024 * 1024;
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+const DEFAULT_CLIENT_RETRIES: usize = 5;
+const DEFAULT_CLIENT_BACKOFF_BASE: Duration = Duration::from_millis(250);
+const DEFAULT_CLIENT_BACKOFF_CAP: Duration = Duration::from_secs(10);
+const RANGE_IO_RETRIES: usize = 10;
+const RANGE_IO_BACKOFF_BASE: Duration = Duration::from_millis(250);
+const RANGE_IO_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// Errors that can occur during offload/download.
 #[derive(Debug)]
@@ -62,6 +68,7 @@ pub struct OffloadClient {
     prefix: String,
     max_retries: usize,
     backoff_base: Duration,
+    backoff_cap: Duration,
 }
 
 impl OffloadClient {
@@ -76,8 +83,9 @@ impl OffloadClient {
             store,
             bucket: bucket.into(),
             prefix: prefix.into(),
-            max_retries: 3,
-            backoff_base: Duration::from_millis(50),
+            max_retries: DEFAULT_CLIENT_RETRIES,
+            backoff_base: DEFAULT_CLIENT_BACKOFF_BASE,
+            backoff_cap: DEFAULT_CLIENT_BACKOFF_CAP,
         }
     }
 
@@ -85,6 +93,7 @@ impl OffloadClient {
     pub fn with_retry(mut self, max_retries: usize, backoff_base: Duration) -> Self {
         self.max_retries = max_retries;
         self.backoff_base = backoff_base;
+        self.backoff_cap = DEFAULT_CLIENT_BACKOFF_CAP;
         self
     }
 
@@ -110,7 +119,7 @@ impl OffloadClient {
     /// Upload a file to the configured bucket/prefix. Returns the object key used.
     pub fn upload_file(&self, local_path: &Path, relative: &Path) -> Result<String, OffloadError> {
         let key = self.object_key(relative);
-        self.retry("put", &key, || {
+        self.retry("remote_upload", &key, || {
             self.store.put(&self.bucket, &key, local_path)
         })?;
         Ok(key)
@@ -118,30 +127,25 @@ impl OffloadClient {
 
     /// Download an object to a local path.
     pub fn download_file(&self, key: &str, dest_path: &Path) -> Result<(), OffloadError> {
-        self.retry("get", key, || self.store.get(&self.bucket, key, dest_path))
+        self.retry("remote_download", key, || {
+            self.store.get(&self.bucket, key, dest_path)
+        })
     }
 
-    fn retry<F>(&self, op: &str, key: &str, mut action: F) -> Result<(), OffloadError>
+    fn retry<F>(&self, op: &str, key: &str, action: F) -> Result<(), OffloadError>
     where
         F: FnMut() -> Result<(), OffloadError>,
     {
-        let mut last_err: Option<OffloadError> = None;
-        for attempt in 0..=self.max_retries {
-            match action() {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    last_err = Some(err);
-                    if attempt == self.max_retries {
-                        break;
-                    }
-                    let sleep_dur = self.backoff_base.mul_f64((attempt + 1) as f64);
-                    thread::sleep(sleep_dur);
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            OffloadError::Other(format!("{} failed with no error detail for {}", op, key))
-        }))
+        retry_retryable(
+            op,
+            key,
+            RetryPolicy {
+                max_retries: self.max_retries,
+                backoff_base: self.backoff_base,
+                backoff_cap: self.backoff_cap,
+            },
+            action,
+        )
     }
 }
 
@@ -339,16 +343,18 @@ impl SpacesObjectStore {
                     break;
                 }
                 let is_last = chunk.len() < self.part_bytes;
-                let part = self
-                    .client
-                    .put_multipart_chunk_blocking(
-                        chunk,
-                        &upload.key,
-                        part_number,
-                        &upload.upload_id,
-                        DEFAULT_CONTENT_TYPE,
-                    )
-                    .map_err(|e| OffloadError::Other(e.to_string()))?;
+                let part =
+                    retry_retryable("remote_upload_part", key, RetryPolicy::range_io(), || {
+                        self.client
+                            .put_multipart_chunk_blocking(
+                                chunk.clone(),
+                                &upload.key,
+                                part_number,
+                                &upload.upload_id,
+                                DEFAULT_CONTENT_TYPE,
+                            )
+                            .map_err(|e| OffloadError::Other(e.to_string()))
+                    })?;
                 parts.push(part);
                 part_number = part_number.saturating_add(1);
                 if is_last {
@@ -434,23 +440,29 @@ impl ObjectStore for SpacesObjectStore {
                 OffloadError::Other(format!("negative content length for object {}", key))
             })?;
 
-        download_in_parts(dest_path, total_bytes, self.part_bytes, |start, end| {
-            let response = self
-                .client
-                .get_object_range_blocking(key, start, Some(end))
-                .map_err(|e| OffloadError::Other(e.to_string()))?;
-            let status = response.status_code();
-            if !(200..300).contains(&status) {
-                if status == 404 {
-                    return Err(OffloadError::Missing(key.to_string()));
+        download_in_parts_with_retry(
+            dest_path,
+            total_bytes,
+            self.part_bytes,
+            RetryPolicy::range_io(),
+            |start, end| {
+                let response = self
+                    .client
+                    .get_object_range_blocking(key, start, Some(end))
+                    .map_err(|e| OffloadError::Other(e.to_string()))?;
+                let status = response.status_code();
+                if !(200..300).contains(&status) {
+                    if status == 404 {
+                        return Err(OffloadError::Missing(key.to_string()));
+                    }
+                    return Err(OffloadError::Other(format!(
+                        "get_object_range failed: status {}",
+                        status
+                    )));
                 }
-                return Err(OffloadError::Other(format!(
-                    "get_object_range failed: status {}",
-                    status
-                )));
-            }
-            Ok(response.to_vec())
-        })
+                Ok(response.to_vec())
+            },
+        )
     }
 }
 
@@ -505,6 +517,104 @@ mod tests {
         let err = download_in_parts(&dest, 9, 8, |_start, _end| Ok(vec![1, 2, 3])).unwrap_err();
 
         assert!(err.to_string().contains("range download returned"));
+    }
+
+    #[test]
+    fn download_in_parts_retries_transient_range_error() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+        let source = b"abcdefghijklmnopqrs".to_vec();
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_clone = Arc::clone(&calls);
+
+        download_in_parts_with_retry(
+            &dest,
+            source.len() as u64,
+            8,
+            RetryPolicy::test_immediate(2),
+            move |start, end| {
+                let mut guard = calls_clone.lock().unwrap();
+                *guard += 1;
+                if *guard == 2 {
+                    return Err(OffloadError::Other(
+                        "hyper: error reading a body from connection: end of file before message length reached"
+                            .to_string(),
+                    ));
+                }
+                Ok(source[start as usize..=end as usize].to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"abcdefghijklmnopqrs");
+        assert!(*calls.lock().unwrap() > 3);
+    }
+
+    #[test]
+    fn download_in_parts_retries_short_range_body() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("download.bin");
+        let source = b"abcdefghijklmnopqrs".to_vec();
+        let short_once = Arc::new(Mutex::new(true));
+        let short_once_clone = Arc::clone(&short_once);
+
+        download_in_parts_with_retry(
+            &dest,
+            source.len() as u64,
+            8,
+            RetryPolicy::test_immediate(2),
+            move |start, end| {
+                if start == 8 && *short_once_clone.lock().unwrap() {
+                    *short_once_clone.lock().unwrap() = false;
+                    return Ok(vec![1, 2, 3]);
+                }
+                Ok(source[start as usize..=end as usize].to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"abcdefghijklmnopqrs");
+    }
+
+    #[test]
+    fn retry_retryable_does_not_retry_missing_object() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_clone = Arc::clone(&calls);
+        let err = retry_retryable(
+            "remote_download",
+            "missing",
+            RetryPolicy::test_immediate(4),
+            || {
+                *calls_clone.lock().unwrap() += 1;
+                Err::<(), OffloadError>(OffloadError::Missing("missing".to_string()))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, OffloadError::Missing(_)));
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn retry_retryable_retries_upload_part_failure() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_clone = Arc::clone(&calls);
+        retry_retryable(
+            "remote_upload_part",
+            "key",
+            RetryPolicy::test_immediate(3),
+            || {
+                let mut guard = calls_clone.lock().unwrap();
+                *guard += 1;
+                if *guard < 3 {
+                    return Err(OffloadError::Other("status 503".to_string()));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 3);
     }
 
     #[test]
@@ -600,10 +710,172 @@ fn read_part<R: Read>(reader: &mut R, part_bytes: usize) -> Result<Vec<u8>, Offl
     Ok(chunk)
 }
 
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    max_retries: usize,
+    backoff_base: Duration,
+    backoff_cap: Duration,
+}
+
+impl RetryPolicy {
+    fn range_io() -> Self {
+        Self {
+            max_retries: RANGE_IO_RETRIES,
+            backoff_base: RANGE_IO_BACKOFF_BASE,
+            backoff_cap: RANGE_IO_BACKOFF_CAP,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_immediate(max_retries: usize) -> Self {
+        Self {
+            max_retries,
+            backoff_base: Duration::ZERO,
+            backoff_cap: Duration::ZERO,
+        }
+    }
+}
+
+fn retry_retryable<F, T>(
+    op: &str,
+    key: &str,
+    policy: RetryPolicy,
+    mut action: F,
+) -> Result<T, OffloadError>
+where
+    F: FnMut() -> Result<T, OffloadError>,
+{
+    let mut last_err: Option<OffloadError> = None;
+    for attempt in 0..=policy.max_retries {
+        match action() {
+            Ok(value) => return Ok(value),
+            Err(err) if !is_retryable_offload_error(&err) => return Err(err),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt == policy.max_retries {
+                    break;
+                }
+                let sleep_dur = retry_delay(policy, attempt, key);
+                if !sleep_dur.is_zero() {
+                    thread::sleep(sleep_dur);
+                }
+            }
+        }
+    }
+
+    Err(OffloadError::Other(format!(
+        "{}_exhausted: key={}, attempts={}, last_error={}",
+        op,
+        key,
+        policy.max_retries.saturating_add(1),
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )))
+}
+
+fn retry_delay(policy: RetryPolicy, attempt: usize, key: &str) -> Duration {
+    if policy.backoff_base.is_zero() || policy.backoff_cap.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = attempt.min(10) as u32;
+    let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+    let base_ms = policy.backoff_base.as_millis() as u64;
+    let capped_ms =
+        (base_ms.saturating_mul(multiplier as u64)).min(policy.backoff_cap.as_millis() as u64);
+    let jitter_ms = ((key.len() as u64)
+        .saturating_mul(37)
+        .saturating_add((attempt as u64).saturating_mul(101)))
+        % 250;
+    Duration::from_millis(capped_ms.saturating_add(jitter_ms))
+}
+
+fn is_retryable_offload_error(err: &OffloadError) -> bool {
+    match err {
+        OffloadError::Missing(_) => false,
+        OffloadError::Io(err) => matches!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::Other
+        ),
+        OffloadError::Other(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("missing object")
+                || lower.contains("bucket mismatch")
+                || lower.contains("invalid credentials")
+                || lower.contains("status 400")
+                || lower.contains("status 401")
+                || lower.contains("status 403")
+                || lower.contains("status 404")
+                || lower.contains("_exhausted")
+            {
+                return false;
+            }
+            lower.contains("hyper")
+                || lower.contains("end of file")
+                || lower.contains("unexpected eof")
+                || lower.contains("connection")
+                || lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("tls")
+                || lower.contains("body")
+                || lower.contains("reset")
+                || lower.contains("temporar")
+                || lower.contains("broken pipe")
+                || lower.contains("status 429")
+                || lower.contains("status 500")
+                || lower.contains("status 502")
+                || lower.contains("status 503")
+                || lower.contains("status 504")
+                || lower.contains("range download returned")
+                || lower.contains("injected")
+        }
+    }
+}
+
+#[cfg(test)]
 fn download_in_parts<F>(
     dest_path: &Path,
     total_bytes: u64,
     part_bytes: usize,
+    fetch_range: F,
+) -> Result<(), OffloadError>
+where
+    F: FnMut(u64, u64) -> Result<Vec<u8>, OffloadError>,
+{
+    download_in_parts_inner(dest_path, total_bytes, part_bytes, None, fetch_range)
+}
+
+fn download_in_parts_with_retry<F>(
+    dest_path: &Path,
+    total_bytes: u64,
+    part_bytes: usize,
+    retry_policy: RetryPolicy,
+    fetch_range: F,
+) -> Result<(), OffloadError>
+where
+    F: FnMut(u64, u64) -> Result<Vec<u8>, OffloadError>,
+{
+    download_in_parts_inner(
+        dest_path,
+        total_bytes,
+        part_bytes,
+        Some(retry_policy),
+        fetch_range,
+    )
+}
+
+fn download_in_parts_inner<F>(
+    dest_path: &Path,
+    total_bytes: u64,
+    part_bytes: usize,
+    retry_policy: Option<RetryPolicy>,
     mut fetch_range: F,
 ) -> Result<(), OffloadError>
 where
@@ -622,16 +894,29 @@ where
             .saturating_sub(1)
             .min(total_bytes.saturating_sub(1));
         let expected_len = (end - start + 1) as usize;
-        let chunk = fetch_range(start, end)?;
-        if chunk.len() != expected_len {
-            return Err(OffloadError::Other(format!(
-                "range download returned {} bytes for {}-{} (expected {})",
-                chunk.len(),
-                start,
-                end,
-                expected_len
-            )));
-        }
+        let fetch = |fetch_range: &mut F| {
+            let chunk = fetch_range(start, end)?;
+            if chunk.len() != expected_len {
+                return Err(OffloadError::Other(format!(
+                    "range download returned {} bytes for {}-{} (expected {})",
+                    chunk.len(),
+                    start,
+                    end,
+                    expected_len
+                )));
+            }
+            Ok(chunk)
+        };
+        let chunk = if let Some(policy) = retry_policy {
+            retry_retryable(
+                "remote_download_range",
+                &format!("{}-{}", start, end),
+                policy,
+                || fetch(&mut fetch_range),
+            )?
+        } else {
+            fetch(&mut fetch_range)?
+        };
         std::io::Write::write_all(&mut writer, &chunk)?;
         start = end.saturating_add(1);
     }
