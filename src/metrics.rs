@@ -1,891 +1,223 @@
-use crate::ortho::{Dim, OrthoScore, PayloadVal};
+use crate::ortho::{Dim, OrthoScore};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_SAMPLES: usize = 2000;
-const DOWNSAMPLE_THRESHOLD: usize = 1500;
-
-#[derive(Clone, Debug)]
-pub struct MetricSample {
-    pub timestamp: u64,
-    pub value: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct StatusHistoryEntry {
-    pub status: String,
-    pub start_time: u64,
-    pub duration: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct StatusDurationStats {
-    pub total_count: usize,
-    pub total_duration: u64,
-    pub min_duration: u64,
-    pub max_duration: u64,
-}
+const MAX_LOGS: usize = 400;
+const MAX_RATE_SAMPLES: usize = 64;
+const RATE_WINDOW: Duration = Duration::from_secs(10);
+const RATE_STALE_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct GlobalMetrics {
-    pub mode: String,
-    pub role: String,
-    pub run_input_words: usize,
-    pub run_disk_bytes: u64,
-    pub interner_version: usize,
-    pub vocab_size: usize,
-    pub total_chunks: usize,
-    pub processed_chunks: usize,
-    pub remaining_chunks: usize,
-    pub system_memory_percent: usize,
-    pub start_time: u64,
-    pub current_lineage: String,
-    pub distinct_jobs_count: usize,
-    pub ram_bytes: usize,
-    pub process_rss_bytes: usize,
-    pub process_rss_cap_bytes: usize,
-    pub disk_total_bytes: u64,
-    pub disk_available_bytes: u64,
-    pub compression_uncompressed_bytes: u64,
-    pub compression_compressed_bytes: u64,
-    // Generational store fields
-    pub generation: u64,
+    pub input_path: String,
     pub phase: String,
-    pub work_len: u64,
-    pub seen_len_accepted: u64,
-    pub landing_buffer_bytes: u64,
-    pub run_budget_bytes: usize,
-    pub compaction_arena_cap_bytes: usize,
-    pub compaction_arena_bytes: usize,
-    pub fan_in: usize,
-    pub work_cache_cap_bytes: usize,
-    pub work_cache_bytes: usize,
-    pub segment_batch_cap_bytes: usize,
-    pub segment_batch_bytes: usize,
-    pub spill_created_files: u64,
-    pub spill_created_bytes: u64,
-    pub spill_pending_files: u64,
-    pub spill_pending_bytes: u64,
-    pub spill_consumed_files: u64,
-    pub spill_consumed_bytes: u64,
-    // Offload/caching
-    pub offloaded_files: u64,
-    pub offloaded_bytes: u64,
-    pub downloaded_files: u64,
-    pub downloaded_bytes: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub pressure_triggers: u64,
+    pub start_time: u64,
+    pub nodes_expanded: u64,
+    pub nodes_pruned: u64,
+    pub completions_pruned: u64,
+    pub current_depth: usize,
+    pub max_depth: usize,
+    pub current_bound: OrthoScore,
+    pub incumbent_score: OrthoScore,
+    pub incumbent_dims: Vec<Dim>,
+    pub incumbent_capacity: usize,
+    pub incumbent_display: String,
+    pub checkpoint_time: u64,
+    pub checkpoint_status: String,
+    pub open_siblings_total: u64,
+    pub open_siblings_by_depth: Vec<u64>,
+    pub seen_by_depth: Vec<u64>,
+    pub descended_by_depth: Vec<u64>,
+    pub pruned_by_depth: Vec<u64>,
+    pub path_progress_by_depth: Vec<(usize, usize)>,
+    pub frontier_max_bound: Option<OrthoScore>,
+    pub last_improvement_unix: u64,
+    pub last_improvement_depth: usize,
+    pub nodes_per_sec: f64,
+    pub prunes_per_sec: f64,
+    pub completion_prunes_per_sec: f64,
 }
 
 impl Default for GlobalMetrics {
     fn default() -> Self {
-        let start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         Self {
-            mode: "Starting".to_string(),
-            role: String::new(),
-            run_input_words: 0,
-            run_disk_bytes: 0,
-            interner_version: 0,
-            vocab_size: 0,
-            total_chunks: 0,
-            processed_chunks: 0,
-            remaining_chunks: 0,
-            system_memory_percent: 0,
-            start_time,
-            current_lineage: String::new(),
-            distinct_jobs_count: 0,
-            ram_bytes: 0,
-            process_rss_bytes: 0,
-            process_rss_cap_bytes: 0,
-            disk_total_bytes: 0,
-            disk_available_bytes: 0,
-            compression_uncompressed_bytes: 0,
-            compression_compressed_bytes: 0,
-            generation: 0,
-            phase: "Idle".to_string(),
-            work_len: 0,
-            seen_len_accepted: 0,
-            landing_buffer_bytes: 0,
-            run_budget_bytes: 0,
-            compaction_arena_cap_bytes: 0,
-            compaction_arena_bytes: 0,
-            fan_in: 0,
-            work_cache_cap_bytes: 0,
-            work_cache_bytes: 0,
-            segment_batch_cap_bytes: 0,
-            segment_batch_bytes: 0,
-            spill_created_files: 0,
-            spill_created_bytes: 0,
-            spill_pending_files: 0,
-            spill_pending_bytes: 0,
-            spill_consumed_files: 0,
-            spill_consumed_bytes: 0,
-            offloaded_files: 0,
-            offloaded_bytes: 0,
-            downloaded_files: 0,
-            downloaded_bytes: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-            pressure_triggers: 0,
+            input_path: String::new(),
+            phase: "Starting".to_string(),
+            start_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            nodes_expanded: 0,
+            nodes_pruned: 0,
+            completions_pruned: 0,
+            current_depth: 0,
+            max_depth: 0,
+            current_bound: OrthoScore::zero(),
+            incumbent_score: OrthoScore::zero(),
+            incumbent_dims: Vec::new(),
+            incumbent_capacity: 0,
+            incumbent_display: String::new(),
+            checkpoint_time: 0,
+            checkpoint_status: "Not yet checkpointed".to_string(),
+            open_siblings_total: 0,
+            open_siblings_by_depth: Vec::new(),
+            seen_by_depth: Vec::new(),
+            descended_by_depth: Vec::new(),
+            pruned_by_depth: Vec::new(),
+            path_progress_by_depth: Vec::new(),
+            frontier_max_bound: None,
+            last_improvement_unix: 0,
+            last_improvement_depth: 0,
+            nodes_per_sec: 0.0,
+            prunes_per_sec: 0.0,
+            completion_prunes_per_sec: 0.0,
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct OperationStatus {
-    pub current_file: String,
-    pub status: String,
-    pub status_start_time: u64,
-    pub progress_current: usize,
-    pub progress_total: usize,
-    pub text_preview: String,
-    pub word_count: usize,
-    pub new_orthos: usize,
-    pub pruned_completions: usize,
-    pub expanded_completions: usize,
-    pub pruned_root_span: usize,
-    pub pruned_bound: usize,
-}
-
-impl Default for OperationStatus {
-    fn default() -> Self {
-        let start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        Self {
-            current_file: String::new(),
-            status: "Idle".to_string(),
-            status_start_time: start_time,
-            progress_current: 0,
-            progress_total: 0,
-            text_preview: String::new(),
-            word_count: 0,
-            new_orthos: 0,
-            pruned_completions: 0,
-            expanded_completions: 0,
-            pruned_root_span: 0,
-            pruned_bound: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MergeStatus {
-    pub completed_merges: usize,
-    pub current_merge: String,
-    pub archive_a_orthos: usize,
-    pub archive_b_orthos: usize,
-    pub impacted_a: usize,
-    pub impacted_b: usize,
-    pub seed_orthos_a: usize,
-    pub seed_orthos_b: usize,
-    pub impacted_queued_a: usize,
-    pub impacted_queued_b: usize,
-    pub impacted_pruned_a: usize,
-    pub impacted_pruned_b: usize,
-    pub new_orthos_from_merge: usize,
-    pub text_preview_a: String,
-    pub text_preview_b: String,
-    pub word_count_a: usize,
-    pub word_count_b: usize,
-    pub compaction_kept: usize,
-    pub compaction_pruned: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OperationDeltas {
-    pub new_orthos: usize,
-    pub pruned_completions: usize,
-    pub expanded_completions: usize,
-    pub pruned_root_span: usize,
-    pub pruned_bound: usize,
-}
-
-impl Default for MergeStatus {
-    fn default() -> Self {
-        Self {
-            completed_merges: 0,
-            current_merge: String::new(),
-            archive_a_orthos: 0,
-            archive_b_orthos: 0,
-            impacted_a: 0,
-            impacted_b: 0,
-            seed_orthos_a: 0,
-            seed_orthos_b: 0,
-            impacted_queued_a: 0,
-            impacted_queued_b: 0,
-            impacted_pruned_a: 0,
-            impacted_pruned_b: 0,
-            new_orthos_from_merge: 0,
-            text_preview_a: String::new(),
-            text_preview_b: String::new(),
-            word_count_a: 0,
-            word_count_b: 0,
-            compaction_kept: 0,
-            compaction_pruned: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct LargestArchive {
-    pub filename: String,
-    pub ortho_count: usize,
-    pub lineage: String,
-}
-
-impl Default for LargestArchive {
-    fn default() -> Self {
-        Self {
-            filename: String::new(),
-            ortho_count: 0,
-            lineage: String::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OptimalOrtho {
-    pub volume: usize,
-    pub variance_num: u128,
-    pub variance_den: u128,
-    pub dims: Vec<Dim>,
-    pub fullness: usize,
-    pub capacity: usize,
-    pub payload: Vec<Option<PayloadVal>>,
-    pub vocab: Vec<String>,
-    pub last_update_time: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct GenerationStat {
-    pub generation: u64,
-    pub processing_secs: f64,
-    pub transition_secs: f64,
-    pub accepted: u64,
-    pub new_work: u64,
-}
-
-impl Default for OptimalOrtho {
-    fn default() -> Self {
-        Self {
-            volume: 0,
-            variance_num: 0,
-            variance_den: 1,
-            dims: vec![],
-            fullness: 0,
-            capacity: 0,
-            payload: vec![],
-            vocab: vec![],
-            last_update_time: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct LogEntry {
-    pub timestamp: u64,
-    pub message: String,
+#[derive(Clone, Debug, Default)]
+pub struct MetricsSnapshot {
+    pub global: GlobalMetrics,
+    pub logs: Vec<String>,
 }
 
 #[derive(Clone)]
-pub struct Metrics {
-    inner: Arc<Mutex<MetricsInner>>,
+pub struct Metrics(Arc<Mutex<MetricsState>>);
+
+#[derive(Debug, Default)]
+struct MetricsState {
+    global: GlobalMetrics,
+    logs: VecDeque<String>,
+    rate_samples: VecDeque<RateSample>,
 }
 
 #[derive(Clone, Debug)]
-pub struct PruneSample {
-    pub generation: u64,
-    pub pruned: usize,
-    pub expanded: usize,
-    pub pruned_root_span: usize,
-    pub pruned_bound: usize,
-}
-
-struct MetricsInner {
-    global: GlobalMetrics,
-    operation: OperationStatus,
-    merge: MergeStatus,
-    largest_archive: LargestArchive,
-    optimal_ortho: OptimalOrtho,
-    generation_stats: Vec<GenerationStat>,
-    prune_history: VecDeque<PruneSample>,
-
-    seen_history_samples: VecDeque<MetricSample>,
-    optimal_volume_samples: VecDeque<MetricSample>,
-
-    // Generational store metrics
-    work_len_samples: VecDeque<MetricSample>,
-    landing_buffer_samples: VecDeque<MetricSample>,
-    bucket_metrics: Vec<BucketMetrics>,
-
-    status_history: VecDeque<StatusHistoryEntry>,
-    status_duration_stats: StatusDurationStats,
-
-    logs: VecDeque<LogEntry>,
+struct RateSample {
+    at: Instant,
+    nodes_expanded: u64,
+    nodes_pruned: u64,
+    completions_pruned: u64,
 }
 
 impl Metrics {
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(MetricsInner {
-                global: GlobalMetrics::default(),
-                operation: OperationStatus::default(),
-                merge: MergeStatus::default(),
-                largest_archive: LargestArchive::default(),
-                optimal_ortho: OptimalOrtho::default(),
-                generation_stats: Vec::new(),
-                prune_history: VecDeque::with_capacity(20),
-                seen_history_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                optimal_volume_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                work_len_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                landing_buffer_samples: VecDeque::with_capacity(MAX_SAMPLES),
-                bucket_metrics: Vec::new(),
-                status_history: VecDeque::with_capacity(100),
-                status_duration_stats: StatusDurationStats::default(),
-                logs: VecDeque::with_capacity(100),
-            })),
-        }
+        Self(Arc::new(Mutex::new(MetricsState::default())))
     }
 
-    pub fn clone_handle(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
+    pub fn update_global<F>(&self, update: F)
+    where
+        F: FnOnce(&mut GlobalMetrics),
+    {
+        let mut state = self.0.lock().unwrap();
+        update(&mut state.global);
+        record_rate_sample(&mut state);
     }
 
-    fn current_timestamp() -> u64 {
-        SystemTime::now()
+    pub fn add_log(&self, message: impl Into<String>) {
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs()
-    }
-
-    pub fn update_global(&self, update: impl FnOnce(&mut GlobalMetrics)) {
-        let mut inner = self.inner.lock().unwrap();
-        update(&mut inner.global);
-    }
-
-    pub fn update_operation(&self, update: impl FnOnce(&mut OperationStatus)) {
-        let mut inner = self.inner.lock().unwrap();
-        update(&mut inner.operation);
-    }
-
-    pub fn set_operation_status(&self, status: String) {
-        let mut inner = self.inner.lock().unwrap();
-        let now = Self::current_timestamp();
-        let prev_start = inner.operation.status_start_time;
-        let duration = now.saturating_sub(prev_start);
-
-        // Record previous status if it had non-zero duration
-        if duration > 0 && !inner.operation.status.is_empty() {
-            let entry = StatusHistoryEntry {
-                status: inner.operation.status.clone(),
-                start_time: prev_start,
-                duration,
-            };
-            inner.status_history.push_back(entry);
-            if inner.status_history.len() > 100 {
-                inner.status_history.pop_front();
-            }
-
-            // Update all-time statistics
-            let stats = &mut inner.status_duration_stats;
-            stats.total_count += 1;
-            stats.total_duration += duration;
-            if stats.total_count == 1 {
-                stats.min_duration = duration;
-                stats.max_duration = duration;
-            } else {
-                stats.min_duration = stats.min_duration.min(duration);
-                stats.max_duration = stats.max_duration.max(duration);
-            }
+            .as_secs();
+        let mut state = self.0.lock().unwrap();
+        if state.logs.len() >= MAX_LOGS {
+            state.logs.pop_front();
         }
-
-        inner.operation.status = status;
-        inner.operation.status_start_time = now;
-    }
-
-    pub fn update_merge(&self, update: impl FnOnce(&mut MergeStatus)) {
-        let mut inner = self.inner.lock().unwrap();
-        update(&mut inner.merge);
-    }
-
-    pub fn update_largest_archive(&self, update: impl FnOnce(&mut LargestArchive)) {
-        let mut inner = self.inner.lock().unwrap();
-        update(&mut inner.largest_archive);
-    }
-
-    pub fn set_generation_stats(&self, stats: Vec<GenerationStat>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.generation_stats = stats;
-    }
-
-    pub fn update_optimal_ortho(&self, update: impl FnOnce(&mut OptimalOrtho)) {
-        let mut inner = self.inner.lock().unwrap();
-        update(&mut inner.optimal_ortho);
-    }
-
-    pub fn optimal_score(&self) -> OrthoScore {
-        let inner = self.inner.lock().unwrap();
-        OrthoScore {
-            volume: inner.optimal_ortho.volume,
-            variance_num: inner.optimal_ortho.variance_num,
-            variance_den: inner.optimal_ortho.variance_den,
-            fullness: inner.optimal_ortho.fullness,
-        }
-    }
-
-    pub fn reset_seen_history(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.seen_history_samples.clear();
-    }
-
-    pub fn record_work_len(&self, len: usize) {
-        self.record_sample(len, |inner| &mut inner.work_len_samples);
-    }
-
-    pub fn record_landing_buffer_count(&self, count: usize) {
-        self.record_sample(count, |inner| &mut inner.landing_buffer_samples);
-    }
-
-    pub fn record_landing_buffer_bytes(&self, bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.landing_buffer_bytes = bytes;
-    }
-
-    pub fn record_seen_len_accepted(&self, len: usize) {
-        // Only record to persistent history that survives chunk resets
-        self.record_sample(len, |inner| &mut inner.seen_history_samples);
-    }
-
-    pub fn reset_new_orthos(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.new_orthos = 0;
-    }
-
-    pub fn increment_new_orthos(&self, count: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.new_orthos = inner.operation.new_orthos.saturating_add(count);
-    }
-
-    pub fn apply_operation_deltas(&self, delta: OperationDeltas) {
-        if delta == OperationDeltas::default() {
-            return;
-        }
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.new_orthos = inner.operation.new_orthos.saturating_add(delta.new_orthos);
-        inner.operation.pruned_completions = inner
-            .operation
-            .pruned_completions
-            .saturating_add(delta.pruned_completions);
-        inner.operation.expanded_completions = inner
-            .operation
-            .expanded_completions
-            .saturating_add(delta.expanded_completions);
-        inner.operation.pruned_root_span = inner
-            .operation
-            .pruned_root_span
-            .saturating_add(delta.pruned_root_span);
-        inner.operation.pruned_bound = inner
-            .operation
-            .pruned_bound
-            .saturating_add(delta.pruned_bound);
-    }
-
-    pub fn reset_prune_counts(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.pruned_completions = 0;
-        inner.operation.expanded_completions = 0;
-        inner.operation.pruned_root_span = 0;
-        inner.operation.pruned_bound = 0;
-    }
-
-    pub fn record_offload(&self, files: u64, bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.offloaded_files = inner.global.offloaded_files.saturating_add(files);
-        inner.global.offloaded_bytes = inner.global.offloaded_bytes.saturating_add(bytes);
-    }
-
-    pub fn record_download(&self, files: u64, bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.downloaded_files = inner.global.downloaded_files.saturating_add(files);
-        inner.global.downloaded_bytes = inner.global.downloaded_bytes.saturating_add(bytes);
-    }
-
-    pub fn record_cache_hit(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.cache_hits = inner.global.cache_hits.saturating_add(1);
-    }
-
-    pub fn record_cache_miss(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.cache_misses = inner.global.cache_misses.saturating_add(1);
-    }
-
-    pub fn record_pressure_trigger(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.pressure_triggers = inner.global.pressure_triggers.saturating_add(1);
-    }
-
-    pub fn record_spill_created(&self, files: u64, bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.spill_created_files = inner.global.spill_created_files.saturating_add(files);
-        inner.global.spill_created_bytes = inner.global.spill_created_bytes.saturating_add(bytes);
-    }
-
-    pub fn record_spill_consumed(&self, files: u64, bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.spill_consumed_files = inner.global.spill_consumed_files.saturating_add(files);
-        inner.global.spill_consumed_bytes = inner.global.spill_consumed_bytes.saturating_add(bytes);
-    }
-
-    pub fn set_spill_pending(&self, files: u64, bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.spill_pending_files = files;
-        inner.global.spill_pending_bytes = bytes;
-    }
-
-    pub fn set_disk_usage(&self, total_bytes: u64, available_bytes: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.disk_total_bytes = total_bytes;
-        inner.global.disk_available_bytes = available_bytes;
-    }
-
-    pub fn set_compression_bytes(&self, uncompressed: u64, compressed: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.global.compression_uncompressed_bytes = uncompressed;
-        inner.global.compression_compressed_bytes = compressed;
-    }
-
-    pub fn take_prune_counts(&self) -> (usize, usize, usize, usize) {
-        let mut inner = self.inner.lock().unwrap();
-        let pruned = inner.operation.pruned_completions;
-        let expanded = inner.operation.expanded_completions;
-        let pruned_root_span = inner.operation.pruned_root_span;
-        let pruned_bound = inner.operation.pruned_bound;
-        inner.operation.pruned_completions = 0;
-        inner.operation.expanded_completions = 0;
-        inner.operation.pruned_root_span = 0;
-        inner.operation.pruned_bound = 0;
-        (pruned, expanded, pruned_root_span, pruned_bound)
-    }
-
-    pub fn record_prune_sample(
-        &self,
-        generation: u64,
-        pruned: usize,
-        expanded: usize,
-        pruned_root_span: usize,
-        pruned_bound: usize,
-    ) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.prune_history.push_back(PruneSample {
-            generation,
-            pruned,
-            expanded,
-            pruned_root_span,
-            pruned_bound,
-        });
-        if inner.prune_history.len() > 12 {
-            inner.prune_history.pop_front();
-        }
-    }
-
-    pub fn increment_pruned_completions(&self, count: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.pruned_completions =
-            inner.operation.pruned_completions.saturating_add(count);
-    }
-
-    pub fn increment_pruned_root_span(&self, count: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.pruned_root_span = inner.operation.pruned_root_span.saturating_add(count);
-    }
-
-    pub fn increment_pruned_bound(&self, count: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.pruned_bound = inner.operation.pruned_bound.saturating_add(count);
-    }
-
-    pub fn increment_expanded_completions(&self, count: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.operation.expanded_completions =
-            inner.operation.expanded_completions.saturating_add(count);
-    }
-
-    pub fn record_optimal_volume(&self, volume: usize) {
-        self.record_sample(volume, |inner| &mut inner.optimal_volume_samples);
-    }
-
-    fn record_sample<F>(&self, value: usize, getter: F)
-    where
-        F: FnOnce(&mut MetricsInner) -> &mut VecDeque<MetricSample>,
-    {
-        let mut inner = self.inner.lock().unwrap();
-        let samples = getter(&mut *inner);
-
-        let sample = MetricSample {
-            timestamp: Self::current_timestamp(),
-            value,
-        };
-
-        samples.push_back(sample);
-
-        // When we exceed threshold, downsample by time-based bucketing
-        // This preserves temporal distribution - always keeping oldest and newest data
-        if samples.len() > DOWNSAMPLE_THRESHOLD {
-            let target_size = DOWNSAMPLE_THRESHOLD / 2;
-            let new_samples = Self::downsample_by_time(samples, target_size);
-            *samples = new_samples;
-        }
-    }
-
-    fn downsample_by_time(
-        samples: &VecDeque<MetricSample>,
-        target_size: usize,
-    ) -> VecDeque<MetricSample> {
-        if samples.len() <= target_size {
-            return samples.clone();
-        }
-
-        let mut result = VecDeque::with_capacity(target_size);
-
-        // Always keep first sample
-        if let Some(first) = samples.front() {
-            result.push_back(first.clone());
-        }
-
-        if target_size <= 2 {
-            // Just keep first and last
-            if let Some(last) = samples.back() {
-                if result.len() < target_size {
-                    result.push_back(last.clone());
-                }
-            }
-            return result;
-        }
-
-        // Divide the timeline into buckets and take one sample per bucket
-        let first_ts = samples.front().map(|s| s.timestamp).unwrap_or(0);
-        let last_ts = samples.back().map(|s| s.timestamp).unwrap_or(0);
-        let time_span = last_ts.saturating_sub(first_ts);
-
-        if time_span == 0 {
-            // All samples at same timestamp - just take evenly spaced by index
-            let step = samples.len() / target_size;
-            for i in (step..samples.len()).step_by(step.max(1)) {
-                if result.len() < target_size - 1 {
-                    result.push_back(samples[i].clone());
-                }
-            }
-        } else {
-            // Time-based bucketing
-            let bucket_duration = time_span as f64 / (target_size - 1) as f64;
-
-            for i in 1..target_size {
-                let target_ts = first_ts + (i as f64 * bucket_duration) as u64;
-
-                // Find closest sample to this timestamp
-                let mut best_idx = 0;
-                let mut best_diff = u64::MAX;
-
-                for (idx, sample) in samples.iter().enumerate() {
-                    let diff = if sample.timestamp >= target_ts {
-                        sample.timestamp - target_ts
-                    } else {
-                        target_ts - sample.timestamp
-                    };
-
-                    if diff < best_diff {
-                        best_diff = diff;
-                        best_idx = idx;
-                    }
-                }
-
-                if best_idx < samples.len() && result.len() < target_size {
-                    result.push_back(samples[best_idx].clone());
-                }
-            }
-        }
-
-        result
-    }
-
-    pub fn clear_chart_history(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.work_len_samples.clear();
-        inner.landing_buffer_samples.clear();
-        inner.optimal_volume_samples.clear();
-        // Note: seen_history_samples is NOT cleared - it persists across all chunks
-    }
-
-    pub fn reset_seen_size(&self, baseline: usize) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.landing_buffer_samples.clear();
-        let timestamp = Self::current_timestamp();
-        inner.landing_buffer_samples.push_back(MetricSample {
-            timestamp,
-            value: baseline,
-        });
-    }
-
-    pub fn update_bucket_metrics(&self, bucket_stats: Vec<BucketMetrics>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.bucket_metrics = bucket_stats;
-    }
-
-    pub fn add_log(&self, message: String) {
-        let mut inner = self.inner.lock().unwrap();
-        let clean_message = strip_ansi_codes(&message);
-        let entry = LogEntry {
-            timestamp: Self::current_timestamp(),
-            message: clean_message,
-        };
-
-        inner.logs.push_back(entry);
-        if inner.logs.len() > 100 {
-            inner.logs.pop_front();
-        }
+        state.logs.push_back(format!("{}  {}", now, message.into()));
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let inner = self.inner.lock().unwrap();
+        let state = self.0.lock().unwrap();
+        let mut global = state.global.clone();
+        let (nodes_per_sec, prunes_per_sec, completion_prunes_per_sec) = compute_rates(&state);
+        global.nodes_per_sec = nodes_per_sec;
+        global.prunes_per_sec = prunes_per_sec;
+        global.completion_prunes_per_sec = completion_prunes_per_sec;
         MetricsSnapshot {
-            global: inner.global.clone(),
-            operation: inner.operation.clone(),
-            merge: inner.merge.clone(),
-            largest_archive: inner.largest_archive.clone(),
-            optimal_ortho: inner.optimal_ortho.clone(),
-            prune_history: inner.prune_history.iter().cloned().collect(),
-            seen_history_samples: inner.seen_history_samples.iter().cloned().collect(),
-            optimal_volume_samples: inner.optimal_volume_samples.iter().cloned().collect(),
-            work_len_samples: inner.work_len_samples.iter().cloned().collect(),
-            landing_buffer_samples: inner.landing_buffer_samples.iter().cloned().collect(),
-            status_history: inner.status_history.iter().cloned().collect(),
-            status_duration_stats: inner.status_duration_stats.clone(),
-            logs: inner.logs.iter().cloned().collect(),
-            bucket_metrics: inner.bucket_metrics.clone(),
-            generation_stats: inner.generation_stats.clone(),
+            global,
+            logs: state.logs.iter().cloned().collect(),
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct BucketMetrics {
-    pub bucket_id: usize,
-    pub run_count: usize,
-    // Count of orthos currently pending in landing for this bucket
-    pub landing_size: usize,
-    pub landing_bytes: u64,
-    pub history_size_estimate: usize,
-    pub state: BucketState,
-    pub new_work: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BucketState {
-    Pending,
-    Draining,
-    Sorting,
-    Merging,
-    AntiJoining,
-    Compacting,
-    Complete,
-    Empty,
-}
-
-#[derive(Clone, Debug)]
-pub struct MetricsSnapshot {
-    pub global: GlobalMetrics,
-    pub operation: OperationStatus,
-    pub merge: MergeStatus,
-    pub largest_archive: LargestArchive,
-    pub optimal_ortho: OptimalOrtho,
-    pub generation_stats: Vec<GenerationStat>,
-    pub prune_history: Vec<PruneSample>,
-    pub seen_history_samples: Vec<MetricSample>,
-    pub optimal_volume_samples: Vec<MetricSample>,
-    pub work_len_samples: Vec<MetricSample>,
-    pub landing_buffer_samples: Vec<MetricSample>,
-    pub status_history: Vec<StatusHistoryEntry>,
-    pub status_duration_stats: StatusDurationStats,
-    pub logs: Vec<LogEntry>,
-    pub bucket_metrics: Vec<BucketMetrics>,
-}
-
-// Remove ANSI escape sequences so log lines don't leak color codes into the TUI.
-fn strip_ansi_codes(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut bytes = input.as_bytes().iter().copied().peekable();
-
-    while let Some(b) = bytes.next() {
-        if b == 0x1B {
-            // Skip CSI / OSC sequences and their payload.
-            if let Some(next) = bytes.peek().copied() {
-                match next {
-                    b'[' | b'(' | b')' | b'*' | b'+' | b',' | b'-' | b'.' | b'/' => {
-                        bytes.next();
-                        while let Some(c) = bytes.next() {
-                            if (0x40..=0x7E).contains(&c) {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    b']' => {
-                        bytes.next();
-                        let mut prev_escape = false;
-                        while let Some(c) = bytes.next() {
-                            if c == 0x07 {
-                                break;
-                            }
-                            if prev_escape && c == b'\\' {
-                                break;
-                            }
-                            prev_escape = c == 0x1B;
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            // Bare ESC: drop it.
-            continue;
+fn record_rate_sample(state: &mut MetricsState) {
+    let now = Instant::now();
+    state.rate_samples.push_back(RateSample {
+        at: now,
+        nodes_expanded: state.global.nodes_expanded,
+        nodes_pruned: state.global.nodes_pruned,
+        completions_pruned: state.global.completions_pruned,
+    });
+    while state.rate_samples.len() > MAX_RATE_SAMPLES {
+        state.rate_samples.pop_front();
+    }
+    while let Some(sample) = state.rate_samples.front() {
+        if now.duration_since(sample.at) <= RATE_WINDOW {
+            break;
         }
+        state.rate_samples.pop_front();
+    }
+}
 
-        result.push(b as char);
+fn compute_rates(state: &MetricsState) -> (f64, f64, f64) {
+    let Some(newest) = state.rate_samples.back() else {
+        return (0.0, 0.0, 0.0);
+    };
+    let now = Instant::now();
+    if now.duration_since(newest.at) > RATE_STALE_AFTER {
+        return (0.0, 0.0, 0.0);
     }
 
-    result
+    let oldest = state
+        .rate_samples
+        .iter()
+        .find(|sample| newest.at.duration_since(sample.at) <= RATE_WINDOW)
+        .unwrap_or(newest);
+    let elapsed = newest.at.duration_since(oldest.at).as_secs_f64();
+    if elapsed <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+
+    (
+        newest.nodes_expanded.saturating_sub(oldest.nodes_expanded) as f64 / elapsed,
+        newest.nodes_pruned.saturating_sub(oldest.nodes_pruned) as f64 / elapsed,
+        newest
+            .completions_pruned
+            .saturating_sub(oldest.completions_pruned) as f64
+            / elapsed,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Metrics;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
-    fn apply_operation_deltas_updates_hot_counts_in_one_step() {
+    fn rates_become_nonzero_and_decay_when_stale() {
         let metrics = Metrics::new();
-        metrics.apply_operation_deltas(OperationDeltas {
-            new_orthos: 3,
-            pruned_completions: 5,
-            expanded_completions: 7,
-            pruned_root_span: 11,
-            pruned_bound: 13,
+        metrics.update_global(|g| {
+            g.nodes_expanded = 0;
+            g.nodes_pruned = 0;
+            g.completions_pruned = 0;
+        });
+        thread::sleep(Duration::from_millis(50));
+        metrics.update_global(|g| {
+            g.nodes_expanded = 200;
+            g.nodes_pruned = 40;
+            g.completions_pruned = 10;
         });
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.operation.new_orthos, 3);
-        assert_eq!(snapshot.operation.pruned_completions, 5);
-        assert_eq!(snapshot.operation.expanded_completions, 7);
-        assert_eq!(snapshot.operation.pruned_root_span, 11);
-        assert_eq!(snapshot.operation.pruned_bound, 13);
+        assert!(snapshot.global.nodes_per_sec > 0.0);
+        assert!(snapshot.global.prunes_per_sec > 0.0);
+        assert!(snapshot.global.completion_prunes_per_sec > 0.0);
+
+        thread::sleep(Duration::from_millis(1100));
+        let stale = metrics.snapshot();
+        assert_eq!(stale.global.nodes_per_sec, 0.0);
+        assert_eq!(stale.global.prunes_per_sec, 0.0);
+        assert_eq!(stale.global.completion_prunes_per_sec, 0.0);
     }
 }

@@ -2,14 +2,16 @@ use crate::{FoldError, splitter::Splitter};
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
 use rkyv::{Archive, Deserialize, Serialize};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Interner {
     version: usize,
     vocabulary: Vec<String>,
-    prefix_to_completions: HashMap<Vec<usize>, FixedBitSet>,
-    prefix_stats: HashMap<Vec<usize>, usize>,
+    prefix_to_completions: FxHashMap<Vec<usize>, FixedBitSet>,
+    prefix_stats: FxHashMap<Vec<usize>, usize>,
+    max_prefix_len: usize,
 }
 
 #[derive(Archive, Serialize, Deserialize)]
@@ -52,7 +54,7 @@ impl Interner {
             prefix_to_completions: prefix_vec,
             prefix_stats,
         } = serialized;
-        let mut prefix_to_completions = HashMap::new();
+        let mut prefix_to_completions = FxHashMap::default();
         let vocab_len = vocabulary.len();
         for (prefix, completions) in prefix_vec {
             let mut fbs = FixedBitSet::with_capacity(vocab_len);
@@ -62,15 +64,17 @@ impl Interner {
             }
             prefix_to_completions.insert(prefix, fbs);
         }
-        let mut prefix_stats_map = HashMap::new();
+        let mut prefix_stats_map = FxHashMap::default();
         for (prefix, max_desc_len) in prefix_stats {
             prefix_stats_map.insert(prefix, max_desc_len);
         }
+        let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats_map);
         Interner {
             version,
             vocabulary,
             prefix_to_completions,
             prefix_stats: prefix_stats_map,
+            max_prefix_len,
         }
     }
 
@@ -99,11 +103,13 @@ impl Interner {
         let new_vocab_len = vocabulary.len();
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, None);
+        let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
         let interner = Interner {
             version: Self::initial_version(),
             vocabulary,
             prefix_to_completions,
             prefix_stats,
+            max_prefix_len,
         };
         debug_assert!(
             interner.debug_verify_prefix_closure(&phrases),
@@ -119,6 +125,7 @@ impl Interner {
                 vocabulary: self.vocabulary.clone(),
                 prefix_to_completions: self.prefix_to_completions.clone(),
                 prefix_stats: self.prefix_stats.clone(),
+                max_prefix_len: self.max_prefix_len,
             };
             return interner;
         }
@@ -136,12 +143,14 @@ impl Interner {
 
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, Some(self));
+        let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
 
         let interner = Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
             prefix_stats,
+            max_prefix_len,
         };
         debug_assert!(
             interner.debug_verify_prefix_closure(&phrases),
@@ -155,7 +164,7 @@ impl Interner {
         vocabulary: &[String],
         vocab_len: usize,
         existing: Option<&Interner>,
-    ) -> (HashMap<Vec<usize>, FixedBitSet>, HashMap<Vec<usize>, usize>) {
+    ) -> (FxHashMap<Vec<usize>, FixedBitSet>, FxHashMap<Vec<usize>, usize>) {
         let mut prefix_to_completions = match existing {
             Some(interner) => {
                 let mut new_map = interner.prefix_to_completions.clone();
@@ -164,7 +173,7 @@ impl Interner {
                 }
                 new_map
             }
-            None => HashMap::new(),
+            None => FxHashMap::default(),
         };
         let mut prefix_stats = existing
             .map(|interner| interner.prefix_stats.clone())
@@ -291,6 +300,10 @@ impl Interner {
         true
     }
 
+    fn compute_max_prefix_len(prefix_stats: &FxHashMap<Vec<usize>, usize>) -> usize {
+        prefix_stats.values().copied().max().unwrap_or(0)
+    }
+
     pub fn version(&self) -> usize {
         self.version
     }
@@ -310,7 +323,7 @@ impl Interner {
 
     /// Maximum descriptor length across all prefixes (used for optimistic bounds when axis is missing).
     pub fn max_prefix_len(&self) -> usize {
-        self.prefix_stats.values().copied().max().unwrap_or(0)
+        self.max_prefix_len
     }
 
     pub fn max_suffix_depth(&self, prefix: &[usize]) -> Option<usize> {
@@ -333,24 +346,37 @@ impl Interner {
         self.prefix_to_completions.get(prefix)
     }
 
-    fn get_required_bits(&self, required: &[Vec<usize>]) -> FixedBitSet {
-        let mut result = FixedBitSet::with_capacity(self.vocabulary.len());
-        result.grow(self.vocabulary.len());
-        if required.is_empty() {
-            result.set_range(.., true);
-            return result;
+    fn fill_required_bits(&self, required: &[Vec<usize>], out: &mut FixedBitSet) {
+        if out.len() < self.vocabulary.len() {
+            out.grow(self.vocabulary.len());
         }
-        let mut first = true;
-        for prefix in required {
+        if required.is_empty() {
+            out.set_range(.., true);
+            return;
+        }
+
+        let Some((first_prefix, rest)) = required.split_first() else {
+            out.set_range(.., true);
+            return;
+        };
+
+        match self.prefix_to_completions.get(first_prefix) {
+            Some(bitset) => out.clone_from(bitset),
+            None => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!("[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)", first_prefix);
+                });
+                out.set_range(.., false);
+                return;
+            }
+        }
+
+        for prefix in rest {
             match self.prefix_to_completions.get(prefix) {
                 Some(bitset) => {
-                    if first {
-                        result.clone_from(bitset);
-                        first = false;
-                    } else {
-                        result.intersect_with(bitset);
-                    }
-                    if result.count_ones(..) == 0 {
+                    out.intersect_with(bitset);
+                    if out.count_ones(..) == 0 {
                         break;
                     }
                 }
@@ -359,13 +385,18 @@ impl Interner {
                     ONCE.call_once(|| {
                         eprintln!("[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)", prefix);
                     });
-                    if !first {
-                        result.set_range(.., false);
-                    }
+                    out.set_range(.., false);
                     break;
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn get_required_bits(&self, required: &[Vec<usize>]) -> FixedBitSet {
+        let mut result = FixedBitSet::with_capacity(self.vocabulary.len());
+        result.grow(self.vocabulary.len());
+        self.fill_required_bits(required, &mut result);
         result
     }
 
@@ -375,8 +406,7 @@ impl Interner {
         forbidden: &[usize],
         out: &mut FixedBitSet,
     ) {
-        let required_bits = self.get_required_bits(required);
-        out.clone_from(&required_bits);
+        self.fill_required_bits(required, out);
         for &idx in forbidden {
             out.set(idx, false);
         }
@@ -538,7 +568,7 @@ impl Interner {
         }
 
         // Step 3: Start with self's prefix_to_completions, padded to new vocab length
-        let mut prefix_to_completions = HashMap::new();
+        let mut prefix_to_completions = FxHashMap::default();
         for (prefix, bitset) in &self.prefix_to_completions {
             let mut new_bitset = bitset.clone();
             new_bitset.grow(new_vocab_len);
@@ -593,11 +623,13 @@ impl Interner {
                 .or_insert(1);
         }
 
+        let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
         Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
             prefix_stats,
+            max_prefix_len,
         }
     }
 }
@@ -761,6 +793,7 @@ mod tests {
         let after = decoded.prefix_stats(&prefix).unwrap();
 
         assert_eq!(before, after);
+        assert_eq!(interner.max_prefix_len(), decoded.max_prefix_len());
     }
 
     #[test]
@@ -1564,6 +1597,7 @@ mod version_compare_tests {
             vocabulary: low.vocabulary.clone(),
             prefix_to_completions: low.prefix_to_completions.clone(),
             prefix_stats: low.prefix_stats.clone(),
+            max_prefix_len: low.max_prefix_len,
         };
         let impacted = low.impacted_keys(&high);
         assert_eq!(impacted.len(), 0);

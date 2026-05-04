@@ -1,0 +1,33 @@
+{
+  "version": 4,
+  "input_path": "e.txt",
+  "input_fingerprint": 17920467738217970334,
+  "config_fingerprint": 8548666958158166045,
+  "interner_path": "interner.bin",
+  "state_path": "current.state.bin",
+  "started_unix": 1777921540,
+  "checkpoint_unix": 1777921580,
+  "checkpoint_status": "best-improved",
+  "nodes_expanded": 50664,
+  "nodes_pruned": 0,
+  "completions_pruned": 3979,
+  "current_depth": 17,
+  "max_depth": 17,
+  "open_siblings_total": 4787,
+  "frontier_max_bound_volume": 254803968,
+  "frontier_max_bound_variance_num": 0,
+  "frontier_max_bound_variance_den": 1,
+  "frontier_max_bound_fullness": 282475249,
+  "last_improvement_unix": 1777921580,
+  "last_improvement_depth": 17,
+  "incumbent_volume": 2,
+  "incumbent_variance_num": 3,
+  "incumbent_variance_den": 16,
+  "incumbent_fullness": 16,
+  "incumbent_dims": [
+    2,
+    2,
+    2,
+    3
+  ]
+}

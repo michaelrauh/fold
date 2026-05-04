@@ -168,6 +168,7 @@ impl Ortho {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn from_test_parts(
         dims: Vec<Dim>,
         payload: Vec<Option<PayloadVal>>,

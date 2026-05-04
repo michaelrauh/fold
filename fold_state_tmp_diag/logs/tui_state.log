@@ -1,0 +1,47 @@
+DFS/BnB | time=00:02:23 | phase=Running
+input=e.txt
+expanded=94879 pruned=0 completion_pruned=3984
+rates=(nodes_per_sec=0.0,prunes_per_sec=0.0,completion_prunes_per_sec=0.0)
+depth=22/22 current_bound=(vol=1,full=21) frontier_open=5258
+best_score=(vol=2,var=3/16,full=16) dims=[2, 2, 2, 3] capacity=24
+checkpoint=periodic@1777907020
+frontier_max_bound=(vol=254803968,var=0/1,full=282475249)
+last_improvement=1777906960 depth=17
+path=▁▁▁▁▁▃▁▅▁▁▂▂██▅▂▁▂▅▆▁·
+open=█▂▂▁▂▁▁▁▂▁▁▁··▁▁▂▁▁▁▁·
+pruned=·
+
+[dim0=0, dim1=0]
+      i       a       ·
+    had    full       ·
+
+[dim0=0, dim1=1]
+    was   clear       ·
+another     and       ·
+
+[dim0=1, dim1=0]
+   with  custom       ·
+     it    upon       ·
+
+[dim0=1, dim1=1]
+    all      of       ·
+      i       a       ·
+
+Logs:
+1777906887  Starting search for e.txt
+1777906889  Incumbent improved: vol=1 dims=[2, 2]
+1777906889  Checkpoint saved: status=best-improved nodes=2876 depth=2
+1777906889  Incumbent improved: vol=1 dims=[2, 2]
+1777906889  Checkpoint saved: status=best-improved nodes=3299 depth=3
+1777906890  Incumbent improved: vol=1 dims=[2, 2]
+1777906890  Checkpoint saved: status=best-improved nodes=3721 depth=4
+1777906890  Incumbent improved: vol=2 dims=[2, 3]
+1777906890  Checkpoint saved: status=best-improved nodes=3785 depth=5
+1777906920  Checkpoint saved: status=periodic nodes=24071 depth=8
+1777906950  Checkpoint saved: status=periodic nodes=43543 depth=8
+1777906955  Incumbent improved: vol=2 dims=[2, 2, 3]
+1777906955  Checkpoint saved: status=best-improved nodes=47042 depth=9
+1777906960  Incumbent improved: vol=2 dims=[2, 2, 2, 3]
+1777906960  Checkpoint saved: status=best-improved nodes=50664 depth=17
+1777906990  Checkpoint saved: status=periodic nodes=70397 depth=22
+1777907020  Checkpoint saved: status=periodic nodes=89865 depth=22

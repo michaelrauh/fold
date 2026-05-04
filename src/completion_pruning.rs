@@ -59,6 +59,7 @@ pub struct CompletionContext {
     prefix_with_completion: Vec<Vec<usize>>,
     totals: Vec<usize>,
     impacted_totals: Vec<usize>,
+    bound_scratch: Vec<usize>,
     filled_prefix: Vec<usize>,
     dim_count: usize,
     base_volume: usize,
@@ -141,40 +142,18 @@ pub fn bound_completion_ctx(
     interner: &Interner,
     best_score: OrthoScore,
 ) -> bool {
-    if ctx.is_root {
-        // Empty ortho: require initial span > 1 (i.e., more than a single chain).
-        let completion_count = interner
-            .completions_for_prefix(&[completion])
-            .expect("missing completions bitset for single-token prefix")
-            .count_ones(..);
-        return completion_count <= 1;
+    if ctx.is_root() {
+        let Some(potential_score) = completion_upper_bound_ctx(ctx, completion, interner) else {
+            return true;
+        };
+        return best_score != OrthoScore::zero() && potential_score <= best_score;
     }
     if best_score == OrthoScore::zero() {
         return false;
     }
-
-    ctx.totals.clear();
-    for prefix in &mut ctx.prefix_with_completion {
-        prefix.push(completion);
-        match interner.prefix_stats(prefix.as_slice()) {
-            Some(max_desc_len) => ctx.totals.push(max_desc_len),
-            None => {
-                panic!("[bound][panic] missing prefix stats for {:?}", prefix);
-            }
-        }
-        prefix.pop();
-    }
-
-    let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2); // optimistic for missing axes
-
-    let potential_score = upper_bound_score(
-        &ctx.totals,
-        ctx.base_volume,
-        ctx.base_fullness.saturating_add(1),
-        ctx.dim_count,
-        fallback_total,
-    );
-
+    let Some(potential_score) = completion_upper_bound_ctx(ctx, completion, interner) else {
+        return true;
+    };
     potential_score <= best_score
 }
 
@@ -268,10 +247,82 @@ pub fn bound_existing_ortho_ctx(
     if best_score <= ctx.base_score {
         return false;
     }
-    if ctx.is_root() {
-        return false;
+    let potential_score =
+        existing_ortho_upper_bound_ctx_with_impacted(ctx, interner, impacted_index);
+    potential_score <= best_score
+}
+
+pub fn completion_upper_bound(
+    ortho: &Ortho,
+    completion: usize,
+    interner: &Interner,
+) -> Option<OrthoScore> {
+    let mut ctx = CompletionContext::from_ortho(ortho);
+    completion_upper_bound_ctx(&mut ctx, completion, interner)
+}
+
+pub fn completion_upper_bound_ctx(
+    ctx: &mut CompletionContext,
+    completion: usize,
+    interner: &Interner,
+) -> Option<OrthoScore> {
+    if ctx.is_root {
+        let completion_count = interner
+            .completions_for_prefix(&[completion])
+            .expect("missing completions bitset for single-token prefix")
+            .count_ones(..);
+        if completion_count <= 1 {
+            return None;
+        }
+        let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
+        return Some(upper_bound_score(
+            &[fallback_total],
+            ctx.base_volume,
+            ctx.base_fullness.saturating_add(1),
+            ctx.dim_count,
+            fallback_total,
+        ));
     }
 
+    ctx.totals.clear();
+    for prefix in &mut ctx.prefix_with_completion {
+        prefix.push(completion);
+        match interner.prefix_stats(prefix.as_slice()) {
+            Some(max_desc_len) => ctx.totals.push(max_desc_len),
+            None => {
+                panic!("[bound][panic] missing prefix stats for {:?}", prefix);
+            }
+        }
+        prefix.pop();
+    }
+
+    let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
+    Some(upper_bound_score(
+        &ctx.totals,
+        ctx.base_volume,
+        ctx.base_fullness.saturating_add(1),
+        ctx.dim_count,
+        fallback_total,
+    ))
+}
+
+pub fn existing_ortho_upper_bound(ortho: &Ortho, interner: &Interner) -> OrthoScore {
+    let mut ctx = CompletionContext::from_ortho(ortho);
+    existing_ortho_upper_bound_ctx(&mut ctx, interner)
+}
+
+pub fn existing_ortho_upper_bound_ctx(
+    ctx: &mut CompletionContext,
+    interner: &Interner,
+) -> OrthoScore {
+    existing_ortho_upper_bound_ctx_with_impacted(ctx, interner, None)
+}
+
+fn existing_ortho_upper_bound_ctx_with_impacted(
+    ctx: &mut CompletionContext,
+    interner: &Interner,
+    impacted_index: Option<&ImpactedPrefixIndex>,
+) -> OrthoScore {
     let required_prefixes = &ctx.required_usize;
     let totals = &mut ctx.totals;
     totals.clear();
@@ -301,15 +352,73 @@ pub fn bound_existing_ortho_ctx(
     };
 
     let fallback_total = interner.max_prefix_len().max(2);
-    let potential_score = upper_bound_score(
+    upper_bound_score_with_scratch(
         axis_totals,
         ctx.base_volume,
         ctx.base_fullness,
         ctx.dim_count,
         fallback_total,
-    );
+        &mut ctx.bound_scratch,
+    )
+}
 
-    potential_score <= best_score
+fn insert_desc(top_totals: &mut Vec<usize>, value: usize) {
+    let idx = top_totals.partition_point(|current| *current >= value);
+    top_totals.insert(idx, value);
+}
+
+fn upper_bound_score_with_scratch(
+    axis_totals: &[usize],
+    min_volume: usize,
+    min_fullness: usize,
+    dim_count: usize,
+    fallback_total: usize,
+    scratch: &mut Vec<usize>,
+) -> OrthoScore {
+    if dim_count == 0 {
+        return OrthoScore::optimistic_bound(min_volume.max(1), min_fullness.max(1));
+    }
+
+    let fallback_total = fallback_total.max(2);
+    scratch.clear();
+    if scratch.capacity() < dim_count {
+        scratch.reserve(dim_count - scratch.capacity());
+    }
+
+    for &total in axis_totals {
+        if scratch.len() < dim_count {
+            insert_desc(scratch, total);
+            continue;
+        }
+
+        if let Some(&smallest) = scratch.last() {
+            if total > smallest {
+                scratch.pop();
+                insert_desc(scratch, total);
+            }
+        }
+    }
+
+    let mut volume_upper: usize = 1;
+    let mut fullness_upper: usize = 1;
+
+    for &total in scratch.iter() {
+        volume_upper = volume_upper.saturating_mul(total.saturating_sub(1));
+        fullness_upper = fullness_upper.saturating_mul(total);
+    }
+
+    if scratch.len() < dim_count {
+        let missing = dim_count - scratch.len();
+        let fallback_volume = fallback_total.saturating_sub(1);
+        for _ in 0..missing {
+            volume_upper = volume_upper.saturating_mul(fallback_volume);
+            fullness_upper = fullness_upper.saturating_mul(fallback_total);
+        }
+    }
+
+    volume_upper = volume_upper.max(min_volume);
+    fullness_upper = fullness_upper.max(min_fullness);
+    OrthoScore::optimistic_bound(volume_upper, fullness_upper)
 }
 
 /// Compute an upper-bound (volume, fullness) given per-prefix max lengths, dim count, and score floors.
@@ -324,32 +433,15 @@ pub fn upper_bound_score(
     dim_count: usize,
     fallback_total: usize,
 ) -> OrthoScore {
-    let fallback_total = fallback_total.max(2); // keep optimism for missing axes
-
-    // Pick the top `dim_count` axes (descending) and pad with fallback_total if needed.
-    let mut totals: Vec<usize> = axis_totals.iter().copied().collect();
-    totals.sort_unstable_by(|a, b| b.cmp(a));
-    while totals.len() < dim_count {
-        totals.push(fallback_total);
-    }
-    let totals_iter = totals.into_iter().take(dim_count);
-
-    let mut volume_upper: usize = 1;
-    for t in totals_iter.clone() {
-        volume_upper = volume_upper.saturating_mul(t.saturating_sub(1));
-    }
-    volume_upper = volume_upper.max(min_volume);
-
-    // Fullness tracks how many payload slots can be filled; unlike volume (which is excess volume),
-    // it grows with the full axis lengths. Using volume as a proxy can under-estimate potential
-    // fullness and cause premature pruning when fullness is the tie-breaker.
-    let mut fullness_upper: usize = 1;
-    for t in totals_iter {
-        fullness_upper = fullness_upper.saturating_mul(t);
-    }
-    fullness_upper = fullness_upper.max(min_fullness);
-
-    OrthoScore::optimistic_bound(volume_upper, fullness_upper)
+    let mut scratch = Vec::new();
+    upper_bound_score_with_scratch(
+        axis_totals,
+        min_volume,
+        min_fullness,
+        dim_count,
+        fallback_total,
+        &mut scratch,
+    )
 }
 
 #[cfg(test)]

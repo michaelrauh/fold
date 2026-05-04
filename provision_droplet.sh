@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Script to provision a 16 GB DigitalOcean droplet, sync the repo and e.txt,
+# Script to provision a DigitalOcean droplet, sync the repo and e.txt,
 # and prep the box with Rust + tmux. Requires doctl authenticated with an SSH
 # key fingerprint or ID available to --ssh-keys.
 
@@ -14,19 +14,13 @@ if [ -f .env ]; then
   set +a
 fi
 
-DROPLET_NAME="${DROPLET_NAME:-fold-16gb}"
+DROPLET_NAME="${DROPLET_NAME:-fold-8gb}"
 REGION="${REGION:-nyc3}"
-SIZE="${SIZE:-s-4vcpu-16gb}"
+SIZE="${SIZE:-s-4vcpu-8gb}"
 IMAGE="${IMAGE:-ubuntu-22-04-x64}"
 SSH_KEY="${SSH_KEY:-<ssh-key-id-or-fingerprint>}" # must exist in DO + locally loaded
 TMUX_SESSION="${TMUX_SESSION:-fold}"
-MOUNT_POINT="${MOUNT_POINT:-/mnt/fold}"
-VOLUME_NAME="${VOLUME_NAME:-fold-data}"
-VOLUME_SIZE_GB="${VOLUME_SIZE_GB:-1000}"
-SANITIZED_VOLUME_NAME="${VOLUME_NAME// /_}"
-VOLUME_DEVICE="${VOLUME_DEVICE:-/dev/disk/by-id/scsi-0DO_Volume_${SANITIZED_VOLUME_NAME}}"
-VOLUME_FS_TYPE="${VOLUME_FS_TYPE:-ext4}"
-REMOTE_APP_DIR="${REMOTE_APP_DIR:-$MOUNT_POINT/fold}"
+REMOTE_APP_DIR="${REMOTE_APP_DIR:-/root/fold}"
 # Spaces config (optional: set to enable offload on provisioned droplets)
 SPACES_BUCKET="${SPACES_BUCKET:-fold-offload}"
 SPACES_REGION="${SPACES_REGION:-nyc3}"
@@ -68,10 +62,6 @@ fetch_ip() {
     tr -d '[:space:]'
 }
 
-fetch_droplet_id() {
-  doctl compute droplet get "$DROPLET_NAME" --format ID --no-header |
-    tr -d '[:space:]'
-}
 
 wait_for_ssh() {
   local ip="$1"
@@ -128,26 +118,6 @@ ensure_remote_dir() {
   ssh "root@$ip" "mkdir -p \"$REMOTE_APP_DIR\""
 }
 
-create_spaces_bucket() {
-  local ip="$1"
-  if [ -z "$SPACES_ACCESS_KEY" ] || [ -z "$SPACES_SECRET_KEY" ]; then
-    echo "Spaces creds not provided; skipping bucket create"
-    return
-  fi
-  ssh "root@$ip" <<EOF
-set -euo pipefail
-export AWS_ACCESS_KEY_ID="$SPACES_ACCESS_KEY"
-export AWS_SECRET_ACCESS_KEY="$SPACES_SECRET_KEY"
-export AWS_DEFAULT_REGION="$SPACES_REGION"
-if aws --endpoint-url "$SPACES_ENDPOINT" s3api head-bucket --bucket "$SPACES_BUCKET" >/dev/null 2>&1; then
-  echo "Spaces bucket $SPACES_BUCKET already exists."
-else
-  echo "Creating Spaces bucket $SPACES_BUCKET..."
-  aws --endpoint-url "$SPACES_ENDPOINT" s3api create-bucket --bucket "$SPACES_BUCKET" >/dev/null
-fi
-EOF
-}
-
 sync_code() {
   local ip="$1"
   case "$SYNC_MODE" in
@@ -193,96 +163,23 @@ EOF
   esac
 }
 
-create_or_get_volume() {
-  local id
-  if id="$(doctl compute volume get "$VOLUME_NAME" --format ID --no-header 2>/dev/null | tr -d '[:space:]')"; then
-    echo "Volume $VOLUME_NAME already exists ($id)."
-  else
-    echo "Creating volume $VOLUME_NAME (${VOLUME_SIZE_GB}GiB in $REGION)..."
-    id="$(doctl compute volume create "$VOLUME_NAME" \
-      --region "$REGION" \
-      --size "${VOLUME_SIZE_GB}GiB" \
-      --format ID \
-      --no-header | tr -d '[:space:]')"
-  fi
-  VOLUME_ID="$id"
-}
-
-attach_volume_to_droplet() {
-  local droplet_id="$1"
-  local attached_ids
-  attached_ids="$(doctl compute volume get "$VOLUME_NAME" --format DropletIDs --no-header 2>/dev/null || true)"
-  if echo "$attached_ids" | tr -d '[],' | tr ' ' '\n' | grep -qw "$droplet_id"; then
-    echo "Volume $VOLUME_NAME already attached to droplet $droplet_id."
-    return
-  fi
-
-  echo "Attaching volume $VOLUME_NAME ($VOLUME_ID) to droplet $droplet_id..."
-  doctl compute volume-action attach "$VOLUME_ID" "$droplet_id" --wait
-}
-
-prepare_volume_mount() {
-  local ip="$1"
-  ssh "root@$ip" <<EOF
-set -euo pipefail
-DEVICE="$VOLUME_DEVICE"
-MOUNT_POINT="$MOUNT_POINT"
-REMOTE_APP_DIR="$REMOTE_APP_DIR"
-FS_TYPE="$VOLUME_FS_TYPE"
-TRIES=12
-
-for i in \$(seq 1 "\$TRIES"); do
-  if [ -e "\$DEVICE" ]; then
-    break
-  fi
-  echo "Waiting for \$DEVICE to attach (\$i/\$TRIES)..."
-  sleep 5
-done
-
-if [ ! -e "\$DEVICE" ]; then
-  echo "Block device \$DEVICE not found. Ensure the volume is attached." >&2
-  exit 1
-fi
-
-mkdir -p "\$MOUNT_POINT"
-if ! blkid "\$DEVICE" >/dev/null 2>&1; then
-  echo "Formatting \$DEVICE as \$FS_TYPE..."
-  mkfs -t "\$FS_TYPE" -F "\$DEVICE"
-fi
-
-if ! mountpoint -q "\$MOUNT_POINT"; then
-  mount "\$DEVICE" "\$MOUNT_POINT"
-fi
-
-if ! grep -q "\$DEVICE" /etc/fstab; then
-  echo "\$DEVICE \$MOUNT_POINT \$FS_TYPE defaults,nofail 0 2" >> /etc/fstab
-fi
-
-mkdir -p "\$REMOTE_APP_DIR"
-EOF
-}
 
 main() {
   create_or_get_droplet
-  droplet_id="$(fetch_droplet_id)"
   ip="$(fetch_ip)"
   [ -n "$ip" ] || abort "Could not get droplet IP"
   wait_for_ssh "$ip"
-  create_or_get_volume
-  attach_volume_to_droplet "$droplet_id"
   bootstrap_remote "$ip"
-  prepare_volume_mount "$ip"
   ensure_remote_dir "$ip"
   sync_code "$ip"
   sync_text "$ip"
-  create_spaces_bucket "$ip"
 
   echo
   echo "Droplet ready at: $ip"
   echo "SSH command: ssh root@$ip"
-  echo "App directory on volume: $REMOTE_APP_DIR (mounted from $VOLUME_NAME at $MOUNT_POINT)"
+  echo "App directory: $REMOTE_APP_DIR"
   echo "After SSH: cd $REMOTE_APP_DIR"
-  echo "Start app (tmux w/2 panes): ./start_fold.sh"
+  echo "Start app: ./start_fold.sh"
   echo "One-liner: ssh root@$ip \"cd $REMOTE_APP_DIR && ./start_fold.sh\""
 }
 
