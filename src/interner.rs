@@ -164,7 +164,10 @@ impl Interner {
         vocabulary: &[String],
         vocab_len: usize,
         existing: Option<&Interner>,
-    ) -> (FxHashMap<Vec<usize>, FixedBitSet>, FxHashMap<Vec<usize>, usize>) {
+    ) -> (
+        FxHashMap<Vec<usize>, FixedBitSet>,
+        FxHashMap<Vec<usize>, usize>,
+    ) {
         let mut prefix_to_completions = match existing {
             Some(interner) => {
                 let mut new_map = interner.prefix_to_completions.clone();

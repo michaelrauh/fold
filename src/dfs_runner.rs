@@ -145,13 +145,34 @@ pub fn bound_reuse_shadow_verify_enabled() -> bool {
     verify_bound_reuse_enabled()
 }
 
+fn parse_bool_flag(value: &str) -> Option<bool> {
+    if value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
+        Some(true)
+    } else if value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn release_build_defaults_enabled() -> bool {
+    !cfg!(debug_assertions)
+}
+
+fn resolve_parallel_child_bounds_enabled(env_value: Option<&str>, release_build: bool) -> bool {
+    env_value.and_then(parse_bool_flag).unwrap_or(release_build)
+}
+
 pub fn parallel_child_bounds_enabled() -> bool {
     static PARALLEL_CHILD_BOUNDS: OnceLock<bool> = OnceLock::new();
     *PARALLEL_CHILD_BOUNDS.get_or_init(|| {
-        std::env::var("FOLD_PARALLEL_CHILD_BOUNDS")
-            .ok()
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
+        resolve_parallel_child_bounds_enabled(
+            std::env::var("FOLD_PARALLEL_CHILD_BOUNDS").ok().as_deref(),
+            release_build_defaults_enabled(),
+        )
     })
 }
 
@@ -513,7 +534,8 @@ impl DfsRunner {
                     }
                     frame.bound_precomputed = false;
                     let node_prune_start = profile_start!();
-                    let prune_root = toggles.node_pruning && frame.optimistic_bound <= incumbent_score;
+                    let prune_root =
+                        toggles.node_pruning && frame.optimistic_bound <= incumbent_score;
                     profile_end!(node_prune_start, node_prune_ns);
                     if prune_root {
                         self.nodes_pruned = self.nodes_pruned.saturating_add(1);
@@ -538,7 +560,9 @@ impl DfsRunner {
                     for completion in completion_bits.ones() {
                         let completion_bound = if toggles.compute_bounds {
                             let completion_bound_start = profile_start!();
-                            let Some(bound) = completion_upper_bound_ctx(completion_ctx, completion, interner) else {
+                            let Some(bound) =
+                                completion_upper_bound_ctx(completion_ctx, completion, interner)
+                            else {
                                 profile_end!(completion_bound_start, completion_bound_ns);
                                 self.completions_pruned = self.completions_pruned.saturating_add(1);
                                 continue;
@@ -550,8 +574,9 @@ impl DfsRunner {
                         };
 
                         let completion_prune_start = profile_start!();
-                        let prune_completion =
-                            toggles.completion_pruning && toggles.compute_bounds && completion_bound <= incumbent_score;
+                        let prune_completion = toggles.completion_pruning
+                            && toggles.compute_bounds
+                            && completion_bound <= incumbent_score;
                         profile_end!(completion_prune_start, completion_prune_ns);
                         if prune_completion {
                             self.completions_pruned = self.completions_pruned.saturating_add(1);
@@ -599,7 +624,8 @@ impl DfsRunner {
                         } else {
                             for branch in &mut frame.branches {
                                 frame_ctx.reset(&branch.child);
-                                branch.optimistic_bound = existing_ortho_upper_bound_ctx(frame_ctx, interner);
+                                branch.optimistic_bound =
+                                    existing_ortho_upper_bound_ctx(frame_ctx, interner);
                             }
                         }
 
@@ -607,34 +633,34 @@ impl DfsRunner {
                     }
 
                     match toggles.branch_ordering {
-                    BranchOrdering::BestFirst => {
-                        if toggles.compute_bounds {
-                            let reorder_start = profile_start!();
-                            frame.branches.sort_by(|a, b| {
-                                b.optimistic_bound
-                                    .cmp(&a.optimistic_bound)
-                                    .then_with(|| b.child.score().cmp(&a.child.score()))
-                                    .then_with(|| a.completion.cmp(&b.completion))
-                                    .then_with(|| a.child.id().cmp(&b.child.id()))
-                            });
-                            profile_end!(reorder_start, reorder_ns);
+                        BranchOrdering::BestFirst => {
+                            if toggles.compute_bounds {
+                                let reorder_start = profile_start!();
+                                frame.branches.sort_by(|a, b| {
+                                    b.optimistic_bound
+                                        .cmp(&a.optimistic_bound)
+                                        .then_with(|| b.child.score().cmp(&a.child.score()))
+                                        .then_with(|| a.completion.cmp(&b.completion))
+                                        .then_with(|| a.child.id().cmp(&b.child.id()))
+                                });
+                                profile_end!(reorder_start, reorder_ns);
+                            }
+                        }
+                        BranchOrdering::Insertion => {}
+                        BranchOrdering::WorstFirst => {
+                            if toggles.compute_bounds {
+                                let reorder_start = profile_start!();
+                                frame.branches.sort_by(|a, b| {
+                                    a.optimistic_bound
+                                        .cmp(&b.optimistic_bound)
+                                        .then_with(|| a.child.score().cmp(&b.child.score()))
+                                        .then_with(|| a.completion.cmp(&b.completion))
+                                        .then_with(|| a.child.id().cmp(&b.child.id()))
+                                });
+                                profile_end!(reorder_start, reorder_ns);
+                            }
                         }
                     }
-                    BranchOrdering::Insertion => {}
-                    BranchOrdering::WorstFirst => {
-                        if toggles.compute_bounds {
-                            let reorder_start = profile_start!();
-                            frame.branches.sort_by(|a, b| {
-                                a.optimistic_bound
-                                    .cmp(&b.optimistic_bound)
-                                    .then_with(|| a.child.score().cmp(&b.child.score()))
-                                    .then_with(|| a.completion.cmp(&b.completion))
-                                    .then_with(|| a.child.id().cmp(&b.child.id()))
-                            });
-                            profile_end!(reorder_start, reorder_ns);
-                        }
-                    }
-                }
 
                     frame.prepared = true;
                     Self::add_depth_counter(
@@ -652,7 +678,8 @@ impl DfsRunner {
                     let branch = frame.branches[frame.next_branch_idx].clone();
                     frame.next_branch_idx += 1;
                     let node_prune_start = profile_start!();
-                    let prune_branch = toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
+                    let prune_branch =
+                        toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
                     profile_end!(node_prune_start, node_prune_ns);
                     if prune_branch {
                         self.nodes_pruned = self.nodes_pruned.saturating_add(1);
@@ -704,4 +731,35 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_parallel_child_bounds_enabled;
+
+    #[test]
+    fn parallel_child_bounds_defaults_on_in_release_when_unset() {
+        assert!(resolve_parallel_child_bounds_enabled(None, true));
+    }
+
+    #[test]
+    fn parallel_child_bounds_defaults_off_in_debug_when_unset() {
+        assert!(!resolve_parallel_child_bounds_enabled(None, false));
+    }
+
+    #[test]
+    fn parallel_child_bounds_true_values_override_default() {
+        for value in ["1", "true", "TRUE", "yes", "YES"] {
+            assert!(resolve_parallel_child_bounds_enabled(Some(value), false));
+            assert!(resolve_parallel_child_bounds_enabled(Some(value), true));
+        }
+    }
+
+    #[test]
+    fn parallel_child_bounds_false_values_override_default() {
+        for value in ["0", "false", "FALSE", "no", "NO"] {
+            assert!(!resolve_parallel_child_bounds_enabled(Some(value), false));
+            assert!(!resolve_parallel_child_bounds_enabled(Some(value), true));
+        }
+    }
 }

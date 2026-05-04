@@ -19,8 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SEARCH_LEVEL_ROWS: usize = 40;
-
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -34,7 +32,7 @@ impl Drop for TerminalGuard {
 pub struct Tui {
     metrics: Metrics,
     should_quit: Arc<AtomicBool>,
-    log_scroll: usize,
+    vertical_scroll: usize,
     snapshot_path: Option<PathBuf>,
     last_snapshot_write: Instant,
     prev_touched_by_depth: Vec<u64>,
@@ -50,7 +48,7 @@ impl Tui {
         Self {
             metrics,
             should_quit,
-            log_scroll: 0,
+            vertical_scroll: 0,
             snapshot_path,
             last_snapshot_write: Instant::now(),
             prev_touched_by_depth: Vec::new(),
@@ -83,10 +81,10 @@ impl Tui {
                             break;
                         }
                         KeyCode::Up => {
-                            self.log_scroll = self.log_scroll.saturating_sub(1);
+                            self.vertical_scroll = self.vertical_scroll.saturating_sub(1);
                         }
                         KeyCode::Down => {
-                            self.log_scroll = self.log_scroll.saturating_add(1);
+                            self.vertical_scroll = self.vertical_scroll.saturating_add(1);
                         }
                         _ => {}
                     }
@@ -111,21 +109,12 @@ impl Tui {
     fn render(&mut self, f: &mut Frame) {
         let snapshot = self.metrics.snapshot();
         self.update_level_activity(&snapshot);
+        self.clamp_scroll(f.area(), &snapshot);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
             .split(f.area());
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(8),
-                Constraint::Min(12),
-                Constraint::Length(8),
-            ])
-            .split(columns[0]);
-        self.render_run(f, left[0], &snapshot);
-        self.render_best(f, left[1], &snapshot);
-        self.render_logs(f, left[2], &snapshot);
+        self.render_left_column(f, columns[0], &snapshot);
         self.render_search(f, columns[1], &snapshot);
     }
 
@@ -135,8 +124,7 @@ impl Tui {
             .seen_by_depth
             .len()
             .max(snapshot.global.descended_by_depth.len())
-            .max(snapshot.global.pruned_by_depth.len())
-            .max(SEARCH_LEVEL_ROWS);
+            .max(snapshot.global.pruned_by_depth.len());
         if self.prev_touched_by_depth.len() < level_len {
             self.prev_touched_by_depth.resize(level_len, 0);
         }
@@ -151,26 +139,38 @@ impl Tui {
                 .get(depth)
                 .copied()
                 .unwrap_or(0)
-                .saturating_add(snapshot.global.pruned_by_depth.get(depth).copied().unwrap_or(0));
+                .saturating_add(
+                    snapshot
+                        .global
+                        .pruned_by_depth
+                        .get(depth)
+                        .copied()
+                        .unwrap_or(0),
+                );
             let touched_prev = self.prev_touched_by_depth[depth];
             let delta = touched_now.saturating_sub(touched_prev);
-            let seen = snapshot.global.seen_by_depth.get(depth).copied().unwrap_or(0);
+            let seen = snapshot
+                .global
+                .seen_by_depth
+                .get(depth)
+                .copied()
+                .unwrap_or(0);
             let scale = (seen / 100).max(1);
             let delta_intensity = (delta as f64 / scale as f64).clamp(0.0, 1.0);
 
-            self.level_activity_heat[depth] = (self.level_activity_heat[depth] * 0.86)
-                .max(delta_intensity);
+            self.level_activity_heat[depth] =
+                (self.level_activity_heat[depth] * 0.86).max(delta_intensity);
             self.prev_touched_by_depth[depth] = touched_now;
         }
     }
 
-    fn render_run(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_run_lines(&self, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let elapsed = now.saturating_sub(snapshot.global.start_time);
-        let lines = vec![
+        vec![
             Line::from(format!(
                 "DFS/BnB [Time: {}] [Phase: {}]",
                 format_elapsed(elapsed),
@@ -205,13 +205,17 @@ impl Tui {
                     snapshot.global.checkpoint_time.to_string()
                 }
             )),
-        ];
-        let widget =
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Run"));
-        f.render_widget(widget, area);
+        ]
     }
 
     fn render_search(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let widget = Paragraph::new(self.search_lines(area, snapshot))
+            .scroll((self.vertical_scroll as u16, 0))
+            .block(Block::default().borders(Borders::ALL).title("Search"));
+        f.render_widget(widget, area);
+    }
+
+    fn search_lines(&self, area: Rect, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -253,15 +257,13 @@ impl Tui {
             &snapshot.global.descended_by_depth,
             &snapshot.global.pruned_by_depth,
             &self.level_activity_heat,
-            SEARCH_LEVEL_ROWS,
+            search_level_count(snapshot),
             area,
         ));
-        let widget = Paragraph::new(all_lines)
-            .block(Block::default().borders(Borders::ALL).title("Search"));
-        f.render_widget(widget, area);
+        all_lines
     }
 
-    fn render_best(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+    fn render_best_lines(&self, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::from(format!(
                 "Best score: vol={} var={}/{} full={}",
@@ -277,26 +279,45 @@ impl Tui {
             Line::from(""),
         ];
         lines.extend(multiline_lines(&snapshot.global.incumbent_display));
-        let widget = Paragraph::new(lines)
+        lines
+    }
+
+    fn render_left_column(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
+        let widget = Paragraph::new(self.left_column_lines(snapshot))
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("Incumbent"));
+            .scroll((self.vertical_scroll as u16, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Run / Incumbent / Logs"),
+            );
         f.render_widget(widget, area);
     }
 
-    fn render_logs(&self, f: &mut Frame, area: Rect, snapshot: &MetricsSnapshot) {
-        let height = area.height.saturating_sub(2) as usize;
-        let start = snapshot
-            .logs
-            .len()
-            .saturating_sub(height.saturating_add(self.log_scroll));
-        let end = (start + height).min(snapshot.logs.len());
-        let lines: Vec<Line> = snapshot.logs[start..end]
-            .iter()
-            .map(|line| Line::from(line.clone()))
-            .collect();
-        let widget =
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Logs"));
-        f.render_widget(widget, area);
+    fn left_column_lines(&self, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        lines.push(section_title("Run"));
+        lines.extend(self.render_run_lines(snapshot));
+        lines.push(Line::from(""));
+        lines.push(section_title("Incumbent"));
+        lines.extend(self.render_best_lines(snapshot));
+        lines.push(Line::from(""));
+        lines.push(section_title("Logs"));
+        lines.extend(snapshot.logs.iter().cloned().map(Line::from));
+        lines
+    }
+
+    fn clamp_scroll(&mut self, area: Rect, snapshot: &MetricsSnapshot) {
+        let viewport_height = area.height.saturating_sub(2) as usize;
+        if viewport_height == 0 {
+            self.vertical_scroll = 0;
+            return;
+        }
+        let left_lines = self.left_column_lines(snapshot).len();
+        let right_lines = self.search_lines(area, snapshot).len();
+        let content_height = left_lines.max(right_lines);
+        let max_scroll = content_height.saturating_sub(viewport_height);
+        self.vertical_scroll = self.vertical_scroll.min(max_scroll);
     }
 }
 
@@ -373,7 +394,10 @@ pub fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
         "pruned={}\n\n",
         count_chart(&snapshot.global.pruned_by_depth, 64)
     ));
-    out.push_str(&format!("seen_by_depth={:?}\n\n", snapshot.global.seen_by_depth));
+    out.push_str(&format!(
+        "seen_by_depth={:?}\n\n",
+        snapshot.global.seen_by_depth
+    ));
     out.push_str(&format!(
         "tree={}\n\n",
         tree_occupancy_chart(
@@ -407,6 +431,19 @@ fn multiline_lines(text: &str) -> Vec<Line<'static>> {
     text.lines()
         .map(|line| Line::from(line.to_string()))
         .collect()
+}
+
+fn search_level_count(snapshot: &MetricsSnapshot) -> usize {
+    snapshot
+        .global
+        .seen_by_depth
+        .len()
+        .max(snapshot.global.descended_by_depth.len())
+        .max(snapshot.global.pruned_by_depth.len())
+}
+
+fn section_title(title: &str) -> Line<'static> {
+    Line::from(format!("[{title}]"))
 }
 
 fn chart_width(area: Rect, label: &str) -> usize {
@@ -656,11 +693,15 @@ fn tree_glyph(visited: u64, open: u64, unknown: bool) -> char {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetricsSnapshot, activity_style, count_chart, format_snapshot, multiline_lines,
+        MetricsSnapshot, Tui, activity_style, count_chart, format_snapshot, multiline_lines,
         path_progress_chart, percent_bar, tree_occupancy_chart,
     };
     use crate::metrics::GlobalMetrics;
+    use crate::metrics::Metrics;
     use crate::ortho::OrthoScore;
+    use ratatui::layout::Rect;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn multiline_lines_preserve_row_boundaries() {
@@ -685,7 +726,10 @@ mod tests {
             2
         );
         assert_eq!(percent_bar(3, 4, 10).chars().count(), 10);
-        assert_eq!(format!("{:?}", activity_style(0.8, false)), "Style::new().red()");
+        assert_eq!(
+            format!("{:?}", activity_style(0.8, false)),
+            "Style::new().red()"
+        );
     }
 
     #[test]
@@ -728,5 +772,56 @@ mod tests {
         assert!(rendered.contains("open="));
         assert!(rendered.contains("pruned="));
         assert!(rendered.contains("tree="));
+    }
+
+    #[test]
+    fn clamp_scroll_caps_to_tallest_column() {
+        let mut snapshot = MetricsSnapshot::default();
+        snapshot.global = GlobalMetrics {
+            phase: "Running".to_string(),
+            input_path: "e.txt".to_string(),
+            start_time: 1,
+            incumbent_display: (0..20)
+                .map(|idx| format!("row {idx}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ..GlobalMetrics::default()
+        };
+        snapshot.logs = (0..5).map(|idx| format!("log {idx}")).collect();
+
+        let metrics = Metrics::new();
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let mut tui = Tui::new(metrics, should_quit, None);
+        tui.vertical_scroll = 100;
+        let area = Rect::new(0, 0, 80, 10);
+        tui.clamp_scroll(area, &snapshot);
+        let expected = tui
+            .left_column_lines(&snapshot)
+            .len()
+            .max(tui.search_lines(area, &snapshot).len())
+            .saturating_sub(area.height.saturating_sub(2) as usize);
+
+        assert_eq!(tui.vertical_scroll, expected);
+    }
+
+    #[test]
+    fn search_lines_include_all_known_levels() {
+        let mut snapshot = MetricsSnapshot::default();
+        snapshot.global.seen_by_depth = vec![1; 50];
+        snapshot.global.descended_by_depth = vec![0; 50];
+        snapshot.global.pruned_by_depth = vec![0; 50];
+
+        let metrics = Metrics::new();
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let mut tui = Tui::new(metrics, should_quit, None);
+        tui.update_level_activity(&snapshot);
+
+        let rendered: Vec<String> = tui
+            .search_lines(Rect::new(0, 0, 80, 20), &snapshot)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.starts_with("L50 ")));
     }
 }

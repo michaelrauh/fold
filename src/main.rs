@@ -9,6 +9,7 @@ use fold::{
     metrics::Metrics,
     tui::Tui,
 };
+use rayon::ThreadPoolBuilder;
 use serde_json::json;
 use std::fs;
 use std::io::IsTerminal;
@@ -18,7 +19,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const DEFAULT_RAYON_NUM_THREADS: usize = 2;
+
 fn main() -> Result<(), FoldError> {
+    let rayon_threads = initialize_rayon()?;
+
     let state_dir = std::env::var("FOLD_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("fold_state"));
@@ -69,6 +74,7 @@ fn main() -> Result<(), FoldError> {
         "Parallel child bounds: enabled={} min_branches={}",
         parallel_child_bounds, parallel_child_bounds_min
     ));
+    metrics.add_log(format!("Rayon threads: {}", rayon_threads));
     metrics.add_log(format!(
         "{} search for {}",
         if resumed { "Resumed" } else { "Starting" },
@@ -86,6 +92,7 @@ fn main() -> Result<(), FoldError> {
             input_fingerprint,
             &cfg,
             "initial",
+            rayon_threads,
         )?;
         metrics.update_global(|g| {
             g.checkpoint_status = manifest.checkpoint_status.clone();
@@ -148,6 +155,7 @@ fn main() -> Result<(), FoldError> {
                 input_fingerprint,
                 &cfg,
                 checkpoint_status,
+                rayon_threads,
             )?;
             metrics.update_global(|g| {
                 g.checkpoint_status = manifest.checkpoint_status.clone();
@@ -182,6 +190,7 @@ fn main() -> Result<(), FoldError> {
         input_fingerprint,
         &cfg,
         final_status,
+        rayon_threads,
     )?;
     update_metrics(
         &metrics,
@@ -220,6 +229,22 @@ fn main() -> Result<(), FoldError> {
     );
 
     Ok(())
+}
+
+fn initialize_rayon() -> Result<usize, FoldError> {
+    let threads = resolve_rayon_num_threads(std::env::var("RAYON_NUM_THREADS").ok().as_deref());
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .map_err(|e| FoldError::Other(format!("failed to initialize rayon thread pool: {}", e)))?;
+    Ok(threads)
+}
+
+fn resolve_rayon_num_threads(env_value: Option<&str>) -> usize {
+    env_value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or(DEFAULT_RAYON_NUM_THREADS)
 }
 
 fn initialize_run(
@@ -306,6 +331,7 @@ fn save_outputs(
     input_fingerprint: u64,
     cfg: &DfsConfig,
     status: &str,
+    rayon_threads: usize,
 ) -> Result<(), FoldError> {
     let snapshot = runner.snapshot();
     let summary = json!({
@@ -342,6 +368,7 @@ fn save_outputs(
         "bound_reuse_shadow_verify": bound_reuse_shadow_verify_enabled(),
         "parallel_child_bounds_enabled": parallel_child_bounds_enabled(),
         "parallel_child_bounds_min_branches": parallel_child_bounds_min_branches(),
+        "rayon_num_threads": rayon_threads,
     });
     checkpoint_mgr.save_optimal(runner.incumbent(), incumbent_display, &summary)
 }
@@ -402,4 +429,25 @@ fn spawn_tui_if_enabled(
         let mut tui = Tui::new(metrics, should_quit, Some(snapshot_path));
         let _ = tui.run();
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_rayon_num_threads;
+
+    #[test]
+    fn rayon_threads_default_to_two_when_unset() {
+        assert_eq!(resolve_rayon_num_threads(None), 2);
+    }
+
+    #[test]
+    fn rayon_threads_honor_positive_env_override() {
+        assert_eq!(resolve_rayon_num_threads(Some("4")), 4);
+    }
+
+    #[test]
+    fn rayon_threads_ignore_invalid_or_zero_env_values() {
+        assert_eq!(resolve_rayon_num_threads(Some("0")), 2);
+        assert_eq!(resolve_rayon_num_threads(Some("nope")), 2);
+    }
 }

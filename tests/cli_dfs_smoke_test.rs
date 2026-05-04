@@ -29,4 +29,12 @@ fn cli_runs_single_input_and_writes_dfs_outputs() {
     assert!(!state_dir.join("in_process").exists());
     assert!(!state_dir.join("history").exists());
     assert!(!state_dir.join("work").exists());
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("output/summary.json")).unwrap()).unwrap();
+    assert_eq!(
+        summary["parallel_child_bounds_enabled"],
+        serde_json::Value::Bool(cfg!(not(debug_assertions)))
+    );
+    assert_eq!(summary["rayon_num_threads"], serde_json::Value::from(2));
 }

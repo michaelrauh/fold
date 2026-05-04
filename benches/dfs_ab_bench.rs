@@ -163,16 +163,12 @@ fn bench_dfs_ab(c: &mut Criterion) {
             budget.incumbent_volume,
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("steps", variant.name),
-            &variant,
-            |b, v| {
-                b.iter(|| {
-                    let outcome = run_steps(&interner, v.toggles, step_budget);
-                    black_box(outcome);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("steps", variant.name), &variant, |b, v| {
+            b.iter(|| {
+                let outcome = run_steps(&interner, v.toggles, step_budget);
+                black_box(outcome);
+            })
+        });
     }
 
     group.finish();
@@ -208,7 +204,11 @@ fn run_steps(interner: &Interner, toggles: SearchToggles, step_budget: usize) ->
     }
 }
 
-fn run_for_duration(interner: &Interner, toggles: SearchToggles, budget: Duration) -> BudgetOutcome {
+fn run_for_duration(
+    interner: &Interner,
+    toggles: SearchToggles,
+    budget: Duration,
+) -> BudgetOutcome {
     let start = Instant::now();
     let mut runner = DfsRunner::new();
     let mut steps = 0usize;

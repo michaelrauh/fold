@@ -52,6 +52,12 @@ Process all files in the input directory:
 cargo run --release
 ```
 
+Or run against a specific file directly:
+
+```bash
+cargo run --release -- e.txt
+```
+
 The program will:
 - Process text files from `fold_state/input/`
 - Move file to `in_process/` and create heartbeat
@@ -65,6 +71,19 @@ The program will:
   - Update heartbeat periodically (e.g., every 100K orthos)
 - Track optimal ortho across generations
 - Save archive and delete heartbeat on success
+
+Release builds enable parallel child-bound computation by default. To disable it for comparison or debugging:
+
+```bash
+FOLD_PARALLEL_CHILD_BOUNDS=0 cargo run --release -- e.txt
+```
+
+Fold defaults Rayon to `2` worker threads. Override it if you want a different setting:
+
+```bash
+RAYON_NUM_THREADS=1 cargo run --release -- e.txt
+RAYON_NUM_THREADS=4 cargo run --release -- e.txt
+```
 
 ### Crash Recovery
 
