@@ -8,6 +8,7 @@ use crate::{
 };
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
@@ -16,11 +17,21 @@ use std::cmp::Ordering;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const SEEN_PER_DIMS_LIMIT: usize = 1_000_000;
+
+fn saturating_pow_usize(base: usize, exp: usize) -> usize {
+    (base as u128)
+        .checked_pow(exp as u32)
+        .unwrap_or(u128::MAX)
+        .min(usize::MAX as u128) as usize
+}
+
 #[derive(Default)]
 struct StepScratch {
     completion_ctx: CompletionContext,
     frame_ctx: CompletionContext,
     completion_bits: FixedBitSet,
+    seen_per_dims: FxHashMap<Vec<u8>, FxHashSet<u64>>,
 }
 
 thread_local! {
@@ -202,6 +213,9 @@ pub struct DfsRunner {
     last_improvement_unix: u64,
     last_improvement_depth: usize,
     finished: bool,
+    score_floor: OrthoScore,
+    dedup_lookups: u64,
+    dedup_hits: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -230,7 +244,7 @@ impl Default for SearchToggles {
         Self {
             node_pruning: true,
             completion_pruning: true,
-            branch_ordering: BranchOrdering::BestFirst,
+            branch_ordering: BranchOrdering::Insertion,
             compute_bounds: true,
         }
     }
@@ -266,6 +280,8 @@ pub struct SearchSnapshot {
     pub started_unix: u64,
     pub last_improvement_unix: u64,
     pub last_improvement_depth: usize,
+    pub dedup_lookups: u64,
+    pub dedup_hits: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +304,8 @@ pub struct RunnerSnapshot {
     pub started_unix: u64,
     pub last_improvement_unix: u64,
     pub last_improvement_depth: usize,
+    pub dedup_lookups: u64,
+    pub dedup_hits: u64,
 }
 
 impl DfsRunner {
@@ -308,6 +326,9 @@ impl DfsRunner {
             last_improvement_unix: started_unix,
             last_improvement_depth: 1,
             finished: false,
+            score_floor: OrthoScore::optimistic_bound(8, 27),
+            dedup_lookups: 0,
+            dedup_hits: 0,
         }
     }
 
@@ -326,7 +347,7 @@ impl DfsRunner {
     }
 
     pub fn incumbent_score(&self) -> OrthoScore {
-        self.incumbent.score()
+        self.incumbent.score().max(self.score_floor)
     }
 
     pub fn nodes_expanded(&self) -> u64 {
@@ -407,6 +428,8 @@ impl DfsRunner {
             started_unix: self.started_unix,
             last_improvement_unix: self.last_improvement_unix,
             last_improvement_depth: self.last_improvement_depth,
+            dedup_lookups: self.dedup_lookups,
+            dedup_hits: self.dedup_hits,
         }
     }
 
@@ -432,6 +455,8 @@ impl DfsRunner {
             started_unix: search.started_unix,
             last_improvement_unix: search.last_improvement_unix,
             last_improvement_depth: search.last_improvement_depth,
+            dedup_lookups: search.dedup_lookups,
+            dedup_hits: search.dedup_hits,
         }
     }
 
@@ -500,6 +525,7 @@ impl DfsRunner {
                 completion_ctx,
                 frame_ctx,
                 completion_bits,
+                seen_per_dims,
             } = &mut *scratch;
 
             loop {
@@ -539,7 +565,6 @@ impl DfsRunner {
                     profile_end!(node_prune_start, node_prune_ns);
                     if prune_root {
                         self.nodes_pruned = self.nodes_pruned.saturating_add(1);
-                        Self::bump_depth_counter(&mut self.pruned_by_depth, current_depth);
                         self.stack.pop();
                         continue;
                     }
@@ -554,8 +579,32 @@ impl DfsRunner {
                     );
                     profile_end!(intersect_start, intersect_ns);
 
+                    // Tighten bound using intersection count: if only k completions exist,
+                    // then each axis can hold at most k values, so vol <= (k-1)^dim_count.
+                    let intersection_prune = if toggles.compute_bounds && toggles.node_pruning {
+                        let k = completion_bits.count_ones(..);
+                        let dim_count = frame_ctx.dim_count();
+                        let k_vol = saturating_pow_usize(k.saturating_sub(1), dim_count)
+                            .max(frame_ctx.base_volume());
+                        let k_full = saturating_pow_usize(k, dim_count)
+                            .max(frame_ctx.base_fullness());
+                        let k_bound = OrthoScore::optimistic_bound(k_vol, k_full);
+                        if k_bound < frame.optimistic_bound {
+                            frame.optimistic_bound = k_bound;
+                        }
+                        frame.optimistic_bound <= incumbent_score
+                    } else {
+                        false
+                    };
+
                     frame.branches.clear();
                     frame.next_branch_idx = 0;
+
+                    if intersection_prune {
+                        self.nodes_pruned = self.nodes_pruned.saturating_add(1);
+                        self.stack.pop();
+                        continue;
+                    }
 
                     for completion in completion_bits.ones() {
                         let completion_bound = if toggles.compute_bounds {
@@ -677,6 +726,22 @@ impl DfsRunner {
                 while frame.next_branch_idx < frame.branches.len() {
                     let branch = frame.branches[frame.next_branch_idx].clone();
                     frame.next_branch_idx += 1;
+
+                    // Per-dims generational dedup: skip orthos already expanded this generation.
+                    let child_id = branch.child.id();
+                    let shape_seen = seen_per_dims
+                        .entry(branch.child.dims().clone())
+                        .or_default();
+                    if shape_seen.len() >= SEEN_PER_DIMS_LIMIT {
+                        shape_seen.clear();
+                    }
+                    self.dedup_lookups = self.dedup_lookups.saturating_add(1);
+                    if shape_seen.contains(&child_id) {
+                        self.dedup_hits = self.dedup_hits.saturating_add(1);
+                        continue;
+                    }
+                    shape_seen.insert(child_id);
+
                     let node_prune_start = profile_start!();
                     let prune_branch =
                         toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
@@ -688,6 +753,9 @@ impl DfsRunner {
                     }
 
                     Self::bump_depth_counter(&mut self.descended_by_depth, current_depth);
+                    for v in self.seen_by_depth.iter_mut().skip(current_depth) { *v = 0; }
+                    for v in self.descended_by_depth.iter_mut().skip(current_depth) { *v = 0; }
+                    for v in self.pruned_by_depth.iter_mut().skip(current_depth) { *v = 0; }
                     self.stack.push(SearchFrame::new_with_precomputed_bound(
                         branch.child,
                         branch.optimistic_bound,

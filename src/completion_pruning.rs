@@ -123,6 +123,18 @@ impl CompletionContext {
     pub fn filled_prefix(&self) -> &[usize] {
         &self.filled_prefix
     }
+
+    pub fn dim_count(&self) -> usize {
+        self.dim_count
+    }
+
+    pub fn base_volume(&self) -> usize {
+        self.base_volume
+    }
+
+    pub fn base_fullness(&self) -> usize {
+        self.base_fullness
+    }
 }
 
 /// Returns true if the candidate should be pruned (optimistic bound cannot beat best_score).

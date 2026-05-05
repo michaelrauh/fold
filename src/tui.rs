@@ -149,14 +149,7 @@ impl Tui {
                 );
             let touched_prev = self.prev_touched_by_depth[depth];
             let delta = touched_now.saturating_sub(touched_prev);
-            let seen = snapshot
-                .global
-                .seen_by_depth
-                .get(depth)
-                .copied()
-                .unwrap_or(0);
-            let scale = (seen / 100).max(1);
-            let delta_intensity = (delta as f64 / scale as f64).clamp(0.0, 1.0);
+            let delta_intensity = if delta > 0 { 1.0 } else { 0.0 };
 
             self.level_activity_heat[depth] =
                 (self.level_activity_heat[depth] * 0.86).max(delta_intensity);
@@ -205,6 +198,12 @@ impl Tui {
                     snapshot.global.checkpoint_time.to_string()
                 }
             )),
+            Line::from({
+                let lookups = snapshot.global.dedup_lookups;
+                let hits = snapshot.global.dedup_hits;
+                let rate = if lookups > 0 { hits as f64 / lookups as f64 * 100.0 } else { 0.0 };
+                format!("Dedup: {:.1}% hit  ({} / {})", rate, format_count(hits), format_count(lookups))
+            }),
         ]
     }
 
@@ -763,6 +762,8 @@ mod tests {
             nodes_per_sec: 1000.0,
             prunes_per_sec: 200.0,
             completion_prunes_per_sec: 50.0,
+            dedup_lookups: 10000,
+            dedup_hits: 3000,
         };
 
         let rendered = format_snapshot(&snapshot);
