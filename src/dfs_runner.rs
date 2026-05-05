@@ -8,7 +8,6 @@ use crate::{
 };
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
-use rustc_hash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
@@ -16,8 +15,6 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-const SEEN_PER_DIMS_LIMIT: usize = 1_000_000;
 
 fn saturating_pow_usize(base: usize, exp: usize) -> usize {
     (base as u128)
@@ -31,7 +28,6 @@ struct StepScratch {
     completion_ctx: CompletionContext,
     frame_ctx: CompletionContext,
     completion_bits: FixedBitSet,
-    seen_per_dims: FxHashMap<Vec<u8>, FxHashSet<u64>>,
 }
 
 thread_local! {
@@ -100,6 +96,7 @@ pub struct SearchBranch {
     pub completion: PayloadVal,
     pub child: Ortho,
     pub optimistic_bound: OrthoScore,
+    pub min_insert_axis: usize,
 }
 
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
@@ -111,6 +108,7 @@ pub struct SearchFrame {
     pub prepared: bool,
     pub next_branch_idx: usize,
     pub branches: Vec<SearchBranch>,
+    pub min_insert_axis: usize,
 }
 
 impl SearchFrame {
@@ -123,10 +121,11 @@ impl SearchFrame {
             prepared: false,
             next_branch_idx: 0,
             branches: Vec::new(),
+            min_insert_axis: 0,
         }
     }
 
-    fn new_with_precomputed_bound(ortho: Ortho, optimistic_bound: OrthoScore) -> Self {
+    fn new_with_bound_and_min_axis(ortho: Ortho, optimistic_bound: OrthoScore, min_insert_axis: usize) -> Self {
         Self {
             ortho,
             optimistic_bound,
@@ -134,6 +133,7 @@ impl SearchFrame {
             prepared: false,
             next_branch_idx: 0,
             branches: Vec::new(),
+            min_insert_axis,
         }
     }
 }
@@ -214,8 +214,6 @@ pub struct DfsRunner {
     last_improvement_depth: usize,
     finished: bool,
     score_floor: OrthoScore,
-    dedup_lookups: u64,
-    dedup_hits: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -280,8 +278,6 @@ pub struct SearchSnapshot {
     pub started_unix: u64,
     pub last_improvement_unix: u64,
     pub last_improvement_depth: usize,
-    pub dedup_lookups: u64,
-    pub dedup_hits: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -304,8 +300,6 @@ pub struct RunnerSnapshot {
     pub started_unix: u64,
     pub last_improvement_unix: u64,
     pub last_improvement_depth: usize,
-    pub dedup_lookups: u64,
-    pub dedup_hits: u64,
 }
 
 impl DfsRunner {
@@ -327,8 +321,6 @@ impl DfsRunner {
             last_improvement_depth: 1,
             finished: false,
             score_floor: OrthoScore::optimistic_bound(8, 27),
-            dedup_lookups: 0,
-            dedup_hits: 0,
         }
     }
 
@@ -428,8 +420,6 @@ impl DfsRunner {
             started_unix: self.started_unix,
             last_improvement_unix: self.last_improvement_unix,
             last_improvement_depth: self.last_improvement_depth,
-            dedup_lookups: self.dedup_lookups,
-            dedup_hits: self.dedup_hits,
         }
     }
 
@@ -455,8 +445,6 @@ impl DfsRunner {
             started_unix: search.started_unix,
             last_improvement_unix: search.last_improvement_unix,
             last_improvement_depth: search.last_improvement_depth,
-            dedup_lookups: search.dedup_lookups,
-            dedup_hits: search.dedup_hits,
         }
     }
 
@@ -525,7 +513,6 @@ impl DfsRunner {
                 completion_ctx,
                 frame_ctx,
                 completion_bits,
-                seen_per_dims,
             } = &mut *scratch;
 
             loop {
@@ -634,6 +621,15 @@ impl DfsRunner {
 
                         let completion_val =
                             PayloadVal::try_from(completion).expect("completion overflowed u32");
+
+                        let maybe_axis = frame.ortho.expanding_insert_axis(completion_val);
+                        if let Some(axis) = maybe_axis {
+                            if axis < frame.min_insert_axis {
+                                continue;
+                            }
+                        }
+                        let child_min_insert_axis = maybe_axis.unwrap_or(frame.min_insert_axis);
+
                         let child_generation_start = profile_start!();
                         for child in frame.ortho.add(completion_val) {
                             self.nodes_expanded = self.nodes_expanded.saturating_add(1);
@@ -651,6 +647,7 @@ impl DfsRunner {
                                 completion: completion_val,
                                 child,
                                 optimistic_bound: child_score,
+                                min_insert_axis: child_min_insert_axis,
                             });
                         }
                         profile_end!(child_generation_start, child_generation_ns);
@@ -728,20 +725,6 @@ impl DfsRunner {
                     frame.next_branch_idx += 1;
 
                     // Per-dims generational dedup: skip orthos already expanded this generation.
-                    let child_id = branch.child.id();
-                    let shape_seen = seen_per_dims
-                        .entry(branch.child.dims().clone())
-                        .or_default();
-                    if shape_seen.len() >= SEEN_PER_DIMS_LIMIT {
-                        shape_seen.clear();
-                    }
-                    self.dedup_lookups = self.dedup_lookups.saturating_add(1);
-                    if shape_seen.contains(&child_id) {
-                        self.dedup_hits = self.dedup_hits.saturating_add(1);
-                        continue;
-                    }
-                    shape_seen.insert(child_id);
-
                     let node_prune_start = profile_start!();
                     let prune_branch =
                         toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
@@ -756,9 +739,10 @@ impl DfsRunner {
                     for v in self.seen_by_depth.iter_mut().skip(current_depth) { *v = 0; }
                     for v in self.descended_by_depth.iter_mut().skip(current_depth) { *v = 0; }
                     for v in self.pruned_by_depth.iter_mut().skip(current_depth) { *v = 0; }
-                    self.stack.push(SearchFrame::new_with_precomputed_bound(
+                    self.stack.push(SearchFrame::new_with_bound_and_min_axis(
                         branch.child,
                         branch.optimistic_bound,
+                        branch.min_insert_axis,
                     ));
                     self.max_depth = self.max_depth.max(self.stack.len());
                     return Ok(StepEvent {

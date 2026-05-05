@@ -205,6 +205,17 @@ impl Ortho {
     pub fn get_current_position(&self) -> usize {
         self.next_empty as usize
     }
+
+    /// If `add(value)` would trigger the `expand_up` path, returns `Some(insert_axis)`.
+    /// Returns `None` for normal in-fill and expand-over completions.
+    pub fn expanding_insert_axis(&self, value: PayloadVal) -> Option<usize> {
+        let total_empty = self.payload.len().saturating_sub(self.fill_count as usize);
+        if total_empty == 1 && spatial::is_base(&self.dims) {
+            Some(self.get_insert_position(value))
+        } else {
+            None
+        }
+    }
     pub fn add(&self, value: PayloadVal) -> Vec<Self> {
         let insertion_index = self.get_current_position();
         let total_empty = self.payload.len().saturating_sub(self.fill_count as usize);

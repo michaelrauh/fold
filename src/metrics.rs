@@ -37,8 +37,6 @@ pub struct GlobalMetrics {
     pub nodes_per_sec: f64,
     pub prunes_per_sec: f64,
     pub completion_prunes_per_sec: f64,
-    pub dedup_lookups: u64,
-    pub dedup_hits: u64,
 }
 
 impl Default for GlobalMetrics {
@@ -74,8 +72,6 @@ impl Default for GlobalMetrics {
             nodes_per_sec: 0.0,
             prunes_per_sec: 0.0,
             completion_prunes_per_sec: 0.0,
-            dedup_lookups: 0,
-            dedup_hits: 0,
         }
     }
 }

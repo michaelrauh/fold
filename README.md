@@ -154,3 +154,14 @@ fold_state/
 - **DISK_BACKED_QUEUE_DESIGN.md**: External sort and bucketed compaction
 - **SEEN_TRACKER_DESIGN.md**: History store and anti-join correctness
 - **MEMORY_OPTIMIZATION.md**: Dynamic RAM policy for leader/follower roles
+
+## DFS Rotation Pruning
+
+When the DFS reaches a base ortho (all dims == 2) with one empty slot, filling that slot triggers `expand_up`, which inserts a new axis at a position determined by `get_insert_position(completion_token)`. The position reflects where the new axis value sorts among the existing axis tokens.
+
+Two different parent frames with different history can both arrive at the same canonical expanded ortho via `expand_up` calls that use different `insert_axis` values. To prevent exploring these rotations multiple times:
+
+Each `SearchFrame` carries a `min_insert_axis` value. When `expand_up` fires, the completion is skipped if its `insert_axis < frame.min_insert_axis`. Child frames are created with `min_insert_axis = insert_axis`, enforcing a non-decreasing sequence of axis expansion positions along every root-to-leaf path. This guarantees exactly one canonical construction path for each unique expanded ortho.
+
+This pruning only applies to the `expand_up` path. The `[2,2]` axis-swap canonicalization (which ensures axis tokens at positions 1 and 2 are always held in sorted order) handles the analogous symmetry within the base shape.
+

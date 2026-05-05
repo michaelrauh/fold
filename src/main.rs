@@ -320,8 +320,6 @@ fn update_metrics(
         g.incumbent_display = incumbent_display.to_string();
         g.last_improvement_unix = snapshot.last_improvement_unix;
         g.last_improvement_depth = snapshot.last_improvement_depth;
-        g.dedup_lookups = snapshot.dedup_lookups;
-        g.dedup_hits = snapshot.dedup_hits;
     });
 }
 
