@@ -37,6 +37,39 @@ pub struct GlobalMetrics {
     pub nodes_per_sec: f64,
     pub prunes_per_sec: f64,
     pub completion_prunes_per_sec: f64,
+    pub effective_prune_score: OrthoScore,
+    pub score_floor: OrthoScore,
+    pub parallel: ParallelMetrics,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ParallelMetrics {
+    pub enabled: bool,
+    pub mode: String,
+    pub workers_total: usize,
+    pub workers_active: usize,
+    pub shards_pending: usize,
+    pub shards_running: usize,
+    pub shards_done: usize,
+    pub hunt_nodes: u64,
+    pub hunt_target_nodes: u64,
+    pub frontier_buckets: Vec<u64>,
+    pub active_buckets: Vec<usize>,
+    pub worker_summaries: Vec<WorkerMetrics>,
+    pub worker_rate_min: f64,
+    pub worker_rate_avg: f64,
+    pub worker_rate_max: f64,
+    pub slowest_worker: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkerMetrics {
+    pub id: usize,
+    pub mode: String,
+    pub shard_id: Option<usize>,
+    pub depth: usize,
+    pub rate: f64,
+    pub current_bound: Option<OrthoScore>,
 }
 
 impl Default for GlobalMetrics {
@@ -72,6 +105,9 @@ impl Default for GlobalMetrics {
             nodes_per_sec: 0.0,
             prunes_per_sec: 0.0,
             completion_prunes_per_sec: 0.0,
+            effective_prune_score: OrthoScore::zero(),
+            score_floor: OrthoScore::zero(),
+            parallel: ParallelMetrics::default(),
         }
     }
 }

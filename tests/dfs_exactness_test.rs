@@ -1,7 +1,7 @@
 use fixedbitset::FixedBitSet;
 use fold::{
     completion_pruning::{CompletionContext, completion_upper_bound_ctx},
-    dfs_runner::DfsRunner,
+    dfs_runner::{DfsRunner, SearchToggles},
     interner::Interner,
     ortho::{Ortho, PayloadVal},
 };
@@ -40,11 +40,16 @@ fn dfs_matches_exhaustive_best_score_on_small_corpus() {
     let exhaustive = exhaustive_best(&interner);
 
     let mut runner = DfsRunner::new();
+    let toggles = SearchToggles {
+        node_pruning: false,
+        completion_pruning: false,
+        ..SearchToggles::default()
+    };
     while !runner.is_finished() {
-        runner.step(&interner).unwrap();
+        runner.step_with_toggles(&interner, &toggles).unwrap();
     }
 
-    assert_eq!(runner.incumbent_score(), exhaustive.score());
+    assert_eq!(runner.incumbent().score(), exhaustive.score());
 }
 
 #[test]

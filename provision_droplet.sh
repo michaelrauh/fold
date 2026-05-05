@@ -122,7 +122,7 @@ sync_code() {
   local ip="$1"
   case "$SYNC_MODE" in
     local)
-      rsync -az --delete --exclude target --exclude .git "$LOCAL_REPO_PATH"/ "root@$ip:$REMOTE_APP_DIR/"
+      rsync -az --delete --exclude target --exclude .git --exclude fold_state "$LOCAL_REPO_PATH"/ "root@$ip:$REMOTE_APP_DIR/"
       ;;
     github)
       ssh "root@$ip" <<EOF

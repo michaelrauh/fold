@@ -209,6 +209,9 @@ impl Tui {
     }
 
     fn search_lines(&self, area: Rect, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
+        if snapshot.global.parallel.enabled {
+            return self.parallel_search_lines(area, snapshot);
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -256,21 +259,110 @@ impl Tui {
         all_lines
     }
 
-    fn render_best_lines(&self, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
+    fn parallel_search_lines(&self, area: Rect, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let best_age = if snapshot.global.last_improvement_unix == 0 {
+            "n/a".to_string()
+        } else {
+            format_elapsed(now.saturating_sub(snapshot.global.last_improvement_unix))
+        };
+        let parallel = &snapshot.global.parallel;
+        let frontier_max = snapshot
+            .global
+            .frontier_max_bound
+            .map(|bound| bound.volume.to_string())
+            .unwrap_or_else(|| "none".to_string());
         let mut lines = vec![
             Line::from(format!(
-                "Best score: vol={} var={}/{} full={}",
-                snapshot.global.incumbent_score.volume,
-                snapshot.global.incumbent_score.variance_num,
-                snapshot.global.incumbent_score.variance_den,
-                snapshot.global.incumbent_score.fullness
+                "Mode: {}  Workers: {}/{}  Queue: {} pending  {} running  {} done",
+                parallel.mode,
+                parallel.workers_active,
+                parallel.workers_total,
+                format_count(parallel.shards_pending as u64),
+                format_count(parallel.shards_running as u64),
+                format_count(parallel.shards_done as u64)
             )),
             Line::from(format!(
-                "Best dims: {:?}  capacity={}",
-                snapshot.global.incumbent_dims, snapshot.global.incumbent_capacity
+                "Hunt: {} / {} nodes",
+                format_count(parallel.hunt_nodes),
+                format_count(parallel.hunt_target_nodes)
             )),
-            Line::from(""),
+            Line::from(format!(
+                "Best actual vol={}  Effective prune vol={}  Floor vol={}  Frontier max vol={}",
+                snapshot.global.incumbent_score.volume,
+                snapshot.global.effective_prune_score.volume,
+                snapshot.global.score_floor.volume,
+                frontier_max
+            )),
+            Line::from(format!(
+                "Rates: {} n/s  {} p/s  {} cp/s  Balance min/avg/max={}/{}/{}",
+                format_rate(snapshot.global.nodes_per_sec),
+                format_rate(snapshot.global.prunes_per_sec),
+                format_rate(snapshot.global.completion_prunes_per_sec),
+                format_rate(parallel.worker_rate_min),
+                format_rate(parallel.worker_rate_avg),
+                format_rate(parallel.worker_rate_max)
+            )),
+            Line::from(format!(
+                "Best age: {} at depth {}",
+                best_age, snapshot.global.last_improvement_depth
+            )),
         ];
+        lines.extend(worker_health_lines(snapshot, area));
+        lines.push(Line::from(""));
+        lines.push(Line::from("Touched/Seen by level"));
+        lines.extend(level_progress_lines(
+            &snapshot.global.seen_by_depth,
+            &snapshot.global.descended_by_depth,
+            &snapshot.global.pruned_by_depth,
+            &self.level_activity_heat,
+            search_level_count(snapshot),
+            area,
+        ));
+        lines
+    }
+
+    fn render_best_lines(&self, snapshot: &MetricsSnapshot) -> Vec<Line<'static>> {
+        let mut lines = if snapshot.global.parallel.enabled {
+            vec![
+                Line::from(format!(
+                    "Best actual: vol={} var={}/{} full={}",
+                    snapshot.global.incumbent_score.volume,
+                    snapshot.global.incumbent_score.variance_num,
+                    snapshot.global.incumbent_score.variance_den,
+                    snapshot.global.incumbent_score.fullness
+                )),
+                Line::from(format!(
+                    "Effective prune: vol={} full={}",
+                    snapshot.global.effective_prune_score.volume,
+                    snapshot.global.effective_prune_score.fullness
+                )),
+                Line::from(format!("Floor: vol={}", snapshot.global.score_floor.volume)),
+                Line::from(format!(
+                    "Best dims: {:?}  capacity={}",
+                    snapshot.global.incumbent_dims, snapshot.global.incumbent_capacity
+                )),
+                Line::from(""),
+            ]
+        } else {
+            vec![
+                Line::from(format!(
+                    "Best score: vol={} var={}/{} full={}",
+                    snapshot.global.incumbent_score.volume,
+                    snapshot.global.incumbent_score.variance_num,
+                    snapshot.global.incumbent_score.variance_den,
+                    snapshot.global.incumbent_score.fullness
+                )),
+                Line::from(format!(
+                    "Best dims: {:?}  capacity={}",
+                    snapshot.global.incumbent_dims, snapshot.global.incumbent_capacity
+                )),
+                Line::from(""),
+            ]
+        };
         lines.extend(multiline_lines(&snapshot.global.incumbent_display));
         lines
     }
@@ -565,6 +657,60 @@ fn path_progress_chart(values: &[(usize, usize)], width: usize) -> String {
         .collect()
 }
 
+fn worker_health_lines(snapshot: &MetricsSnapshot, area: Rect) -> Vec<Line<'static>> {
+    let workers = &snapshot.global.parallel.worker_summaries;
+    if workers.is_empty() {
+        return vec![Line::from("Workers: idle")];
+    }
+    if workers.len() > 4 {
+        let slowest = snapshot
+            .global
+            .parallel
+            .slowest_worker
+            .map(|id| format!(" slowest=W{id}"))
+            .unwrap_or_default();
+        return vec![Line::from(format!(
+            "Workers: {}/{} active min/avg/max={}/{}/{}{}",
+            snapshot.global.parallel.workers_active,
+            snapshot.global.parallel.workers_total,
+            format_rate(snapshot.global.parallel.worker_rate_min),
+            format_rate(snapshot.global.parallel.worker_rate_avg),
+            format_rate(snapshot.global.parallel.worker_rate_max),
+            slowest
+        ))];
+    }
+
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::new();
+    let mut current = String::from("Workers:");
+    for worker in workers {
+        let bound = worker
+            .current_bound
+            .map(|score| format!(" vol={}", format_count(score.volume as u64)))
+            .unwrap_or_default();
+        let shard = worker
+            .shard_id
+            .map(|id| format!(" s{id}"))
+            .unwrap_or_default();
+        let item = format!(
+            " W{} {}{} d{} {}/s{}",
+            worker.id,
+            worker.mode.chars().next().unwrap_or('?'),
+            shard,
+            worker.depth,
+            format_rate(worker.rate),
+            bound
+        );
+        if current.chars().count() + item.chars().count() > width && current != "Workers:" {
+            lines.push(Line::from(current));
+            current = String::from("        ");
+        }
+        current.push_str(&item);
+    }
+    lines.push(Line::from(current));
+    lines
+}
+
 fn count_chart(values: &[u64], width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -756,6 +902,7 @@ mod tests {
             nodes_per_sec: 1000.0,
             prunes_per_sec: 200.0,
             completion_prunes_per_sec: 50.0,
+            ..GlobalMetrics::default()
         };
 
         let rendered = format_snapshot(&snapshot);

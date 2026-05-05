@@ -193,14 +193,14 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn file_name_string(path: &Path) -> String {
+pub fn file_name_string(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string()
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), FoldError> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), FoldError> {
     let parent = path.parent().ok_or_else(|| {
         FoldError::Io(std::io::Error::new(
             ErrorKind::InvalidInput,

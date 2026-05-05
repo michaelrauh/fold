@@ -1,4 +1,4 @@
-use crate::{FoldError, spatial};
+use crate::{spatial, FoldError};
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 use rustc_hash::FxHasher;
@@ -109,6 +109,19 @@ impl Ortho {
     fn from_parts(dims: Vec<Dim>, payload: Vec<Option<PayloadVal>>, up_axis: Option<Dim>) -> Self {
         let id = Self::compute_id(&dims, &payload, up_axis);
         let (fill_count, next_empty, score) = Self::compute_cached_fields(&dims, &payload);
+        Self::from_parts_with_cached(dims, payload, up_axis, fill_count, next_empty, score, id)
+    }
+
+    #[inline]
+    fn from_parts_with_cached(
+        dims: Vec<Dim>,
+        payload: Vec<Option<PayloadVal>>,
+        up_axis: Option<Dim>,
+        fill_count: u32,
+        next_empty: u32,
+        score: OrthoScore,
+        id: OrthoId,
+    ) -> Self {
         Ortho {
             dims,
             payload,
@@ -118,6 +131,40 @@ impl Ortho {
             score,
             id,
         }
+    }
+
+    #[inline]
+    fn next_empty_after(payload: &[Option<PayloadVal>], start: usize) -> usize {
+        for idx in start..payload.len() {
+            if payload[idx].is_none() {
+                return idx;
+            }
+        }
+        payload.len()
+    }
+
+    #[inline]
+    fn in_fill_child_from_payload(&self, payload: Vec<Option<PayloadVal>>) -> Self {
+        let fill_count = self
+            .fill_count
+            .checked_add(1)
+            .expect("fill count overflowed cached u32 field");
+        let next_empty = Self::next_empty_after(&payload, self.next_empty as usize + 1);
+        let next_empty =
+            u32::try_from(next_empty).expect("next empty position overflowed cached u32 field");
+        let mut score = self.score;
+        score.fullness = fill_count as usize;
+        let dims = self.dims.clone();
+        let id = Self::compute_id(&dims, &payload, self.up_axis);
+        Self::from_parts_with_cached(
+            dims,
+            payload,
+            self.up_axis,
+            fill_count,
+            next_empty,
+            score,
+            id,
+        )
     }
 
     fn compute_score_components(dims: &[Dim], fullness: usize) -> OrthoScore {
@@ -217,25 +264,35 @@ impl Ortho {
         }
     }
     pub fn add(&self, value: PayloadVal) -> Vec<Self> {
+        let mut out = Vec::new();
+        self.add_into(value, &mut out);
+        out
+    }
+
+    pub fn add_into(&self, value: PayloadVal, out: &mut Vec<Self>) {
         let insertion_index = self.get_current_position();
         let total_empty = self.payload.len().saturating_sub(self.fill_count as usize);
         if total_empty == 1 {
             if spatial::is_base(&self.dims) {
                 let insert_axis = self.get_insert_position(value);
-                return Self::expand_up(
+                Self::expand_up_into(
                     self,
                     spatial::expand_up(&self.dims, insert_axis),
                     value,
                     insertion_index,
                     insert_axis,
+                    out,
                 );
+                return;
             } else {
-                return Self::expand_over(
+                Self::expand_over_into(
                     self,
                     spatial::expand_over(&self.dims),
                     value,
                     insertion_index,
+                    out,
                 );
+                return;
             }
         }
         if insertion_index == 2 && self.dims.as_slice() == [2, 2] {
@@ -247,11 +304,8 @@ impl Ortho {
                     new_payload[2] = Some(second);
                 }
             }
-            return vec![Ortho::from_parts(
-                self.dims.clone(),
-                new_payload,
-                self.up_axis,
-            )];
+            out.push(self.in_fill_child_from_payload(new_payload));
+            return;
         }
         let len = self.payload.len();
         let mut new_payload: Vec<Option<PayloadVal>> = Vec::with_capacity(len);
@@ -262,47 +316,47 @@ impl Ortho {
         if insertion_index < new_payload.len() {
             new_payload[insertion_index] = Some(value);
         }
-        vec![Ortho::from_parts(
-            self.dims.clone(),
-            new_payload,
-            self.up_axis,
-        )]
+        out.push(self.in_fill_child_from_payload(new_payload));
     }
-    fn expand_over(
+    fn expand_over_into(
         ortho: &Ortho,
         expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
         value: PayloadVal,
         insertion_index: usize,
-    ) -> Vec<Ortho> {
-        let mut old_payload_with_value = ortho.payload.clone();
-        old_payload_with_value[insertion_index] = Some(value);
-
-        let mut out = Vec::with_capacity(expansions.len());
+        out: &mut Vec<Ortho>,
+    ) {
+        out.reserve(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
             let mut new_payload = vec![None; new_capacity];
             for (i, &pos) in reorg.iter().enumerate() {
-                new_payload[pos] = old_payload_with_value.get(i).cloned().flatten();
+                new_payload[pos] = if i == insertion_index {
+                    Some(value)
+                } else {
+                    ortho.payload.get(i).cloned().flatten()
+                };
             }
             // Over expansions set up_axis to None
             out.push(Ortho::from_parts(new_dims_vec, new_payload, None));
         }
-        out
     }
-    fn expand_up(
+
+    fn expand_up_into(
         ortho: &Ortho,
         expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
         value: PayloadVal,
         insertion_index: usize,
         insert_axis: usize,
-    ) -> Vec<Ortho> {
-        let mut old_payload_with_value = ortho.payload.clone();
-        old_payload_with_value[insertion_index] = Some(value);
-
-        let mut out = Vec::with_capacity(expansions.len());
+        out: &mut Vec<Ortho>,
+    ) {
+        out.reserve(expansions.len());
         for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
             let mut new_payload = vec![None; new_capacity];
             for (i, &pos) in reorg.iter().enumerate() {
-                new_payload[pos] = old_payload_with_value.get(i).cloned().flatten();
+                new_payload[pos] = if i == insertion_index {
+                    Some(value)
+                } else {
+                    ortho.payload.get(i).cloned().flatten()
+                };
             }
             // The up child (one with extra dimension) gets the insert_axis, over children get None
             let is_up_child = new_dims_vec.len() > ortho.dims.len();
@@ -313,12 +367,10 @@ impl Ortho {
             };
             out.push(Ortho::from_parts(new_dims_vec, new_payload, up_axis));
         }
-        out
     }
     fn get_insert_position(&self, to_add: PayloadVal) -> usize {
-        let axis_positions = spatial::get_axis_positions(&self.dims);
         let mut idx = 0;
-        for &pos in axis_positions.iter() {
+        for pos in 1..=self.dims.len() {
             if let Some(&axis) = self.payload.get(pos).and_then(|x| x.as_ref()) {
                 if to_add < axis {
                     return idx;
@@ -976,12 +1028,12 @@ mod tests {
         o1 = o1.add(10).pop().unwrap(); // a
         o1 = o1.add(20).pop().unwrap(); // b
         o1 = o1.add(30).pop().unwrap(); // c
-        // Path 2: a < c but b < c (second and third swapped relative to path 1)
+                                        // Path 2: a < c but b < c (second and third swapped relative to path 1)
         let mut o2 = Ortho::new();
         o2 = o2.add(10).pop().unwrap(); // a
         o2 = o2.add(30).pop().unwrap(); // c
         o2 = o2.add(20).pop().unwrap(); // b (unsorted axis order)
-        // Insert 4th token to force expansion candidates
+                                        // Insert 4th token to force expansion candidates
         let children1 = o1.add(40);
         let children2 = o2.add(40);
         // Normalize each child to (dims, filled_values_in_order)

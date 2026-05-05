@@ -1,12 +1,9 @@
 use fold::{
     FoldError,
-    dfs_checkpoint::{CheckpointManager, LoadedCheckpoint},
-    dfs_runner::{
-        DfsConfig, DfsRunner, bound_reuse_enabled, bound_reuse_shadow_verify_enabled,
-        parallel_child_bounds_enabled, parallel_child_bounds_min_branches,
-    },
+    dfs_checkpoint::CheckpointManager,
     interner::Interner,
     metrics::Metrics,
+    parallel_search::{ParallelCheckpointStore, ParallelSearchConfig, ParallelSearchResult, run_parallel_search},
     tui::Tui,
 };
 use rayon::ThreadPoolBuilder;
@@ -17,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
 
 const DEFAULT_RAYON_NUM_THREADS: usize = 2;
 
@@ -30,10 +26,10 @@ fn main() -> Result<(), FoldError> {
     fs::create_dir_all(&state_dir)?;
     fs::create_dir_all(state_dir.join("logs"))?;
 
-    let cfg = DfsConfig::from_env();
     let checkpoint_mgr = CheckpointManager::new(state_dir.clone())?;
     let metrics = Metrics::new();
     let should_quit = Arc::new(AtomicBool::new(false));
+    let parallel_cfg = ParallelSearchConfig::from_env();
 
     {
         let quit = Arc::clone(&should_quit);
@@ -44,191 +40,14 @@ fn main() -> Result<(), FoldError> {
     }
 
     let tui_handle = spawn_tui_if_enabled(&metrics, &should_quit, &state_dir);
-
-    let loaded = checkpoint_mgr.load()?;
-    let (input_path, input_fingerprint, interner, mut runner, resumed) =
-        initialize_run(&checkpoint_mgr, &cfg, loaded, &metrics)?;
-
-    let mut incumbent_display = format!("{}", runner.incumbent().display(&interner));
-    let mut last_metrics_nodes = 0u64;
-    let mut last_checkpoint_nodes = 0u64;
-    let mut last_checkpoint_at = Instant::now();
-    let mut last_checkpoint_score = runner.incumbent_score();
-
-    update_metrics(
-        &metrics,
-        &runner,
-        &input_path,
-        &incumbent_display,
-        if resumed { "Resumed" } else { "Running" },
-    );
-    let reuse_enabled = bound_reuse_enabled();
-    let reuse_shadow_verify = bound_reuse_shadow_verify_enabled();
-    metrics.add_log(format!(
-        "Bound reuse: enabled={} shadow_verify={}",
-        reuse_enabled, reuse_shadow_verify
-    ));
-    let parallel_child_bounds = parallel_child_bounds_enabled();
-    let parallel_child_bounds_min = parallel_child_bounds_min_branches();
-    metrics.add_log(format!(
-        "Parallel child bounds: enabled={} min_branches={}",
-        parallel_child_bounds, parallel_child_bounds_min
-    ));
     metrics.add_log(format!("Rayon threads: {}", rayon_threads));
-    metrics.add_log(format!(
-        "{} search for {}",
-        if resumed { "Resumed" } else { "Starting" },
-        input_path.display()
-    ));
-
-    if !resumed {
-        let manifest =
-            checkpoint_mgr.save(&runner, &input_path, input_fingerprint, &cfg, "initial")?;
-        save_outputs(
-            &checkpoint_mgr,
-            &runner,
-            &incumbent_display,
-            &input_path,
-            input_fingerprint,
-            &cfg,
-            "initial",
-            rayon_threads,
-        )?;
-        metrics.update_global(|g| {
-            g.checkpoint_status = manifest.checkpoint_status.clone();
-            g.checkpoint_time = manifest.checkpoint_unix;
-        });
-    }
-
-    while !runner.is_finished() && !should_quit.load(Ordering::Relaxed) {
-        let event = runner.step(&interner)?;
-
-        if event.incumbent_improved {
-            incumbent_display = format!("{}", runner.incumbent().display(&interner));
-            metrics.add_log(format!(
-                "Incumbent improved: vol={} dims={:?}",
-                runner.incumbent_score().volume,
-                runner.incumbent().dims()
-            ));
-        }
-
-        let should_refresh_metrics = runner.nodes_expanded().saturating_sub(last_metrics_nodes)
-            >= cfg.metrics_every_nodes
-            || event.incumbent_improved
-            || event.finished;
-        if should_refresh_metrics {
-            update_metrics(
-                &metrics,
-                &runner,
-                &input_path,
-                &incumbent_display,
-                "Running",
-            );
-            last_metrics_nodes = runner.nodes_expanded();
-        }
-
-        let should_checkpoint = event.incumbent_improved
-            || runner
-                .nodes_expanded()
-                .saturating_sub(last_checkpoint_nodes)
-                >= cfg.checkpoint_every_nodes
-            || last_checkpoint_at.elapsed() >= Duration::from_secs(cfg.checkpoint_every_secs);
-
-        if should_checkpoint {
-            let checkpoint_status = if event.incumbent_improved {
-                "best-improved"
-            } else {
-                "periodic"
-            };
-            let manifest = checkpoint_mgr.save(
-                &runner,
-                &input_path,
-                input_fingerprint,
-                &cfg,
-                checkpoint_status,
-            )?;
-            save_outputs(
-                &checkpoint_mgr,
-                &runner,
-                &incumbent_display,
-                &input_path,
-                input_fingerprint,
-                &cfg,
-                checkpoint_status,
-                rayon_threads,
-            )?;
-            metrics.update_global(|g| {
-                g.checkpoint_status = manifest.checkpoint_status.clone();
-                g.checkpoint_time = manifest.checkpoint_unix;
-            });
-            metrics.add_log(format!(
-                "Checkpoint saved: status={} nodes={} depth={}",
-                checkpoint_status,
-                runner.nodes_expanded(),
-                runner.current_depth()
-            ));
-            last_checkpoint_nodes = runner.nodes_expanded();
-            last_checkpoint_at = Instant::now();
-            last_checkpoint_score = runner.incumbent_score();
-        } else if runner.incumbent_score() > last_checkpoint_score {
-            last_checkpoint_score = runner.incumbent_score();
-        }
-    }
-
-    let final_status = if runner.is_finished() {
-        "complete"
-    } else {
-        "interrupted"
-    };
-    let manifest =
-        checkpoint_mgr.save(&runner, &input_path, input_fingerprint, &cfg, final_status)?;
-    save_outputs(
-        &checkpoint_mgr,
-        &runner,
-        &incumbent_display,
-        &input_path,
-        input_fingerprint,
-        &cfg,
-        final_status,
-        rayon_threads,
-    )?;
-    update_metrics(
-        &metrics,
-        &runner,
-        &input_path,
-        &incumbent_display,
-        if runner.is_finished() {
-            "Complete"
-        } else {
-            "Interrupted"
-        },
-    );
-    metrics.update_global(|g| {
-        g.checkpoint_status = manifest.checkpoint_status.clone();
-        g.checkpoint_time = manifest.checkpoint_unix;
-    });
-    metrics.add_log(format!(
-        "Run {}: expanded={} pruned={} best_volume={}",
-        final_status,
-        runner.nodes_expanded(),
-        runner.nodes_pruned(),
-        runner.incumbent_score().volume
-    ));
-
-    should_quit.store(true, Ordering::Relaxed);
-    if let Some(handle) = tui_handle {
-        let _ = handle.join();
-    }
-
-    println!(
-        "DFS/BnB {}. Best volume={} dims={:?} outputs={}",
-        final_status,
-        runner.incumbent_score().volume,
-        runner.incumbent().dims(),
-        checkpoint_mgr.output_dir().display()
-    );
-
-    Ok(())
+    run_parallel_main(
+        parallel_cfg,
+        checkpoint_mgr,
+        metrics,
+        should_quit,
+        tui_handle,
+    )
 }
 
 fn initialize_rayon() -> Result<usize, FoldError> {
@@ -247,130 +66,126 @@ fn resolve_rayon_num_threads(env_value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_RAYON_NUM_THREADS)
 }
 
-fn initialize_run(
-    checkpoint_mgr: &CheckpointManager,
-    cfg: &DfsConfig,
-    loaded: Option<LoadedCheckpoint>,
-    metrics: &Metrics,
-) -> Result<(PathBuf, u64, Interner, DfsRunner, bool), FoldError> {
-    if let Some(loaded) = loaded {
-        if loaded.manifest.config_fingerprint != cfg.fingerprint() {
-            metrics.add_log(format!(
-                "Checkpoint config fingerprint differs (checkpoint={} current={}); resuming anyway",
-                loaded.manifest.config_fingerprint,
-                cfg.fingerprint()
-            ));
-        }
-        let input_path = PathBuf::from(&loaded.manifest.input_path);
-        return Ok((
-            input_path,
-            loaded.manifest.input_fingerprint,
-            loaded.interner,
-            loaded.runner,
-            true,
-        ));
-    }
-
+fn run_parallel_main(
+    parallel_cfg: ParallelSearchConfig,
+    checkpoint_mgr: CheckpointManager,
+    metrics: Metrics,
+    should_quit: Arc<AtomicBool>,
+    tui_handle: Option<thread::JoinHandle<()>>,
+) -> Result<(), FoldError> {
     let input_path = resolve_input_path(checkpoint_mgr.root())?;
     let input_bytes = fs::read(&input_path)?;
     let input_fingerprint = fingerprint_bytes(&input_bytes);
     let text = String::from_utf8(input_bytes)
         .map_err(|e| FoldError::Other(format!("input is not valid UTF-8: {}", e)))?;
-    let interner = Interner::from_text(&text);
+    let interner = Arc::new(Interner::from_text(&text));
     checkpoint_mgr.write_interner(&interner)?;
-    Ok((
-        input_path,
+    let checkpoint_store =
+        ParallelCheckpointStore::new(checkpoint_mgr.root(), checkpoint_mgr.output_dir())?;
+    let resume_state = if parallel_cfg.resume_enabled {
+        match checkpoint_store.load(input_fingerprint, &parallel_cfg) {
+            Ok(state) => {
+                if state.is_some() {
+                    metrics.add_log("Resuming from parallel checkpoint".to_string());
+                }
+                state
+            }
+            Err(e) => {
+                metrics.add_log(format!("Parallel checkpoint load failed, starting fresh: {}", e));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    metrics.add_log(format!(
+        "Starting parallel search workers={} shard_depth={} hunt_nodes={}",
+        parallel_cfg.workers, parallel_cfg.shard_depth, parallel_cfg.hunt_nodes
+    ));
+
+    let result = run_parallel_search(
+        Arc::clone(&interner),
+        metrics.clone(),
+        Arc::clone(&should_quit),
+        parallel_cfg.clone(),
+        input_path.display().to_string(),
         input_fingerprint,
-        interner,
-        DfsRunner::new(),
-        false,
-    ))
+        checkpoint_store,
+        resume_state,
+    )?;
+    let final_status = if result.finished {
+        "parallel-complete"
+    } else {
+        "parallel-interrupted"
+    };
+    save_parallel_outputs(
+        &checkpoint_mgr,
+        &result,
+        &interner,
+        &input_path,
+        input_fingerprint,
+        &parallel_cfg,
+        final_status,
+    )?;
+    metrics.add_log(format!(
+        "Parallel run {}: expanded={} pruned={} best_volume={}",
+        final_status,
+        result.nodes_expanded,
+        result.nodes_pruned,
+        result.best.score().volume
+    ));
+    should_quit.store(true, Ordering::Relaxed);
+    if let Some(handle) = tui_handle {
+        let _ = handle.join();
+    }
+    println!(
+        "Parallel DFS/BnB {}. Best volume={} dims={:?} outputs={}",
+        final_status,
+        result.best.score().volume,
+        result.best.dims(),
+        checkpoint_mgr.output_dir().display()
+    );
+    Ok(())
 }
 
-fn update_metrics(
-    metrics: &Metrics,
-    runner: &DfsRunner,
-    input_path: &Path,
-    incumbent_display: &str,
-    phase: &str,
-) {
-    let snapshot = runner.snapshot();
-    metrics.update_global(|g| {
-        g.input_path = input_path.display().to_string();
-        g.phase = phase.to_string();
-        g.start_time = snapshot.started_unix;
-        g.nodes_expanded = snapshot.nodes_expanded;
-        g.nodes_pruned = snapshot.nodes_pruned;
-        g.completions_pruned = snapshot.completions_pruned;
-        g.current_depth = snapshot.current_depth;
-        g.max_depth = snapshot.max_depth;
-        g.current_bound = snapshot
-            .current_bound
-            .unwrap_or_else(|| snapshot.incumbent.score());
-        g.open_siblings_total = snapshot.open_siblings_total;
-        g.open_siblings_by_depth = snapshot.open_siblings_by_depth.clone();
-        g.seen_by_depth = snapshot.seen_by_depth.clone();
-        g.descended_by_depth = snapshot.descended_by_depth.clone();
-        g.pruned_by_depth = snapshot.pruned_by_depth.clone();
-        g.path_progress_by_depth = snapshot.path_progress_by_depth.clone();
-        g.frontier_max_bound = snapshot.frontier_max_bound;
-        g.incumbent_score = snapshot.incumbent.score();
-        g.incumbent_dims = snapshot.incumbent.dims().clone();
-        g.incumbent_capacity = snapshot.incumbent.payload().len();
-        g.incumbent_display = incumbent_display.to_string();
-        g.last_improvement_unix = snapshot.last_improvement_unix;
-        g.last_improvement_depth = snapshot.last_improvement_depth;
-    });
-}
-
-fn save_outputs(
+fn save_parallel_outputs(
     checkpoint_mgr: &CheckpointManager,
-    runner: &DfsRunner,
-    incumbent_display: &str,
+    result: &ParallelSearchResult,
+    interner: &Interner,
     input_path: &Path,
     input_fingerprint: u64,
-    cfg: &DfsConfig,
+    cfg: &ParallelSearchConfig,
     status: &str,
-    rayon_threads: usize,
 ) -> Result<(), FoldError> {
-    let snapshot = runner.snapshot();
+    let display = format!("{}", result.best.display(interner));
     let summary = json!({
+        "mode": "parallel",
         "input_path": input_path.display().to_string(),
         "input_fingerprint": input_fingerprint,
-        "config_fingerprint": cfg.fingerprint(),
         "status": status,
-        "started_unix": snapshot.started_unix,
-        "finished": snapshot.finished,
-        "nodes_expanded": snapshot.nodes_expanded,
-        "nodes_pruned": snapshot.nodes_pruned,
-        "completions_pruned": snapshot.completions_pruned,
-        "current_depth": snapshot.current_depth,
-        "max_depth": snapshot.max_depth,
-        "open_siblings_total": snapshot.open_siblings_total,
-        "seen_by_depth": snapshot.seen_by_depth,
-        "last_improvement_unix": snapshot.last_improvement_unix,
-        "last_improvement_depth": snapshot.last_improvement_depth,
-        "frontier_max_bound": snapshot.frontier_max_bound.map(|bound| json!({
-            "volume": bound.volume,
-            "variance_num": bound.variance_num,
-            "variance_den": bound.variance_den,
-            "fullness": bound.fullness,
-        })),
+        "started_unix": result.started_unix,
+        "finished": result.finished,
+        "nodes_expanded": result.nodes_expanded,
+        "nodes_pruned": result.nodes_pruned,
+        "completions_pruned": result.completions_pruned,
+        "last_improvement_unix": result.last_improvement_unix,
+        "last_improvement_depth": result.last_improvement_depth,
+        "total_shards": result.total_shards,
+        "shards_done": result.shards_done,
+        "workers": cfg.workers,
+        "hunt_nodes": cfg.hunt_nodes,
+        "shard_depth": cfg.shard_depth,
+        "completion_pruning_default": false,
         "best_score": {
-            "volume": snapshot.incumbent.score().volume,
-            "variance_num": snapshot.incumbent.score().variance_num,
-            "variance_den": snapshot.incumbent.score().variance_den,
-            "fullness": snapshot.incumbent.score().fullness,
+            "volume": result.best.score().volume,
+            "variance_num": result.best.score().variance_num,
+            "variance_den": result.best.score().variance_den,
+            "fullness": result.best.score().fullness,
         },
-        "best_dims": snapshot.incumbent.dims(),
-        "best_capacity": snapshot.incumbent.payload().len(),
-        "bound_reuse_enabled": bound_reuse_enabled(),
-        "bound_reuse_shadow_verify": bound_reuse_shadow_verify_enabled(),
-        "parallel_child_bounds_enabled": parallel_child_bounds_enabled(),
-        "parallel_child_bounds_min_branches": parallel_child_bounds_min_branches(),
-        "rayon_num_threads": rayon_threads,
+        "best_dims": result.best.dims(),
+        "best_capacity": result.best.payload().len(),
     });
-    checkpoint_mgr.save_optimal(runner.incumbent(), incumbent_display, &summary)
+    checkpoint_mgr.save_optimal(&result.best, &display, &summary)
 }
 
 fn resolve_input_path(state_dir: &Path) -> Result<PathBuf, FoldError> {
@@ -421,13 +236,14 @@ fn spawn_tui_if_enabled(
     if !tui_enabled {
         return None;
     }
-
     let metrics = metrics.clone();
     let should_quit = Arc::clone(should_quit);
-    let snapshot_path = state_dir.join("logs").join("tui_state.log");
+    let snapshot_path = Some(state_dir.join("logs").join("tui_state.log"));
     Some(thread::spawn(move || {
-        let mut tui = Tui::new(metrics, should_quit, Some(snapshot_path));
-        let _ = tui.run();
+        let mut tui = Tui::new(metrics, should_quit, snapshot_path);
+        if let Err(e) = tui.run() {
+            eprintln!("TUI error: {}", e);
+        }
     }))
 }
 

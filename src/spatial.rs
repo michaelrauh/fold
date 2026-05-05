@@ -6,13 +6,36 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{cell::RefCell, cmp::Ordering};
 
 type Dim = u8;
+const DIM_KEY_CAP: usize = 64;
 
 fn dim_to_usize(value: Dim) -> usize {
     usize::from(value)
 }
 
-// Cache key: (dims, up_axis)
-type MetaCacheKey = (Vec<Dim>, Option<Dim>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DimKey {
+    len: u8,
+    up_axis: Option<Dim>,
+    dims: [Dim; DIM_KEY_CAP],
+}
+
+impl DimKey {
+    fn new(dims: &[Dim], up_axis: Option<Dim>) -> Self {
+        assert!(
+            dims.len() <= DIM_KEY_CAP,
+            "dims length {} exceeds spatial cache key capacity {}",
+            dims.len(),
+            DIM_KEY_CAP
+        );
+        let mut packed = [0; DIM_KEY_CAP];
+        packed[..dims.len()].copy_from_slice(dims);
+        Self {
+            len: Dim::try_from(dims.len()).expect("dims length overflowed u8"),
+            up_axis,
+            dims: packed,
+        }
+    }
+}
 
 // Consolidated metadata per (dims, up_axis) pair - fully cached
 struct DimMeta {
@@ -180,9 +203,9 @@ fn pad_internal(dims: &[Dim], position: usize) -> Vec<Vec<usize>> {
 }
 
 thread_local! {
-    static DIM_META_CACHE: RefCell<FxHashMap<MetaCacheKey, Rc<DimMeta>>> = RefCell::new(FxHashMap::default());
-    static EXPAND_UP_CACHE: RefCell<FxHashMap<(Vec<Dim>, usize), Vec<(Vec<Dim>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
-    static EXPAND_OVER_CACHE: RefCell<FxHashMap<Vec<Dim>, Vec<(Vec<Dim>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
+    static DIM_META_CACHE: RefCell<FxHashMap<DimKey, Rc<DimMeta>>> = RefCell::new(FxHashMap::default());
+    static EXPAND_UP_CACHE: RefCell<FxHashMap<(DimKey, usize), Vec<(Vec<Dim>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
+    static EXPAND_OVER_CACHE: RefCell<FxHashMap<DimKey, Vec<(Vec<Dim>, usize, Vec<usize>)>>> = RefCell::new(FxHashMap::default());
 }
 
 static META_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -191,7 +214,7 @@ static META_MISSES: AtomicUsize = AtomicUsize::new(0);
 fn get_meta_with_axis(dims: &[Dim], up_axis: Option<Dim>) -> Rc<DimMeta> {
     DIM_META_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let key = (dims.to_vec(), up_axis);
+        let key = DimKey::new(dims, up_axis);
         if let Some(m) = cache.get(&key) {
             META_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             return m.clone();
@@ -253,6 +276,11 @@ pub fn get_axis_positions(dims: &[Dim]) -> Vec<usize> {
     get_meta(dims).axis_positions.clone()
 }
 
+pub fn fill_axis_positions(dims: &[Dim], out: &mut Vec<usize>) {
+    out.clear();
+    out.extend(1..=dims.len());
+}
+
 pub fn get_location_to_index(dims: &[Dim]) -> FxHashMap<Vec<usize>, usize> {
     get_meta(dims).location_to_index.clone()
 }
@@ -262,7 +290,7 @@ pub fn is_base(dims: &[Dim]) -> bool {
 }
 
 pub fn expand_up(old_dims: &[Dim], position: usize) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
-    let key = (old_dims.to_vec(), position);
+    let key = (DimKey::new(old_dims, None), position);
     EXPAND_UP_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(result) = cache.get(&key) {
@@ -276,7 +304,7 @@ pub fn expand_up(old_dims: &[Dim], position: usize) -> Vec<(Vec<Dim>, usize, Vec
 }
 
 pub fn expand_over(old_dims: &[Dim]) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
-    let key = old_dims.to_vec();
+    let key = DimKey::new(old_dims, None);
     EXPAND_OVER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(result) = cache.get(&key) {

@@ -5,6 +5,7 @@ pub mod error;
 pub mod interner;
 pub mod metrics;
 pub mod ortho;
+pub mod parallel_search;
 pub mod spatial;
 pub mod splitter;
 pub mod tui;

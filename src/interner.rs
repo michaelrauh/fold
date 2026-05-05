@@ -1,4 +1,4 @@
-use crate::{FoldError, splitter::Splitter};
+use crate::{splitter::Splitter, FoldError};
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -10,6 +10,7 @@ pub struct Interner {
     version: usize,
     vocabulary: Vec<String>,
     prefix_to_completions: FxHashMap<Vec<usize>, FixedBitSet>,
+    prefix_completion_counts: FxHashMap<Vec<usize>, usize>,
     prefix_stats: FxHashMap<Vec<usize>, usize>,
     max_prefix_len: usize,
 }
@@ -64,6 +65,7 @@ impl Interner {
             }
             prefix_to_completions.insert(prefix, fbs);
         }
+        let prefix_completion_counts = Self::compute_completion_counts(&prefix_to_completions);
         let mut prefix_stats_map = FxHashMap::default();
         for (prefix, max_desc_len) in prefix_stats {
             prefix_stats_map.insert(prefix, max_desc_len);
@@ -73,6 +75,7 @@ impl Interner {
             version,
             vocabulary,
             prefix_to_completions,
+            prefix_completion_counts,
             prefix_stats: prefix_stats_map,
             max_prefix_len,
         }
@@ -104,10 +107,12 @@ impl Interner {
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, None);
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
+        let prefix_completion_counts = Self::compute_completion_counts(&prefix_to_completions);
         let interner = Interner {
             version: Self::initial_version(),
             vocabulary,
             prefix_to_completions,
+            prefix_completion_counts,
             prefix_stats,
             max_prefix_len,
         };
@@ -124,6 +129,7 @@ impl Interner {
                 version: self.version + 1,
                 vocabulary: self.vocabulary.clone(),
                 prefix_to_completions: self.prefix_to_completions.clone(),
+                prefix_completion_counts: self.prefix_completion_counts.clone(),
                 prefix_stats: self.prefix_stats.clone(),
                 max_prefix_len: self.max_prefix_len,
             };
@@ -144,11 +150,13 @@ impl Interner {
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, Some(self));
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
+        let prefix_completion_counts = Self::compute_completion_counts(&prefix_to_completions);
 
         let interner = Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
+            prefix_completion_counts,
             prefix_stats,
             max_prefix_len,
         };
@@ -307,6 +315,15 @@ impl Interner {
         prefix_stats.values().copied().max().unwrap_or(0)
     }
 
+    fn compute_completion_counts(
+        prefix_to_completions: &FxHashMap<Vec<usize>, FixedBitSet>,
+    ) -> FxHashMap<Vec<usize>, usize> {
+        prefix_to_completions
+            .iter()
+            .map(|(prefix, bitset)| (prefix.clone(), bitset.count_ones(..)))
+            .collect()
+    }
+
     pub fn version(&self) -> usize {
         self.version
     }
@@ -322,6 +339,19 @@ impl Interner {
 
     pub fn prefix_stats(&self, prefix: &[usize]) -> Option<usize> {
         self.prefix_stats.get(prefix).copied()
+    }
+
+    pub fn prefix_stats_with_appended(
+        &self,
+        prefix: &[usize],
+        appended: usize,
+        scratch: &mut Vec<usize>,
+    ) -> Option<usize> {
+        scratch.clear();
+        scratch.reserve(prefix.len().saturating_add(1));
+        scratch.extend_from_slice(prefix);
+        scratch.push(appended);
+        self.prefix_stats(scratch.as_slice())
     }
 
     /// Maximum descriptor length across all prefixes (used for optimistic bounds when axis is missing).
@@ -349,57 +379,75 @@ impl Interner {
         self.prefix_to_completions.get(prefix)
     }
 
-    fn fill_required_bits(&self, required: &[Vec<usize>], out: &mut FixedBitSet) {
-        if out.len() < self.vocabulary.len() {
-            out.grow(self.vocabulary.len());
-        }
-        if required.is_empty() {
-            out.set_range(.., true);
-            return;
-        }
+    fn warn_missing_prefix(prefix: &[usize]) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)",
+                prefix
+            );
+        });
+    }
 
-        let Some((first_prefix, rest)) = required.split_first() else {
-            out.set_range(.., true);
-            return;
-        };
+    fn intersect_bitsets_into_count(out: &mut FixedBitSet, bitset: &FixedBitSet) -> usize {
+        let mut count = 0;
+        let out_words = out.as_mut_slice();
+        let bitset_words = bitset.as_slice();
+        let shared_len = out_words.len().min(bitset_words.len());
 
-        match self.prefix_to_completions.get(first_prefix) {
-            Some(bitset) => out.clone_from(bitset),
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    eprintln!("[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)", first_prefix);
-                });
-                out.set_range(.., false);
-                return;
-            }
+        for idx in 0..shared_len {
+            out_words[idx] &= bitset_words[idx];
+            count += out_words[idx].count_ones() as usize;
+        }
+        for word in &mut out_words[shared_len..] {
+            *word = 0;
         }
 
-        for prefix in rest {
-            match self.prefix_to_completions.get(prefix) {
-                Some(bitset) => {
-                    out.intersect_with(bitset);
-                    if out.count_ones(..) == 0 {
-                        break;
-                    }
+        count
+    }
+
+    fn should_use_sparse_intersection(seed_count: usize, out: &FixedBitSet) -> bool {
+        let _ = out;
+        seed_count == 0
+    }
+
+    fn sparse_intersect_into_count(
+        &self,
+        required: &[Vec<usize>],
+        forbidden: &[usize],
+        seed_idx: usize,
+        seed_bitset: &FixedBitSet,
+        out: &mut FixedBitSet,
+    ) -> usize {
+        out.set_range(.., false);
+        let mut count = 0usize;
+        'candidate: for candidate in seed_bitset.ones() {
+            for (idx, prefix) in required.iter().enumerate() {
+                if idx == seed_idx {
+                    continue;
                 }
-                None => {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        eprintln!("[interner][warn] encountered missing prefix {:?}; treating as empty completion set (further occurrences suppressed)", prefix);
-                    });
-                    out.set_range(.., false);
-                    break;
+                let bitset = self
+                    .prefix_to_completions
+                    .get(prefix)
+                    .expect("required prefixes were already checked");
+                if !bitset.contains(candidate) {
+                    continue 'candidate;
                 }
             }
+            if forbidden.iter().any(|&idx| idx == candidate) {
+                continue;
+            }
+            out.insert(candidate);
+            count += 1;
         }
+        count
     }
 
     #[cfg(test)]
     fn get_required_bits(&self, required: &[Vec<usize>]) -> FixedBitSet {
         let mut result = FixedBitSet::with_capacity(self.vocabulary.len());
         result.grow(self.vocabulary.len());
-        self.fill_required_bits(required, &mut result);
+        self.intersect_into_count(required, &[], &mut result);
         result
     }
 
@@ -409,10 +457,83 @@ impl Interner {
         forbidden: &[usize],
         out: &mut FixedBitSet,
     ) {
-        self.fill_required_bits(required, out);
-        for &idx in forbidden {
-            out.set(idx, false);
+        self.intersect_into_count(required, forbidden, out);
+    }
+
+    pub fn intersect_into_count(
+        &self,
+        required: &[Vec<usize>],
+        forbidden: &[usize],
+        out: &mut FixedBitSet,
+    ) -> usize {
+        if out.len() < self.vocabulary.len() {
+            out.grow(self.vocabulary.len());
         }
+
+        let mut count = if required.is_empty() {
+            out.set_range(.., true);
+            self.vocabulary.len()
+        } else {
+            let mut seed = None;
+            for (idx, prefix) in required.iter().enumerate() {
+                let Some(bitset) = self.prefix_to_completions.get(prefix) else {
+                    Self::warn_missing_prefix(prefix);
+                    out.set_range(.., false);
+                    return 0;
+                };
+                let completion_count = self
+                    .prefix_completion_counts
+                    .get(prefix)
+                    .copied()
+                    .unwrap_or_else(|| bitset.count_ones(..));
+                if seed
+                    .as_ref()
+                    .is_none_or(|(_, _, seed_count)| completion_count < *seed_count)
+                {
+                    seed = Some((idx, bitset, completion_count));
+                }
+            }
+
+            let Some((seed_idx, seed_bitset, seed_count)) = seed else {
+                out.set_range(.., true);
+                return self.vocabulary.len();
+            };
+            if Self::should_use_sparse_intersection(seed_count, out) {
+                return self.sparse_intersect_into_count(
+                    required,
+                    forbidden,
+                    seed_idx,
+                    seed_bitset,
+                    out,
+                );
+            }
+            out.clone_from(seed_bitset);
+
+            let mut count = seed_count;
+            for (idx, prefix) in required.iter().enumerate() {
+                if idx == seed_idx {
+                    continue;
+                }
+                let bitset = self
+                    .prefix_to_completions
+                    .get(prefix)
+                    .expect("required prefixes were already checked");
+                count = Self::intersect_bitsets_into_count(out, bitset);
+                if count == 0 {
+                    break;
+                }
+            }
+            count
+        };
+
+        for &idx in forbidden {
+            if out.contains(idx) {
+                out.set(idx, false);
+                count = count.saturating_sub(1);
+            }
+        }
+
+        count
     }
 
     pub fn intersect(&self, required: &[Vec<usize>], forbidden: &[usize]) -> Vec<usize> {
@@ -627,10 +748,12 @@ impl Interner {
         }
 
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
+        let prefix_completion_counts = Self::compute_completion_counts(&prefix_to_completions);
         Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
+            prefix_completion_counts,
             prefix_stats,
             max_prefix_len,
         }
@@ -1458,6 +1581,18 @@ mod intersect_logic_tests {
     }
 
     #[test]
+    fn test_intersect_into_count_all_empty_returns_all_indexes() {
+        let interner = build_interner("a b c");
+        let mut bits = FixedBitSet::with_capacity(interner.vocab_size());
+        bits.grow(interner.vocab_size());
+
+        let count = interner.intersect_into_count(&[], &[], &mut bits);
+
+        assert_eq!(count, 3);
+        assert_eq!(bits.ones().collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
     fn test_intersect_required_and_forbidden() {
         let interner = build_interner("a b c d");
 
@@ -1467,6 +1602,22 @@ mod intersect_logic_tests {
         let result = interner.intersect(&[prefix], &forbidden);
 
         assert!(!result.contains(&1));
+    }
+
+    #[test]
+    fn test_intersect_into_count_required_and_forbidden_matches_intersect() {
+        let interner = build_interner("a b c d. a c.");
+        let required = vec![vec![0]];
+        let forbidden = vec![1];
+        let expected = interner.intersect(&required, &forbidden);
+        let mut bits = FixedBitSet::with_capacity(interner.vocab_size());
+        bits.grow(interner.vocab_size());
+
+        let count = interner.intersect_into_count(&required, &forbidden, &mut bits);
+        let actual = bits.ones().collect::<Vec<_>>();
+
+        assert_eq!(count, expected.len());
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1481,6 +1632,21 @@ mod intersect_logic_tests {
     }
 
     #[test]
+    fn test_intersect_into_count_required_anded_matches_intersect() {
+        let interner = build_interner("a c. b c. a d. b d. a b.");
+        let required = vec![vec![0], vec![1]];
+        let expected = interner.intersect(&required, &[]);
+        let mut bits = FixedBitSet::with_capacity(interner.vocab_size());
+        bits.grow(interner.vocab_size());
+
+        let count = interner.intersect_into_count(&required, &[], &mut bits);
+        let actual = bits.ones().collect::<Vec<_>>();
+
+        assert_eq!(count, expected.len());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_intersect_forbidden_zeroes_out() {
         let interner = build_interner("a b c");
 
@@ -1488,6 +1654,30 @@ mod intersect_logic_tests {
         let forbidden: Vec<usize> = (0..interner.vocabulary().len()).collect();
         let result = interner.intersect(&[], &forbidden);
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_intersect_into_count_missing_prefix_returns_empty() {
+        let interner = build_interner("a b c");
+        let mut bits = FixedBitSet::with_capacity(interner.vocab_size());
+        bits.grow(interner.vocab_size());
+
+        let count = interner.intersect_into_count(&[vec![999]], &[], &mut bits);
+
+        assert_eq!(count, 0);
+        assert_eq!(bits.ones().count(), 0);
+    }
+
+    #[test]
+    fn test_intersect_into_count_duplicate_forbidden_decrements_once() {
+        let interner = build_interner("a b c");
+        let mut bits = FixedBitSet::with_capacity(interner.vocab_size());
+        bits.grow(interner.vocab_size());
+
+        let count = interner.intersect_into_count(&[], &[1, 1], &mut bits);
+
+        assert_eq!(count, 2);
+        assert_eq!(bits.ones().collect::<Vec<_>>(), vec![0, 2]);
     }
 
     #[test]
@@ -1599,6 +1789,7 @@ mod version_compare_tests {
             version: low.version + 1,
             vocabulary: low.vocabulary.clone(),
             prefix_to_completions: low.prefix_to_completions.clone(),
+            prefix_completion_counts: low.prefix_completion_counts.clone(),
             prefix_stats: low.prefix_stats.clone(),
             max_prefix_len: low.max_prefix_len,
         };

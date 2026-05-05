@@ -25,6 +25,10 @@ struct ProbeOutcome {
     node_prune_ns: u128,
     completion_prune_ns: u128,
     completion_bound_ns: u128,
+    ctx_reset_ns: u128,
+    k_bound_ns: u128,
+    depth_counter_ns: u128,
+    completion_iter_ns: u128,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -119,7 +123,7 @@ fn bench_dfs_ab(c: &mut Criterion) {
     for variant in variants {
         let probe = run_steps(&interner, variant.toggles, step_budget);
         eprintln!(
-            "probe {} steps={} expanded={} pruned={} cpruned={} best_vol={} total_ms={:.3} existing_bound_ms={:.3} intersect_ms={:.3} child_gen_ms={:.3} reorder_ms={:.3} node_prune_ms={:.3} completion_prune_ms={:.3} completion_bound_ms={:.3}",
+            "probe {} steps={} expanded={} pruned={} cpruned={} best_vol={} total_ms={:.3} existing_bound_ms={:.3} intersect_ms={:.3} child_gen_ms={:.3} reorder_ms={:.3} node_prune_ms={:.3} completion_prune_ms={:.3} completion_bound_ms={:.3} ctx_reset_ms={:.3} k_bound_ms={:.3} depth_counter_ms={:.3} completion_iter_ms={:.3}",
             variant.name,
             probe.steps_executed,
             probe.nodes_expanded,
@@ -134,10 +138,14 @@ fn bench_dfs_ab(c: &mut Criterion) {
             probe.node_prune_ns as f64 / 1_000_000.0,
             probe.completion_prune_ns as f64 / 1_000_000.0,
             probe.completion_bound_ns as f64 / 1_000_000.0,
+            probe.ctx_reset_ns as f64 / 1_000_000.0,
+            probe.k_bound_ns as f64 / 1_000_000.0,
+            probe.depth_counter_ns as f64 / 1_000_000.0,
+            probe.completion_iter_ns as f64 / 1_000_000.0,
         );
         let total = probe.total_step_ns.max(1) as f64;
         eprintln!(
-            "probe_pct {} existing_bound={:.2}% intersect={:.2}% child_gen={:.2}% reorder={:.2}% node_prune={:.2}% completion_prune={:.2}% completion_bound={:.2}%",
+            "probe_pct {} existing_bound={:.2}% intersect={:.2}% child_gen={:.2}% reorder={:.2}% node_prune={:.2}% completion_prune={:.2}% completion_bound={:.2}% ctx_reset={:.2}% k_bound={:.2}% depth_counter={:.2}% completion_iter={:.2}%",
             variant.name,
             100.0 * probe.existing_bound_ns as f64 / total,
             100.0 * probe.intersect_ns as f64 / total,
@@ -146,6 +154,10 @@ fn bench_dfs_ab(c: &mut Criterion) {
             100.0 * probe.node_prune_ns as f64 / total,
             100.0 * probe.completion_prune_ns as f64 / total,
             100.0 * probe.completion_bound_ns as f64 / total,
+            100.0 * probe.ctx_reset_ns as f64 / total,
+            100.0 * probe.k_bound_ns as f64 / total,
+            100.0 * probe.depth_counter_ns as f64 / total,
+            100.0 * probe.completion_iter_ns as f64 / total,
         );
 
         let budget = run_for_duration(
@@ -201,6 +213,10 @@ fn run_steps(interner: &Interner, toggles: SearchToggles, step_budget: usize) ->
         node_prune_ns: profile.node_prune_ns,
         completion_prune_ns: profile.completion_prune_ns,
         completion_bound_ns: profile.completion_bound_ns,
+        ctx_reset_ns: profile.ctx_reset_ns,
+        k_bound_ns: profile.k_bound_ns,
+        depth_counter_ns: profile.depth_counter_ns,
+        completion_iter_ns: profile.completion_iter_ns,
     }
 }
 

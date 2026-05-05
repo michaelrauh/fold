@@ -1,6 +1,6 @@
 use crate::{
     interner::Interner,
-    ortho::{Ortho, OrthoScore, payload_to_usize},
+    ortho::{payload_to_usize, Ortho, OrthoScore},
 };
 use std::collections::HashMap;
 
@@ -57,6 +57,7 @@ pub struct CompletionContext {
     prefix_positions: Vec<Vec<usize>>,
     diagonal_positions: Vec<usize>,
     prefix_with_completion: Vec<Vec<usize>>,
+    prefix_stat_scratch: Vec<usize>,
     totals: Vec<usize>,
     impacted_totals: Vec<usize>,
     bound_scratch: Vec<usize>,
@@ -90,22 +91,37 @@ impl CompletionContext {
                 .filter_map(|v| *v)
                 .map(payload_to_usize),
         );
-        self.prefix_with_completion.clear();
-        self.prefix_with_completion
-            .extend(self.required_usize.iter().map(|prefix| {
-                let mut with_completion = Vec::with_capacity(prefix.len().saturating_add(1));
-                with_completion.extend_from_slice(prefix);
-                with_completion
-            }));
+        self.copy_required_prefixes_for_completion();
         self.totals.clear();
-        self.totals.reserve(self.required_usize.len());
+        if self.totals.capacity() < self.required_usize.len() {
+            self.totals.reserve(self.required_usize.len());
+        }
         self.impacted_totals.clear();
-        self.impacted_totals.reserve(self.filled_prefix.len());
+        if self.impacted_totals.capacity() < self.filled_prefix.len() {
+            self.impacted_totals.reserve(self.filled_prefix.len());
+        }
         self.dim_count = ortho.dims().len();
         self.base_score = ortho.score();
         self.base_volume = self.base_score.volume;
         self.base_fullness = self.base_score.fullness;
         self.is_root = self.required_usize.is_empty();
+    }
+
+    fn copy_required_prefixes_for_completion(&mut self) {
+        while self.prefix_with_completion.len() < self.required_usize.len() {
+            self.prefix_with_completion.push(Vec::new());
+        }
+        self.prefix_with_completion
+            .truncate(self.required_usize.len());
+        for (out, prefix) in self
+            .prefix_with_completion
+            .iter_mut()
+            .zip(self.required_usize.iter())
+        {
+            out.clear();
+            out.reserve(prefix.len().saturating_add(1));
+            out.extend_from_slice(prefix);
+        }
     }
 
     pub fn required_usize(&self) -> &[Vec<usize>] {
@@ -134,6 +150,19 @@ impl CompletionContext {
 
     pub fn base_fullness(&self) -> usize {
         self.base_fullness
+    }
+
+    fn prefix_stats_with_completion(
+        &mut self,
+        interner: &Interner,
+        prefix_idx: usize,
+        completion: usize,
+    ) -> Option<usize> {
+        interner.prefix_stats_with_appended(
+            &self.prefix_with_completion[prefix_idx],
+            completion,
+            &mut self.prefix_stat_scratch,
+        )
     }
 }
 
@@ -296,19 +325,19 @@ pub fn completion_upper_bound_ctx(
         ));
     }
 
+    let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
     ctx.totals.clear();
-    for prefix in &mut ctx.prefix_with_completion {
-        prefix.push(completion);
-        match interner.prefix_stats(prefix.as_slice()) {
+    for idx in 0..ctx.prefix_with_completion.len() {
+        match ctx.prefix_stats_with_completion(interner, idx, completion) {
             Some(max_desc_len) => ctx.totals.push(max_desc_len),
             None => {
-                panic!("[bound][panic] missing prefix stats for {:?}", prefix);
+                let mut missing = ctx.prefix_with_completion[idx].clone();
+                missing.push(completion);
+                panic!("[bound][panic] missing prefix stats for {:?}", missing);
             }
         }
-        prefix.pop();
     }
 
-    let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
     Some(upper_bound_score(
         &ctx.totals,
         ctx.base_volume,
