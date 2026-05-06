@@ -1,4 +1,4 @@
-use crate::{splitter::Splitter, FoldError};
+use crate::{FoldError, splitter::Splitter};
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -406,43 +406,6 @@ impl Interner {
         count
     }
 
-    fn should_use_sparse_intersection(seed_count: usize, out: &FixedBitSet) -> bool {
-        let _ = out;
-        seed_count == 0
-    }
-
-    fn sparse_intersect_into_count(
-        &self,
-        required: &[Vec<usize>],
-        forbidden: &[usize],
-        seed_idx: usize,
-        seed_bitset: &FixedBitSet,
-        out: &mut FixedBitSet,
-    ) -> usize {
-        out.set_range(.., false);
-        let mut count = 0usize;
-        'candidate: for candidate in seed_bitset.ones() {
-            for (idx, prefix) in required.iter().enumerate() {
-                if idx == seed_idx {
-                    continue;
-                }
-                let bitset = self
-                    .prefix_to_completions
-                    .get(prefix)
-                    .expect("required prefixes were already checked");
-                if !bitset.contains(candidate) {
-                    continue 'candidate;
-                }
-            }
-            if forbidden.iter().any(|&idx| idx == candidate) {
-                continue;
-            }
-            out.insert(candidate);
-            count += 1;
-        }
-        count
-    }
-
     #[cfg(test)]
     fn get_required_bits(&self, required: &[Vec<usize>]) -> FixedBitSet {
         let mut result = FixedBitSet::with_capacity(self.vocabulary.len());
@@ -461,6 +424,15 @@ impl Interner {
     }
 
     pub fn intersect_into_count(
+        &self,
+        required: &[Vec<usize>],
+        forbidden: &[usize],
+        out: &mut FixedBitSet,
+    ) -> usize {
+        self.intersect_into_count_baseline(required, forbidden, out)
+    }
+
+    fn intersect_into_count_baseline(
         &self,
         required: &[Vec<usize>],
         forbidden: &[usize],
@@ -498,15 +470,6 @@ impl Interner {
                 out.set_range(.., true);
                 return self.vocabulary.len();
             };
-            if Self::should_use_sparse_intersection(seed_count, out) {
-                return self.sparse_intersect_into_count(
-                    required,
-                    forbidden,
-                    seed_idx,
-                    seed_bitset,
-                    out,
-                );
-            }
             out.clone_from(seed_bitset);
 
             let mut count = seed_count;

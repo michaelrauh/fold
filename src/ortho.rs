@@ -1,4 +1,4 @@
-use crate::{spatial, FoldError};
+use crate::{FoldError, spatial};
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
 use rustc_hash::FxHasher;
@@ -270,28 +270,16 @@ impl Ortho {
     }
 
     pub fn add_into(&self, value: PayloadVal, out: &mut Vec<Self>) {
+        out.reserve(1);
         let insertion_index = self.get_current_position();
         let total_empty = self.payload.len().saturating_sub(self.fill_count as usize);
         if total_empty == 1 {
             if spatial::is_base(&self.dims) {
                 let insert_axis = self.get_insert_position(value);
-                Self::expand_up_into(
-                    self,
-                    spatial::expand_up(&self.dims, insert_axis),
-                    value,
-                    insertion_index,
-                    insert_axis,
-                    out,
-                );
+                Self::expand_up_into(self, value, insertion_index, insert_axis, out);
                 return;
             } else {
-                Self::expand_over_into(
-                    self,
-                    spatial::expand_over(&self.dims),
-                    value,
-                    insertion_index,
-                    out,
-                );
+                Self::expand_over_into(self, value, insertion_index, out);
                 return;
             }
         }
@@ -307,26 +295,20 @@ impl Ortho {
             out.push(self.in_fill_child_from_payload(new_payload));
             return;
         }
-        let len = self.payload.len();
-        let mut new_payload: Vec<Option<PayloadVal>> = Vec::with_capacity(len);
-        unsafe {
-            new_payload.set_len(len);
-            std::ptr::copy_nonoverlapping(self.payload.as_ptr(), new_payload.as_mut_ptr(), len);
-        }
+        let mut new_payload = self.payload.clone();
         if insertion_index < new_payload.len() {
             new_payload[insertion_index] = Some(value);
         }
         out.push(self.in_fill_child_from_payload(new_payload));
     }
+
     fn expand_over_into(
         ortho: &Ortho,
-        expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
         value: PayloadVal,
         insertion_index: usize,
         out: &mut Vec<Ortho>,
     ) {
-        out.reserve(expansions.len());
-        for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
+        spatial::for_each_expand_over(&ortho.dims, |new_dims, new_capacity, reorg| {
             let mut new_payload = vec![None; new_capacity];
             for (i, &pos) in reorg.iter().enumerate() {
                 new_payload[pos] = if i == insertion_index {
@@ -336,20 +318,18 @@ impl Ortho {
                 };
             }
             // Over expansions set up_axis to None
-            out.push(Ortho::from_parts(new_dims_vec, new_payload, None));
-        }
+            out.push(Ortho::from_parts(new_dims.to_vec(), new_payload, None));
+        });
     }
 
     fn expand_up_into(
         ortho: &Ortho,
-        expansions: Vec<(Vec<Dim>, usize, Vec<usize>)>,
         value: PayloadVal,
         insertion_index: usize,
         insert_axis: usize,
         out: &mut Vec<Ortho>,
     ) {
-        out.reserve(expansions.len());
-        for (new_dims_vec, new_capacity, reorg) in expansions.into_iter() {
+        spatial::for_each_expand_up(&ortho.dims, insert_axis, |new_dims, new_capacity, reorg| {
             let mut new_payload = vec![None; new_capacity];
             for (i, &pos) in reorg.iter().enumerate() {
                 new_payload[pos] = if i == insertion_index {
@@ -359,15 +339,16 @@ impl Ortho {
                 };
             }
             // The up child (one with extra dimension) gets the insert_axis, over children get None
-            let is_up_child = new_dims_vec.len() > ortho.dims.len();
+            let is_up_child = new_dims.len() > ortho.dims.len();
             let up_axis = if is_up_child {
                 Some(Dim::try_from(insert_axis).expect("insert axis overflowed u8"))
             } else {
                 None
             };
-            out.push(Ortho::from_parts(new_dims_vec, new_payload, up_axis));
-        }
+            out.push(Ortho::from_parts(new_dims.to_vec(), new_payload, up_axis));
+        });
     }
+
     fn get_insert_position(&self, to_add: PayloadVal) -> usize {
         let mut idx = 0;
         for pos in 1..=self.dims.len() {
@@ -1028,12 +1009,12 @@ mod tests {
         o1 = o1.add(10).pop().unwrap(); // a
         o1 = o1.add(20).pop().unwrap(); // b
         o1 = o1.add(30).pop().unwrap(); // c
-                                        // Path 2: a < c but b < c (second and third swapped relative to path 1)
+        // Path 2: a < c but b < c (second and third swapped relative to path 1)
         let mut o2 = Ortho::new();
         o2 = o2.add(10).pop().unwrap(); // a
         o2 = o2.add(30).pop().unwrap(); // c
         o2 = o2.add(20).pop().unwrap(); // b (unsorted axis order)
-                                        // Insert 4th token to force expansion candidates
+        // Insert 4th token to force expansion candidates
         let children1 = o1.add(40);
         let children2 = o2.add(40);
         // Normalize each child to (dims, filled_values_in_order)

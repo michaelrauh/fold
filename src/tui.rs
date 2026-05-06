@@ -177,9 +177,10 @@ impl Tui {
                 format_count(snapshot.global.completions_pruned)
             )),
             Line::from(format!(
-                "Rates: {} n/s  {} p/s  {} cp/s",
+                "Rates: {} n/s  {} p/s  {} accepted/s  {} cp/s",
                 format_rate(snapshot.global.nodes_per_sec),
                 format_rate(snapshot.global.prunes_per_sec),
+                format_rate(accepted_rate(snapshot)),
                 format_rate(snapshot.global.completion_prunes_per_sec)
             )),
             Line::from(format!(
@@ -190,13 +191,12 @@ impl Tui {
                 snapshot.global.current_bound.fullness
             )),
             Line::from(format!(
-                "Checkpoint: {} @ {}",
-                snapshot.global.checkpoint_status,
-                if snapshot.global.checkpoint_time == 0 {
-                    "n/a".to_string()
-                } else {
-                    snapshot.global.checkpoint_time.to_string()
-                }
+                "Checkpoint: {}",
+                format_checkpoint(
+                    &snapshot.global.checkpoint_status,
+                    snapshot.global.checkpoint_time,
+                    now,
+                )
             )),
         ]
     }
@@ -298,10 +298,14 @@ impl Tui {
                 frontier_max
             )),
             Line::from(format!(
-                "Rates: {} n/s  {} p/s  {} cp/s  Balance min/avg/max={}/{}/{}",
+                "Rates: {} n/s  {} p/s  {} accepted/s  {} cp/s",
                 format_rate(snapshot.global.nodes_per_sec),
                 format_rate(snapshot.global.prunes_per_sec),
-                format_rate(snapshot.global.completion_prunes_per_sec),
+                format_rate(accepted_rate(snapshot)),
+                format_rate(snapshot.global.completion_prunes_per_sec)
+            )),
+            Line::from(format!(
+                "Balance min/avg/max={}/{}/{}",
                 format_rate(parallel.worker_rate_min),
                 format_rate(parallel.worker_rate_avg),
                 format_rate(parallel.worker_rate_max)
@@ -426,9 +430,10 @@ pub fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
         snapshot.global.completions_pruned
     ));
     out.push_str(&format!(
-        "rates=(nodes_per_sec={:.1},prunes_per_sec={:.1},completion_prunes_per_sec={:.1})\n",
+        "rates=(nodes_per_sec={:.1},prunes_per_sec={:.1},accepted_per_sec={:.1},completion_prunes_per_sec={:.1})\n",
         snapshot.global.nodes_per_sec,
         snapshot.global.prunes_per_sec,
+        accepted_rate(snapshot),
         snapshot.global.completion_prunes_per_sec
     ));
     out.push_str(&format!(
@@ -449,8 +454,12 @@ pub fn format_snapshot(snapshot: &MetricsSnapshot) -> String {
         snapshot.global.incumbent_capacity
     ));
     out.push_str(&format!(
-        "checkpoint={}@{}\n",
-        snapshot.global.checkpoint_status, snapshot.global.checkpoint_time
+        "checkpoint={}\n",
+        format_checkpoint(
+            &snapshot.global.checkpoint_status,
+            snapshot.global.checkpoint_time,
+            now,
+        )
     ));
     out.push_str(&format!(
         "frontier_max_bound={}\n",
@@ -509,6 +518,17 @@ fn format_elapsed(total_secs: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
+fn format_checkpoint(status: &str, checkpoint_time: u64, now: u64) -> String {
+    if checkpoint_time == 0 {
+        format!("{status} @ n/a")
+    } else {
+        format!(
+            "{status} @ {checkpoint_time} age {}",
+            format_elapsed(now.saturating_sub(checkpoint_time))
+        )
+    }
+}
+
 fn multiline_lines(text: &str) -> Vec<Line<'static>> {
     if text.is_empty() {
         return vec![Line::from("")];
@@ -519,12 +539,33 @@ fn multiline_lines(text: &str) -> Vec<Line<'static>> {
 }
 
 fn search_level_count(snapshot: &MetricsSnapshot) -> usize {
-    snapshot
+    let vector_len = snapshot
         .global
         .seen_by_depth
         .len()
         .max(snapshot.global.descended_by_depth.len())
-        .max(snapshot.global.pruned_by_depth.len())
+        .max(snapshot.global.pruned_by_depth.len());
+    let deepest_non_empty = (0..vector_len)
+        .rfind(|&idx| {
+            snapshot.global.seen_by_depth.get(idx).copied().unwrap_or(0) > 0
+                || snapshot
+                    .global
+                    .descended_by_depth
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                || snapshot
+                    .global
+                    .pruned_by_depth
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+        })
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    deepest_non_empty
 }
 
 fn section_title(title: &str) -> Line<'static> {
@@ -630,6 +671,10 @@ fn format_rate(value: f64) -> String {
     } else {
         format!("{value:.2}")
     }
+}
+
+fn accepted_rate(snapshot: &MetricsSnapshot) -> f64 {
+    (snapshot.global.nodes_per_sec - snapshot.global.prunes_per_sec).max(0.0)
 }
 
 fn path_progress_chart(values: &[(usize, usize)], width: usize) -> String {
@@ -832,8 +877,9 @@ fn tree_glyph(visited: u64, open: u64, unknown: bool) -> char {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetricsSnapshot, Tui, activity_style, count_chart, format_snapshot, multiline_lines,
-        path_progress_chart, percent_bar, tree_occupancy_chart,
+        MetricsSnapshot, Tui, accepted_rate, activity_style, count_chart, format_checkpoint,
+        format_snapshot, multiline_lines, path_progress_chart, percent_bar, search_level_count,
+        tree_occupancy_chart,
     };
     use crate::metrics::GlobalMetrics;
     use crate::metrics::Metrics;
@@ -868,6 +914,22 @@ mod tests {
         assert_eq!(
             format!("{:?}", activity_style(0.8, false)),
             "Style::new().red()"
+        );
+    }
+
+    #[test]
+    fn checkpoint_line_includes_age() {
+        assert_eq!(
+            format_checkpoint("saved in 0.22s", 1_778_078_041, 1_778_081_641),
+            "saved in 0.22s @ 1778078041 age 01:00:00"
+        );
+    }
+
+    #[test]
+    fn checkpoint_line_handles_missing_time() {
+        assert_eq!(
+            format_checkpoint("Not yet checkpointed", 0, 1_778_081_641),
+            "Not yet checkpointed @ n/a"
         );
     }
 
@@ -911,7 +973,17 @@ mod tests {
         assert!(rendered.contains("path="));
         assert!(rendered.contains("open="));
         assert!(rendered.contains("pruned="));
+        assert!(rendered.contains("accepted_per_sec=800.0"));
         assert!(rendered.contains("tree="));
+    }
+
+    #[test]
+    fn accepted_rate_saturates_at_zero() {
+        let mut snapshot = MetricsSnapshot::default();
+        snapshot.global.nodes_per_sec = 100.0;
+        snapshot.global.prunes_per_sec = 150.0;
+
+        assert_eq!(accepted_rate(&snapshot), 0.0);
     }
 
     #[test]
@@ -963,5 +1035,16 @@ mod tests {
             .collect();
 
         assert!(rendered.iter().any(|line| line.starts_with("L50 ")));
+    }
+
+    #[test]
+    fn search_level_count_ignores_trailing_zero_rows() {
+        let mut snapshot = MetricsSnapshot::default();
+        snapshot.global.current_depth = 21;
+        snapshot.global.seen_by_depth = vec![10, 5, 0, 0];
+        snapshot.global.descended_by_depth = vec![10, 2, 0, 0];
+        snapshot.global.pruned_by_depth = vec![0, 1, 0, 0];
+
+        assert_eq!(search_level_count(&snapshot), 2);
     }
 }

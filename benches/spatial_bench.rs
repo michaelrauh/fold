@@ -54,8 +54,7 @@ fn bench_get_location_to_index(c: &mut Criterion) {
     });
 }
 
-fn bench_cached_vs_uncached(c: &mut Criterion) {
-    // This benchmark calls the same function multiple times to demonstrate caching benefits
+fn bench_repeated_calls(c: &mut Criterion) {
     c.bench_function("repeated_calls_expand_over", |b| {
         b.iter(|| {
             for _ in 0..10 {
@@ -82,6 +81,6 @@ criterion_group!(
     bench_capacity,
     bench_get_axis_positions,
     bench_get_location_to_index,
-    bench_cached_vs_uncached
+    bench_repeated_calls
 );
 criterion_main!(benches);

@@ -1,18 +1,17 @@
 use crate::{
     FoldError,
     dfs_checkpoint::{file_name_string, write_atomic},
-    dfs_runner::{BranchOrdering, DfsRunner, SearchToggles},
+    dfs_runner::{BranchOrdering, DfsRunner, SearchToggles, StepScratch},
     interner::Interner,
     metrics::{Metrics, WorkerMetrics},
     ortho::{Ortho, OrthoScore},
 };
 use bytecheck::CheckBytes;
 use rkyv::{Archive, Deserialize, Serialize};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::collections::VecDeque;
-use rustc_hash::FxHashMap;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -37,26 +36,17 @@ pub struct ParallelSearchConfig {
 }
 
 impl ParallelSearchConfig {
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("FOLD_PARALLEL_SEARCH")
-            .ok()
-            .as_deref()
-            .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(true);
+    pub fn default_runtime() -> Self {
         let default_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         Self {
-            enabled,
-            workers: parse_env_usize("FOLD_WORKERS")
-                .unwrap_or(default_workers)
-                .max(1),
-            hunt_nodes: parse_env_u64("FOLD_HUNT_NODES").unwrap_or(5_000_000_000),
-            shard_depth: parse_env_usize("FOLD_SHARD_DEPTH").unwrap_or(3).max(1),
-            checkpoint_every_secs: parse_env_u64("FOLD_PARALLEL_CHECKPOINT_EVERY_SECS")
-                .unwrap_or(30)
-                .max(1),
-            resume_enabled: std::env::var("FOLD_DISABLE_PARALLEL_RESUME").is_err(),
+            enabled: true,
+            workers: default_workers,
+            hunt_nodes: 5_000_000_000,
+            shard_depth: 3,
+            checkpoint_every_secs: 30,
+            resume_enabled: true,
         }
     }
 
@@ -78,7 +68,7 @@ impl ParallelSearchConfig {
 
     pub fn proof_toggles(&self) -> SearchToggles {
         SearchToggles {
-            completion_pruning: false,
+            completion_pruning: true,
             ..SearchToggles::default()
         }
     }
@@ -161,7 +151,6 @@ pub struct ParallelCheckpointManifest {
 
 #[derive(Clone, Debug)]
 pub struct ParallelCheckpointStore {
-    dir: PathBuf,
     manifest_path: PathBuf,
     state_path: PathBuf,
     output_dir: PathBuf,
@@ -250,7 +239,6 @@ impl ParallelCheckpointStore {
         Ok(Self {
             manifest_path: dir.join("manifest.json"),
             state_path: dir.join("state.bin"),
-            dir,
             output_dir: output_dir.to_path_buf(),
         })
     }
@@ -359,7 +347,10 @@ impl ParallelCheckpointStore {
             "best_dims": state.best_incumbent.dims(),
             "best_capacity": state.best_incumbent.payload().len(),
         });
-        write_atomic(&self.output_dir.join("optimal.bin"), &state.best_incumbent.to_bytes()?)?;
+        write_atomic(
+            &self.output_dir.join("optimal.bin"),
+            &state.best_incumbent.to_bytes()?,
+        )?;
         write_atomic(&self.output_dir.join("optimal.txt"), display.as_bytes())?;
         let summary_bytes = serde_json::to_vec_pretty(&summary)
             .map_err(|e| FoldError::Serialization(e.to_string()))?;
@@ -377,96 +368,108 @@ pub fn run_parallel_search(
     checkpoint_store: ParallelCheckpointStore,
     resume_state: Option<ParallelCheckpointState>,
 ) -> Result<ParallelSearchResult, FoldError> {
-    let (queue, completed_depths, best, total_expanded, total_pruned, total_completion_pruned, hunt_expanded, shards_done, total_shards, started_unix, shallow_seen, ancestor_total, level_completions_base) =
-        match resume_state {
-            Some(state) => {
-                let mut tasks: Vec<ShardTask> = Vec::with_capacity(
-                    state.pending_shards.len() + state.running_shards.len(),
-                );
-                for shard in state.pending_shards {
-                    tasks.push(shard);
-                }
-                for running in state.running_shards {
-                    tasks.push(running.shard);
-                }
-                tasks.sort_by_key(|t| t.runner.top_frame_bound());
-                let total_for_bucket = tasks.len();
-                for (sorted_idx, task) in tasks.iter_mut().enumerate() {
-                    task.bucket = bucket_for(sorted_idx, total_for_bucket);
-                }
-                let ancestor_total = build_ancestor_total(&tasks);
-                let queue: VecDeque<ShardTask> = tasks.into();
-                (
-                    queue,
-                    state.completed_depths,
-                    SharedBest {
-                        incumbent: state.best_incumbent,
-                        last_improvement_unix: state.last_improvement_unix,
-                        last_improvement_depth: state.last_improvement_depth,
-                    },
-                    state.nodes_expanded,
-                    state.nodes_pruned,
-                    state.completions_pruned,
-                    state.hunt_expanded,
-                    state.shards_done,
-                    state.total_shards,
-                    state.started_unix,
-                    state.shallow_seen,
-                    ancestor_total,
-                    state.level_completions,
-                )
+    let (
+        queue,
+        completed_depths,
+        best,
+        total_expanded,
+        total_pruned,
+        total_completion_pruned,
+        hunt_expanded,
+        shards_done,
+        total_shards,
+        started_unix,
+        shallow_seen,
+        ancestor_total,
+        level_completions_base,
+    ) = match resume_state {
+        Some(state) => {
+            let mut tasks: Vec<ShardTask> =
+                Vec::with_capacity(state.pending_shards.len() + state.running_shards.len());
+            for shard in state.pending_shards {
+                tasks.push(shard);
             }
-            None => {
-                let mut shard_toggles = config.hunt_toggles();
-                shard_toggles.node_pruning = false;
-                let (shard_stacks, shard_ancestors, gen_seen) =
-                    DfsRunner::frontier_shards(&interner, config.shard_depth, &shard_toggles)?;
-                if shard_stacks.is_empty() {
-                    return Err(FoldError::Other(
-                        "parallel shard generation produced no work".to_string(),
-                    ));
-                }
-                let total_shards = shard_stacks.len();
-                let mut tasks: Vec<ShardTask> = shard_stacks
-                    .into_iter()
-                    .zip(shard_ancestors)
-                    .enumerate()
-                    .map(|(id, (stack, ancestors))| ShardTask {
-                        id,
-                        bucket: 0,
-                        ancestors,
-                        runner: DfsRunner::from_stack(stack, Ortho::new()),
-                    })
-                    .collect();
-                tasks.sort_by_key(|t| t.runner.top_frame_bound());
-                let total_for_bucket = tasks.len();
-                for (sorted_idx, task) in tasks.iter_mut().enumerate() {
-                    task.bucket = bucket_for(sorted_idx, total_for_bucket);
-                }
-                let ancestor_total = build_ancestor_total(&tasks);
-                let queue: VecDeque<ShardTask> = tasks.into();
-                let started_unix = now_unix();
-                (
-                    queue,
-                    CompletedDepths::default(),
-                    SharedBest {
-                        incumbent: Ortho::new(),
-                        last_improvement_unix: started_unix,
-                        last_improvement_depth: 1,
-                    },
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    total_shards,
-                    started_unix,
-                    gen_seen,
-                    ancestor_total,
-                    Vec::new(),
-                )
+            for running in state.running_shards {
+                tasks.push(running.shard);
             }
-        };
+            tasks.sort_by_key(|t| t.runner.top_frame_bound());
+            let total_for_bucket = tasks.len();
+            for (sorted_idx, task) in tasks.iter_mut().enumerate() {
+                task.bucket = bucket_for(sorted_idx, total_for_bucket);
+            }
+            let ancestor_total = build_ancestor_total(&tasks);
+            let queue: VecDeque<ShardTask> = tasks.into();
+            (
+                queue,
+                state.completed_depths,
+                SharedBest {
+                    incumbent: state.best_incumbent,
+                    last_improvement_unix: state.last_improvement_unix,
+                    last_improvement_depth: state.last_improvement_depth,
+                },
+                state.nodes_expanded,
+                state.nodes_pruned,
+                state.completions_pruned,
+                state.hunt_expanded,
+                state.shards_done,
+                state.total_shards,
+                state.started_unix,
+                state.shallow_seen,
+                ancestor_total,
+                state.level_completions,
+            )
+        }
+        None => {
+            let mut shard_toggles = config.hunt_toggles();
+            shard_toggles.node_pruning = false;
+            let (shard_stacks, shard_ancestors, gen_seen) =
+                DfsRunner::frontier_shards(&interner, config.shard_depth, &shard_toggles)?;
+            if shard_stacks.is_empty() {
+                return Err(FoldError::Other(
+                    "parallel shard generation produced no work".to_string(),
+                ));
+            }
+            let total_shards = shard_stacks.len();
+            let mut tasks: Vec<ShardTask> = shard_stacks
+                .into_iter()
+                .zip(shard_ancestors)
+                .enumerate()
+                .map(|(id, (stack, ancestors))| ShardTask {
+                    id,
+                    bucket: 0,
+                    ancestors,
+                    runner: DfsRunner::from_stack(stack, Ortho::new()),
+                })
+                .collect();
+            tasks.sort_by_key(|t| t.runner.top_frame_bound());
+            let total_for_bucket = tasks.len();
+            for (sorted_idx, task) in tasks.iter_mut().enumerate() {
+                task.bucket = bucket_for(sorted_idx, total_for_bucket);
+            }
+            let ancestor_total = build_ancestor_total(&tasks);
+            let queue: VecDeque<ShardTask> = tasks.into();
+            let started_unix = now_unix();
+            (
+                queue,
+                CompletedDepths::default(),
+                SharedBest {
+                    incumbent: Ortho::new(),
+                    last_improvement_unix: started_unix,
+                    last_improvement_depth: 1,
+                },
+                0,
+                0,
+                0,
+                0,
+                0,
+                total_shards,
+                started_unix,
+                gen_seen,
+                ancestor_total,
+                Vec::new(),
+            )
+        }
+    };
     let shared = Arc::new(SharedState {
         queue: Mutex::new(queue),
         workers: Mutex::new(vec![WorkerState::default(); config.workers]),
@@ -562,6 +565,7 @@ fn worker_loop(
         let mut last_rate_at = Instant::now();
         let mut last_rate_nodes = 0;
         let mut steps_since_update = 0usize;
+        let mut scratch = StepScratch::default();
 
         update_worker_state(
             &shared,
@@ -579,7 +583,7 @@ fn worker_loop(
                 SearchPhase::Hunt => config.hunt_toggles(),
                 SearchPhase::Proof => config.proof_toggles(),
             };
-            match runner.step_with_toggles(&interner, &toggles) {
+            match runner.step_with_toggles_and_scratch(&interner, &toggles, &mut scratch) {
                 Ok(event) => {
                     if event.incumbent_improved {
                         publish_best(&shared, runner.incumbent(), runner.current_depth());
@@ -721,17 +725,15 @@ fn maybe_pause_for_checkpoint(
     let expanded = runner.nodes_expanded();
     let pruned = runner.nodes_pruned();
     let cpruned = runner.completions_pruned();
-    shared.total_expanded.fetch_add(
-        expanded.saturating_sub(*last_expanded),
-        Ordering::Relaxed,
-    );
+    shared
+        .total_expanded
+        .fetch_add(expanded.saturating_sub(*last_expanded), Ordering::Relaxed);
     shared
         .total_pruned
         .fetch_add(pruned.saturating_sub(*last_pruned), Ordering::Relaxed);
-    shared.total_completion_pruned.fetch_add(
-        cpruned.saturating_sub(*last_cpruned),
-        Ordering::Relaxed,
-    );
+    shared
+        .total_completion_pruned
+        .fetch_add(cpruned.saturating_sub(*last_cpruned), Ordering::Relaxed);
     *last_expanded = expanded;
     *last_pruned = pruned;
     *last_cpruned = cpruned;
@@ -916,7 +918,9 @@ fn save_parallel_checkpoint(
             break;
         }
         if wait_start.elapsed() > Duration::from_secs(15) {
-            shared.checkpoint_release.store(generation, Ordering::Release);
+            shared
+                .checkpoint_release
+                .store(generation, Ordering::Release);
             shared.checkpoint_saving.store(false, Ordering::Relaxed);
             return Err(FoldError::Other(format!(
                 "timed out waiting for checkpoint barrier acks={acks} active={active}"
@@ -931,7 +935,9 @@ fn save_parallel_checkpoint(
         store.save_progress_output(&state, interner, config, status)?;
         Ok::<ParallelCheckpointManifest, FoldError>(manifest)
     })();
-    shared.checkpoint_release.store(generation, Ordering::Release);
+    shared
+        .checkpoint_release
+        .store(generation, Ordering::Release);
     shared.checkpoint_saving.store(false, Ordering::Relaxed);
     let manifest = result?;
     shared
@@ -975,23 +981,26 @@ fn capture_parallel_checkpoint_state(
 
 fn compute_level_completions(shared: &SharedState) -> Vec<usize> {
     let done = shared.ancestor_done.lock().unwrap();
-    shared
-        .level_completions_base
-        .iter()
-        .enumerate()
-        .map(|(level, &base)| {
-            let new_completions = done.get(level).map_or(0, |done_map| {
-                done_map
-                    .iter()
-                    .filter(|(id, done_count)| {
-                        shared
-                            .ancestor_total
-                            .get(level)
-                            .and_then(|totals| totals.get(*id))
-                            .is_some_and(|&total| **done_count >= total)
-                    })
-                    .count()
-            });
+    compute_level_completions_from(
+        &shared.ancestor_total,
+        &done,
+        &shared.level_completions_base,
+    )
+}
+
+fn compute_level_completions_from(
+    ancestor_total: &[FxHashMap<u64, usize>],
+    ancestor_done: &[FxHashMap<u64, usize>],
+    level_completions_base: &[usize],
+) -> Vec<usize> {
+    let levels = ancestor_total.len().max(level_completions_base.len());
+    (0..levels)
+        .map(|level| {
+            let base = level_completions_base.get(level).copied().unwrap_or(0);
+            let new_completions = ancestor_total
+                .get(level)
+                .map(|totals| completed_ancestor_count(totals, ancestor_done.get(level)) as usize)
+                .unwrap_or(0);
             base + new_completions
         })
         .collect()
@@ -1010,9 +1019,25 @@ fn update_parallel_metrics(
     let pending = shared.queue.lock().unwrap().len();
     let phase = phase_for(shared, config);
 
-    let mut seen_by_depth = completed.seen_by_depth;
-    let mut descended_by_depth = completed.descended_by_depth;
-    let mut pruned_by_depth = completed.pruned_by_depth;
+    let mut seen_by_depth = shared.shallow_seen.clone();
+    let mut descended_by_depth = vec![0; seen_by_depth.len()];
+    let mut pruned_by_depth = vec![0; seen_by_depth.len()];
+    let shard_local_start = config.shard_depth.saturating_sub(1);
+    add_depth_vec_from(
+        &mut seen_by_depth,
+        &completed.seen_by_depth,
+        shard_local_start,
+    );
+    add_depth_vec_from(
+        &mut descended_by_depth,
+        &completed.descended_by_depth,
+        shard_local_start,
+    );
+    add_depth_vec_from(
+        &mut pruned_by_depth,
+        &completed.pruned_by_depth,
+        shard_local_start,
+    );
     let mut max_depth = 0usize;
     let mut current_depth = 0usize;
     let mut current_bound = None;
@@ -1024,9 +1049,17 @@ fn update_parallel_metrics(
         if !worker.active {
             continue;
         }
-        add_depth_vec(&mut seen_by_depth, &worker.seen_by_depth);
-        add_depth_vec(&mut descended_by_depth, &worker.descended_by_depth);
-        add_depth_vec(&mut pruned_by_depth, &worker.pruned_by_depth);
+        add_depth_vec_from(&mut seen_by_depth, &worker.seen_by_depth, shard_local_start);
+        add_depth_vec_from(
+            &mut descended_by_depth,
+            &worker.descended_by_depth,
+            shard_local_start,
+        );
+        add_depth_vec_from(
+            &mut pruned_by_depth,
+            &worker.pruned_by_depth,
+            shard_local_start,
+        );
         max_depth = max_depth.max(worker.max_depth);
         current_depth = current_depth.max(worker.depth);
         if let Some(bound) = worker.current_bound {
@@ -1057,33 +1090,14 @@ fn update_parallel_metrics(
         .score()
         .max(OrthoScore::optimistic_bound(8, 27));
 
-    for (level, ancestor_map) in shared.ancestor_total.iter().enumerate() {
-        let done_guard = shared.ancestor_done.lock().unwrap();
-        let done_count = done_guard
-            .get(level)
-            .map_or(0, |done_map| {
-                done_map
-                    .iter()
-                    .filter(|(id, done_n)| {
-                        ancestor_map
-                            .get(*id)
-                            .is_some_and(|&total| **done_n >= total)
-                    })
-                    .count()
-            }) as u64;
-        drop(done_guard);
-        while seen_by_depth.len() <= level {
-            seen_by_depth.push(0);
-        }
-        while descended_by_depth.len() <= level {
-            descended_by_depth.push(0);
-        }
-        if pruned_by_depth.len() > level {
-            pruned_by_depth[level] = 0;
-        }
-        seen_by_depth[level] = ancestor_map.len() as u64;
-        descended_by_depth[level] = done_count;
-    }
+    apply_ancestor_progress(
+        &mut seen_by_depth,
+        &mut descended_by_depth,
+        &mut pruned_by_depth,
+        &shared.ancestor_total,
+        &shared.ancestor_done.lock().unwrap(),
+        &shared.level_completions_base,
+    );
     metrics.update_global(|g| {
         g.input_path = input_path.to_string();
         g.phase = if shared.checkpoint_saving.load(Ordering::Relaxed) {
@@ -1175,20 +1189,75 @@ fn add_depth_vec(target: &mut Vec<u64>, source: &[u64]) {
     }
 }
 
+fn add_depth_vec_from(target: &mut Vec<u64>, source: &[u64], start_idx: usize) {
+    if target.len() < source.len() {
+        target.resize(source.len(), 0);
+    }
+    for (idx, value) in source.iter().copied().enumerate().skip(start_idx) {
+        target[idx] = target[idx].saturating_add(value);
+    }
+}
+
+fn apply_ancestor_progress(
+    seen_by_depth: &mut Vec<u64>,
+    descended_by_depth: &mut Vec<u64>,
+    pruned_by_depth: &mut Vec<u64>,
+    ancestor_total: &[FxHashMap<u64, usize>],
+    ancestor_done: &[FxHashMap<u64, usize>],
+    level_completions_base: &[usize],
+) {
+    for (ancestor_level, ancestor_map) in ancestor_total.iter().enumerate().skip(1) {
+        let depth_idx = ancestor_level - 1;
+        let seen = ancestor_map.len() as u64;
+        let new_done = completed_ancestor_count(ancestor_map, ancestor_done.get(ancestor_level));
+        let base_done = level_completions_base
+            .get(ancestor_level)
+            .copied()
+            .unwrap_or(0) as u64;
+        let touched = base_done.saturating_add(new_done);
+
+        while seen_by_depth.len() <= depth_idx {
+            seen_by_depth.push(0);
+        }
+        while descended_by_depth.len() <= depth_idx {
+            descended_by_depth.push(0);
+        }
+        while pruned_by_depth.len() <= depth_idx {
+            pruned_by_depth.push(0);
+        }
+        let existing_seen = seen_by_depth[depth_idx];
+        let existing_touched =
+            descended_by_depth[depth_idx].saturating_add(pruned_by_depth[depth_idx]);
+        let merged_seen = existing_seen.max(seen);
+        let merged_touched = existing_touched.max(touched).min(merged_seen);
+        pruned_by_depth[depth_idx] = 0;
+        seen_by_depth[depth_idx] = merged_seen;
+        descended_by_depth[depth_idx] = merged_touched;
+    }
+}
+
+fn completed_ancestor_count(
+    ancestor_map: &FxHashMap<u64, usize>,
+    done_map: Option<&FxHashMap<u64, usize>>,
+) -> u64 {
+    done_map.map_or(0, |done_map| {
+        done_map
+            .iter()
+            .filter(|(id, done_n)| {
+                ancestor_map
+                    .get(*id)
+                    .is_some_and(|&total| **done_n >= total)
+            })
+            .count() as u64
+    })
+}
+
 fn bucket_for(idx: usize, total: usize) -> usize {
     if total == 0 {
         0
     } else {
         (idx * FRONTIER_BUCKETS / total).min(FRONTIER_BUCKETS - 1)
     }
-}
-
-fn parse_env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.parse().ok()
-}
-
-fn parse_env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.parse().ok()
 }
 
 fn now_unix() -> u64 {
@@ -1201,8 +1270,31 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dfs_runner::SearchToggles;
+    use crate::dfs_runner::{BranchOrdering, SearchToggles};
     use std::collections::HashSet;
+
+    #[test]
+    fn parallel_phase_toggles_use_completion_pruning_only_for_proof() {
+        let config = ParallelSearchConfig {
+            enabled: true,
+            workers: 4,
+            hunt_nodes: 1_000,
+            shard_depth: 3,
+            checkpoint_every_secs: 30,
+            resume_enabled: true,
+        };
+
+        let hunt = config.hunt_toggles();
+        assert_eq!(hunt.branch_ordering, BranchOrdering::WorstFirst);
+        assert!(!hunt.completion_pruning);
+        assert!(hunt.compute_bounds);
+        assert!(hunt.node_pruning);
+
+        let proof = config.proof_toggles();
+        assert!(proof.completion_pruning);
+        assert!(proof.compute_bounds);
+        assert!(proof.node_pruning);
+    }
 
     #[test]
     fn frontier_shards_are_disjoint_at_depth() {
@@ -1225,6 +1317,297 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_progress_does_not_display_root_level() {
+        let mut seen_by_depth = vec![2_580];
+        let mut descended_by_depth = vec![0];
+        let mut pruned_by_depth = vec![0];
+        let mut root = FxHashMap::default();
+        root.insert(1, 4);
+        let ancestor_total = vec![root];
+        let ancestor_done = vec![FxHashMap::default()];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[],
+        );
+
+        assert_eq!(seen_by_depth, vec![2_580]);
+        assert_eq!(descended_by_depth, vec![0]);
+    }
+
+    #[test]
+    fn pre_shard_levels_start_open_when_frontier_exists() {
+        let mut seen_by_depth = vec![2, 3];
+        let mut descended_by_depth = vec![0; seen_by_depth.len()];
+        let mut pruned_by_depth = vec![0; seen_by_depth.len()];
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 3)]),
+            ancestor_totals(&[(10, 2), (20, 1)]),
+            ancestor_totals(&[(100, 1), (101, 1), (200, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[],
+        );
+
+        assert_eq!(seen_by_depth, vec![2, 3]);
+        assert_eq!(descended_by_depth, vec![0, 0]);
+    }
+
+    #[test]
+    fn shard_depth_three_progress_ticks_shard_before_parent() {
+        let mut seen_by_depth = vec![2, 3];
+        let mut descended_by_depth = vec![0; seen_by_depth.len()];
+        let mut pruned_by_depth = vec![0; seen_by_depth.len()];
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 3)]),
+            ancestor_totals(&[(10, 2), (20, 1)]),
+            ancestor_totals(&[(100, 1), (101, 1), (200, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(100, 1)]),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[],
+        );
+
+        assert_eq!(seen_by_depth, vec![2, 3]);
+        assert_eq!(descended_by_depth, vec![0, 1]);
+
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            ancestor_totals(&[(10, 2)]),
+            ancestor_totals(&[(100, 1), (101, 1)]),
+        ];
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[],
+        );
+
+        assert_eq!(descended_by_depth, vec![1, 2]);
+    }
+
+    #[test]
+    fn resumed_ancestor_progress_does_not_shrink_existing_totals() {
+        let mut seen_by_depth = vec![2_580, 182];
+        let mut descended_by_depth = vec![0, 100];
+        let mut pruned_by_depth = vec![0, 20];
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 1)]),
+            ancestor_totals(&[(10, 1), (20, 1)]),
+            ancestor_totals(&[(100, 1), (200, 1), (300, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(100, 1)]),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[0, 1, 1],
+        );
+
+        assert_eq!(seen_by_depth, vec![2_580, 182]);
+        assert_eq!(descended_by_depth, vec![2, 120]);
+        assert_eq!(pruned_by_depth, vec![0, 0]);
+    }
+
+    #[test]
+    fn resumed_ancestor_progress_includes_saved_base() {
+        let mut seen_by_depth = Vec::new();
+        let mut descended_by_depth = Vec::new();
+        let mut pruned_by_depth = Vec::new();
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 1)]),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(100, 1), (200, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[0, 0, 1],
+        );
+
+        assert_eq!(seen_by_depth, vec![1, 2]);
+        assert_eq!(descended_by_depth, vec![0, 1]);
+    }
+
+    #[test]
+    fn resumed_ancestor_progress_adds_new_completions() {
+        let mut seen_by_depth = Vec::new();
+        let mut descended_by_depth = Vec::new();
+        let mut pruned_by_depth = Vec::new();
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 1)]),
+            ancestor_totals(&[(10, 2), (20, 1), (30, 1)]),
+            ancestor_totals(&[(100, 1), (101, 1), (200, 1), (300, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            ancestor_totals(&[(10, 2), (20, 1), (30, 0)]),
+            ancestor_totals(&[(100, 1), (101, 1), (200, 1)]),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[0, 1],
+        );
+
+        assert_eq!(seen_by_depth, vec![3, 4]);
+        assert_eq!(descended_by_depth, vec![3, 3]);
+    }
+
+    #[test]
+    fn resumed_ancestor_progress_clamps_to_seen() {
+        let mut seen_by_depth = Vec::new();
+        let mut descended_by_depth = Vec::new();
+        let mut pruned_by_depth = Vec::new();
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 1)]),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(100, 1), (200, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(100, 1), (200, 1)]),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[0, 5, 5],
+        );
+
+        assert_eq!(seen_by_depth, vec![1, 2]);
+        assert_eq!(descended_by_depth, vec![1, 2]);
+    }
+
+    #[test]
+    fn resumed_ancestor_progress_keeps_running_shards_open() {
+        let mut seen_by_depth = vec![2, 3];
+        let mut descended_by_depth = vec![0; seen_by_depth.len()];
+        let mut pruned_by_depth = vec![0; seen_by_depth.len()];
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 1)]),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(102, 1)]),
+        ];
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        ];
+
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[0, 1, 2],
+        );
+
+        assert_eq!(seen_by_depth, vec![2, 3]);
+        assert_eq!(descended_by_depth, vec![1, 2]);
+
+        let ancestor_done = vec![
+            FxHashMap::default(),
+            ancestor_totals(&[(10, 1)]),
+            ancestor_totals(&[(102, 1)]),
+        ];
+        apply_ancestor_progress(
+            &mut seen_by_depth,
+            &mut descended_by_depth,
+            &mut pruned_by_depth,
+            &ancestor_total,
+            &ancestor_done,
+            &[0, 1, 2],
+        );
+
+        assert_eq!(descended_by_depth, vec![2, 3]);
+    }
+
+    #[test]
+    fn checkpoint_level_completions_include_fresh_run_levels() {
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 2)]),
+            ancestor_totals(&[(10, 1), (20, 2)]),
+        ];
+        let ancestor_done = vec![
+            ancestor_totals(&[(1, 2)]),
+            ancestor_totals(&[(10, 1), (20, 1)]),
+        ];
+
+        let completions = compute_level_completions_from(&ancestor_total, &ancestor_done, &[]);
+
+        assert_eq!(completions, vec![1, 1]);
+    }
+
+    #[test]
+    fn checkpoint_level_completions_add_saved_base() {
+        let ancestor_total = vec![
+            ancestor_totals(&[(1, 2)]),
+            ancestor_totals(&[(10, 1), (20, 2)]),
+        ];
+        let ancestor_done = vec![
+            ancestor_totals(&[(1, 2)]),
+            ancestor_totals(&[(10, 1), (20, 2)]),
+        ];
+
+        let completions = compute_level_completions_from(&ancestor_total, &ancestor_done, &[3, 5]);
+
+        assert_eq!(completions, vec![4, 7]);
+    }
+
+    #[test]
     fn one_worker_parallel_matches_single_best_on_small_corpus() {
         let interner = Arc::new(Interner::from_text("a b c. a d e."));
         let mut single = DfsRunner::new();
@@ -1243,8 +1626,7 @@ mod tests {
             resume_enabled: false,
         };
         let tmp = tempfile::tempdir().unwrap();
-        let checkpoint_store =
-            ParallelCheckpointStore::new(tmp.path(), tmp.path()).unwrap();
+        let checkpoint_store = ParallelCheckpointStore::new(tmp.path(), tmp.path()).unwrap();
         let result = run_parallel_search(
             interner,
             metrics,
@@ -1259,5 +1641,9 @@ mod tests {
 
         assert!(result.finished);
         assert_eq!(result.best.score(), single.incumbent().score());
+    }
+
+    fn ancestor_totals(entries: &[(u64, usize)]) -> FxHashMap<u64, usize> {
+        entries.iter().copied().collect()
     }
 }

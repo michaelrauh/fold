@@ -303,6 +303,23 @@ pub fn expand_up(old_dims: &[Dim], position: usize) -> Vec<(Vec<Dim>, usize, Vec
     })
 }
 
+pub fn for_each_expand_up<F>(old_dims: &[Dim], position: usize, mut f: F)
+where
+    F: FnMut(&[Dim], usize, &[usize]),
+{
+    let key = (DimKey::new(old_dims, None), position);
+    EXPAND_UP_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            cache.insert(key.clone(), expand_for_up(old_dims, position));
+        }
+        let expansions = cache.get(&key).expect("expand_up cache entry missing");
+        for (new_dims, new_capacity, reorg) in expansions {
+            f(new_dims.as_slice(), *new_capacity, reorg.as_slice());
+        }
+    });
+}
+
 pub fn expand_over(old_dims: &[Dim]) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
     let key = DimKey::new(old_dims, None);
     EXPAND_OVER_CACHE.with(|cache| {
@@ -315,6 +332,23 @@ pub fn expand_over(old_dims: &[Dim]) -> Vec<(Vec<Dim>, usize, Vec<usize>)> {
             result
         }
     })
+}
+
+pub fn for_each_expand_over<F>(old_dims: &[Dim], mut f: F)
+where
+    F: FnMut(&[Dim], usize, &[usize]),
+{
+    let key = DimKey::new(old_dims, None);
+    EXPAND_OVER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            cache.insert(key.clone(), expand_for_over(old_dims));
+        }
+        let expansions = cache.get(&key).expect("expand_over cache entry missing");
+        for (new_dims, new_capacity, reorg) in expansions {
+            f(new_dims.as_slice(), *new_capacity, reorg.as_slice());
+        }
+    });
 }
 
 pub fn capacity(dims: &[Dim]) -> usize {

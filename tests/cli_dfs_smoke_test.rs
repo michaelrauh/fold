@@ -12,9 +12,6 @@ fn cli_runs_parallel_input_and_writes_outputs() {
         .arg(&input_path)
         .env("FOLD_STATE_DIR", &state_dir)
         .env("FOLD_DISABLE_TUI", "1")
-        .env("FOLD_WORKERS", "1")
-        .env("FOLD_HUNT_NODES", "1")
-        .env("FOLD_SHARD_DEPTH", "2")
         .output()
         .expect("failed to run fold");
 
@@ -36,6 +33,9 @@ fn cli_runs_parallel_input_and_writes_outputs() {
     let summary: serde_json::Value =
         serde_json::from_slice(&fs::read(state_dir.join("output/summary.json")).unwrap()).unwrap();
     assert_eq!(summary["mode"], serde_json::Value::from("parallel"));
-    assert_eq!(summary["workers"], serde_json::Value::from(1));
-    assert_eq!(summary["hunt_nodes"], serde_json::Value::from(1));
+    assert!(summary["workers"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        summary["hunt_nodes"],
+        serde_json::Value::from(5_000_000_000u64)
+    );
 }

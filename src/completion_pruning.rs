@@ -1,17 +1,18 @@
 use crate::{
     interner::Interner,
-    ortho::{payload_to_usize, Ortho, OrthoScore},
+    ortho::{Ortho, OrthoScore, payload_to_usize},
 };
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct ImpactedPrefixIndex {
-    prefix_stats: HashMap<Vec<usize>, usize>,
+    prefix_stats: FxHashMap<Vec<usize>, usize>,
 }
 
 impl ImpactedPrefixIndex {
     pub fn new(prefixes: Vec<Vec<usize>>, interner: &Interner) -> Self {
-        let mut prefix_stats = HashMap::with_capacity(prefixes.len());
+        let mut prefix_stats = FxHashMap::default();
+        prefix_stats.reserve(prefixes.len());
         for prefix in prefixes {
             let max_desc_len = interner.prefix_stats(prefix.as_slice()).unwrap_or_else(|| {
                 panic!(
@@ -77,12 +78,26 @@ impl CompletionContext {
     }
 
     pub fn reset(&mut self, ortho: &Ortho) {
+        self.reset_for_impacted_bounds(ortho);
+    }
+
+    pub fn reset_for_node(&mut self, ortho: &Ortho) {
         ortho.fill_requirements_usize(
             &mut self.forbidden_usize,
             &mut self.required_usize,
             &mut self.prefix_positions,
             &mut self.diagonal_positions,
         );
+        self.reset_common_fields(ortho);
+    }
+
+    pub fn reset_for_completion_bounds(&mut self, ortho: &Ortho) {
+        self.reset_for_node(ortho);
+        self.copy_required_prefixes_for_completion();
+    }
+
+    pub fn reset_for_impacted_bounds(&mut self, ortho: &Ortho) {
+        self.reset_for_completion_bounds(ortho);
         self.filled_prefix.clear();
         self.filled_prefix.extend(
             ortho
@@ -91,14 +106,20 @@ impl CompletionContext {
                 .filter_map(|v| *v)
                 .map(payload_to_usize),
         );
-        self.copy_required_prefixes_for_completion();
-        self.totals.clear();
-        if self.totals.capacity() < self.required_usize.len() {
-            self.totals.reserve(self.required_usize.len());
-        }
         self.impacted_totals.clear();
         if self.impacted_totals.capacity() < self.filled_prefix.len() {
             self.impacted_totals.reserve(self.filled_prefix.len());
+        }
+    }
+
+    pub fn enable_completion_bounds(&mut self) {
+        self.copy_required_prefixes_for_completion();
+    }
+
+    fn reset_common_fields(&mut self, ortho: &Ortho) {
+        self.totals.clear();
+        if self.totals.capacity() < self.required_usize.len() {
+            self.totals.reserve(self.required_usize.len());
         }
         self.dim_count = ortho.dims().len();
         self.base_score = ortho.score();
@@ -754,6 +775,31 @@ mod tests {
             bound_completion_ctx(&mut ctx, c_idx, &interner, best_score),
             "context path should preserve pruning behavior"
         );
+    }
+
+    #[test]
+    fn reset_modes_preserve_required_and_forbidden_data() {
+        let interner = Interner::from_text("a b c\na b d\na e f");
+        let a_idx = vocab_index(&interner, "a");
+        let b_idx = vocab_index(&interner, "b");
+        let ortho = Ortho::new().add(PayloadVal::try_from(a_idx).unwrap())[0]
+            .clone()
+            .add(PayloadVal::try_from(b_idx).unwrap())[0]
+            .clone();
+
+        let mut full = CompletionContext::default();
+        full.reset(&ortho);
+        let mut node = CompletionContext::default();
+        node.reset_for_node(&ortho);
+        let mut completion = CompletionContext::default();
+        completion.reset_for_completion_bounds(&ortho);
+        assert_eq!(node.required_usize(), full.required_usize());
+        assert_eq!(node.forbidden_usize(), full.forbidden_usize());
+        assert_eq!(completion.required_usize(), full.required_usize());
+        assert_eq!(completion.forbidden_usize(), full.forbidden_usize());
+        assert_eq!(node.dim_count(), full.dim_count());
+        assert_eq!(node.base_volume(), full.base_volume());
+        assert_eq!(node.base_fullness(), full.base_fullness());
     }
 
     #[test]

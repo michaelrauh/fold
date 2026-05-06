@@ -408,7 +408,6 @@ dependencies = [
  "itertools 0.12.1",
  "libc",
  "ratatui",
- "rayon",
  "rkyv",
  "rustc-hash",
  "serde",

@@ -72,19 +72,6 @@ The program will:
 - Track optimal ortho across generations
 - Save archive and delete heartbeat on success
 
-Release builds enable parallel child-bound computation by default. To disable it for comparison or debugging:
-
-```bash
-FOLD_PARALLEL_CHILD_BOUNDS=0 cargo run --release -- e.txt
-```
-
-Fold defaults Rayon to `2` worker threads. Override it if you want a different setting:
-
-```bash
-RAYON_NUM_THREADS=1 cargo run --release -- e.txt
-RAYON_NUM_THREADS=4 cargo run --release -- e.txt
-```
-
 ### Crash Recovery
 
 **Heartbeat mechanism**:
@@ -164,4 +151,3 @@ Two different parent frames with different history can both arrive at the same c
 Each `SearchFrame` carries a `min_insert_axis` value. When `expand_up` fires, the completion is skipped if its `insert_axis < frame.min_insert_axis`. Child frames are created with `min_insert_axis = insert_axis`, enforcing a non-decreasing sequence of axis expansion positions along every root-to-leaf path. This guarantees exactly one canonical construction path for each unique expanded ortho.
 
 This pruning only applies to the `expand_up` path. The `[2,2]` axis-swap canonicalization (which ensures axis tokens at positions 1 and 2 are always held in sorted order) handles the analogous symmetry within the base shape.
-

@@ -1,6 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal};
+use fold::ortho::Ortho;
 
 fn bench_ortho_new(c: &mut Criterion) {
     c.bench_function("ortho_new", |b| b.iter(|| Ortho::new()));

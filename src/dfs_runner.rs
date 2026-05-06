@@ -1,6 +1,6 @@
 use crate::{
     completion_pruning::{
-        completion_upper_bound_ctx, existing_ortho_upper_bound_ctx, CompletionContext,
+        CompletionContext, completion_upper_bound_ctx, existing_ortho_upper_bound_ctx,
     },
     error::FoldError,
     interner::Interner,
@@ -8,12 +8,9 @@ use crate::{
 };
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
-use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 fn saturating_pow_usize(base: usize, exp: usize) -> usize {
@@ -24,14 +21,10 @@ fn saturating_pow_usize(base: usize, exp: usize) -> usize {
 }
 
 #[derive(Default)]
-struct StepScratch {
+pub(crate) struct StepScratch {
     frame_ctx: CompletionContext,
     completion_bits: FixedBitSet,
     child_scratch: Vec<Ortho>,
-}
-
-thread_local! {
-    static STEP_SCRATCH: RefCell<StepScratch> = RefCell::new(StepScratch::default());
 }
 
 #[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
@@ -54,31 +47,6 @@ impl Default for DfsConfig {
 }
 
 impl DfsConfig {
-    pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if let Ok(value) = std::env::var("FOLD_CHECKPOINT_EVERY_NODES") {
-            if let Ok(parsed) = value.parse() {
-                cfg.checkpoint_every_nodes = parsed;
-            }
-        }
-        if let Ok(value) = std::env::var("FOLD_CHECKPOINT_EVERY_SECS") {
-            if let Ok(parsed) = value.parse() {
-                cfg.checkpoint_every_secs = parsed;
-            }
-        }
-        if let Ok(value) = std::env::var("FOLD_METRICS_EVERY_NODES") {
-            if let Ok(parsed) = value.parse() {
-                cfg.metrics_every_nodes = parsed;
-            }
-        }
-        if let Ok(value) = std::env::var("FOLD_MAX_FRAME_BRANCH_CACHE") {
-            if let Ok(parsed) = value.parse() {
-                cfg.max_frame_branch_cache = Some(parsed);
-            }
-        }
-        cfg
-    }
-
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
@@ -140,74 +108,6 @@ impl SearchFrame {
             min_insert_axis,
         }
     }
-}
-
-fn verify_bound_reuse_enabled() -> bool {
-    static VERIFY_BOUND_REUSE: OnceLock<bool> = OnceLock::new();
-    *VERIFY_BOUND_REUSE.get_or_init(|| {
-        std::env::var("FOLD_VERIFY_BOUND_REUSE")
-            .ok()
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-    })
-}
-
-pub fn bound_reuse_enabled() -> bool {
-    true
-}
-
-pub fn bound_reuse_shadow_verify_enabled() -> bool {
-    verify_bound_reuse_enabled()
-}
-
-fn parse_bool_flag(value: &str) -> Option<bool> {
-    if value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
-        Some(true)
-    } else if value == "0"
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("no")
-    {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn release_build_defaults_enabled() -> bool {
-    !cfg!(debug_assertions)
-}
-
-fn resolve_parallel_child_bounds_enabled(env_value: Option<&str>, release_build: bool) -> bool {
-    env_value.and_then(parse_bool_flag).unwrap_or(release_build)
-}
-
-pub fn parallel_child_bounds_enabled() -> bool {
-    static PARALLEL_CHILD_BOUNDS: OnceLock<bool> = OnceLock::new();
-    *PARALLEL_CHILD_BOUNDS.get_or_init(|| {
-        resolve_parallel_child_bounds_enabled(
-            std::env::var("FOLD_PARALLEL_CHILD_BOUNDS").ok().as_deref(),
-            release_build_defaults_enabled(),
-        )
-    })
-}
-
-pub fn parallel_child_bounds_min_branches() -> usize {
-    static MIN_BRANCHES: OnceLock<usize> = OnceLock::new();
-    *MIN_BRANCHES.get_or_init(|| {
-        std::env::var("FOLD_PARALLEL_CHILD_BOUNDS_MIN_BRANCHES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(32)
-    })
-}
-
-pub fn child_bound_parallelism_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get() > 1)
-            .unwrap_or(false)
-    })
 }
 
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
@@ -275,6 +175,8 @@ pub struct SearchProfile {
     pub k_bound_ns: u128,
     pub depth_counter_ns: u128,
     pub completion_iter_ns: u128,
+    pub completion_bound_attempts: u64,
+    pub completion_bound_pruned: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -317,6 +219,15 @@ pub struct RunnerSnapshot {
     pub started_unix: u64,
     pub last_improvement_unix: u64,
     pub last_improvement_depth: usize,
+}
+
+fn record_completion_bound_result(pruned: bool, profile: Option<&mut SearchProfile>) {
+    if let Some(profile) = profile {
+        profile.completion_bound_attempts = profile.completion_bound_attempts.saturating_add(1);
+        if pruned {
+            profile.completion_bound_pruned = profile.completion_bound_pruned.saturating_add(1);
+        }
+    }
 }
 
 impl DfsRunner {
@@ -386,10 +297,7 @@ impl DfsRunner {
             if runner.is_finished() {
                 break;
             }
-            let ancestors: Vec<u64> = runner.stack[..runner.stack.len().saturating_sub(1)]
-                .iter()
-                .map(|f| f.ortho.id())
-                .collect();
+            let ancestors: Vec<u64> = runner.stack.iter().map(|f| f.ortho.id()).collect();
             let mut shard_stack = runner.stack.clone();
             let leaf = shard_stack.len().saturating_sub(1);
             for frame in &mut shard_stack[..leaf] {
@@ -555,7 +463,17 @@ impl DfsRunner {
         interner: &Interner,
         toggles: &SearchToggles,
     ) -> Result<StepEvent, FoldError> {
-        self.step_with_toggles_profiled(interner, toggles, None)
+        let mut scratch = StepScratch::default();
+        self.step_with_toggles_profiled(interner, toggles, &mut scratch, None)
+    }
+
+    pub(crate) fn step_with_toggles_and_scratch(
+        &mut self,
+        interner: &Interner,
+        toggles: &SearchToggles,
+        scratch: &mut StepScratch,
+    ) -> Result<StepEvent, FoldError> {
+        self.step_with_toggles_profiled(interner, toggles, scratch, None)
     }
 
     pub fn step_with_toggles_and_profile(
@@ -564,13 +482,15 @@ impl DfsRunner {
         toggles: &SearchToggles,
         profile: &mut SearchProfile,
     ) -> Result<StepEvent, FoldError> {
-        self.step_with_toggles_profiled(interner, toggles, Some(profile))
+        let mut scratch = StepScratch::default();
+        self.step_with_toggles_profiled(interner, toggles, &mut scratch, Some(profile))
     }
 
     fn step_with_toggles_profiled(
         &mut self,
         interner: &Interner,
         toggles: &SearchToggles,
+        scratch: &mut StepScratch,
         mut profile: Option<&mut SearchProfile>,
     ) -> Result<StepEvent, FoldError> {
         let profiling = profile.is_some();
@@ -598,272 +518,249 @@ impl DfsRunner {
         }
 
         let mut incumbent_improved = false;
-        let result: Result<StepEvent, FoldError> = STEP_SCRATCH.with(|scratch_cell| {
-            let mut scratch = scratch_cell.borrow_mut();
-            if scratch.completion_bits.len() < interner.vocab_size() {
-                scratch.completion_bits.grow(interner.vocab_size());
-            }
-            let StepScratch {
-                frame_ctx,
-                completion_bits,
-                child_scratch,
-            } = &mut *scratch;
+        if scratch.completion_bits.len() < interner.vocab_size() {
+            scratch.completion_bits.grow(interner.vocab_size());
+        }
+        let StepScratch {
+            frame_ctx,
+            completion_bits,
+            child_scratch,
+        } = scratch;
 
-            loop {
-                let mut incumbent_score = self.incumbent_score();
-                let mut actual_incumbent_score = self.incumbent.score();
-                let current_depth = self.stack.len();
-                let Some(frame) = self.stack.last_mut() else {
-                    self.finished = true;
-                    return Ok(StepEvent {
-                        finished: true,
-                        incumbent_improved,
-                    });
+        let result: Result<StepEvent, FoldError> = 'step: loop {
+            let mut incumbent_score = self.incumbent_score();
+            let mut actual_incumbent_score = self.incumbent.score();
+            let current_depth = self.stack.len();
+            let Some(frame) = self.stack.last_mut() else {
+                self.finished = true;
+                break Ok(StepEvent {
+                    finished: true,
+                    incumbent_improved,
+                });
+            };
+
+            if !frame.prepared {
+                let prune_completions = toggles.compute_bounds && toggles.completion_pruning;
+                let ctx_reset_start = profile_start!();
+                if prune_completions {
+                    frame_ctx.reset_for_completion_bounds(&frame.ortho);
+                } else {
+                    frame_ctx.reset_for_node(&frame.ortho);
+                }
+                profile_end!(ctx_reset_start, ctx_reset_ns);
+                if toggles.compute_bounds {
+                    if !frame.bound_precomputed {
+                        let existing_bound_start = profile_start!();
+                        frame.optimistic_bound =
+                            existing_ortho_upper_bound_ctx(frame_ctx, interner);
+                        profile_end!(existing_bound_start, existing_bound_ns);
+                    }
+                } else {
+                    frame.optimistic_bound = frame.ortho.score();
+                }
+                frame.bound_precomputed = false;
+                let node_prune_start = profile_start!();
+                let prune_root = toggles.node_pruning && frame.optimistic_bound <= incumbent_score;
+                profile_end!(node_prune_start, node_prune_ns);
+                if prune_root {
+                    self.nodes_pruned = self.nodes_pruned.saturating_add(1);
+                    self.stack.pop();
+                    continue;
+                }
+
+                let ctx_reset_start = profile_start!();
+                completion_bits.clear();
+                profile_end!(ctx_reset_start, ctx_reset_ns);
+                let intersect_start = profile_start!();
+                let k = interner.intersect_into_count(
+                    frame_ctx.required_usize(),
+                    frame_ctx.forbidden_usize(),
+                    completion_bits,
+                );
+                profile_end!(intersect_start, intersect_ns);
+
+                // Tighten bound using intersection count: if only k completions exist,
+                // then each axis can hold at most k values, so vol <= (k-1)^dim_count.
+                let intersection_prune = if toggles.compute_bounds && toggles.node_pruning {
+                    let k_bound_start = profile_start!();
+                    let dim_count = frame_ctx.dim_count();
+                    let k_vol = saturating_pow_usize(k.saturating_sub(1), dim_count)
+                        .max(frame_ctx.base_volume());
+                    let k_full = saturating_pow_usize(k, dim_count).max(frame_ctx.base_fullness());
+                    let k_bound = OrthoScore::optimistic_bound(k_vol, k_full);
+                    if k_bound < frame.optimistic_bound {
+                        frame.optimistic_bound = k_bound;
+                    }
+                    let prune_result = frame.optimistic_bound <= incumbent_score;
+                    profile_end!(k_bound_start, k_bound_ns);
+                    prune_result
+                } else {
+                    false
                 };
 
-                if !frame.prepared {
-                    let ctx_reset_start = profile_start!();
-                    frame_ctx.reset(&frame.ortho);
-                    profile_end!(ctx_reset_start, ctx_reset_ns);
-                    if toggles.compute_bounds {
-                        if !frame.bound_precomputed {
-                            let existing_bound_start = profile_start!();
-                            frame.optimistic_bound =
-                                existing_ortho_upper_bound_ctx(frame_ctx, interner);
-                            profile_end!(existing_bound_start, existing_bound_ns);
-                        } else if verify_bound_reuse_enabled() {
-                            let existing_bound_start = profile_start!();
-                            let recomputed = existing_ortho_upper_bound_ctx(frame_ctx, interner);
-                            profile_end!(existing_bound_start, existing_bound_ns);
-                            if frame.optimistic_bound < recomputed {
-                                frame.optimistic_bound = recomputed;
-                            }
-                        }
-                    } else {
-                        frame.optimistic_bound = frame.ortho.score();
-                    }
-                    frame.bound_precomputed = false;
-                    let node_prune_start = profile_start!();
-                    let prune_root =
-                        toggles.node_pruning && frame.optimistic_bound <= incumbent_score;
-                    profile_end!(node_prune_start, node_prune_ns);
-                    if prune_root {
-                        self.nodes_pruned = self.nodes_pruned.saturating_add(1);
-                        self.stack.pop();
-                        continue;
-                    }
+                frame.branches.clear();
 
-                    let ctx_reset_start = profile_start!();
-                    completion_bits.clear();
-                    profile_end!(ctx_reset_start, ctx_reset_ns);
-                    let intersect_start = profile_start!();
-                    let k = interner.intersect_into_count(
-                        frame_ctx.required_usize(),
-                        frame_ctx.forbidden_usize(),
-                        completion_bits,
-                    );
-                    profile_end!(intersect_start, intersect_ns);
+                if intersection_prune {
+                    self.nodes_pruned = self.nodes_pruned.saturating_add(1);
+                    self.stack.pop();
+                    continue;
+                }
 
-                    // Tighten bound using intersection count: if only k completions exist,
-                    // then each axis can hold at most k values, so vol <= (k-1)^dim_count.
-                    let intersection_prune = if toggles.compute_bounds && toggles.node_pruning {
-                        let k_bound_start = profile_start!();
-                        let dim_count = frame_ctx.dim_count();
-                        let k_vol = saturating_pow_usize(k.saturating_sub(1), dim_count)
-                            .max(frame_ctx.base_volume());
-                        let k_full =
-                            saturating_pow_usize(k, dim_count).max(frame_ctx.base_fullness());
-                        let k_bound = OrthoScore::optimistic_bound(k_vol, k_full);
-                        if k_bound < frame.optimistic_bound {
-                            frame.optimistic_bound = k_bound;
-                        }
-                        let prune_result = frame.optimistic_bound <= incumbent_score;
-                        profile_end!(k_bound_start, k_bound_ns);
-                        prune_result
-                    } else {
-                        false
-                    };
-
-                    frame.branches.clear();
-
-                    if intersection_prune {
-                        self.nodes_pruned = self.nodes_pruned.saturating_add(1);
-                        self.stack.pop();
-                        continue;
-                    }
-
-                    for completion in completion_bits.ones() {
-                        let completion_bound = if toggles.compute_bounds {
-                            let completion_bound_start = profile_start!();
-                            let Some(bound) =
-                                completion_upper_bound_ctx(frame_ctx, completion, interner)
-                            else {
-                                profile_end!(completion_bound_start, completion_bound_ns);
-                                self.completions_pruned = self.completions_pruned.saturating_add(1);
-                                continue;
-                            };
+                for completion in completion_bits.ones() {
+                    if prune_completions {
+                        let completion_bound_start = profile_start!();
+                        let Some(completion_bound) =
+                            completion_upper_bound_ctx(frame_ctx, completion, interner)
+                        else {
                             profile_end!(completion_bound_start, completion_bound_ns);
-                            bound
-                        } else {
-                            OrthoScore::optimistic_bound(1, 1)
+                            record_completion_bound_result(true, profile.as_deref_mut());
+                            self.completions_pruned = self.completions_pruned.saturating_add(1);
+                            continue;
                         };
-
+                        profile_end!(completion_bound_start, completion_bound_ns);
                         let completion_prune_start = profile_start!();
-                        let prune_completion = toggles.completion_pruning
-                            && toggles.compute_bounds
-                            && completion_bound <= incumbent_score;
+                        let prune_completion = completion_bound <= incumbent_score;
                         profile_end!(completion_prune_start, completion_prune_ns);
+                        record_completion_bound_result(prune_completion, profile.as_deref_mut());
                         if prune_completion {
                             self.completions_pruned = self.completions_pruned.saturating_add(1);
                             continue;
                         }
+                    }
 
-                        let completion_val =
-                            PayloadVal::try_from(completion).expect("completion overflowed u32");
+                    let completion_val =
+                        PayloadVal::try_from(completion).expect("completion overflowed u32");
 
-                        let completion_iter_start = profile_start!();
-                        let maybe_axis = frame.ortho.expanding_insert_axis(completion_val);
-                        if let Some(axis) = maybe_axis {
-                            if axis < frame.min_insert_axis {
-                                profile_end!(completion_iter_start, completion_iter_ns);
-                                continue;
-                            }
+                    let completion_iter_start = profile_start!();
+                    let maybe_axis = frame.ortho.expanding_insert_axis(completion_val);
+                    if let Some(axis) = maybe_axis {
+                        if axis < frame.min_insert_axis {
+                            profile_end!(completion_iter_start, completion_iter_ns);
+                            continue;
                         }
-                        let child_min_insert_axis = maybe_axis.unwrap_or(frame.min_insert_axis);
-                        profile_end!(completion_iter_start, completion_iter_ns);
+                    }
+                    let child_min_insert_axis = maybe_axis.unwrap_or(frame.min_insert_axis);
+                    profile_end!(completion_iter_start, completion_iter_ns);
 
-                        let child_generation_start = profile_start!();
-                        child_scratch.clear();
-                        frame.ortho.add_into(completion_val, child_scratch);
-                        for child in child_scratch.drain(..) {
-                            self.nodes_expanded = self.nodes_expanded.saturating_add(1);
+                    let child_generation_start = profile_start!();
+                    child_scratch.clear();
+                    frame.ortho.add_into(completion_val, child_scratch);
+                    for child in child_scratch.drain(..) {
+                        self.nodes_expanded = self.nodes_expanded.saturating_add(1);
 
-                            let child_score = child.score();
-                            if child_score > actual_incumbent_score {
-                                self.incumbent = child.clone();
-                                actual_incumbent_score = child_score;
-                                incumbent_score = child_score.max(self.score_floor);
-                                incumbent_improved = true;
-                                self.last_improvement_unix = now_unix();
-                                self.last_improvement_depth = current_depth.saturating_add(1);
-                            }
+                        let child_score = child.score();
+                        if child_score > actual_incumbent_score {
+                            self.incumbent = child.clone();
+                            actual_incumbent_score = child_score;
+                            incumbent_score = child_score.max(self.score_floor);
+                            incumbent_improved = true;
+                            self.last_improvement_unix = now_unix();
+                            self.last_improvement_depth = current_depth.saturating_add(1);
+                        }
 
-                            frame.branches.push(SearchBranch {
-                                completion: completion_val,
-                                child,
-                                optimistic_bound: child_score,
-                                min_insert_axis: child_min_insert_axis,
+                        frame.branches.push(SearchBranch {
+                            completion: completion_val,
+                            child,
+                            optimistic_bound: child_score,
+                            min_insert_axis: child_min_insert_axis,
+                        });
+                    }
+                    profile_end!(child_generation_start, child_generation_ns);
+                }
+
+                if toggles.compute_bounds && !frame.branches.is_empty() {
+                    let existing_bound_start = profile_start!();
+                    for branch in &mut frame.branches {
+                        frame_ctx.reset_for_node(&branch.child);
+                        branch.optimistic_bound =
+                            existing_ortho_upper_bound_ctx(frame_ctx, interner);
+                    }
+
+                    profile_end!(existing_bound_start, existing_bound_ns);
+                }
+
+                match toggles.branch_ordering {
+                    BranchOrdering::BestFirst => {
+                        if toggles.compute_bounds {
+                            let reorder_start = profile_start!();
+                            frame.branches.sort_by(|a, b| {
+                                b.optimistic_bound
+                                    .cmp(&a.optimistic_bound)
+                                    .then_with(|| b.child.score().cmp(&a.child.score()))
+                                    .then_with(|| a.completion.cmp(&b.completion))
+                                    .then_with(|| a.child.id().cmp(&b.child.id()))
                             });
+                            profile_end!(reorder_start, reorder_ns);
                         }
-                        profile_end!(child_generation_start, child_generation_ns);
                     }
-
-                    if toggles.compute_bounds && !frame.branches.is_empty() {
-                        let existing_bound_start = profile_start!();
-                        let should_parallelize = parallel_child_bounds_enabled()
-                            && frame.branches.len() >= parallel_child_bounds_min_branches()
-                            && child_bound_parallelism_available();
-
-                        if should_parallelize {
-                            frame.branches.par_iter_mut().for_each(|branch| {
-                                let mut local_ctx = CompletionContext::from_ortho(&branch.child);
-                                branch.optimistic_bound =
-                                    existing_ortho_upper_bound_ctx(&mut local_ctx, interner);
+                    BranchOrdering::Insertion => {}
+                    BranchOrdering::WorstFirst => {
+                        if toggles.compute_bounds {
+                            let reorder_start = profile_start!();
+                            frame.branches.sort_by(|a, b| {
+                                a.optimistic_bound
+                                    .cmp(&b.optimistic_bound)
+                                    .then_with(|| a.child.score().cmp(&b.child.score()))
+                                    .then_with(|| a.completion.cmp(&b.completion))
+                                    .then_with(|| a.child.id().cmp(&b.child.id()))
                             });
-                        } else {
-                            for branch in &mut frame.branches {
-                                frame_ctx.reset(&branch.child);
-                                branch.optimistic_bound =
-                                    existing_ortho_upper_bound_ctx(frame_ctx, interner);
-                            }
+                            profile_end!(reorder_start, reorder_ns);
                         }
-
-                        profile_end!(existing_bound_start, existing_bound_ns);
-                    }
-
-                    match toggles.branch_ordering {
-                        BranchOrdering::BestFirst => {
-                            if toggles.compute_bounds {
-                                let reorder_start = profile_start!();
-                                frame.branches.sort_by(|a, b| {
-                                    b.optimistic_bound
-                                        .cmp(&a.optimistic_bound)
-                                        .then_with(|| b.child.score().cmp(&a.child.score()))
-                                        .then_with(|| a.completion.cmp(&b.completion))
-                                        .then_with(|| a.child.id().cmp(&b.child.id()))
-                                });
-                                profile_end!(reorder_start, reorder_ns);
-                            }
-                        }
-                        BranchOrdering::Insertion => {}
-                        BranchOrdering::WorstFirst => {
-                            if toggles.compute_bounds {
-                                let reorder_start = profile_start!();
-                                frame.branches.sort_by(|a, b| {
-                                    a.optimistic_bound
-                                        .cmp(&b.optimistic_bound)
-                                        .then_with(|| a.child.score().cmp(&b.child.score()))
-                                        .then_with(|| a.completion.cmp(&b.completion))
-                                        .then_with(|| a.child.id().cmp(&b.child.id()))
-                                });
-                                profile_end!(reorder_start, reorder_ns);
-                            }
-                        }
-                    }
-
-                    frame.branches.reverse();
-                    frame.initial_branches_len = frame.branches.len();
-                    frame.prepared = true;
-                    Self::add_depth_counter(
-                        &mut self.seen_by_depth,
-                        current_depth,
-                        frame.branches.len() as u64,
-                    );
-                    if frame.branches.is_empty() {
-                        self.stack.pop();
-                        continue;
                     }
                 }
 
-                while let Some(branch) = frame.branches.pop() {
-                    // Per-dims generational dedup: skip orthos already expanded this generation.
-                    let node_prune_start = profile_start!();
-                    let prune_branch =
-                        toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
-                    profile_end!(node_prune_start, node_prune_ns);
-                    if prune_branch {
-                        self.nodes_pruned = self.nodes_pruned.saturating_add(1);
-                        Self::bump_depth_counter(&mut self.pruned_by_depth, current_depth);
-                        continue;
-                    }
-
-                    Self::bump_depth_counter(&mut self.descended_by_depth, current_depth);
-                    let depth_counter_start = profile_start!();
-                    for v in self.seen_by_depth.iter_mut().skip(current_depth) {
-                        *v = 0;
-                    }
-                    for v in self.descended_by_depth.iter_mut().skip(current_depth) {
-                        *v = 0;
-                    }
-                    for v in self.pruned_by_depth.iter_mut().skip(current_depth) {
-                        *v = 0;
-                    }
-                    self.stack.push(SearchFrame::new_with_bound_and_min_axis(
-                        branch.child,
-                        branch.optimistic_bound,
-                        branch.min_insert_axis,
-                    ));
-                    profile_end!(depth_counter_start, depth_counter_ns);
-                    self.max_depth = self.max_depth.max(self.stack.len());
-                    return Ok(StepEvent {
-                        finished: false,
-                        incumbent_improved,
-                    });
+                frame.branches.reverse();
+                frame.initial_branches_len = frame.branches.len();
+                frame.prepared = true;
+                Self::add_depth_counter(
+                    &mut self.seen_by_depth,
+                    current_depth,
+                    frame.branches.len() as u64,
+                );
+                if frame.branches.is_empty() {
+                    self.stack.pop();
+                    continue;
                 }
-
-                self.stack.pop();
             }
-        });
+
+            while let Some(branch) = frame.branches.pop() {
+                // Per-dims generational dedup: skip orthos already expanded this generation.
+                let node_prune_start = profile_start!();
+                let prune_branch =
+                    toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
+                profile_end!(node_prune_start, node_prune_ns);
+                if prune_branch {
+                    self.nodes_pruned = self.nodes_pruned.saturating_add(1);
+                    Self::bump_depth_counter(&mut self.pruned_by_depth, current_depth);
+                    continue;
+                }
+
+                Self::bump_depth_counter(&mut self.descended_by_depth, current_depth);
+                let depth_counter_start = profile_start!();
+                for v in self.seen_by_depth.iter_mut().skip(current_depth) {
+                    *v = 0;
+                }
+                for v in self.descended_by_depth.iter_mut().skip(current_depth) {
+                    *v = 0;
+                }
+                for v in self.pruned_by_depth.iter_mut().skip(current_depth) {
+                    *v = 0;
+                }
+                self.stack.push(SearchFrame::new_with_bound_and_min_axis(
+                    branch.child,
+                    branch.optimistic_bound,
+                    branch.min_insert_axis,
+                ));
+                profile_end!(depth_counter_start, depth_counter_ns);
+                self.max_depth = self.max_depth.max(self.stack.len());
+                break 'step Ok(StepEvent {
+                    finished: false,
+                    incumbent_improved,
+                });
+            }
+
+            self.stack.pop();
+        };
         let event = result?;
         profile_end!(step_start, total_step_ns);
         Ok(event)
@@ -897,31 +794,109 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_parallel_child_bounds_enabled;
+    use super::*;
+    use crate::ortho::payload_to_usize;
 
-    #[test]
-    fn parallel_child_bounds_defaults_on_in_release_when_unset() {
-        assert!(resolve_parallel_child_bounds_enabled(None, true));
+    fn vocab_index(interner: &Interner, word: &str) -> usize {
+        interner
+            .vocabulary()
+            .iter()
+            .position(|candidate| candidate == word)
+            .expect("word not found in vocab")
+    }
+
+    fn runner_after_word(interner: &Interner, word: &str, score_floor: OrthoScore) -> DfsRunner {
+        let word_idx = vocab_index(interner, word);
+        let ortho = Ortho::new().add(PayloadVal::try_from(word_idx).unwrap())[0].clone();
+        let mut runner = DfsRunner::from_stack(vec![SearchFrame::new(ortho)], Ortho::new());
+        runner.score_floor = score_floor;
+        runner
     }
 
     #[test]
-    fn parallel_child_bounds_defaults_off_in_debug_when_unset() {
-        assert!(!resolve_parallel_child_bounds_enabled(None, false));
+    fn completion_pruning_toggle_controls_completion_pruned_count() {
+        let interner = Interner::from_text("x y. x z z z z");
+        let score_floor = OrthoScore::optimistic_bound(2, 4);
+
+        let mut with_pruning = runner_after_word(&interner, "x", score_floor);
+        let pruning_toggles = SearchToggles {
+            node_pruning: false,
+            completion_pruning: true,
+            branch_ordering: BranchOrdering::Insertion,
+            compute_bounds: true,
+        };
+        with_pruning
+            .step_with_toggles(&interner, &pruning_toggles)
+            .unwrap();
+        assert!(
+            with_pruning.completions_pruned() > 0,
+            "score-based completion pruning should skip the shallow x y branch"
+        );
+
+        let mut without_pruning = runner_after_word(&interner, "x", score_floor);
+        let no_pruning_toggles = SearchToggles {
+            completion_pruning: false,
+            ..pruning_toggles
+        };
+        without_pruning
+            .step_with_toggles(&interner, &no_pruning_toggles)
+            .unwrap();
+        assert_eq!(
+            without_pruning.completions_pruned(),
+            0,
+            "disabled completion pruning should not count skipped completions"
+        );
     }
 
     #[test]
-    fn parallel_child_bounds_true_values_override_default() {
-        for value in ["1", "true", "TRUE", "yes", "YES"] {
-            assert!(resolve_parallel_child_bounds_enabled(Some(value), false));
-            assert!(resolve_parallel_child_bounds_enabled(Some(value), true));
-        }
+    fn disabled_completion_pruning_skips_completion_bound_work() {
+        let interner = Interner::from_text("x y. x z z z z");
+        let score_floor = OrthoScore::optimistic_bound(2, 4);
+        let mut runner = runner_after_word(&interner, "x", score_floor);
+        let toggles = SearchToggles {
+            node_pruning: false,
+            completion_pruning: false,
+            branch_ordering: BranchOrdering::Insertion,
+            compute_bounds: true,
+        };
+        let mut profile = SearchProfile::default();
+
+        runner
+            .step_with_toggles_and_profile(&interner, &toggles, &mut profile)
+            .unwrap();
+
+        assert_eq!(runner.completions_pruned(), 0);
+        assert_eq!(
+            profile.completion_bound_ns, 0,
+            "completion bounds should not be computed when completion pruning is disabled"
+        );
     }
 
     #[test]
-    fn parallel_child_bounds_false_values_override_default() {
-        for value in ["0", "false", "FALSE", "no", "NO"] {
-            assert!(!resolve_parallel_child_bounds_enabled(Some(value), false));
-            assert!(!resolve_parallel_child_bounds_enabled(Some(value), true));
-        }
+    fn root_single_span_pruning_is_tied_to_completion_pruning() {
+        let interner = Interner::from_text("a b");
+        let mut runner = DfsRunner::new();
+        runner.score_floor = OrthoScore::zero();
+        let toggles = SearchToggles {
+            node_pruning: false,
+            completion_pruning: true,
+            branch_ordering: BranchOrdering::Insertion,
+            compute_bounds: true,
+        };
+
+        runner.step_with_toggles(&interner, &toggles).unwrap();
+
+        assert!(
+            runner.completions_pruned() > 0,
+            "single-span root candidates should still prune when completion pruning is enabled"
+        );
+        assert!(
+            runner
+                .incumbent()
+                .payload()
+                .iter()
+                .flatten()
+                .all(|value| payload_to_usize(*value) < interner.vocab_size())
+        );
     }
 }
