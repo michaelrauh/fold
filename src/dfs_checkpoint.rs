@@ -10,7 +10,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CHECKPOINT_VERSION: u32 = 4;
+const CHECKPOINT_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointManifest {
@@ -163,7 +163,7 @@ impl CheckpointManager {
             incumbent_variance_num: incumbent.score().variance_num,
             incumbent_variance_den: incumbent.score().variance_den,
             incumbent_fullness: incumbent.score().fullness,
-            incumbent_dims: incumbent.dims().clone(),
+            incumbent_dims: incumbent.dims().to_vec(),
         };
         write_atomic(&self.state_path, &runner.to_bytes()?)?;
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)

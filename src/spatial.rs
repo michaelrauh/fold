@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::{cell::RefCell, cmp::Ordering};
 
 type Dim = u8;
-const DIM_KEY_CAP: usize = 64;
+const DIM_KEY_CAP: usize = 8;
 
 fn dim_to_usize(value: Dim) -> usize {
     usize::from(value)
@@ -38,11 +38,11 @@ impl DimKey {
 }
 
 // Consolidated metadata per (dims, up_axis) pair - fully cached
-struct DimMeta {
+pub(crate) struct DimMeta {
     indices_in_order: Vec<Vec<usize>>,
     axis_positions: Vec<usize>,
-    impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
-    diagonals: Vec<Vec<usize>>, // Enriched diagonals (base + parent-filled forward positions)
+    pub(crate) impacted_phrase_locations: Vec<Vec<Vec<usize>>>,
+    pub(crate) diagonals: Vec<Vec<usize>>, // Enriched diagonals (base + parent-filled forward positions)
     location_to_index: FxHashMap<Vec<usize>, usize>,
 }
 
@@ -251,6 +251,19 @@ pub fn get_requirements(
     )
 }
 
+/// Returns a cached metadata handle for the given dims/up_axis — avoids re-hashing on repeated calls.
+pub(crate) fn get_meta_handle(dims: &[Dim], up_axis: Option<Dim>) -> Rc<DimMeta> {
+    get_meta_with_axis(dims, up_axis)
+}
+
+/// Fill requirements directly from a pre-acquired metadata handle without cache lookup.
+pub(crate) fn with_meta_requirements<F, R>(meta: &Rc<DimMeta>, loc: usize, f: F) -> R
+where
+    F: FnOnce(&[Vec<usize>], &[usize]) -> R,
+{
+    f(&meta.impacted_phrase_locations[loc], &meta.diagonals[loc])
+}
+
 pub fn fill_requirements(
     loc: usize,
     dims: &[Dim],
@@ -270,6 +283,15 @@ pub fn fill_requirements(
     }
     diagonals_out.clear();
     diagonals_out.extend_from_slice(&meta.diagonals[loc]);
+}
+
+/// Calls `f` with references directly into the cached requirement data — no copies.
+pub fn with_requirements<F, R>(loc: usize, dims: &[Dim], up_axis: Option<Dim>, f: F) -> R
+where
+    F: FnOnce(&[Vec<usize>], &[usize]) -> R,
+{
+    let meta = get_meta_with_axis(dims, up_axis);
+    f(&meta.impacted_phrase_locations[loc], &meta.diagonals[loc])
 }
 
 pub fn get_axis_positions(dims: &[Dim]) -> Vec<usize> {

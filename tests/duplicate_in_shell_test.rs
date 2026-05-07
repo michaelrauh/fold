@@ -40,7 +40,7 @@ fn test_duplicate_token_in_same_shell_forbidden() {
         .collect();
 
     println!("Forbidden list for position 2: {:?}", forbidden);
-    println!("Payload at this point: {:?}", ortho.payload());
+    println!("Payload at this point: {:?}", ortho.payload_raw());
 
     // Position 1 has 'b' (index b_idx)
     // It should be in the forbidden list since it's on the same diagonal

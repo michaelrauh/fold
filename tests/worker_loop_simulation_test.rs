@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
+use fold::ortho::{Ortho, PayloadVal, EMPTY_CELL, payload_to_usize};
 
 /// Test that simulates the worker loop logic to see if it can create
 /// an ortho with duplicate tokens on the same diagonal
@@ -40,7 +40,7 @@ fn test_worker_loop_prevents_duplicates() {
             "\nStep {}: ortho dims={:?}, payload={:?}",
             steps,
             ortho.dims(),
-            ortho.payload()
+            ortho.payload_raw()
         );
         println!("  Required: {:?}", required);
         println!("  Forbidden: {:?}", forbidden);
@@ -65,11 +65,11 @@ fn test_worker_loop_prevents_duplicates() {
             println!("  -> 'and' is NOT a valid completion!");
 
             // Verify that if payload already contains 'and' on the diagonal, it should be forbidden
-            let payload = ortho.payload();
+            let payload = ortho.payload_raw();
             let and_positions: Vec<usize> = payload
                 .iter()
                 .enumerate()
-                .filter_map(|(i, opt)| if *opt == Some(and_val) { Some(i) } else { None })
+                .filter_map(|(i, &v)| if v == and_val { Some(i) } else { None })
                 .collect();
 
             if !and_positions.is_empty() {
@@ -83,15 +83,15 @@ fn test_worker_loop_prevents_duplicates() {
 
     // Final check: count how many times "and" appears in the final ortho
     let final_and_count = ortho
-        .payload()
+        .payload_raw()
         .iter()
-        .filter(|opt| **opt == Some(and_val))
+        .filter(|&&v| v == and_val)
         .count();
     println!(
         "\nFinal ortho has 'and' appearing {} times",
         final_and_count
     );
-    println!("Final ortho: {:?}", ortho.payload());
+    println!("Final ortho: {:?}", ortho.payload_raw());
 
     // The test passes if we can't add "and" multiple times to the same diagonal
     // Let's manually verify the logic is sound
@@ -122,7 +122,7 @@ fn test_3x3_duplicate_and() {
     println!(
         "After adding 'The': dims={:?}, payload={:?}",
         ortho.dims(),
-        ortho.payload()
+        ortho.payload_raw()
     );
 
     // Position 1: [0,1] - distance 1
@@ -130,7 +130,7 @@ fn test_3x3_duplicate_and() {
     println!(
         "After adding 'south': dims={:?}, payload={:?}",
         ortho.dims(),
-        ortho.payload()
+        ortho.payload_raw()
     );
 
     // Position 2: [1,0] - distance 1 (diagonal with position 1)
@@ -138,7 +138,7 @@ fn test_3x3_duplicate_and() {
     println!(
         "After adding 'shoulders': dims={:?}, payload={:?}",
         ortho.dims(),
-        ortho.payload()
+        ortho.payload_raw()
     );
 
     // Position 3: [0,2] or [1,1] depending on expansion - will trigger expansion
@@ -152,14 +152,14 @@ fn test_3x3_duplicate_and() {
             "  Child {}: dims={:?}, payload={:?}",
             i,
             child.dims(),
-            child.payload()
+            child.payload_raw()
         );
     }
 
     // Find a 3x3 child if it exists, or verify the expansion worked correctly
     let ortho_3x3 = children.iter().find(|o| o.dims() == &vec![3, 3]).cloned();
     if let Some(ortho) = ortho_3x3 {
-        println!("\nFound 3x3 ortho: {:?}", ortho.payload());
+        println!("\nFound 3x3 ortho: {:?}", ortho.payload_raw());
 
         // Verify position 4 [1,1] (distance 2) has position 3 [0,2] on its diagonal
         let (forbidden, required) = ortho.get_requirements();
@@ -182,7 +182,7 @@ fn test_3x3_duplicate_and() {
         );
 
         // If position 3 has 'and', it should be forbidden at position 4 if they're on the same diagonal
-        if ortho.payload().get(3) == Some(&Some(and_val)) {
+        if ortho.payload_at(3) == Some(and_val) {
             assert!(
                 !completions.contains(&and_idx),
                 "'and' should be forbidden at position 4 since it's at position 3 (same diagonal)"

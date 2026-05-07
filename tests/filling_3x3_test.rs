@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
+use fold::ortho::{Ortho, PayloadVal, EMPTY_CELL, payload_to_usize};
 
 /// Test filling a [3,3] ortho to see when diagonal conflicts should occur
 #[test]
@@ -30,7 +30,7 @@ fn test_filling_3x3_with_diagonal_check() {
         ortho.dims(),
         ortho.get_current_position()
     );
-    println!("Payload: {:?}\n", ortho.payload());
+    println!("Payload: {:?}\n", ortho.payload_raw());
 
     // Now add the 6th token to trigger expansion - one child should be [3,3]
     let children = ortho.add(PayloadVal::try_from(of_idx).unwrap());
@@ -41,7 +41,7 @@ fn test_filling_3x3_with_diagonal_check() {
             i,
             child.dims(),
             child.get_current_position(),
-            child.payload()
+            child.payload_raw()
         );
     }
 
@@ -57,7 +57,7 @@ fn test_filling_3x3_with_diagonal_check() {
         "Starting [3,3] ortho: dims={:?}, filled={}, payload={:?}\n",
         ortho_3x3.dims(),
         ortho_3x3.get_current_position(),
-        ortho_3x3.payload()
+        ortho_3x3.payload_raw()
     );
 
     let mut current = ortho_3x3;
@@ -71,7 +71,7 @@ fn test_filling_3x3_with_diagonal_check() {
         }
 
         let pos = current.get_current_position();
-        if pos >= current.payload().len() {
+        if pos >= current.payload_len() {
             println!("Ortho is full!");
             break;
         }
@@ -104,7 +104,7 @@ fn test_filling_3x3_with_diagonal_check() {
 
         // Check if 'and' is in forbidden list
         let and_val = PayloadVal::try_from(and_idx).unwrap();
-        let and_in_payload = current.payload().iter().any(|opt| *opt == Some(and_val));
+        let and_in_payload = current.payload_raw().iter().any(|&v| v == and_val);
         let and_is_forbidden = forbidden_usize.contains(&and_idx);
         let and_is_completion = completions.contains(&and_idx);
 
@@ -116,7 +116,7 @@ fn test_filling_3x3_with_diagonal_check() {
         if and_in_payload && and_is_completion {
             println!("\n*** BUG FOUND! ***");
             println!("'and' is already in the payload but is still a valid completion!");
-            println!("Current payload: {:?}", current.payload());
+            println!("Current payload: {:?}", current.payload_raw());
             println!("Display:\n{}", current.display(&interner));
             panic!("Bug: 'and' allowed on same diagonal!");
         }
@@ -135,7 +135,7 @@ fn test_filling_3x3_with_diagonal_check() {
                     current = children[0].clone();
                     println!(
                         "Successfully added 'and'! New payload: {:?}\n",
-                        current.payload()
+                        current.payload_raw()
                     );
                     continue;
                 }
@@ -158,7 +158,7 @@ fn test_filling_3x3_with_diagonal_check() {
             break;
         }
         current = children[0].clone();
-        println!("New payload: {:?}\n", current.payload());
+        println!("New payload: {:?}\n", current.payload_raw());
     }
 
     println!("\nFinal ortho:");

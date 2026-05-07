@@ -795,7 +795,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ortho::payload_to_usize;
+    use crate::ortho::{payload_to_usize, EMPTY_CELL};
 
     fn vocab_index(interner: &Interner, word: &str) -> usize {
         interner
@@ -893,10 +893,10 @@ mod tests {
         assert!(
             runner
                 .incumbent()
-                .payload()
+                .payload_raw()
                 .iter()
-                .flatten()
-                .all(|value| payload_to_usize(*value) < interner.vocab_size())
+                .filter(|&&v| v != EMPTY_CELL)
+                .all(|&value| payload_to_usize(value) < interner.vocab_size())
         );
     }
 }

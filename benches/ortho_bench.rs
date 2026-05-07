@@ -108,7 +108,7 @@ fn bench_ortho_payload(c: &mut Criterion) {
     let ortho = Ortho::new();
     let ortho = ortho.add(1)[0].clone();
 
-    c.bench_function("ortho_payload", |b| b.iter(|| ortho.payload()));
+    c.bench_function("ortho_payload", |b| b.iter(|| ortho.payload_raw()));
 }
 
 fn bench_ortho_display(c: &mut Criterion) {

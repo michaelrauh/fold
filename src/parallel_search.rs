@@ -345,7 +345,7 @@ impl ParallelCheckpointStore {
                 "fullness": state.best_incumbent.score().fullness,
             },
             "best_dims": state.best_incumbent.dims(),
-            "best_capacity": state.best_incumbent.payload().len(),
+            "best_capacity": state.best_incumbent.payload_len(),
         });
         write_atomic(
             &self.output_dir.join("optimal.bin"),
@@ -1123,8 +1123,8 @@ fn update_parallel_metrics(
         g.incumbent_score = best.incumbent.score();
         g.effective_prune_score = effective_score;
         g.score_floor = OrthoScore::optimistic_bound(8, 27);
-        g.incumbent_dims = best.incumbent.dims().clone();
-        g.incumbent_capacity = best.incumbent.payload().len();
+        g.incumbent_dims = best.incumbent.dims().to_vec();
+        g.incumbent_capacity = best.incumbent.payload_len();
         g.incumbent_display = format!("{}", best.incumbent.display(interner));
         g.last_improvement_unix = best.last_improvement_unix;
         g.last_improvement_depth = best.last_improvement_depth;

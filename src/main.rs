@@ -166,7 +166,7 @@ fn save_parallel_outputs(
             "fullness": result.best.score().fullness,
         },
         "best_dims": result.best.dims(),
-        "best_capacity": result.best.payload().len(),
+        "best_capacity": result.best.payload_len(),
     });
     checkpoint_mgr.save_optimal(&result.best, &display, &summary)
 }

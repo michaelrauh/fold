@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
+use fold::ortho::{Ortho, PayloadVal, EMPTY_CELL, payload_to_usize};
 
 /// This test reproduces the EXACT bug from the user's report:
 /// "and" appears at [0,2] (position 3) and [1,1] (position 4), both in shell 2
@@ -30,7 +30,7 @@ fn test_and_duplicate_in_shell_2() {
     println!(
         "After 3 additions: dims={:?}, payload={:?}",
         ortho.dims(),
-        ortho.payload()
+        ortho.payload_raw()
     );
 
     // Add 'and' at position 3 - this will trigger expansion
@@ -41,7 +41,7 @@ fn test_and_duplicate_in_shell_2() {
             "  Child {}: dims={:?}, payload={:?}",
             i,
             child.dims(),
-            child.payload()
+            child.payload_raw()
         );
     }
 
@@ -54,13 +54,13 @@ fn test_and_duplicate_in_shell_2() {
     println!(
         "\nChosen ortho: dims={:?}, payload={:?}",
         ortho.dims(),
-        ortho.payload()
+        ortho.payload_raw()
     );
 
     // Continue filling until we have a [3,3] with 'and' at position 4
     // (With [2,3] layout, 'and' is at position 4 after remap)
     let mut steps = 0;
-    while ortho.get_current_position() < ortho.payload().len() && steps < 20 {
+    while ortho.get_current_position() < ortho.payload_len() && steps < 20 {
         steps += 1;
 
         let _pos = ortho.get_current_position();
@@ -97,7 +97,7 @@ fn test_and_duplicate_in_shell_2() {
             println!(
                 "\nReached [3,3] at step {}: payload={:?}",
                 steps,
-                ortho.payload()
+                ortho.payload_raw()
             );
             break;
         }
@@ -106,16 +106,16 @@ fn test_and_duplicate_in_shell_2() {
     // Now we should have a [3,3] ortho
     // Find where 'and' is in the payload
     let and_positions: Vec<usize> = ortho
-        .payload()
+        .payload_raw()
         .iter()
         .enumerate()
-        .filter_map(|(i, opt)| if *opt == Some(and_val) { Some(i) } else { None })
+        .filter_map(|(i, &v)| if v == and_val { Some(i) } else { None })
         .collect();
 
     println!("\n'and' is at positions: {:?}", and_positions);
 
     // With sorted [2,3] layout, 'and' ends up at position 4 after remap
     // Check the diagonal behavior from the current layout
-    println!("\nFinal payload: {:?}", ortho.payload());
+    println!("\nFinal payload: {:?}", ortho.payload_raw());
     println!("Display:\n{}", ortho.display(&interner));
 }

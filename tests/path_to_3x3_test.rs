@@ -30,7 +30,7 @@ fn test_path_to_3x3() {
                 "  Child {}: dims={:?}, capacity={}, filled={}",
                 i,
                 child.dims(),
-                child.payload().len(),
+                child.payload_len(),
                 child.get_current_position()
             );
         }
@@ -41,7 +41,7 @@ fn test_path_to_3x3() {
 
             if ortho.dims() == &vec![3, 3] {
                 println!("\n*** Reached [3, 3]! ***");
-                println!("Payload: {:?}", ortho.payload());
+                println!("Payload: {:?}", ortho.payload_raw());
                 break;
             }
         } else {

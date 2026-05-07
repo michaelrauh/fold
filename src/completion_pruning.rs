@@ -1,8 +1,24 @@
 use crate::{
     interner::Interner,
-    ortho::{Ortho, OrthoScore, payload_to_usize},
+    ortho::{Ortho, OrthoScore, EMPTY_CELL, payload_to_usize},
+    spatial::DimMeta,
 };
 use rustc_hash::FxHashMap;
+use std::rc::Rc;
+
+// Opaque meta cache entry — avoids re-fetching DimMeta on successive calls with same (dims, up_axis)
+#[derive(Clone)]
+struct CachedMeta {
+    meta: Rc<DimMeta>,
+    dims: [u8; 8],
+    dims_len: u8,
+    up_axis: Option<u8>,
+}
+impl std::fmt::Debug for CachedMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CachedMeta(dims_len={})", self.dims_len)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ImpactedPrefixIndex {
@@ -55,9 +71,6 @@ impl ImpactedPrefixIndex {
 pub struct CompletionContext {
     required_usize: Vec<Vec<usize>>,
     forbidden_usize: Vec<usize>,
-    prefix_positions: Vec<Vec<usize>>,
-    diagonal_positions: Vec<usize>,
-    prefix_with_completion: Vec<Vec<usize>>,
     prefix_stat_scratch: Vec<usize>,
     totals: Vec<usize>,
     impacted_totals: Vec<usize>,
@@ -68,6 +81,7 @@ pub struct CompletionContext {
     base_fullness: usize,
     base_score: OrthoScore,
     is_root: bool,
+    meta_cache: Option<CachedMeta>,
 }
 
 impl CompletionContext {
@@ -82,18 +96,35 @@ impl CompletionContext {
     }
 
     pub fn reset_for_node(&mut self, ortho: &Ortho) {
-        ortho.fill_requirements_usize(
-            &mut self.forbidden_usize,
-            &mut self.required_usize,
-            &mut self.prefix_positions,
-            &mut self.diagonal_positions,
-        );
+        let ortho_dims = ortho.dims();
+        let ortho_up_axis = ortho.up_axis();
+        // Refresh the cached meta only when (dims, up_axis) changes
+        let need_refresh = match &self.meta_cache {
+            None => true,
+            Some(c) => {
+                c.dims_len as usize != ortho_dims.len()
+                    || c.up_axis != ortho_up_axis
+                    || c.dims[..ortho_dims.len()] != *ortho_dims
+            }
+        };
+        if need_refresh {
+            let mut dims_arr = [0u8; 8];
+            dims_arr[..ortho_dims.len()].copy_from_slice(ortho_dims);
+            let meta = crate::spatial::get_meta_handle(ortho_dims, ortho_up_axis);
+            self.meta_cache = Some(CachedMeta {
+                meta,
+                dims: dims_arr,
+                dims_len: ortho_dims.len() as u8,
+                up_axis: ortho_up_axis,
+            });
+        }
+        let meta = &self.meta_cache.as_ref().unwrap().meta;
+        ortho.fill_requirements_usize_with_meta(meta, &mut self.forbidden_usize, &mut self.required_usize);
         self.reset_common_fields(ortho);
     }
 
     pub fn reset_for_completion_bounds(&mut self, ortho: &Ortho) {
         self.reset_for_node(ortho);
-        self.copy_required_prefixes_for_completion();
     }
 
     pub fn reset_for_impacted_bounds(&mut self, ortho: &Ortho) {
@@ -101,19 +132,15 @@ impl CompletionContext {
         self.filled_prefix.clear();
         self.filled_prefix.extend(
             ortho
-                .payload()
+                .payload_raw()
                 .iter()
-                .filter_map(|v| *v)
-                .map(payload_to_usize),
+                .filter(|&&v| v != EMPTY_CELL)
+                .map(|&v| payload_to_usize(v)),
         );
         self.impacted_totals.clear();
         if self.impacted_totals.capacity() < self.filled_prefix.len() {
             self.impacted_totals.reserve(self.filled_prefix.len());
         }
-    }
-
-    pub fn enable_completion_bounds(&mut self) {
-        self.copy_required_prefixes_for_completion();
     }
 
     fn reset_common_fields(&mut self, ortho: &Ortho) {
@@ -126,23 +153,6 @@ impl CompletionContext {
         self.base_volume = self.base_score.volume;
         self.base_fullness = self.base_score.fullness;
         self.is_root = self.required_usize.is_empty();
-    }
-
-    fn copy_required_prefixes_for_completion(&mut self) {
-        while self.prefix_with_completion.len() < self.required_usize.len() {
-            self.prefix_with_completion.push(Vec::new());
-        }
-        self.prefix_with_completion
-            .truncate(self.required_usize.len());
-        for (out, prefix) in self
-            .prefix_with_completion
-            .iter_mut()
-            .zip(self.required_usize.iter())
-        {
-            out.clear();
-            out.reserve(prefix.len().saturating_add(1));
-            out.extend_from_slice(prefix);
-        }
     }
 
     pub fn required_usize(&self) -> &[Vec<usize>] {
@@ -173,18 +183,6 @@ impl CompletionContext {
         self.base_fullness
     }
 
-    fn prefix_stats_with_completion(
-        &mut self,
-        interner: &Interner,
-        prefix_idx: usize,
-        completion: usize,
-    ) -> Option<usize> {
-        interner.prefix_stats_with_appended(
-            &self.prefix_with_completion[prefix_idx],
-            completion,
-            &mut self.prefix_stat_scratch,
-        )
-    }
 }
 
 /// Returns true if the candidate should be pruned (optimistic bound cannot beat best_score).
@@ -259,10 +257,10 @@ pub fn bound_existing_ortho(
     let mut impacted_totals: Vec<usize> = Vec::new();
     if let Some(impacted) = impacted_prefixes {
         let filled_prefix: Vec<usize> = ortho
-            .payload()
+            .payload_raw()
             .iter()
-            .filter_map(|v| *v)
-            .map(payload_to_usize)
+            .filter(|&&v| v != EMPTY_CELL)
+            .map(|&v| payload_to_usize(v))
             .collect();
         for imp in impacted {
             if imp.len() <= filled_prefix.len()
@@ -348,11 +346,15 @@ pub fn completion_upper_bound_ctx(
 
     let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
     ctx.totals.clear();
-    for idx in 0..ctx.prefix_with_completion.len() {
-        match ctx.prefix_stats_with_completion(interner, idx, completion) {
+    for idx in 0..ctx.required_usize.len() {
+        match interner.prefix_stats_with_appended(
+            &ctx.required_usize[idx],
+            completion,
+            &mut ctx.prefix_stat_scratch,
+        ) {
             Some(max_desc_len) => ctx.totals.push(max_desc_len),
             None => {
-                let mut missing = ctx.prefix_with_completion[idx].clone();
+                let mut missing = ctx.required_usize[idx].clone();
                 missing.push(completion);
                 panic!("[bound][panic] missing prefix stats for {:?}", missing);
             }
@@ -528,10 +530,10 @@ mod tests {
         interner: &Interner,
     ) -> Vec<usize> {
         let filled_prefix: Vec<usize> = ortho
-            .payload()
+            .payload_raw()
             .iter()
-            .filter_map(|v| *v)
-            .map(payload_to_usize)
+            .filter(|&&v| v != EMPTY_CELL)
+            .map(|&v| payload_to_usize(v))
             .collect();
         impacted
             .iter()
@@ -815,10 +817,10 @@ mod tests {
         let index = ImpactedPrefixIndex::new(impacted.clone(), &interner);
         let mut totals = Vec::new();
         let filled_prefix: Vec<usize> = ortho
-            .payload()
+            .payload_raw()
             .iter()
-            .filter_map(|v| *v)
-            .map(payload_to_usize)
+            .filter(|&&v| v != EMPTY_CELL)
+            .map(|&v| payload_to_usize(v))
             .collect();
         let mut indexed = index
             .ancestor_axis_totals(&filled_prefix, &mut totals)
