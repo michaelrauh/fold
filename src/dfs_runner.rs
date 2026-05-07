@@ -301,7 +301,7 @@ impl DfsRunner {
             let mut shard_stack = runner.stack.clone();
             let leaf = shard_stack.len().saturating_sub(1);
             for frame in &mut shard_stack[..leaf] {
-                frame.branches.clear();
+                frame.branches = Vec::new();
                 frame.initial_branches_len = 0;
             }
             shards.push((shard_stack, ancestors));
@@ -795,7 +795,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ortho::{payload_to_usize, EMPTY_CELL};
+    use crate::ortho::{EMPTY_CELL, payload_to_usize};
 
     fn vocab_index(interner: &Interner, word: &str) -> usize {
         interner

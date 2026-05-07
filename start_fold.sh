@@ -22,7 +22,8 @@ FOLD_FORCE_ROLE="${FOLD_FORCE_ROLE:-leader}"
 FOLD_MERGE_POLICY="${FOLD_MERGE_POLICY:-adjacent_balanced}"
 
 # Default to debuginfo + frame pointers for better perf attribution; allow override via env.
-RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2}"
+# target-cpu=native enables hardware POPCNT/AVX2/BMI2 on the AMD prod box.
+RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2 -C target-cpu=native}"
 export RUSTFLAGS
 
 if [ -f "$CARGO_ENV" ]; then

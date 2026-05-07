@@ -277,18 +277,12 @@ impl Tui {
             .unwrap_or_else(|| "none".to_string());
         let mut lines = vec![
             Line::from(format!(
-                "Mode: {}  Workers: {}/{}  Queue: {} pending  {} running  {} done",
-                parallel.mode,
+                "Workers: {}/{}  Queue: {} pending  {} running  {} done",
                 parallel.workers_active,
                 parallel.workers_total,
                 format_count(parallel.shards_pending as u64),
                 format_count(parallel.shards_running as u64),
                 format_count(parallel.shards_done as u64)
-            )),
-            Line::from(format!(
-                "Hunt: {} / {} nodes",
-                format_count(parallel.hunt_nodes),
-                format_count(parallel.hunt_target_nodes)
             )),
             Line::from(format!(
                 "Best actual vol={}  Effective prune vol={}  Floor vol={}  Frontier max vol={}",
@@ -738,9 +732,8 @@ fn worker_health_lines(snapshot: &MetricsSnapshot, area: Rect) -> Vec<Line<'stat
             .map(|id| format!(" s{id}"))
             .unwrap_or_default();
         let item = format!(
-            " W{} {}{} d{} {}/s{}",
+            " W{}{} d{} {}/s{}",
             worker.id,
-            worker.mode.chars().next().unwrap_or('?'),
             shard,
             worker.depth,
             format_rate(worker.rate),

@@ -1,6 +1,6 @@
 use crate::{
     interner::Interner,
-    ortho::{Ortho, OrthoScore, EMPTY_CELL, payload_to_usize},
+    ortho::{EMPTY_CELL, Ortho, OrthoScore, payload_to_usize},
     spatial::DimMeta,
 };
 use rustc_hash::FxHashMap;
@@ -71,7 +71,6 @@ impl ImpactedPrefixIndex {
 pub struct CompletionContext {
     required_usize: Vec<Vec<usize>>,
     forbidden_usize: Vec<usize>,
-    prefix_stat_scratch: Vec<usize>,
     totals: Vec<usize>,
     impacted_totals: Vec<usize>,
     bound_scratch: Vec<usize>,
@@ -82,6 +81,7 @@ pub struct CompletionContext {
     base_score: OrthoScore,
     is_root: bool,
     meta_cache: Option<CachedMeta>,
+    required_prefix_ids: Vec<u32>,
 }
 
 impl CompletionContext {
@@ -119,7 +119,11 @@ impl CompletionContext {
             });
         }
         let meta = &self.meta_cache.as_ref().unwrap().meta;
-        ortho.fill_requirements_usize_with_meta(meta, &mut self.forbidden_usize, &mut self.required_usize);
+        ortho.fill_requirements_usize_with_meta(
+            meta,
+            &mut self.forbidden_usize,
+            &mut self.required_usize,
+        );
         self.reset_common_fields(ortho);
     }
 
@@ -153,6 +157,7 @@ impl CompletionContext {
         self.base_volume = self.base_score.volume;
         self.base_fullness = self.base_score.fullness;
         self.is_root = self.required_usize.is_empty();
+        self.required_prefix_ids.clear();
     }
 
     pub fn required_usize(&self) -> &[Vec<usize>] {
@@ -183,6 +188,18 @@ impl CompletionContext {
         self.base_fullness
     }
 
+    pub fn ensure_prefix_ids(&mut self, interner: &Interner) {
+        if self.required_prefix_ids.len() == self.required_usize.len() {
+            return;
+        }
+        self.required_prefix_ids.clear();
+        for prefix in &self.required_usize {
+            let id = interner
+                .prefix_id_for(prefix.as_slice())
+                .expect("required prefix must have a prefix ID in interner");
+            self.required_prefix_ids.push(id);
+        }
+    }
 }
 
 /// Returns true if the candidate should be pruned (optimistic bound cannot beat best_score).
@@ -328,9 +345,8 @@ pub fn completion_upper_bound_ctx(
 ) -> Option<OrthoScore> {
     if ctx.is_root {
         let completion_count = interner
-            .completions_for_prefix(&[completion])
-            .expect("missing completions bitset for single-token prefix")
-            .count_ones(..);
+            .completion_count_for_prefix(&[completion])
+            .expect("missing completions set for single-token prefix");
         if completion_count <= 1 {
             return None;
         }
@@ -346,12 +362,10 @@ pub fn completion_upper_bound_ctx(
 
     let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
     ctx.totals.clear();
+    ctx.ensure_prefix_ids(interner);
     for idx in 0..ctx.required_usize.len() {
-        match interner.prefix_stats_with_appended(
-            &ctx.required_usize[idx],
-            completion,
-            &mut ctx.prefix_stat_scratch,
-        ) {
+        let parent_id = ctx.required_prefix_ids[idx];
+        match interner.prefix_stats_by_parent_id(parent_id, completion) {
             Some(max_desc_len) => ctx.totals.push(max_desc_len),
             None => {
                 let mut missing = ctx.required_usize[idx].clone();

@@ -208,3 +208,140 @@ Checkpoint version bumped 5 → 6.
 Primary production config: ~40.6 ms → 38.5 ms, **−5.3%**
 Probe budget: 3.98M → 4.10M steps/5s (+3.0%).
 Cumulative vs baseline (70.853 ms): **~−45.6%**
+
+---
+
+## Item 7 — Add hunt-path and large-vocab intersect benchmarks
+
+**Change:** Added two local benchmarks that better match the current long-running hunt:
+
+- `dfs_ab_bench::hunt_worstfirst_no_completion_prune`
+- `interner_bench::interner_intersect_e_txt_large_vocab`
+
+Baseline after Item 6, before Items 8-9:
+
+| Benchmark / probe | Baseline |
+|---|---:|
+| hunt_worstfirst_no_completion_prune | 34.922 ms |
+| interner_intersect_e_txt_large_vocab | 129.07 ns |
+| probe_budget | 2,727,614 steps / 3s |
+| profiled probe total | 32.164 ms |
+| profiled probe intersect | 6.025 ms |
+| profiled probe ctx_reset | 6.512 ms |
+
+This is the benchmark set used for the following changes.
+
+---
+
+## Item 8 — Resolve required prefix bitsets once per intersect
+
+**Change:** `intersect_into_count` now resolves required prefixes into stack storage
+for the common <= 8 prefix case, carries cached completion counts with the bitsets,
+and fuses the first dense bitset intersection directly into the output buffer.
+The rare > 8 prefix case falls back to a heap vector helper.
+
+| Benchmark / probe | Item 7 | Item 8 | Δ |
+|---|---:|---:|---:|
+| interner_intersect_e_txt_large_vocab | 129.07 ns | 104.35 ns | **−19.1%** |
+| hunt_worstfirst_no_completion_prune | 34.922 ms | 31.488 ms | **−9.8%** |
+| probe_budget | 2,727,614 | 2,919,562 | **+7.0%** |
+| profiled probe total | 32.164 ms | 29.749 ms | −7.5% |
+| profiled probe intersect | 6.025 ms | 4.997 ms | −17.1% |
+
+Kept `SPARSE_INTERSECT_THRESHOLD = 20`; the focused benchmark says the prefix lookup
+and fused dense path matter more than pushing the sparse threshold higher.
+
+---
+
+## Item 9 — Single-pass requirement fill
+
+**Change:** `fill_from_meta_data` no longer pre-counts non-empty prefixes or calls
+a separate nested-capacity helper. It now walks the prefix metadata once, reuses
+existing `Vec`s when available, and truncates the required-prefix output at the end.
+
+| Benchmark / probe | Item 8 | Item 9 | Δ |
+|---|---:|---:|---:|
+| hunt_worstfirst_no_completion_prune | 31.488 ms | 30.303 ms | **−3.8%** |
+| probe_budget | 2,919,562 | 3,224,316 | **+10.4%** |
+| profiled probe total | 29.749 ms | 25.761 ms | −13.4% |
+| profiled probe ctx_reset | 6.560 ms | 5.422 ms | −17.3% |
+
+Cumulative for this hunt-path slice:
+
+| Benchmark / probe | Item 7 | Item 9 | Δ |
+|---|---:|---:|---:|
+| hunt_worstfirst_no_completion_prune | 34.922 ms | 30.303 ms | **−13.2%** |
+| probe_budget | 2,727,614 | 3,224,316 | **+18.2%** |
+
+Remote expectation: if the 4-worker droplet remains CPU-bound in the same hunt mode,
+expect roughly a 10-15% local-hot-path gain. End-to-end wall-clock can be lower if
+work stealing, checkpointing, terminal rendering, or frontier balance dominate.
+
+---
+
+## Item 10 — Sparse threshold sweep
+
+**Change tested:** varied `SPARSE_INTERSECT_THRESHOLD` on top of Items 8-9.
+
+| Threshold | hunt_worstfirst_no_completion_prune | probe_budget |
+|---:|---:|---:|
+| 12 | 30.876 ms | 3,149,316 |
+| 20 | **30.303 ms** | **3,224,316** |
+| 32 | 30.545 ms | 3,198,631 |
+| 64 | 31.190 ms | 3,167,132 |
+
+Decision: keep threshold 20. Larger thresholds increase sparse membership checks enough
+to lose against dense word-wise AND+popcount on this workload.
+
+Final confirmation run against the current diff:
+
+| Benchmark / probe | Current diff |
+|---|---:|
+| hunt_worstfirst_no_completion_prune | 30.216 ms |
+| probe_budget | 3,260,081 steps / 3s |
+| profiled probe total | 27.204 ms |
+| profiled probe intersect | 4.153 ms |
+| profiled probe ctx_reset | 5.628 ms |
+| interner_intersect_e_txt_large_vocab | 100.45 ns |
+
+---
+
+## Item 11 — Remove hunt mode
+
+**Change:** Removed the parallel hunt/proof phase split. Parallel worker execution now uses
+one proof-oriented path with completion pruning enabled. Startup still uses a bounded
+frontier partitioning pass to create shards, but it is no longer a long-running mode and
+no longer has a target node counter. Removed `hunt_nodes`, hunt progress counters,
+hunt/proof worker labels, and the hunt-specific DFS benchmark variant so the UI no longer
+presents node-count progress from a mode that was not improving the incumbent.
+
+Checkpoint version bumped `2 → 3` because the parallel checkpoint schema no longer stores
+hunt counters. Existing version-2 parallel checkpoints will be rejected and restarted.
+
+---
+
+## Item 12 — Hybrid sparse/dense completion storage
+
+**Change:** Replaced the all-dense `prefix_to_completions: FixedBitSet` storage with
+a hybrid `CompletionSet`: prefixes with fanout <= 64 store sorted `Vec<u32>` completions,
+while larger fanouts keep a dense `FixedBitSet` with a cached count. Removed the duplicate
+`prefix_completion_counts` map. Intersection, impact comparison, serialization, merge,
+and completion views now operate against the hybrid set API.
+
+The first implementation regressed version-comparison helpers by rematerializing sparse sets
+as bitsets. The kept version compares through `CompletionSet::ones/contains` and only
+materializes where the operation genuinely needs a dense output bitset.
+
+### Interner bench
+
+| Benchmark | Before | After | Δ |
+|---|---:|---:|---:|
+| interner_intersect_e_txt_large_vocab | 99.916 ns | 89.337 ns | **−10.6%** |
+| interner_intersect_simple | previous Criterion baseline | 107.40 ns | improved in final focused run |
+| interner_impacted_keys | previous Criterion baseline | 43.970 µs | healthy / within noise |
+| interner_completions_equal_up_to_vocab | previous Criterion baseline | 33.044 ns | improved |
+| interner_all_completions_equal_up_to_vocab | previous Criterion baseline | 87.046 ns | improved |
+
+Full interner bench spot-checks showed no construction-path regression (`interner_from_text`
+224.19 µs, `interner_from_text_large` 313.40 µs, `interner_add_text` 98.718 µs,
+`interner_merge` 78.114 µs). Decision: keep.

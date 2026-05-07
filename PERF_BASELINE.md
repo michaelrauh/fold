@@ -113,3 +113,20 @@ Each `clone()` in the hot loop allocates two heap buffers. Item 1 targets elimin
 
 Reported on DigitalOcean s-4vcpu-8gb (x86-64, 4 cores, 8 GB), vocab ~7k:  
 **~2.8 M msg/s** at baseline.
+
+---
+
+## Additional local hunt baseline — 2026-05-07
+
+Captured after Items 1-6 and before the 2026-05-07 local hunt-path changes.
+This is not the original project baseline; it is the comparison point for
+PERF_RESULTS Items 8-10.
+
+| Benchmark / probe | Baseline |
+|---|---:|
+| hunt_worstfirst_no_completion_prune | 34.922 ms |
+| interner_intersect_e_txt_large_vocab | 129.07 ns |
+| probe_budget | 2,727,614 steps / 3s |
+| profiled probe total | 32.164 ms |
+| profiled probe intersect | 6.025 ms |
+| profiled probe ctx_reset | 6.512 ms |

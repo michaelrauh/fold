@@ -59,6 +59,10 @@ fn run_parallel_main(
     let text = String::from_utf8(input_bytes)
         .map_err(|e| FoldError::Other(format!("input is not valid UTF-8: {}", e)))?;
     let interner = Arc::new(Interner::from_text(&text));
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
     checkpoint_mgr.write_interner(&interner)?;
     let checkpoint_store =
         ParallelCheckpointStore::new(checkpoint_mgr.root(), checkpoint_mgr.output_dir())?;
@@ -82,8 +86,8 @@ fn run_parallel_main(
         None
     };
     metrics.add_log(format!(
-        "Starting parallel search workers={} shard_depth={} hunt_nodes={}",
-        parallel_cfg.workers, parallel_cfg.shard_depth, parallel_cfg.hunt_nodes
+        "Starting parallel search workers={} shard_depth={}",
+        parallel_cfg.workers, parallel_cfg.shard_depth
     ));
 
     let result = run_parallel_search(
@@ -156,9 +160,8 @@ fn save_parallel_outputs(
         "total_shards": result.total_shards,
         "shards_done": result.shards_done,
         "workers": cfg.workers,
-        "hunt_nodes": cfg.hunt_nodes,
         "shard_depth": cfg.shard_depth,
-        "completion_pruning_default": false,
+        "completion_pruning": true,
         "best_score": {
             "volume": result.best.score().volume,
             "variance_num": result.best.score().variance_num,

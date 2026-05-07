@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal, EMPTY_CELL, payload_to_usize};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// Test that simulates the worker loop logic to see if it can create
 /// an ortho with duplicate tokens on the same diagonal

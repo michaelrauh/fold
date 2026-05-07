@@ -34,8 +34,5 @@ fn cli_runs_parallel_input_and_writes_outputs() {
         serde_json::from_slice(&fs::read(state_dir.join("output/summary.json")).unwrap()).unwrap();
     assert_eq!(summary["mode"], serde_json::Value::from("parallel"));
     assert!(summary["workers"].as_u64().unwrap() >= 1);
-    assert_eq!(
-        summary["hunt_nodes"],
-        serde_json::Value::from(5_000_000_000u64)
-    );
+    assert_eq!(summary["completion_pruning"], serde_json::Value::from(true));
 }

@@ -4,7 +4,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use rustc_hash::FxHasher;
 use std::cmp::Ordering;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 pub type Dim = u8;
 pub type PayloadVal = u32;
@@ -125,14 +125,24 @@ impl Ortho {
     }
 
     fn dims_to_inline(dims: &[Dim]) -> ([Dim; MAX_DIMS], u8) {
-        debug_assert!(dims.len() <= MAX_DIMS, "dims length {} exceeds MAX_DIMS {}", dims.len(), MAX_DIMS);
+        debug_assert!(
+            dims.len() <= MAX_DIMS,
+            "dims length {} exceeds MAX_DIMS {}",
+            dims.len(),
+            MAX_DIMS
+        );
         let mut arr = [0u8; MAX_DIMS];
         arr[..dims.len()].copy_from_slice(dims);
         (arr, dims.len() as u8)
     }
 
     fn opts_to_inline(payload: &[Option<PayloadVal>]) -> ([PayloadVal; MAX_PAYLOAD], u8) {
-        debug_assert!(payload.len() <= MAX_PAYLOAD, "payload length {} exceeds MAX_PAYLOAD {}", payload.len(), MAX_PAYLOAD);
+        debug_assert!(
+            payload.len() <= MAX_PAYLOAD,
+            "payload length {} exceeds MAX_PAYLOAD {}",
+            payload.len(),
+            MAX_PAYLOAD
+        );
         let mut arr = [EMPTY_CELL; MAX_PAYLOAD];
         for (i, &opt) in payload.iter().enumerate() {
             arr[i] = opt.unwrap_or(EMPTY_CELL);
@@ -143,8 +153,16 @@ impl Ortho {
     fn from_parts(dims: &[Dim], payload: &[Option<PayloadVal>], up_axis: Option<Dim>) -> Self {
         let (dims_arr, dims_len) = Self::dims_to_inline(dims);
         let (payload_arr, payload_cap) = Self::opts_to_inline(payload);
-        let id = Self::compute_id(&dims_arr[..dims_len as usize], &payload_arr[..payload_cap as usize], up_axis);
-        let (fill_count, next_empty, score) = Self::compute_cached_fields(&dims_arr[..dims_len as usize], &payload_arr, payload_cap as usize);
+        let id = Self::compute_id(
+            &dims_arr[..dims_len as usize],
+            &payload_arr[..payload_cap as usize],
+            up_axis,
+        );
+        let (fill_count, next_empty, score) = Self::compute_cached_fields(
+            &dims_arr[..dims_len as usize],
+            &payload_arr,
+            payload_cap as usize,
+        );
         Self {
             dims: dims_arr,
             dims_len,
@@ -158,10 +176,23 @@ impl Ortho {
         }
     }
 
-    fn from_parts_raw(dims: &[Dim], payload_arr: [PayloadVal; MAX_PAYLOAD], payload_cap: u8, up_axis: Option<Dim>) -> Self {
+    fn from_parts_raw(
+        dims: &[Dim],
+        payload_arr: [PayloadVal; MAX_PAYLOAD],
+        payload_cap: u8,
+        up_axis: Option<Dim>,
+    ) -> Self {
         let (dims_arr, dims_len) = Self::dims_to_inline(dims);
-        let id = Self::compute_id(&dims_arr[..dims_len as usize], &payload_arr[..payload_cap as usize], up_axis);
-        let (fill_count, next_empty, score) = Self::compute_cached_fields(&dims_arr[..dims_len as usize], &payload_arr, payload_cap as usize);
+        let id = Self::compute_id(
+            &dims_arr[..dims_len as usize],
+            &payload_arr[..payload_cap as usize],
+            up_axis,
+        );
+        let (fill_count, next_empty, score) = Self::compute_cached_fields(
+            &dims_arr[..dims_len as usize],
+            &payload_arr,
+            payload_cap as usize,
+        );
         Self {
             dims: dims_arr,
             dims_len,
@@ -191,12 +222,20 @@ impl Ortho {
             .fill_count
             .checked_add(1)
             .expect("fill count overflowed cached u32 field");
-        let next_empty = Self::next_empty_after(&payload_arr, self.payload_cap as usize, self.next_empty as usize + 1);
+        let next_empty = Self::next_empty_after(
+            &payload_arr,
+            self.payload_cap as usize,
+            self.next_empty as usize + 1,
+        );
         let next_empty =
             u32::try_from(next_empty).expect("next empty position overflowed cached u32 field");
         let mut score = self.score;
         score.fullness = fill_count as usize;
-        let id = Self::compute_id(self.dims(), &payload_arr[..self.payload_cap as usize], self.up_axis);
+        let id = Self::compute_id(
+            self.dims(),
+            &payload_arr[..self.payload_cap as usize],
+            self.up_axis,
+        );
         Self {
             dims: self.dims,
             dims_len: self.dims_len,
@@ -324,7 +363,10 @@ impl Ortho {
         if insertion_index == 2 && self.dims() == &[2u8, 2u8] {
             let mut new_payload = self.payload;
             new_payload[insertion_index] = value;
-            if new_payload[1] != EMPTY_CELL && new_payload[2] != EMPTY_CELL && new_payload[1] > new_payload[2] {
+            if new_payload[1] != EMPTY_CELL
+                && new_payload[2] != EMPTY_CELL
+                && new_payload[1] > new_payload[2]
+            {
                 new_payload.swap(1, 2);
             }
             out.push(self.in_fill_child_from_payload_raw(new_payload));
@@ -355,7 +397,12 @@ impl Ortho {
                     EMPTY_CELL
                 };
             }
-            out.push(Ortho::from_parts_raw(new_dims, new_payload, new_capacity as u8, None));
+            out.push(Ortho::from_parts_raw(
+                new_dims,
+                new_payload,
+                new_capacity as u8,
+                None,
+            ));
         });
     }
 
@@ -366,26 +413,35 @@ impl Ortho {
         insert_axis: usize,
         out: &mut Vec<Ortho>,
     ) {
-        spatial::for_each_expand_up(ortho.dims(), insert_axis, |new_dims, new_capacity, reorg| {
-            debug_assert!(new_capacity <= MAX_PAYLOAD);
-            let mut new_payload = [EMPTY_CELL; MAX_PAYLOAD];
-            for (i, &pos) in reorg.iter().enumerate() {
-                new_payload[pos] = if i == insertion_index {
-                    value
-                } else if i < ortho.payload_cap as usize {
-                    ortho.payload[i]
+        spatial::for_each_expand_up(
+            ortho.dims(),
+            insert_axis,
+            |new_dims, new_capacity, reorg| {
+                debug_assert!(new_capacity <= MAX_PAYLOAD);
+                let mut new_payload = [EMPTY_CELL; MAX_PAYLOAD];
+                for (i, &pos) in reorg.iter().enumerate() {
+                    new_payload[pos] = if i == insertion_index {
+                        value
+                    } else if i < ortho.payload_cap as usize {
+                        ortho.payload[i]
+                    } else {
+                        EMPTY_CELL
+                    };
+                }
+                let is_up_child = new_dims.len() > ortho.dims().len();
+                let up_axis = if is_up_child {
+                    Some(Dim::try_from(insert_axis).expect("insert axis overflowed u8"))
                 } else {
-                    EMPTY_CELL
+                    None
                 };
-            }
-            let is_up_child = new_dims.len() > ortho.dims().len();
-            let up_axis = if is_up_child {
-                Some(Dim::try_from(insert_axis).expect("insert axis overflowed u8"))
-            } else {
-                None
-            };
-            out.push(Ortho::from_parts_raw(new_dims, new_payload, new_capacity as u8, up_axis));
-        });
+                out.push(Ortho::from_parts_raw(
+                    new_dims,
+                    new_payload,
+                    new_capacity as u8,
+                    up_axis,
+                ));
+            },
+        );
     }
 
     fn get_insert_position(&self, to_add: PayloadVal) -> usize {
@@ -402,13 +458,6 @@ impl Ortho {
         idx
     }
 
-    fn ensure_nested_capacity(buffer: &mut Vec<Vec<usize>>, required_len: usize) {
-        while buffer.len() < required_len {
-            buffer.push(Vec::new());
-        }
-        buffer.truncate(required_len);
-    }
-
     pub fn fill_requirements_usize(
         &self,
         forbidden_out: &mut Vec<usize>,
@@ -421,7 +470,7 @@ impl Ortho {
         });
     }
 
-    pub fn fill_requirements_usize_with_meta(
+    pub(crate) fn fill_requirements_usize_with_meta(
         &self,
         meta: &std::rc::Rc<spatial::DimMeta>,
         forbidden_out: &mut Vec<usize>,
@@ -451,12 +500,19 @@ impl Ortho {
             }
         }
 
-        let non_empty_prefixes = prefixes.iter().filter(|p| !p.is_empty()).count();
-        Self::ensure_nested_capacity(required_out, non_empty_prefixes);
         let mut out_idx = 0usize;
-        for prefix in prefixes.iter().filter(|p| !p.is_empty()) {
+        for prefix in prefixes {
+            if prefix.is_empty() {
+                continue;
+            }
+            if out_idx == required_out.len() {
+                required_out.push(Vec::with_capacity(prefix.len()));
+            }
             let out = &mut required_out[out_idx];
             out.clear();
+            if out.capacity() < prefix.len() {
+                out.reserve(prefix.len() - out.capacity());
+            }
             for &idx in prefix {
                 if idx < payload.len() {
                     let v = payload[idx];
@@ -467,6 +523,7 @@ impl Ortho {
             }
             out_idx += 1;
         }
+        required_out.truncate(out_idx);
     }
 
     pub fn get_requirements(&self) -> (Vec<PayloadVal>, Vec<Vec<PayloadVal>>) {
@@ -518,10 +575,16 @@ impl Ortho {
             if v != EMPTY_CELL {
                 let idx = payload_to_usize(v);
                 let mapped = vocab_map[idx];
-                new_payload[i] = PayloadVal::try_from(mapped).expect("vocab map value overflowed u32");
+                new_payload[i] =
+                    PayloadVal::try_from(mapped).expect("vocab map value overflowed u32");
             }
         }
-        Some(Ortho::from_parts_raw(self.dims(), new_payload, self.payload_cap, self.up_axis))
+        Some(Ortho::from_parts_raw(
+            self.dims(),
+            new_payload,
+            self.payload_cap,
+            self.up_axis,
+        ))
     }
 
     pub fn prefixes(&self) -> Vec<Vec<PayloadVal>> {
@@ -1113,7 +1176,11 @@ mod tests {
         fn norm(o: &Ortho) -> (Vec<Dim>, Vec<PayloadVal>) {
             (
                 o.dims().to_vec(),
-                o.payload_raw().iter().filter(|&&v| v != EMPTY_CELL).copied().collect(),
+                o.payload_raw()
+                    .iter()
+                    .filter(|&&v| v != EMPTY_CELL)
+                    .copied()
+                    .collect(),
             )
         }
         let mut norms1: Vec<_> = children1.iter().map(norm).collect();

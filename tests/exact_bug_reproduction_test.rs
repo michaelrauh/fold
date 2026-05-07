@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal, EMPTY_CELL, payload_to_usize};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// This test reproduces the EXACT bug from the user's report:
 /// "and" appears at [0,2] (position 3) and [1,1] (position 4), both in shell 2

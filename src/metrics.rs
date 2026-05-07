@@ -45,14 +45,11 @@ pub struct GlobalMetrics {
 #[derive(Clone, Debug, Default)]
 pub struct ParallelMetrics {
     pub enabled: bool,
-    pub mode: String,
     pub workers_total: usize,
     pub workers_active: usize,
     pub shards_pending: usize,
     pub shards_running: usize,
     pub shards_done: usize,
-    pub hunt_nodes: u64,
-    pub hunt_target_nodes: u64,
     pub frontier_buckets: Vec<u64>,
     pub active_buckets: Vec<usize>,
     pub worker_summaries: Vec<WorkerMetrics>,
@@ -65,7 +62,6 @@ pub struct ParallelMetrics {
 #[derive(Clone, Debug, Default)]
 pub struct WorkerMetrics {
     pub id: usize,
-    pub mode: String,
     pub shard_id: Option<usize>,
     pub depth: usize,
     pub rate: f64,

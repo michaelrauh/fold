@@ -1,5 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use fixedbitset::FixedBitSet;
 use fold::interner::Interner;
+use std::fs;
 
 const SAMPLE_TEXT: &str = "The quick brown fox jumps over the lazy dog. \
     A journey of a thousand miles begins with a single step. \
@@ -68,6 +70,48 @@ fn bench_intersect_many_forbidden(c: &mut Criterion) {
     });
 }
 
+fn high_fanout_single_token_prefixes(interner: &Interner, count: usize) -> Vec<Vec<usize>> {
+    let mut prefixes: Vec<(usize, usize)> = (0..interner.vocab_size())
+        .filter_map(|idx| {
+            interner
+                .completions_for_prefix(&[idx])
+                .map(|bits| (idx, bits.count_ones(..)))
+        })
+        .collect();
+    prefixes.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    prefixes
+        .into_iter()
+        .take(count)
+        .map(|(idx, _)| vec![idx])
+        .collect()
+}
+
+fn bench_intersect_e_txt_large_vocab(c: &mut Criterion) {
+    let text = fs::read_to_string("e.txt").expect("failed to read e.txt from repository root");
+    let interner = Interner::from_text(&text);
+    assert!(
+        interner.vocab_size() >= 1024,
+        "e.txt should exercise a large vocabulary"
+    );
+
+    let required = high_fanout_single_token_prefixes(&interner, 2);
+    let forbidden = Vec::new();
+    let mut out = FixedBitSet::with_capacity(interner.vocab_size());
+    out.grow(interner.vocab_size());
+    black_box(interner.intersect_into_count(&required, &forbidden, &mut out));
+
+    c.bench_function("interner_intersect_e_txt_large_vocab", |b| {
+        b.iter(|| {
+            let count = interner.intersect_into_count(
+                black_box(&required),
+                black_box(&forbidden),
+                black_box(&mut out),
+            );
+            black_box(count)
+        })
+    });
+}
+
 fn bench_merge(c: &mut Criterion) {
     let interner1 = Interner::from_text(SAMPLE_TEXT);
     let interner2 = Interner::from_text("The pen is mightier than the sword.");
@@ -127,6 +171,21 @@ fn bench_string_for_index(c: &mut Criterion) {
     });
 }
 
+fn bench_prefix_stats_by_parent_id(c: &mut Criterion) {
+    let interner = Interner::from_text(LARGE_TEXT);
+    // Find a prefix of length >= 2 that has children in prefix_stats
+    let prefix: Vec<usize> = (0..interner.vocab_size())
+        .flat_map(|a| (0..interner.vocab_size()).map(move |b| vec![a, b]))
+        .find(|p| interner.prefix_id_for(p).is_some())
+        .expect("should find a 2-token prefix");
+    let parent_id = interner.prefix_id_for(&prefix).unwrap();
+    let appended = 0usize;
+
+    c.bench_function("interner_prefix_stats_by_parent_id", |b| {
+        b.iter(|| interner.prefix_stats_by_parent_id(black_box(parent_id), black_box(appended)))
+    });
+}
+
 fn bench_vocab_accessors(c: &mut Criterion) {
     let interner = Interner::from_text(SAMPLE_TEXT);
 
@@ -145,12 +204,14 @@ criterion_group!(
     bench_intersect_simple,
     bench_intersect_complex,
     bench_intersect_many_forbidden,
+    bench_intersect_e_txt_large_vocab,
     bench_merge,
     bench_completions_for_prefix,
     bench_impacted_keys,
     bench_completions_equal_up_to_vocab,
     bench_all_completions_equal_up_to_vocab,
     bench_string_for_index,
+    bench_prefix_stats_by_parent_id,
     bench_vocab_accessors,
 );
 criterion_main!(benches);

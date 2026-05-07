@@ -23,13 +23,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const WORKER_UPDATE_STEPS: usize = 2048;
 const METRICS_UPDATE_MS: u64 = 500;
 const FRONTIER_BUCKETS: usize = 48;
-const PARALLEL_CHECKPOINT_VERSION: u32 = 2;
+const PARALLEL_CHECKPOINT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct ParallelSearchConfig {
     pub enabled: bool,
     pub workers: usize,
-    pub hunt_nodes: u64,
     pub shard_depth: usize,
     pub checkpoint_every_secs: u64,
     pub resume_enabled: bool,
@@ -43,7 +42,6 @@ impl ParallelSearchConfig {
         Self {
             enabled: true,
             workers: default_workers,
-            hunt_nodes: 5_000_000_000,
             shard_depth: 3,
             checkpoint_every_secs: 30,
             resume_enabled: true,
@@ -53,38 +51,23 @@ impl ParallelSearchConfig {
     pub fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
-        self.hunt_nodes.hash(&mut hasher);
         self.shard_depth.hash(&mut hasher);
         hasher.finish()
     }
 
-    pub fn hunt_toggles(&self) -> SearchToggles {
-        SearchToggles {
-            branch_ordering: BranchOrdering::WorstFirst,
-            completion_pruning: false,
-            ..SearchToggles::default()
-        }
-    }
-
-    pub fn proof_toggles(&self) -> SearchToggles {
+    pub fn search_toggles(&self) -> SearchToggles {
         SearchToggles {
             completion_pruning: true,
             ..SearchToggles::default()
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SearchPhase {
-    Hunt,
-    Proof,
-}
-
-impl SearchPhase {
-    fn label(self) -> &'static str {
-        match self {
-            SearchPhase::Hunt => "Hunt",
-            SearchPhase::Proof => "Proof",
+    pub fn frontier_toggles(&self) -> SearchToggles {
+        SearchToggles {
+            node_pruning: false,
+            completion_pruning: false,
+            branch_ordering: BranchOrdering::WorstFirst,
+            ..SearchToggles::default()
         }
     }
 }
@@ -120,7 +103,6 @@ pub struct ParallelCheckpointState {
     nodes_expanded: u64,
     nodes_pruned: u64,
     completions_pruned: u64,
-    hunt_expanded: u64,
     total_shards: usize,
     shards_done: usize,
     started_unix: u64,
@@ -140,7 +122,6 @@ pub struct ParallelCheckpointManifest {
     nodes_expanded: u64,
     nodes_pruned: u64,
     completions_pruned: u64,
-    hunt_expanded: u64,
     pending_shards: usize,
     running_shards: usize,
     shards_done: usize,
@@ -159,7 +140,6 @@ pub struct ParallelCheckpointStore {
 #[derive(Clone, Debug, Default)]
 struct WorkerState {
     active: bool,
-    phase: String,
     shard_id: Option<usize>,
     bucket: Option<usize>,
     depth: usize,
@@ -200,7 +180,6 @@ struct SharedState {
     total_expanded: AtomicU64,
     total_pruned: AtomicU64,
     total_completion_pruned: AtomicU64,
-    hunt_expanded: AtomicU64,
     checkpoint_request: AtomicU64,
     checkpoint_release: AtomicU64,
     checkpoint_acks: AtomicUsize,
@@ -267,7 +246,7 @@ impl ParallelCheckpointStore {
         }
         if manifest.config_fingerprint != config.fingerprint() {
             return Err(FoldError::Other(
-                "parallel checkpoint config differs from current hunt/shard config".to_string(),
+                "parallel checkpoint config differs from current shard config".to_string(),
             ));
         }
         let state_bytes = fs::read(&self.state_path)?;
@@ -297,7 +276,6 @@ impl ParallelCheckpointStore {
             nodes_expanded: state.nodes_expanded,
             nodes_pruned: state.nodes_pruned,
             completions_pruned: state.completions_pruned,
-            hunt_expanded: state.hunt_expanded,
             pending_shards: state.pending_shards.len(),
             running_shards: state.running_shards.len(),
             shards_done: state.shards_done,
@@ -329,13 +307,11 @@ impl ParallelCheckpointStore {
             "nodes_expanded": state.nodes_expanded,
             "nodes_pruned": state.nodes_pruned,
             "completions_pruned": state.completions_pruned,
-            "hunt_expanded": state.hunt_expanded,
             "pending_shards": state.pending_shards.len(),
             "running_shards": state.running_shards.len(),
             "shards_done": state.shards_done,
             "total_shards": state.total_shards,
             "workers": config.workers,
-            "hunt_nodes": config.hunt_nodes,
             "shard_depth": config.shard_depth,
             "checkpoint_every_secs": config.checkpoint_every_secs,
             "best_score": {
@@ -375,7 +351,6 @@ pub fn run_parallel_search(
         total_expanded,
         total_pruned,
         total_completion_pruned,
-        hunt_expanded,
         shards_done,
         total_shards,
         started_unix,
@@ -410,7 +385,6 @@ pub fn run_parallel_search(
                 state.nodes_expanded,
                 state.nodes_pruned,
                 state.completions_pruned,
-                state.hunt_expanded,
                 state.shards_done,
                 state.total_shards,
                 state.started_unix,
@@ -420,10 +394,13 @@ pub fn run_parallel_search(
             )
         }
         None => {
-            let mut shard_toggles = config.hunt_toggles();
-            shard_toggles.node_pruning = false;
+            let shard_toggles = config.frontier_toggles();
             let (shard_stacks, shard_ancestors, gen_seen) =
                 DfsRunner::frontier_shards(&interner, config.shard_depth, &shard_toggles)?;
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::malloc_trim(0);
+            }
             if shard_stacks.is_empty() {
                 return Err(FoldError::Other(
                     "parallel shard generation produced no work".to_string(),
@@ -461,7 +438,6 @@ pub fn run_parallel_search(
                 0,
                 0,
                 0,
-                0,
                 total_shards,
                 started_unix,
                 gen_seen,
@@ -480,7 +456,6 @@ pub fn run_parallel_search(
         total_expanded: AtomicU64::new(total_expanded),
         total_pruned: AtomicU64::new(total_pruned),
         total_completion_pruned: AtomicU64::new(total_completion_pruned),
-        hunt_expanded: AtomicU64::new(hunt_expanded),
         checkpoint_request: AtomicU64::new(0),
         checkpoint_release: AtomicU64::new(0),
         checkpoint_acks: AtomicUsize::new(0),
@@ -567,22 +542,10 @@ fn worker_loop(
         let mut steps_since_update = 0usize;
         let mut scratch = StepScratch::default();
 
-        update_worker_state(
-            &shared,
-            worker_id,
-            &runner,
-            shard_id,
-            shard_bucket,
-            phase_for(&shared, &config),
-            0.0,
-        );
+        update_worker_state(&shared, worker_id, &runner, shard_id, shard_bucket, 0.0);
 
         while !runner.is_finished() && !should_quit.load(Ordering::Relaxed) {
-            let phase = phase_for(&shared, &config);
-            let toggles = match phase {
-                SearchPhase::Hunt => config.hunt_toggles(),
-                SearchPhase::Proof => config.proof_toggles(),
-            };
+            let toggles = config.search_toggles();
             match runner.step_with_toggles_and_scratch(&interner, &toggles, &mut scratch) {
                 Ok(event) => {
                     if event.incumbent_improved {
@@ -603,7 +566,6 @@ fn worker_loop(
                     &runner,
                     shard_id,
                     shard_bucket,
-                    phase,
                     &mut last_expanded,
                     &mut last_pruned,
                     &mut last_cpruned,
@@ -632,7 +594,6 @@ fn worker_loop(
             &runner,
             shard_id,
             shard_bucket,
-            phase_for(&shared, &config),
             &mut last_expanded,
             &mut last_pruned,
             &mut last_cpruned,
@@ -655,7 +616,6 @@ fn flush_worker_progress(
     runner: &DfsRunner,
     shard_id: usize,
     shard_bucket: usize,
-    phase: SearchPhase,
     last_expanded: &mut u64,
     last_pruned: &mut u64,
     last_cpruned: &mut u64,
@@ -677,11 +637,6 @@ fn flush_worker_progress(
     shared
         .total_completion_pruned
         .fetch_add(cpruned_delta, Ordering::Relaxed);
-    if phase == SearchPhase::Hunt {
-        shared
-            .hunt_expanded
-            .fetch_add(expanded_delta, Ordering::Relaxed);
-    }
     *last_expanded = expanded;
     *last_pruned = pruned;
     *last_cpruned = cpruned;
@@ -695,15 +650,7 @@ fn flush_worker_progress(
     };
     *last_rate_nodes = expanded;
     *last_rate_at = Instant::now();
-    update_worker_state(
-        shared,
-        worker_id,
-        runner,
-        shard_id,
-        shard_bucket,
-        phase,
-        rate,
-    );
+    update_worker_state(shared, worker_id, runner, shard_id, shard_bucket, rate);
 }
 
 fn maybe_pause_for_checkpoint(
@@ -763,14 +710,12 @@ fn update_worker_state(
     runner: &DfsRunner,
     shard_id: usize,
     shard_bucket: usize,
-    phase: SearchPhase,
     rate: f64,
 ) {
     let snapshot = runner.search_snapshot();
     let mut workers = shared.workers.lock().unwrap();
     let worker = &mut workers[worker_id];
     worker.active = true;
-    worker.phase = phase.label().to_string();
     worker.shard_id = Some(shard_id);
     worker.bucket = Some(shard_bucket);
     worker.depth = snapshot.current_depth;
@@ -826,14 +771,6 @@ fn record_shard_ancestor_completion(shared: &SharedState, ancestors: &[u64]) {
             break;
         }
         *done[level].entry(ancestor_id).or_insert(0) += 1;
-    }
-}
-
-fn phase_for(shared: &SharedState, config: &ParallelSearchConfig) -> SearchPhase {
-    if shared.hunt_expanded.load(Ordering::Relaxed) < config.hunt_nodes {
-        SearchPhase::Hunt
-    } else {
-        SearchPhase::Proof
     }
 }
 
@@ -970,7 +907,6 @@ fn capture_parallel_checkpoint_state(
         nodes_expanded: shared.total_expanded.load(Ordering::Relaxed),
         nodes_pruned: shared.total_pruned.load(Ordering::Relaxed),
         completions_pruned: shared.total_completion_pruned.load(Ordering::Relaxed),
-        hunt_expanded: shared.hunt_expanded.load(Ordering::Relaxed),
         total_shards: shared.total_shards,
         shards_done: shared.shards_done.load(Ordering::Relaxed),
         started_unix: shared.started_unix,
@@ -1017,7 +953,6 @@ fn update_parallel_metrics(
     let completed = shared.completed_depths.lock().unwrap().clone();
     let best = shared.best.lock().unwrap();
     let pending = shared.queue.lock().unwrap().len();
-    let phase = phase_for(shared, config);
 
     let mut seen_by_depth = shared.shallow_seen.clone();
     let mut descended_by_depth = vec![0; seen_by_depth.len()];
@@ -1074,7 +1009,6 @@ fn update_parallel_metrics(
         worker_rates.push((id, worker.rate));
         worker_summaries.push(WorkerMetrics {
             id,
-            mode: worker.phase.clone(),
             shard_id: worker.shard_id,
             depth: worker.depth,
             rate: worker.rate,
@@ -1103,7 +1037,7 @@ fn update_parallel_metrics(
         g.phase = if shared.checkpoint_saving.load(Ordering::Relaxed) {
             "Parallel Checkpointing".to_string()
         } else {
-            format!("Parallel {}", phase.label())
+            "Parallel Search".to_string()
         };
         g.start_time = shared.started_unix;
         g.nodes_expanded = shared.total_expanded.load(Ordering::Relaxed);
@@ -1131,14 +1065,11 @@ fn update_parallel_metrics(
         g.checkpoint_status = shared.checkpoint_status.lock().unwrap().clone();
         g.checkpoint_time = shared.checkpoint_time.load(Ordering::Relaxed);
         g.parallel.enabled = true;
-        g.parallel.mode = phase.label().to_string();
         g.parallel.workers_total = config.workers;
         g.parallel.workers_active = shared.workers_active.load(Ordering::Relaxed);
         g.parallel.shards_pending = pending;
         g.parallel.shards_running = shared.shards_running.load(Ordering::Relaxed);
         g.parallel.shards_done = shared.shards_done.load(Ordering::Relaxed);
-        g.parallel.hunt_nodes = shared.hunt_expanded.load(Ordering::Relaxed);
-        g.parallel.hunt_target_nodes = config.hunt_nodes;
         g.parallel.frontier_buckets = frontier_buckets;
         g.parallel.active_buckets = active_buckets;
         g.parallel.worker_summaries = worker_summaries;
@@ -1274,26 +1205,25 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn parallel_phase_toggles_use_completion_pruning_only_for_proof() {
+    fn parallel_search_toggles_enable_completion_pruning() {
         let config = ParallelSearchConfig {
             enabled: true,
             workers: 4,
-            hunt_nodes: 1_000,
             shard_depth: 3,
             checkpoint_every_secs: 30,
             resume_enabled: true,
         };
 
-        let hunt = config.hunt_toggles();
-        assert_eq!(hunt.branch_ordering, BranchOrdering::WorstFirst);
-        assert!(!hunt.completion_pruning);
-        assert!(hunt.compute_bounds);
-        assert!(hunt.node_pruning);
+        let toggles = config.search_toggles();
+        assert!(toggles.completion_pruning);
+        assert!(toggles.compute_bounds);
+        assert!(toggles.node_pruning);
 
-        let proof = config.proof_toggles();
-        assert!(proof.completion_pruning);
-        assert!(proof.compute_bounds);
-        assert!(proof.node_pruning);
+        let frontier = config.frontier_toggles();
+        assert_eq!(frontier.branch_ordering, BranchOrdering::WorstFirst);
+        assert!(!frontier.completion_pruning);
+        assert!(!frontier.node_pruning);
+        assert!(frontier.compute_bounds);
     }
 
     #[test]
@@ -1620,7 +1550,6 @@ mod tests {
         let config = ParallelSearchConfig {
             enabled: true,
             workers: 1,
-            hunt_nodes: 1,
             shard_depth: 2,
             checkpoint_every_secs: 3600,
             resume_enabled: false,

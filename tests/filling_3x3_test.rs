@@ -1,5 +1,5 @@
 use fold::interner::Interner;
-use fold::ortho::{Ortho, PayloadVal, EMPTY_CELL, payload_to_usize};
+use fold::ortho::{Ortho, PayloadVal, payload_to_usize};
 
 /// Test filling a [3,3] ortho to see when diagonal conflicts should occur
 #[test]
