@@ -112,6 +112,36 @@ fn bench_intersect_e_txt_large_vocab(c: &mut Criterion) {
     });
 }
 
+fn bench_intersect_e_txt_large_vocab_prefix_ids(c: &mut Criterion) {
+    let text = fs::read_to_string("e.txt").expect("failed to read e.txt from repository root");
+    let interner = Interner::from_text(&text);
+    assert!(
+        interner.vocab_size() >= 1024,
+        "e.txt should exercise a large vocabulary"
+    );
+
+    let required = high_fanout_single_token_prefixes(&interner, 2);
+    let required_ids: Vec<u32> = required
+        .iter()
+        .map(|prefix| interner.prefix_id_for(prefix).expect("prefix should exist"))
+        .collect();
+    let forbidden = Vec::new();
+    let mut out = FixedBitSet::with_capacity(interner.vocab_size());
+    out.grow(interner.vocab_size());
+    black_box(interner.intersect_prefix_ids_into_count(&required_ids, &forbidden, &mut out));
+
+    c.bench_function("interner_intersect_e_txt_large_vocab_prefix_ids", |b| {
+        b.iter(|| {
+            let count = interner.intersect_prefix_ids_into_count(
+                black_box(&required_ids),
+                black_box(&forbidden),
+                black_box(&mut out),
+            );
+            black_box(count)
+        })
+    });
+}
+
 fn bench_merge(c: &mut Criterion) {
     let interner1 = Interner::from_text(SAMPLE_TEXT);
     let interner2 = Interner::from_text("The pen is mightier than the sword.");
@@ -205,6 +235,7 @@ criterion_group!(
     bench_intersect_complex,
     bench_intersect_many_forbidden,
     bench_intersect_e_txt_large_vocab,
+    bench_intersect_e_txt_large_vocab_prefix_ids,
     bench_merge,
     bench_completions_for_prefix,
     bench_impacted_keys,

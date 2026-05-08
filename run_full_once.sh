@@ -15,6 +15,7 @@ if [ -f .env ]; then
   source .env
   set +a
 fi
+run_bundle_export_perf_rustflags
 
 SRC_FILE="${1:-e.txt}"
 if [[ ! -f "$SRC_FILE" ]]; then

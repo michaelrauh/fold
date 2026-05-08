@@ -104,24 +104,32 @@ pub struct Ortho {
 }
 
 impl Ortho {
+    #[inline]
+    fn mix_id_word(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    #[inline]
+    fn payload_cell_id(idx: usize, value: PayloadVal) -> OrthoId {
+        Self::mix_id_word(((idx as u64) << 32) ^ u64::from(value)) & 0x7FFF_FFFF_FFFF_FFFF
+    }
+
     fn compute_id(dims: &[Dim], payload: &[PayloadVal], up_axis: Option<Dim>) -> OrthoId {
         use std::hash::Hasher;
         let mut hasher = FxHasher::default();
-        // dims is &[u8]: its Hash impl calls write(self) directly — already optimal
         dims.hash(&mut hasher);
-        // payload is &[u32]: default Hash hashes len + each u32 via write_u32 (4-byte writes).
-        // Reinterpret as bytes so FxHasher processes 8 bytes per chunk instead of 4.
         hasher.write_usize(payload.len());
-        // SAFETY: u32 has no padding; reinterpreting as bytes is valid.
-        let payload_bytes = unsafe {
-            std::slice::from_raw_parts(
-                payload.as_ptr() as *const u8,
-                payload.len() * std::mem::size_of::<PayloadVal>(),
-            )
-        };
-        hasher.write(payload_bytes);
         up_axis.hash(&mut hasher);
-        hasher.finish() & 0x7FFF_FFFF_FFFF_FFFF
+        let mut id = hasher.finish();
+        for (idx, &value) in payload.iter().enumerate() {
+            if value != EMPTY_CELL {
+                id ^= Self::payload_cell_id(idx, value);
+            }
+        }
+        id & 0x7FFF_FFFF_FFFF_FFFF
     }
 
     fn dims_to_inline(dims: &[Dim]) -> ([Dim; MAX_DIMS], u8) {
@@ -217,7 +225,11 @@ impl Ortho {
     }
 
     #[inline]
-    fn in_fill_child_from_payload_raw(&self, payload_arr: [PayloadVal; MAX_PAYLOAD]) -> Self {
+    fn in_fill_child_from_payload_raw(
+        &self,
+        payload_arr: [PayloadVal; MAX_PAYLOAD],
+        id: OrthoId,
+    ) -> Self {
         let fill_count = self
             .fill_count
             .checked_add(1)
@@ -231,11 +243,6 @@ impl Ortho {
             u32::try_from(next_empty).expect("next empty position overflowed cached u32 field");
         let mut score = self.score;
         score.fullness = fill_count as usize;
-        let id = Self::compute_id(
-            self.dims(),
-            &payload_arr[..self.payload_cap as usize],
-            self.up_axis,
-        );
         Self {
             dims: self.dims,
             dims_len: self.dims_len,
@@ -369,14 +376,28 @@ impl Ortho {
             {
                 new_payload.swap(1, 2);
             }
-            out.push(self.in_fill_child_from_payload_raw(new_payload));
+            let id = Self::compute_id(
+                self.dims(),
+                &new_payload[..self.payload_cap as usize],
+                self.up_axis,
+            );
+            out.push(self.in_fill_child_from_payload_raw(new_payload, id));
             return;
         }
         let mut new_payload = self.payload;
         if insertion_index < self.payload_cap as usize {
             new_payload[insertion_index] = value;
         }
-        out.push(self.in_fill_child_from_payload_raw(new_payload));
+        let id = if insertion_index < self.payload_cap as usize {
+            (self.id ^ Self::payload_cell_id(insertion_index, value)) & 0x7FFF_FFFF_FFFF_FFFF
+        } else {
+            Self::compute_id(
+                self.dims(),
+                &new_payload[..self.payload_cap as usize],
+                self.up_axis,
+            )
+        };
+        out.push(self.in_fill_child_from_payload_raw(new_payload, id));
     }
 
     fn expand_over_into(
@@ -483,6 +504,27 @@ impl Ortho {
         });
     }
 
+    pub(crate) fn fill_requirements_flat_with_meta(
+        &self,
+        meta: &std::rc::Rc<spatial::DimMeta>,
+        forbidden_out: &mut Vec<usize>,
+        required_ranges_out: &mut Vec<(usize, usize)>,
+        required_values_out: &mut Vec<usize>,
+    ) {
+        let pos = self.get_current_position();
+        let payload = &self.payload[..self.payload_cap as usize];
+        spatial::with_meta_requirements(meta, pos, |prefixes, diagonals| {
+            Self::fill_flat_from_meta_data(
+                payload,
+                prefixes,
+                diagonals,
+                forbidden_out,
+                required_ranges_out,
+                required_values_out,
+            );
+        });
+    }
+
     fn fill_from_meta_data(
         payload: &[PayloadVal],
         prefixes: &[Vec<usize>],
@@ -524,6 +566,43 @@ impl Ortho {
             out_idx += 1;
         }
         required_out.truncate(out_idx);
+    }
+
+    fn fill_flat_from_meta_data(
+        payload: &[PayloadVal],
+        prefixes: &[Vec<usize>],
+        diagonals: &[usize],
+        forbidden_out: &mut Vec<usize>,
+        required_ranges_out: &mut Vec<(usize, usize)>,
+        required_values_out: &mut Vec<usize>,
+    ) {
+        forbidden_out.clear();
+        for &idx in diagonals {
+            if idx < payload.len() {
+                let v = payload[idx];
+                if v != EMPTY_CELL {
+                    forbidden_out.push(payload_to_usize(v));
+                }
+            }
+        }
+
+        required_ranges_out.clear();
+        required_values_out.clear();
+        for prefix in prefixes {
+            if prefix.is_empty() {
+                continue;
+            }
+            let start = required_values_out.len();
+            for &idx in prefix {
+                if idx < payload.len() {
+                    let v = payload[idx];
+                    if v != EMPTY_CELL {
+                        required_values_out.push(payload_to_usize(v));
+                    }
+                }
+            }
+            required_ranges_out.push((start, required_values_out.len() - start));
+        }
     }
 
     pub fn get_requirements(&self) -> (Vec<PayloadVal>, Vec<Vec<PayloadVal>>) {

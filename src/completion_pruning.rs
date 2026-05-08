@@ -71,6 +71,9 @@ impl ImpactedPrefixIndex {
 pub struct CompletionContext {
     required_usize: Vec<Vec<usize>>,
     forbidden_usize: Vec<usize>,
+    required_ranges: Vec<(usize, usize)>,
+    required_values: Vec<usize>,
+    compact_requirements: bool,
     totals: Vec<usize>,
     impacted_totals: Vec<usize>,
     bound_scratch: Vec<usize>,
@@ -124,11 +127,30 @@ impl CompletionContext {
             &mut self.forbidden_usize,
             &mut self.required_usize,
         );
+        self.compact_requirements = false;
+        self.reset_common_fields(ortho);
+    }
+
+    pub fn reset_for_node_compact(&mut self, ortho: &Ortho) {
+        self.refresh_meta(ortho);
+        let meta = &self.meta_cache.as_ref().unwrap().meta;
+        ortho.fill_requirements_flat_with_meta(
+            meta,
+            &mut self.forbidden_usize,
+            &mut self.required_ranges,
+            &mut self.required_values,
+        );
+        self.required_usize.clear();
+        self.compact_requirements = true;
         self.reset_common_fields(ortho);
     }
 
     pub fn reset_for_completion_bounds(&mut self, ortho: &Ortho) {
         self.reset_for_node(ortho);
+    }
+
+    pub fn reset_for_completion_bounds_compact(&mut self, ortho: &Ortho) {
+        self.reset_for_node_compact(ortho);
     }
 
     pub fn reset_for_impacted_bounds(&mut self, ortho: &Ortho) {
@@ -149,15 +171,57 @@ impl CompletionContext {
 
     fn reset_common_fields(&mut self, ortho: &Ortho) {
         self.totals.clear();
-        if self.totals.capacity() < self.required_usize.len() {
-            self.totals.reserve(self.required_usize.len());
+        let required_len = self.required_len();
+        if self.totals.capacity() < required_len {
+            self.totals.reserve(required_len);
         }
         self.dim_count = ortho.dims().len();
         self.base_score = ortho.score();
         self.base_volume = self.base_score.volume;
         self.base_fullness = self.base_score.fullness;
-        self.is_root = self.required_usize.is_empty();
+        self.is_root = required_len == 0;
         self.required_prefix_ids.clear();
+    }
+
+    fn refresh_meta(&mut self, ortho: &Ortho) {
+        let ortho_dims = ortho.dims();
+        let ortho_up_axis = ortho.up_axis();
+        let need_refresh = match &self.meta_cache {
+            None => true,
+            Some(c) => {
+                c.dims_len as usize != ortho_dims.len()
+                    || c.up_axis != ortho_up_axis
+                    || c.dims[..ortho_dims.len()] != *ortho_dims
+            }
+        };
+        if need_refresh {
+            let mut dims_arr = [0u8; 8];
+            dims_arr[..ortho_dims.len()].copy_from_slice(ortho_dims);
+            let meta = crate::spatial::get_meta_handle(ortho_dims, ortho_up_axis);
+            self.meta_cache = Some(CachedMeta {
+                meta,
+                dims: dims_arr,
+                dims_len: ortho_dims.len() as u8,
+                up_axis: ortho_up_axis,
+            });
+        }
+    }
+
+    fn required_len(&self) -> usize {
+        if self.compact_requirements {
+            self.required_ranges.len()
+        } else {
+            self.required_usize.len()
+        }
+    }
+
+    fn required_prefix(&self, idx: usize) -> &[usize] {
+        if self.compact_requirements {
+            let (start, len) = self.required_ranges[idx];
+            &self.required_values[start..start + len]
+        } else {
+            &self.required_usize[idx]
+        }
     }
 
     pub fn required_usize(&self) -> &[Vec<usize>] {
@@ -189,16 +253,22 @@ impl CompletionContext {
     }
 
     pub fn ensure_prefix_ids(&mut self, interner: &Interner) {
-        if self.required_prefix_ids.len() == self.required_usize.len() {
+        let required_len = self.required_len();
+        if self.required_prefix_ids.len() == required_len {
             return;
         }
         self.required_prefix_ids.clear();
-        for prefix in &self.required_usize {
+        for idx in 0..required_len {
+            let prefix = self.required_prefix(idx);
             let id = interner
-                .prefix_id_for(prefix.as_slice())
+                .prefix_id_for(prefix)
                 .expect("required prefix must have a prefix ID in interner");
             self.required_prefix_ids.push(id);
         }
+    }
+
+    pub fn required_prefix_ids(&self) -> &[u32] {
+        &self.required_prefix_ids
     }
 }
 
@@ -363,12 +433,12 @@ pub fn completion_upper_bound_ctx(
     let fallback_total = interner.prefix_stats(&[completion]).unwrap_or(1).max(2);
     ctx.totals.clear();
     ctx.ensure_prefix_ids(interner);
-    for idx in 0..ctx.required_usize.len() {
+    for idx in 0..ctx.required_len() {
         let parent_id = ctx.required_prefix_ids[idx];
         match interner.prefix_stats_by_parent_id(parent_id, completion) {
             Some(max_desc_len) => ctx.totals.push(max_desc_len),
             None => {
-                let mut missing = ctx.required_usize[idx].clone();
+                let mut missing = ctx.required_prefix(idx).to_vec();
                 missing.push(completion);
                 panic!("[bound][panic] missing prefix stats for {:?}", missing);
             }
@@ -401,19 +471,21 @@ fn existing_ortho_upper_bound_ctx_with_impacted(
     interner: &Interner,
     impacted_index: Option<&ImpactedPrefixIndex>,
 ) -> OrthoScore {
-    let required_prefixes = &ctx.required_usize;
-    let totals = &mut ctx.totals;
-    totals.clear();
-    for prefix in required_prefixes {
-        match interner.prefix_stats(prefix.as_slice()) {
-            Some(max_desc_len) => totals.push(max_desc_len),
-            None => {
-                panic!(
-                    "[bound][panic] missing prefix stats for impacted prefix {:?}",
-                    prefix
-                );
+    ctx.totals.clear();
+    for idx in 0..ctx.required_len() {
+        let max_desc_len = {
+            let prefix = ctx.required_prefix(idx);
+            match interner.prefix_stats(prefix) {
+                Some(max_desc_len) => max_desc_len,
+                None => {
+                    panic!(
+                        "[bound][panic] missing prefix stats for impacted prefix {:?}",
+                        prefix
+                    );
+                }
             }
-        }
+        };
+        ctx.totals.push(max_desc_len);
     }
 
     let axis_totals = if let Some(index) = impacted_index {

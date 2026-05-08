@@ -9,6 +9,7 @@ use std::collections::HashMap;
 const STACK_REQUIRED_PREFIXES: usize = 8;
 const SPARSE_INTERSECT_THRESHOLD: usize = 20;
 const SPARSE_COMPLETION_STORAGE_THRESHOLD: usize = 64;
+const DENSE_CHILD_STATS_THRESHOLD: usize = 64;
 
 #[derive(Clone, Copy)]
 struct ResolvedPrefix<'a> {
@@ -20,6 +21,13 @@ struct ResolvedPrefix<'a> {
 enum CompletionSet {
     Sparse(Vec<u32>),
     Dense { bitset: FixedBitSet, count: usize },
+}
+
+#[derive(Clone, Debug)]
+enum ChildStats {
+    Empty,
+    Sparse(Vec<(u32, u32)>),
+    Dense(Vec<u32>),
 }
 
 pub struct CompletionView<'a> {
@@ -133,6 +141,46 @@ impl CompletionSet {
     }
 }
 
+impl ChildStats {
+    fn from_edges(mut edges: Vec<(u32, u32)>, vocab_len: usize) -> Self {
+        if edges.is_empty() {
+            return ChildStats::Empty;
+        }
+        edges.sort_unstable_by_key(|&(token, _)| token);
+        if edges.len() >= DENSE_CHILD_STATS_THRESHOLD {
+            let mut stats_plus_one = vec![0u32; vocab_len];
+            for (token, stat) in edges {
+                if let Some(slot) = stats_plus_one.get_mut(token as usize) {
+                    *slot = stat.saturating_add(1);
+                }
+            }
+            return ChildStats::Dense(stats_plus_one);
+        }
+        ChildStats::Sparse(edges)
+    }
+
+    #[inline]
+    fn get(&self, token: usize) -> Option<usize> {
+        let token = token as u32;
+        match self {
+            ChildStats::Empty => None,
+            ChildStats::Sparse(edges) if edges.len() <= 8 => edges
+                .iter()
+                .find(|&&(child_token, _)| child_token == token)
+                .map(|&(_, stat)| stat as usize),
+            ChildStats::Sparse(edges) => edges
+                .binary_search_by_key(&token, |&(child_token, _)| child_token)
+                .ok()
+                .map(|idx| edges[idx].1 as usize),
+            ChildStats::Dense(stats_plus_one) => stats_plus_one
+                .get(token as usize)
+                .copied()
+                .and_then(|stat| stat.checked_sub(1))
+                .map(|stat| stat as usize),
+        }
+    }
+}
+
 impl<'a> CompletionView<'a> {
     #[inline]
     pub fn count_ones<T: IndexRange>(&self, range: T) -> usize {
@@ -167,11 +215,12 @@ pub struct Interner {
     version: usize,
     vocabulary: Vec<String>,
     prefix_to_completions: FxHashMap<Vec<usize>, CompletionSet>,
+    prefix_completions_by_id: Vec<CompletionSet>,
     prefix_stats: FxHashMap<Vec<usize>, usize>,
     single_token_stats: Vec<usize>,
     max_prefix_len: usize,
     prefix_to_id: FxHashMap<Vec<usize>, u32>,
-    child_stats_by_id: FxHashMap<(u32, u32), usize>,
+    child_stats_by_id: Vec<ChildStats>,
 }
 
 #[derive(Archive, Serialize, Deserialize)]
@@ -224,7 +273,6 @@ impl Interner {
             }
             prefix_to_completions_dense.insert(prefix, fbs);
         }
-        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions_dense);
         let mut prefix_stats_map = FxHashMap::default();
         for (prefix, max_desc_len) in prefix_stats {
             prefix_stats_map.insert(prefix, max_desc_len);
@@ -232,11 +280,16 @@ impl Interner {
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats_map);
         let vocab_len = vocabulary.len();
         let single_token_stats = Self::build_single_token_stats(&prefix_stats_map, vocab_len);
-        let (prefix_to_id, child_stats_by_id) = Self::build_prefix_id_maps(&prefix_stats_map);
+        let (prefix_to_id, child_stats_by_id) =
+            Self::build_prefix_id_maps(&prefix_stats_map, vocab_len);
+        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions_dense);
+        let prefix_completions_by_id =
+            Self::build_prefix_completions_by_id(&prefix_to_completions, &prefix_to_id);
         Interner {
             version,
             vocabulary,
             prefix_to_completions,
+            prefix_completions_by_id,
             prefix_stats: prefix_stats_map,
             single_token_stats,
             max_prefix_len,
@@ -271,13 +324,17 @@ impl Interner {
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, None);
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
-        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions);
         let single_token_stats = Self::build_single_token_stats(&prefix_stats, new_vocab_len);
-        let (prefix_to_id, child_stats_by_id) = Self::build_prefix_id_maps(&prefix_stats);
+        let (prefix_to_id, child_stats_by_id) =
+            Self::build_prefix_id_maps(&prefix_stats, new_vocab_len);
+        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions);
+        let prefix_completions_by_id =
+            Self::build_prefix_completions_by_id(&prefix_to_completions, &prefix_to_id);
         let interner = Interner {
             version: Self::initial_version(),
             vocabulary,
             prefix_to_completions,
+            prefix_completions_by_id,
             prefix_stats,
             single_token_stats,
             max_prefix_len,
@@ -297,6 +354,7 @@ impl Interner {
                 version: self.version + 1,
                 vocabulary: self.vocabulary.clone(),
                 prefix_to_completions: self.prefix_to_completions.clone(),
+                prefix_completions_by_id: self.prefix_completions_by_id.clone(),
                 prefix_stats: self.prefix_stats.clone(),
                 single_token_stats: self.single_token_stats.clone(),
                 max_prefix_len: self.max_prefix_len,
@@ -320,14 +378,18 @@ impl Interner {
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, Some(self));
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
-        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions);
         let single_token_stats = Self::build_single_token_stats(&prefix_stats, new_vocab_len);
-        let (prefix_to_id, child_stats_by_id) = Self::build_prefix_id_maps(&prefix_stats);
+        let (prefix_to_id, child_stats_by_id) =
+            Self::build_prefix_id_maps(&prefix_stats, new_vocab_len);
+        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions);
+        let prefix_completions_by_id =
+            Self::build_prefix_completions_by_id(&prefix_to_completions, &prefix_to_id);
 
         let interner = Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
+            prefix_completions_by_id,
             prefix_stats,
             single_token_stats,
             max_prefix_len,
@@ -460,6 +522,23 @@ impl Interner {
         storage
     }
 
+    fn build_prefix_completions_by_id(
+        prefix_to_completions: &FxHashMap<Vec<usize>, CompletionSet>,
+        prefix_to_id: &FxHashMap<Vec<usize>, u32>,
+    ) -> Vec<CompletionSet> {
+        let mut by_id = vec![None; prefix_to_id.len()];
+        for (prefix, &id) in prefix_to_id {
+            let completions = prefix_to_completions
+                .get(prefix)
+                .expect("prefix ID must have completion storage");
+            by_id[id as usize] = Some(completions.clone());
+        }
+        by_id
+            .into_iter()
+            .map(|entry| entry.expect("prefix completion ID table must be dense"))
+            .collect()
+    }
+
     fn debug_verify_prefix_closure(&self, new_phrases: &[Vec<String>]) -> bool {
         // Only verify prefixes introduced by new_phrases (historical ones validated earlier).
         for phrase in new_phrases {
@@ -516,13 +595,14 @@ impl Interner {
 
     fn build_prefix_id_maps(
         prefix_stats: &FxHashMap<Vec<usize>, usize>,
-    ) -> (FxHashMap<Vec<usize>, u32>, FxHashMap<(u32, u32), usize>) {
+        vocab_len: usize,
+    ) -> (FxHashMap<Vec<usize>, u32>, Vec<ChildStats>) {
         let mut prefix_to_id: FxHashMap<Vec<usize>, u32> = FxHashMap::default();
         prefix_to_id.reserve(prefix_stats.len());
         for (idx, prefix) in prefix_stats.keys().enumerate() {
             prefix_to_id.insert(prefix.clone(), idx as u32);
         }
-        let mut child_stats_by_id: FxHashMap<(u32, u32), usize> = FxHashMap::default();
+        let mut child_edges_by_id = vec![Vec::new(); prefix_to_id.len()];
         for (prefix, &stat) in prefix_stats {
             if prefix.len() < 2 {
                 continue;
@@ -530,9 +610,14 @@ impl Interner {
             let parent = &prefix[..prefix.len() - 1];
             let token = prefix[prefix.len() - 1] as u32;
             if let Some(&parent_id) = prefix_to_id.get(parent) {
-                child_stats_by_id.insert((parent_id, token), stat);
+                let stat = u32::try_from(stat).expect("prefix stat must fit in u32");
+                child_edges_by_id[parent_id as usize].push((token, stat));
             }
         }
+        let child_stats_by_id = child_edges_by_id
+            .into_iter()
+            .map(|edges| ChildStats::from_edges(edges, vocab_len))
+            .collect();
         (prefix_to_id, child_stats_by_id)
     }
 
@@ -540,10 +625,15 @@ impl Interner {
         self.prefix_to_id.get(prefix).copied()
     }
 
+    #[inline]
+    fn completions_for_prefix_id(&self, prefix_id: u32) -> Option<&CompletionSet> {
+        self.prefix_completions_by_id.get(prefix_id as usize)
+    }
+
     pub fn prefix_stats_by_parent_id(&self, parent_id: u32, appended: usize) -> Option<usize> {
         self.child_stats_by_id
-            .get(&(parent_id, appended as u32))
-            .copied()
+            .get(parent_id as usize)
+            .and_then(|stats| stats.get(appended))
     }
 
     pub fn version(&self) -> usize {
@@ -911,6 +1001,198 @@ impl Interner {
         count
     }
 
+    pub fn intersect_prefix_ids_into_count(
+        &self,
+        required_prefix_ids: &[u32],
+        forbidden: &[usize],
+        out: &mut FixedBitSet,
+    ) -> usize {
+        if out.len() < self.vocabulary.len() {
+            out.grow(self.vocabulary.len());
+        }
+
+        let mut count = if required_prefix_ids.is_empty() {
+            out.set_range(.., true);
+            self.vocabulary.len()
+        } else {
+            let mut resolved = [None; STACK_REQUIRED_PREFIXES];
+            let mut resolved_len = 0usize;
+            let mut seed_slot = 0usize;
+            let mut seed_count = usize::MAX;
+            for (idx, &prefix_id) in required_prefix_ids.iter().enumerate() {
+                let Some(completions) = self.completions_for_prefix_id(prefix_id) else {
+                    out.set_range(.., false);
+                    return 0;
+                };
+                let completion_count = completions.count();
+                if idx >= STACK_REQUIRED_PREFIXES {
+                    return self.intersect_prefix_ids_into_count_resolved_heap(
+                        required_prefix_ids,
+                        forbidden,
+                        out,
+                    );
+                }
+
+                resolved[resolved_len] = Some(ResolvedPrefix {
+                    completions,
+                    count: completion_count,
+                });
+                if completion_count < seed_count {
+                    seed_slot = resolved_len;
+                    seed_count = completion_count;
+                }
+                resolved_len += 1;
+            }
+
+            if resolved_len == 0 {
+                out.set_range(.., true);
+                return self.vocabulary.len();
+            };
+            let seed = resolved[seed_slot].expect("seed slot should be populated");
+
+            if resolved_len == 1 {
+                seed.completions.copy_to_bitset(out, self.vocabulary.len())
+            } else if matches!(seed.completions, CompletionSet::Sparse(_))
+                || seed.count <= SPARSE_INTERSECT_THRESHOLD
+            {
+                out.clear();
+                let mut count = 0usize;
+                'bit: for bit in seed.completions.ones() {
+                    for (slot, resolved_prefix) in resolved[..resolved_len].iter().enumerate() {
+                        if slot == seed_slot {
+                            continue;
+                        }
+                        let completions = resolved_prefix
+                            .expect("resolved prefix slot should be populated")
+                            .completions;
+                        if !completions.contains(bit) {
+                            continue 'bit;
+                        }
+                    }
+                    out.set(bit, true);
+                    count += 1;
+                }
+                count
+            } else {
+                let first_slot = (0..resolved_len)
+                    .find(|&slot| slot != seed_slot)
+                    .expect("resolved_len > 1 should have non-seed slot");
+                let first = resolved[first_slot].expect("first slot should be populated");
+                let mut count = if let (Some(seed_bitset), Some(first_bitset)) =
+                    (seed.completions.as_dense(), first.completions.as_dense())
+                {
+                    Self::intersect_two_bitsets_into_count(out, seed_bitset, first_bitset)
+                } else {
+                    seed.completions.copy_to_bitset(out, self.vocabulary.len());
+                    Self::intersect_completion_set_into_count(out, first.completions)
+                };
+                for (slot, resolved_prefix) in resolved[..resolved_len].iter().enumerate() {
+                    if slot == seed_slot || slot == first_slot {
+                        continue;
+                    }
+                    let completions = resolved_prefix
+                        .expect("resolved prefix slot should be populated")
+                        .completions;
+                    count = Self::intersect_completion_set_into_count(out, completions);
+                    if count == 0 {
+                        break;
+                    }
+                }
+                count
+            }
+        };
+
+        for &idx in forbidden {
+            if out.contains(idx) {
+                out.set(idx, false);
+                count = count.saturating_sub(1);
+            }
+        }
+
+        count
+    }
+
+    fn intersect_prefix_ids_into_count_resolved_heap(
+        &self,
+        required_prefix_ids: &[u32],
+        forbidden: &[usize],
+        out: &mut FixedBitSet,
+    ) -> usize {
+        let mut resolved = Vec::with_capacity(required_prefix_ids.len());
+        let mut seed_slot = 0usize;
+        let mut seed_count = usize::MAX;
+        for &prefix_id in required_prefix_ids {
+            let Some(completions) = self.completions_for_prefix_id(prefix_id) else {
+                out.set_range(.., false);
+                return 0;
+            };
+            let completion_count = completions.count();
+            resolved.push(ResolvedPrefix {
+                completions,
+                count: completion_count,
+            });
+            if completion_count < seed_count {
+                seed_slot = resolved.len() - 1;
+                seed_count = completion_count;
+            }
+        }
+
+        let seed = resolved[seed_slot];
+        let mut count = if resolved.len() == 1 {
+            seed.completions.copy_to_bitset(out, self.vocabulary.len())
+        } else if matches!(seed.completions, CompletionSet::Sparse(_))
+            || seed.count <= SPARSE_INTERSECT_THRESHOLD
+        {
+            out.clear();
+            let mut count = 0usize;
+            'bit: for bit in seed.completions.ones() {
+                for (slot, resolved_prefix) in resolved.iter().enumerate() {
+                    if slot == seed_slot {
+                        continue;
+                    }
+                    if !resolved_prefix.completions.contains(bit) {
+                        continue 'bit;
+                    }
+                }
+                out.set(bit, true);
+                count += 1;
+            }
+            count
+        } else {
+            let first_slot = (0..resolved.len())
+                .find(|&slot| slot != seed_slot)
+                .expect("resolved_len > 1 should have non-seed slot");
+            let first = resolved[first_slot];
+            let mut count = if let (Some(seed_bitset), Some(first_bitset)) =
+                (seed.completions.as_dense(), first.completions.as_dense())
+            {
+                Self::intersect_two_bitsets_into_count(out, seed_bitset, first_bitset)
+            } else {
+                seed.completions.copy_to_bitset(out, self.vocabulary.len());
+                Self::intersect_completion_set_into_count(out, first.completions)
+            };
+            for (slot, resolved_prefix) in resolved.iter().enumerate() {
+                if slot == seed_slot || slot == first_slot {
+                    continue;
+                }
+                count = Self::intersect_completion_set_into_count(out, resolved_prefix.completions);
+                if count == 0 {
+                    break;
+                }
+            }
+            count
+        };
+
+        for &idx in forbidden {
+            if out.contains(idx) {
+                out.set(idx, false);
+                count = count.saturating_sub(1);
+            }
+        }
+
+        count
+    }
+
     pub fn intersect(&self, required: &[Vec<usize>], forbidden: &[usize]) -> Vec<usize> {
         let mut intersection = FixedBitSet::with_capacity(self.vocabulary.len());
         intersection.grow(self.vocabulary.len());
@@ -1109,13 +1391,17 @@ impl Interner {
         }
 
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
-        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions);
         let single_token_stats = Self::build_single_token_stats(&prefix_stats, new_vocab_len);
-        let (prefix_to_id, child_stats_by_id) = Self::build_prefix_id_maps(&prefix_stats);
+        let (prefix_to_id, child_stats_by_id) =
+            Self::build_prefix_id_maps(&prefix_stats, new_vocab_len);
+        let prefix_to_completions = Self::build_completion_storage(prefix_to_completions);
+        let prefix_completions_by_id =
+            Self::build_prefix_completions_by_id(&prefix_to_completions, &prefix_to_id);
         Interner {
             version: self.version + 1,
             vocabulary,
             prefix_to_completions,
+            prefix_completions_by_id,
             prefix_stats,
             single_token_stats,
             max_prefix_len,
@@ -2032,6 +2318,29 @@ mod intersect_logic_tests {
     }
 
     #[test]
+    fn test_intersect_prefix_ids_into_count_matches_prefixes() {
+        let interner = build_interner("a c. b c. a d. b d. a b.");
+        let required = vec![vec![0], vec![1]];
+        let required_ids: Vec<u32> = required
+            .iter()
+            .map(|prefix| interner.prefix_id_for(prefix).unwrap())
+            .collect();
+        let mut prefix_bits = FixedBitSet::with_capacity(interner.vocab_size());
+        let mut id_bits = FixedBitSet::with_capacity(interner.vocab_size());
+        prefix_bits.grow(interner.vocab_size());
+        id_bits.grow(interner.vocab_size());
+
+        let prefix_count = interner.intersect_into_count(&required, &[], &mut prefix_bits);
+        let id_count = interner.intersect_prefix_ids_into_count(&required_ids, &[], &mut id_bits);
+
+        assert_eq!(id_count, prefix_count);
+        assert_eq!(
+            id_bits.ones().collect::<Vec<_>>(),
+            prefix_bits.ones().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_intersect_forbidden_zeroes_out() {
         let interner = build_interner("a b c");
 
@@ -2174,6 +2483,7 @@ mod version_compare_tests {
             version: low.version + 1,
             vocabulary: low.vocabulary.clone(),
             prefix_to_completions: low.prefix_to_completions.clone(),
+            prefix_completions_by_id: low.prefix_completions_by_id.clone(),
             prefix_stats: low.prefix_stats.clone(),
             single_token_stats: low.single_token_stats.clone(),
             max_prefix_len: low.max_prefix_len,

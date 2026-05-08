@@ -21,7 +21,9 @@ APP_BIN="$SCRIPT_DIR/target/release/fold"
 CARGO_ENV="$HOME/.cargo/env"
 FOLD_OFFLOAD_ENABLED="${FOLD_OFFLOAD_ENABLED:-}"
 
-RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2}"
+# Default to debuginfo + frame pointers for perf attribution and native CPU
+# features for the production AMD host; allow override via env.
+RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2 -C target-cpu=native}"
 export RUSTFLAGS
 
 if ! command -v tmux >/dev/null 2>&1; then

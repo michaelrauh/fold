@@ -545,9 +545,9 @@ impl DfsRunner {
                 let prune_completions = toggles.compute_bounds && toggles.completion_pruning;
                 let ctx_reset_start = profile_start!();
                 if prune_completions {
-                    frame_ctx.reset_for_completion_bounds(&frame.ortho);
+                    frame_ctx.reset_for_completion_bounds_compact(&frame.ortho);
                 } else {
-                    frame_ctx.reset_for_node(&frame.ortho);
+                    frame_ctx.reset_for_node_compact(&frame.ortho);
                 }
                 profile_end!(ctx_reset_start, ctx_reset_ns);
                 if toggles.compute_bounds {
@@ -574,8 +574,9 @@ impl DfsRunner {
                 completion_bits.clear();
                 profile_end!(ctx_reset_start, ctx_reset_ns);
                 let intersect_start = profile_start!();
-                let k = interner.intersect_into_count(
-                    frame_ctx.required_usize(),
+                frame_ctx.ensure_prefix_ids(interner);
+                let k = interner.intersect_prefix_ids_into_count(
+                    frame_ctx.required_prefix_ids(),
                     frame_ctx.forbidden_usize(),
                     completion_bits,
                 );
@@ -670,7 +671,7 @@ impl DfsRunner {
                             completion_bound.max(child_score)
                         } else if toggles.compute_bounds && prune_completions {
                             let existing_bound_start = profile_start!();
-                            child_ctx.reset_for_node(&child);
+                            child_ctx.reset_for_node_compact(&child);
                             let bound = existing_ortho_upper_bound_ctx(child_ctx, interner);
                             profile_end!(existing_bound_start, existing_bound_ns);
                             bound
@@ -691,7 +692,7 @@ impl DfsRunner {
                 if toggles.compute_bounds && !prune_completions && !frame.branches.is_empty() {
                     let existing_bound_start = profile_start!();
                     for branch in &mut frame.branches {
-                        frame_ctx.reset_for_node(&branch.child);
+                        frame_ctx.reset_for_node_compact(&branch.child);
                         branch.optimistic_bound =
                             existing_ortho_upper_bound_ctx(frame_ctx, interner);
                     }

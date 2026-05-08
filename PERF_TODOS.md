@@ -13,38 +13,97 @@ All benchmarks run locally (`cargo bench`) unless the item depends on target arc
 
 ---
 
+## Incumbent
+
+Captured from the 2026-05-08 prod `e.txt` parallel search run on `142.93.70.195`.
+
+- Run: `10:32:14`, phase `Parallel Search`
+- Workers: `4/4`, queue `30.4k` pending, `4` running, `1.87k` done
+- Expanded/pruned/completion-pruned: `234B` / `219B` / `2.81B`
+- Rates: `6.44M n/s`, `6.01M p/s`, `431k accepted/s`, `117k cp/s`
+- Depth: `32/35`, current bound `vol=8541936 full=11200000`
+- Checkpoint: saved in `0.23s` at `1778238864`, age `00:00:23`
+- Worker balance: min/avg/max `1.29M/1.63M/2.01M`
+- Best age: `09:32:39` at depth `33`
+- Incumbent: actual `vol=2 var=4/25 full=32`, effective prune `vol=8 full=27`, floor `vol=8`
+- Best dims: `[2, 2, 2, 2, 3]`, capacity `48`
+
+```text
+[dim0=0, dim1=0, dim2=0]
+captive       a       .
+  among  people       .
+
+[dim0=0, dim1=0, dim2=1]
+    was    much       .
+    all      of       .
+
+[dim0=0, dim1=1, dim2=0]
+     to  battle       .
+    her      as       .
+
+[dim0=0, dim1=1, dim2=1]
+     as      in       .
+   that      my       .
+
+[dim0=1, dim1=0, dim2=0]
+   from   heart       .
+   them     and       .
+
+[dim0=1, dim1=0, dim2=1]
+     it       i       .
+ before       a       .
+
+[dim0=1, dim1=1, dim2=0]
+    him    with       .
+```
+
+---
+
 ## TODO
 
-- [x] **Fix shard stack branch-capacity retention**
-  In `src/dfs_runner.rs` line ~301, `frontier_shards` clones the stack then calls `frame.branches.clear()` on ancestor frames. `clear()` retains capacity, so each of ~30k pending shards holds a large empty `Vec` buffer. Replace those branch `Vec`s with fresh empty `Vec`s, or construct stripped ancestor frames that never carry extra capacity. Expected impact: large RSS reduction (~15.8 GB live).
-  - Bench: `baseline_bestfirst_prune_both` local DFS bench; also check RSS on prod box after deploy.
+- [x] **Verify prod build uses native CPU features**
+  The 2026-05-08 perf run on `142.93.70.195` sampled the active `target/release/fold e.txt` process at ~7.3M n/s, but `objdump -d target/release/fold | grep -i popcnt` found no POPCNT instructions even though the DO Premium AMD CPU supports POPCNT/AVX2/BMI2. Confirm the deployed binary is built through `start_fold.sh` or another path that exports `RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=2 -C target-cpu=native"`. If not, fix the deploy/start path and re-check the binary before rerunning perf.
+  - Bench: prod-box `interner_intersect_e_txt_large_vocab`, live `e.txt` throughput, and `perf stat` before/after rebuild.
+  - Result 2026-05-08: added repo `.cargo/config.toml` so plain `cargo run --release` uses frame pointers and `target-cpu=native`; kept script defaults aligned. Rebuilt prod `target/release/fold` and verified POPCNT instructions are present.
+  - Prod bench: non-native `158.22 ns` mean-ish midpoint (`[154.67, 158.22, 161.56]`), native `75.33 ns` (`[73.09, 75.33, 77.59]`).
+  - Short live `e.txt` run: non-native `6.73M n/s`, native `7.30M n/s` at the same 67s snapshot window.
+  - Live `perf stat` 45s: non-native `469.5B cycles / 1.150T instructions`; native `450.9B cycles / 1.045T instructions`.
+  - Recommendation: keep.
 
-- [x] **Build with CPU features enabled**
-  The remote binary does not appear to contain `popcnt` despite the AMD CPU supporting POPCNT/AVX2/BMI2. Update `start_fold.sh` to pass `-C target-cpu=native` (or a portable `x86-64-v3` feature set) so bitset `count_ones` uses hardware popcount. Benchmark and deploy on prod box only (arch-dependent).
-  - Bench: interner bench and DFS bench on prod box before and after redeployment.
-  - Result: Added `-C target-cpu=native` to RUSTFLAGS default in `start_fold.sh`. Clean A/B on idle AMD prod box: `interner_intersect_e_txt_large_vocab` (the large-vocab `intersect_into_count` hot path) improved from 186 ns → 107 ns (**−42%**). DFS `baseline_bestfirst_prune_both` unchanged within noise (59.5 ms vs 59.2 ms). Keep.
+- [x] **Use prefix IDs for completion intersection lookups**
+  `Interner::intersect_into_count` was the top sampled symbol at ~21.3% CPU. Perf annotate showed much of this is hashing/probing `Vec<usize>` keys in `prefix_to_completions.get(prefix)`, including hash work and `bcmp`, not just raw bitset intersection. Add a prefix-ID completion table (for example `prefix_completions_by_id: Vec<CompletionSet>`) and thread `CompletionContext` required prefix IDs into a new `intersect_prefix_ids_into_count` path.
+  - Bench: local `interner_intersect_e_txt_large_vocab`, local DFS probe/bench, then prod-box live throughput and flat perf symbol share.
+  - Result 2026-05-08: added `prefix_completions_by_id` and `Interner::intersect_prefix_ids_into_count`; DFS now calls the ID path after `CompletionContext::ensure_prefix_ids`. The public prefix API keeps the direct map lookup to avoid adding an ID indirection for callers that only have `Vec` prefixes.
+  - Local bench: public `interner_intersect_e_txt_large_vocab` `67.96 ns`; new `interner_intersect_e_txt_large_vocab_prefix_ids` `50.72 ns`. Local DFS `baseline_bestfirst_prune_both` was statistically flat (`39.70 ms`, p=0.63) with probe budget `4.61M` steps/5s.
+  - Prod bench: public prefix path `75.72 ns`; prefix-ID path `55.56 ns`.
+  - Prod short live `e.txt`: `7.55M n/s` at the 67s snapshot, up from `7.30M n/s` after the native-build fix.
+  - Prod flat perf: `intersect_prefix_ids_into_count` `18.17%`; old `intersect_into_count` symbol no longer appears as the top path. `ensure_prefix_ids` is now visible at `3.45%`, which should compound with the compact requirement-data TODO.
+  - Recommendation: keep.
 
-- [x] **Trim allocator memory after construction**
-  Raw bitset storage for the interner is only ~376 MB despite 15 GB RSS, so most RSS is retained transient buffer capacity. Add a call to `malloc_trim(0)` after interner construction and after frontier creation (GNU/Linux only, gate behind `#[cfg(target_os = "linux")]`).
-  - Bench: RSS on prod box; local DFS bench for throughput regression check.
-  - Result: Added `libc::malloc_trim(0)` after `Interner::from_text` in `src/main.rs` and after `DfsRunner::frontier_shards` in `src/parallel_search.rs`, both gated on `#[cfg(target_os = "linux")]`. Local `baseline_bestfirst_prune_both` bench: 4.11M steps/5s before → 4.12M steps/5s after (no throughput regression). RSS on prod box (AMD 4-core): ~15 GB before → **~810 MB after** (VmRSS=829,512 kB, VmHWM=935,932 kB peak). Over 18x RSS reduction. Keep.
+- [x] **Replace parent/completion hash stats with indexed child stats**
+  `completion_upper_bound_ctx` was ~7.6% CPU, and annotate showed hot `(parent_prefix_id, completion)` hash probes in `child_stats_by_id`. Replace `FxHashMap<(u32, u32), usize>` with parent-indexed child storage: sparse sorted child lists for low fanout and dense/table storage only where fanout justifies it. The goal is one cheap parent lookup plus a fast child lookup per required prefix.
+  - Bench: local DFS probe timers for `completion_bound_ms`, `baseline_bestfirst_prune_both`, and prod-box perf share for `completion_upper_bound_ctx`.
+  - Result 2026-05-08: replaced tuple-key `FxHashMap<(u32, u32), usize>` with `Vec<ChildStats>` indexed by parent prefix ID. Low-fanout parents use compact sorted child lists; high-fanout parents use direct vocab-indexed `u32` tables.
+  - Local bench: `interner_prefix_stats_by_parent_id` about `2.06 ns`; `baseline_bestfirst_prune_both` improved to `35.19 ms` and `completion_bound_ms` dropped from `6.114 ms` after prefix IDs to `3.048 ms`.
+  - Prod lookup bench: `3.72 ns`. Prod flat perf: `completion_upper_bound_ctx` dropped to `2.59%` plus `upper_bound_score_with_scratch` `3.23%`, down from roughly `5.98% + 2.88%` after the prefix-ID change.
+  - Prod short live `e.txt`: noisy/negative in two 65-66s samples (`7.26M n/s`, then `5.98M n/s`) versus the prior prefix-ID sample `7.55M n/s`; do not claim a live throughput win from this item alone.
+  - Recommendation: keep for the targeted CPU-share and local DFS-probe improvement, but re-evaluate after the requirement-materialization change because live throughput did not confirm the gain.
 
-- [x] **Replace prefix `Vec<usize>` hash lookups with prefix IDs / trie nodes**
-  `prefix_stats_with_appended` is 7.4% of CPU (`src/interner.rs` line ~379). A trie or prefix-ID scheme turns "prefix + appended token" into a child-pointer lookup instead of allocating/extending/hashing a slice key.
-  - Bench: interner bench locally.
-  - Result: Added interner-level prefix IDs plus `(parent_prefix_id, appended_token)` child stat lookups, and taught `CompletionContext` to cache required prefix IDs so completion bounds no longer allocate/extend/hash a `Vec` per required prefix. Microbench tradeoff: interner construction regressed (`interner_from_text` 214 µs → 235 µs, `interner_add_text` 88.3 µs → 106 µs) because the extra index is built eagerly, but the hot query path improved (`interner_intersect_simple` 126.8 ns → 112.8 ns, **-11%**). The behavior-scoped DFS bench `baseline_bestfirst_prune_both` improved from about **39.9 ms to 38.9 ms** (**-2.5%**, significant), with `completion_bound_ms` down to 6.05 ms on the probe run. Keep.
+- [x] **Avoid eager full-payload hashing for every child Ortho ID**
+  `Ortho::compute_id` was ~6.1% CPU. In-fill child creation currently hashes the full dims/payload slice for every generated child even though `id()` is mostly used for deterministic tie-breaking and progress metadata. Explore a lazy ID, cached incremental fingerprint, or specialized in-fill update that avoids rehashing the full payload on every `Ortho::in_fill_child_from_payload_raw` call.
+  - Bench: local `ortho_add_*`, DFS probe `child_gen_ms`, `baseline_bestfirst_prune_both`, and prod-box perf share for `Ortho::compute_id`.
+  - Result 2026-05-08: changed `Ortho` IDs to a deterministic content hash made from dims/up-axis/cap plus per-cell mixed hashes. Normal in-fill children now update `self.id` with the inserted cell hash instead of hashing the whole payload slice; expansion/remap/canonicalizing paths still compute from the full payload.
+  - Local bench: tiny `ortho_add_*` benches regressed locally, but the DFS hot-path probe improved: `child_gen_ms` dropped from `4.214 ms` to `3.425 ms`, and probe budget rose to `4.71M` steps/5s. `baseline_bestfirst_prune_both` was statistically flat (`38.28 ms`, p=0.17).
+  - Prod bench: `ortho_add_simple` `104 ns`, `ortho_add_multiple` `104 ns`, `ortho_add_shape_expansion` `85.5 ns`, all improved in Criterion's local prod history.
+  - Prod short live `e.txt`: `7.32M n/s` at the 66s snapshot.
+  - Prod flat perf: `Ortho::compute_id` no longer appears in the top flat symbols; remaining Ortho child cost is attributed to `Ortho::add_into` at `4.28%`.
+  - Recommendation: keep.
 
-- [x] **Use hybrid sparse/dense completion storage**
-  `intersect_into_count` is the top symbol at 22.2% (`src/interner.rs` line ~487). Total completion edges are ~454k across ~460k prefixes, so most prefixes have fanout ≤ 1. Store small fanouts as compact sorted `u16`/`u32` lists; keep `FixedBitSet` only for high-fanout prefixes.
-  - Bench: interner bench locally.
-  - Result: Added hybrid `CompletionSet` storage: fanout ≤ 64 uses sorted `Vec<u32>`, larger fanouts keep dense `FixedBitSet` plus cached count. Removed the duplicate `prefix_completion_counts` map and updated intersection/comparison helpers to consume the hybrid representation directly. Local `interner_intersect_e_txt_large_vocab` improved from **99.916 ns → 89.337 ns** (**−10.6%**). Focused comparison benches also stayed healthy after avoiding bitset rematerialization (`interner_impacted_keys` 43.970 µs, `interner_completions_equal_up_to_vocab` 33.044 ns, `interner_all_completions_equal_up_to_vocab` 87.046 ns). Keep.
-
-- [x] **Reuse completion-bound work for child bounds**
-  The DFS loop computes completion bounds (`src/dfs_runner.rs` line ~609) then recomputes existing child bounds (`src/dfs_runner.rs` line ~671). For normal in-fill children much of that prefix-stat work is redundant. Cache or thread results from the first pass into the second.
-  - Bench: `baseline_bestfirst_prune_both` local DFS bench; target the `completion_bound + ctx_reset` timer (~37% of profiled step time).
-  - Result: Reused the already-computed completion bound directly for normal in-fill child branches, while expansion children and runs without completion pruning still compute exact existing-child bounds. A stricter prefix-stat reuse attempt was correct but regressed and was abandoned. Final focused bench was statistically flat (`baseline_bestfirst_prune_both` 34.725 ms before → 35.028 ms after, no significant Criterion change; 3s budget 2.896M → 2.881M steps), but the duplicate existing-child-bound timer dropped 1.506 ms → 0.161 ms in the 20k-step probe. Keep as a neutral cleanup with no measured throughput regression.
-
-- [x] **Specialize small top-k bound scoring**
-  `upper_bound_score_with_scratch` is ~6.5% CPU. `dim_count <= 8` always. Replace the `Vec` insertion path with a fixed small-array top-k routine (stack-allocated `[u32; 8]` or similar).
-  - Bench: `baseline_bestfirst_prune_both` local DFS bench.
-  - Result: Added a `MAX_DIMS`-sized inline top-k path for the normal `dim_count <= 8` case, with the old `Vec` path retained as a defensive fallback for larger callers. Local `baseline_bestfirst_prune_both` was effectively flat by Criterion (`34.504 ms → 34.184 ms`, p=0.07), and 3s probe budget was flat (`2.987M → 2.975M` steps). The 20k-step profiled completion-bound timer dropped from `8.161 ms → 5.304 ms`, mostly by avoiding per-call scratch `Vec` allocation in the public upper-bound helper. Keep as a small cleanup with no measured throughput regression.
+- [x] **Materialize requirements directly into compact hot-path data**
+  `Ortho::fill_from_meta_data` was ~4.3% CPU and still builds/clears nested `Vec<Vec<usize>>` requirement data. Replace the hot reset representation with compact fixed-capacity requirement buffers, or derive required prefix IDs directly while scanning payload positions. This should reduce reset cost and compound with the prefix-ID intersection and child-stat lookup changes.
+  - Bench: local DFS probe `ctx_reset_ms`, `intersect_ms`, `completion_bound_ms`, `baseline_bestfirst_prune_both`, and prod-box live perf after the prefix-ID changes.
+  - Result 2026-05-08: added a compact DFS reset path with flat requirement values plus `(start, len)` ranges. Hot DFS reset/intersection/bound paths read prefix slices from the compact buffers; the legacy `required_usize()` API remains for tests and non-hot callers.
+  - Local DFS probe: `ctx_reset_ms` dropped from `7.624 ms` to `5.702 ms`; `intersect_ms` `3.852 ms` to `3.482 ms`; total probe `31.997 ms` to `29.246 ms`; probe budget `4.71M` to `6.22M` steps/5s. `baseline_bestfirst_prune_both` improved to `32.19 ms` (**-15.8%**, p=0.01).
+  - Prod short live `e.txt`: `7.41M n/s` at the 66s snapshot.
+  - Prod flat perf: old `Ortho::fill_from_meta_data` path is replaced by `fill_flat_from_meta_data` at `4.84%`; `reset_for_node_compact` is `3.16%`. `ensure_prefix_ids` remains visible at `4.95%`, so deriving prefix IDs during reset or adding trie-style prefix IDs is the next reset-side opportunity.
+  - Recommendation: keep.

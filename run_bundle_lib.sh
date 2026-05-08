@@ -24,6 +24,11 @@ run_bundle_abs_path() {
   printf '%s/%s\n' "$dir" "$base"
 }
 
+run_bundle_export_perf_rustflags() {
+  RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2 -C target-cpu=native}"
+  export RUSTFLAGS
+}
+
 run_bundle_file_signature() {
   local path="$1"
   local size
