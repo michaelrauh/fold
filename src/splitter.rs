@@ -51,7 +51,7 @@ impl Splitter {
             .map(|c| self.filter_char(c))
             .collect::<String>()
             .split_whitespace()
-            .map(|word| word.to_lowercase())
+            .map(|word| word.trim_matches('-').to_lowercase())
             .filter(|word| !word.is_empty())
             .collect()
     }
@@ -75,8 +75,8 @@ impl Splitter {
     }
 
     fn filter_char(&self, c: char) -> char {
-        // Keep 's as part of words, remove other punctuation
-        if c.is_alphabetic() || c.is_whitespace() || c == '\'' {
+        // Keep 's and intra-word hyphens (e.g. "so-called"); strip other punctuation.
+        if c.is_alphabetic() || c.is_whitespace() || c == '\'' || c == '-' {
             c
         } else {
             ' '

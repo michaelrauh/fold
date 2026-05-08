@@ -10,7 +10,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CHECKPOINT_VERSION: u32 = 6;
+const CHECKPOINT_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointManifest {
@@ -149,20 +149,24 @@ impl CheckpointManager {
             current_depth: snapshot.current_depth,
             max_depth: snapshot.max_depth,
             open_siblings_total: snapshot.open_siblings_total,
-            frontier_max_bound_volume: snapshot.frontier_max_bound.map(|bound| bound.volume),
+            frontier_max_bound_volume: snapshot
+                .frontier_max_bound
+                .map(|bound| bound.volume as usize),
             frontier_max_bound_variance_num: snapshot
                 .frontier_max_bound
-                .map(|bound| bound.variance_num),
+                .map(|bound| u128::from(bound.variance_num)),
             frontier_max_bound_variance_den: snapshot
                 .frontier_max_bound
-                .map(|bound| bound.variance_den),
-            frontier_max_bound_fullness: snapshot.frontier_max_bound.map(|bound| bound.fullness),
+                .map(|bound| u128::from(bound.variance_den)),
+            frontier_max_bound_fullness: snapshot
+                .frontier_max_bound
+                .map(|bound| bound.fullness as usize),
             last_improvement_unix: snapshot.last_improvement_unix,
             last_improvement_depth: snapshot.last_improvement_depth,
-            incumbent_volume: incumbent.score().volume,
-            incumbent_variance_num: incumbent.score().variance_num,
-            incumbent_variance_den: incumbent.score().variance_den,
-            incumbent_fullness: incumbent.score().fullness,
+            incumbent_volume: incumbent.score().volume as usize,
+            incumbent_variance_num: u128::from(incumbent.score().variance_num),
+            incumbent_variance_den: u128::from(incumbent.score().variance_den),
+            incumbent_fullness: incumbent.score().fullness as usize,
             incumbent_dims: incumbent.dims().to_vec(),
         };
         write_atomic(&self.state_path, &runner.to_bytes()?)?;

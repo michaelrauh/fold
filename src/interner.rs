@@ -1708,7 +1708,7 @@ mod tests {
     // Helper to split text the same way as Splitter for earliest-position tracking.
     fn tokenize_sentences(text: &str) -> Vec<Vec<String>> {
         let filter_char = |c: char| {
-            if c.is_alphabetic() || c.is_whitespace() || c == '\'' {
+            if c.is_alphabetic() || c.is_whitespace() || c == '\'' || c == '-' {
                 c
             } else {
                 ' '
@@ -1725,7 +1725,7 @@ mod tests {
                     .map(filter_char)
                     .collect::<String>()
                     .split_whitespace()
-                    .map(|w| w.to_lowercase())
+                    .map(|w| w.trim_matches('-').to_lowercase())
                     .filter(|w| !w.is_empty())
                     .collect::<Vec<String>>()
             })

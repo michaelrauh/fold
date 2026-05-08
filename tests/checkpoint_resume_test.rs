@@ -49,7 +49,7 @@ fn checkpoint_resume_matches_uninterrupted_run() {
         resumed.step(&loaded.interner).unwrap();
     }
 
-    assert_eq!(loaded.manifest.version, 6);
+    assert_eq!(loaded.manifest.version, 7);
     assert_eq!(resumed.incumbent_score(), uninterrupted.incumbent_score());
 }
 

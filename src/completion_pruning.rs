@@ -1,7 +1,7 @@
 use crate::{
     interner::Interner,
-    ortho::{EMPTY_CELL, MAX_DIMS, Ortho, OrthoScore, payload_to_usize},
-    spatial::DimMeta,
+    ortho::{EMPTY_CELL, MAX_DIMS, Ortho, OrthoScore, PayloadVal, payload_to_usize},
+    spatial::{self, DimMeta},
 };
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
@@ -18,6 +18,16 @@ impl std::fmt::Debug for CachedMeta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CachedMeta(dims_len={})", self.dims_len)
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompactResetCache {
+    dims: [u8; MAX_DIMS],
+    dims_len: u8,
+    up_axis: Option<u8>,
+    position: usize,
+    touched_values: Vec<PayloadVal>,
+    valid: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -85,6 +95,8 @@ pub struct CompletionContext {
     is_root: bool,
     meta_cache: Option<CachedMeta>,
     required_prefix_ids: Vec<u32>,
+    required_prefix_ids_interner_version: Option<usize>,
+    compact_reset_cache: CompactResetCache,
 }
 
 impl CompletionContext {
@@ -128,21 +140,25 @@ impl CompletionContext {
             &mut self.required_usize,
         );
         self.compact_requirements = false;
-        self.reset_common_fields(ortho);
+        self.reset_common_fields(ortho, false);
     }
 
     pub fn reset_for_node_compact(&mut self, ortho: &Ortho) {
         self.refresh_meta(ortho);
-        let meta = &self.meta_cache.as_ref().unwrap().meta;
-        ortho.fill_requirements_flat_with_meta(
-            meta,
-            &mut self.forbidden_usize,
-            &mut self.required_ranges,
-            &mut self.required_values,
-        );
+        let meta = self.meta_cache.as_ref().unwrap().meta.clone();
+        let cache_hit = self.compact_requirements_match(ortho, &meta);
+        if !cache_hit {
+            ortho.fill_requirements_flat_with_meta(
+                &meta,
+                &mut self.forbidden_usize,
+                &mut self.required_ranges,
+                &mut self.required_values,
+            );
+            self.update_compact_reset_cache(ortho, &meta);
+        }
         self.required_usize.clear();
         self.compact_requirements = true;
-        self.reset_common_fields(ortho);
+        self.reset_common_fields(ortho, cache_hit);
     }
 
     pub fn reset_for_completion_bounds(&mut self, ortho: &Ortho) {
@@ -169,7 +185,7 @@ impl CompletionContext {
         }
     }
 
-    fn reset_common_fields(&mut self, ortho: &Ortho) {
+    fn reset_common_fields(&mut self, ortho: &Ortho, preserve_prefix_ids: bool) {
         self.totals.clear();
         let required_len = self.required_len();
         if self.totals.capacity() < required_len {
@@ -177,10 +193,13 @@ impl CompletionContext {
         }
         self.dim_count = ortho.dims().len();
         self.base_score = ortho.score();
-        self.base_volume = self.base_score.volume;
-        self.base_fullness = self.base_score.fullness;
+        self.base_volume = self.base_score.volume as usize;
+        self.base_fullness = self.base_score.fullness as usize;
         self.is_root = required_len == 0;
-        self.required_prefix_ids.clear();
+        if !preserve_prefix_ids {
+            self.required_prefix_ids.clear();
+            self.required_prefix_ids_interner_version = None;
+        }
     }
 
     fn refresh_meta(&mut self, ortho: &Ortho) {
@@ -205,6 +224,80 @@ impl CompletionContext {
                 up_axis: ortho_up_axis,
             });
         }
+    }
+
+    fn compact_requirements_match(&self, ortho: &Ortho, meta: &Rc<DimMeta>) -> bool {
+        let cache = &self.compact_reset_cache;
+        if !cache.valid
+            || cache.dims_len as usize != ortho.dims().len()
+            || cache.up_axis != ortho.up_axis()
+            || cache.position != ortho.get_current_position()
+            || cache.dims[..ortho.dims().len()] != *ortho.dims()
+        {
+            return false;
+        }
+
+        let payload = ortho.payload_raw();
+        spatial::with_meta_requirements(meta, cache.position, |prefixes, diagonals| {
+            let touched_len =
+                diagonals.len() + prefixes.iter().map(|prefix| prefix.len()).sum::<usize>();
+            if cache.touched_values.len() != touched_len {
+                return false;
+            }
+
+            let mut value_idx = 0usize;
+            for &payload_idx in diagonals {
+                let value = payload.get(payload_idx).copied().unwrap_or(EMPTY_CELL);
+                if cache.touched_values[value_idx] != value {
+                    return false;
+                }
+                value_idx += 1;
+            }
+            for prefix in prefixes {
+                for &payload_idx in prefix {
+                    let value = payload.get(payload_idx).copied().unwrap_or(EMPTY_CELL);
+                    if cache.touched_values[value_idx] != value {
+                        return false;
+                    }
+                    value_idx += 1;
+                }
+            }
+            true
+        })
+    }
+
+    fn update_compact_reset_cache(&mut self, ortho: &Ortho, meta: &Rc<DimMeta>) {
+        let cache = &mut self.compact_reset_cache;
+        cache.dims = [0; MAX_DIMS];
+        cache.dims[..ortho.dims().len()].copy_from_slice(ortho.dims());
+        cache.dims_len = ortho.dims().len() as u8;
+        cache.up_axis = ortho.up_axis();
+        cache.position = ortho.get_current_position();
+        cache.touched_values.clear();
+
+        let payload = ortho.payload_raw();
+        spatial::with_meta_requirements(meta, cache.position, |prefixes, diagonals| {
+            let touched_len =
+                diagonals.len() + prefixes.iter().map(|prefix| prefix.len()).sum::<usize>();
+            if cache.touched_values.capacity() < touched_len {
+                cache
+                    .touched_values
+                    .reserve(touched_len - cache.touched_values.capacity());
+            }
+            for &payload_idx in diagonals {
+                cache
+                    .touched_values
+                    .push(payload.get(payload_idx).copied().unwrap_or(EMPTY_CELL));
+            }
+            for prefix in prefixes {
+                for &payload_idx in prefix {
+                    cache
+                        .touched_values
+                        .push(payload.get(payload_idx).copied().unwrap_or(EMPTY_CELL));
+                }
+            }
+        });
+        cache.valid = true;
     }
 
     fn required_len(&self) -> usize {
@@ -254,7 +347,9 @@ impl CompletionContext {
 
     pub fn ensure_prefix_ids(&mut self, interner: &Interner) {
         let required_len = self.required_len();
-        if self.required_prefix_ids.len() == required_len {
+        if self.required_prefix_ids.len() == required_len
+            && self.required_prefix_ids_interner_version == Some(interner.version())
+        {
             return;
         }
         self.required_prefix_ids.clear();
@@ -265,6 +360,7 @@ impl CompletionContext {
                 .expect("required prefix must have a prefix ID in interner");
             self.required_prefix_ids.push(id);
         }
+        self.required_prefix_ids_interner_version = Some(interner.version());
     }
 
     pub fn required_prefix_ids(&self) -> &[u32] {
@@ -810,8 +906,8 @@ mod tests {
 
         // Best score high enough to prune the shallow branch but not the deeper one.
         let best_score = OrthoScore::optimistic_bound(
-            potential_z.volume,
-            potential_z.fullness.saturating_sub(1),
+            potential_z.volume as usize,
+            potential_z.fullness.saturating_sub(1) as usize,
         );
 
         let prunes_y = bound_completion(&ortho, y_idx, &interner, best_score);
@@ -911,8 +1007,8 @@ mod tests {
         let axis_totals = vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let potential = upper_bound_score(&axis_totals, 1, 1, MAX_DIMS + 2, 2);
 
-        assert_eq!(potential.volume, (2..=11).product::<usize>());
-        assert_eq!(potential.fullness, (3..=12).product::<usize>());
+        assert_eq!(potential.volume as usize, (2..=11).product::<usize>());
+        assert_eq!(potential.fullness as usize, (3..=12).product::<usize>());
     }
 
     #[test]

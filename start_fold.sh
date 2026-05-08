@@ -21,9 +21,12 @@ FOLD_OFFLOAD_ENABLED="${FOLD_OFFLOAD_ENABLED:-}"
 FOLD_FORCE_ROLE="${FOLD_FORCE_ROLE:-leader}"
 FOLD_MERGE_POLICY="${FOLD_MERGE_POLICY:-adjacent_balanced}"
 
-# Default to debuginfo + frame pointers for better perf attribution; allow override via env.
+# Default to debuginfo for perf attribution; allow override via env.
 # target-cpu=native enables hardware POPCNT/AVX2/BMI2 on the AMD prod box.
-RUSTFLAGS="${RUSTFLAGS:--C force-frame-pointers=yes -C debuginfo=2 -C target-cpu=native}"
+RUSTFLAGS="${RUSTFLAGS:--C debuginfo=2 -C target-cpu=native}"
+if [ "${FOLD_PROFILE:-}" = "1" ]; then
+  RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"
+fi
 export RUSTFLAGS
 
 if [ -f "$CARGO_ENV" ]; then
@@ -41,7 +44,11 @@ if [ ! -f "$SCRIPT_DIR/e.txt" ]; then
   exit 1
 fi
 
-echo "Building release binary with DWARF + frame pointers for perf..."
+if [ "${FOLD_PROFILE:-}" = "1" ]; then
+  echo "Building release binary with DWARF + frame pointers for perf..."
+else
+  echo "Building release binary with DWARF debug info..."
+fi
 cargo build --release --bins
 if [ ! -x "$APP_BIN" ]; then
   echo "Binary $APP_BIN not found after build" >&2

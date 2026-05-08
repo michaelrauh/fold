@@ -9,6 +9,7 @@ use std::hash::Hash;
 pub type Dim = u8;
 pub type PayloadVal = u32;
 pub type OrthoId = u64;
+pub type ScoreVal = u32;
 
 pub const MAX_DIMS: usize = 8;
 pub const MAX_PAYLOAD: usize = 64;
@@ -25,13 +26,18 @@ pub fn payload_to_usize(value: PayloadVal) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[archive_attr(derive(Debug, PartialEq, CheckBytes))]
 pub struct OrthoScore {
-    pub volume: usize,
-    pub variance_num: u128,
-    pub variance_den: u128,
-    pub fullness: usize,
+    pub volume: ScoreVal,
+    pub variance_num: ScoreVal,
+    pub variance_den: ScoreVal,
+    pub fullness: ScoreVal,
 }
 
 impl OrthoScore {
+    #[inline]
+    fn score_val(value: usize) -> ScoreVal {
+        value.min(ScoreVal::MAX as usize) as ScoreVal
+    }
+
     pub const fn zero() -> Self {
         Self {
             volume: 0,
@@ -41,18 +47,18 @@ impl OrthoScore {
         }
     }
 
-    pub const fn optimistic_bound(volume: usize, fullness: usize) -> Self {
+    pub fn optimistic_bound(volume: usize, fullness: usize) -> Self {
         Self {
-            volume,
+            volume: Self::score_val(volume),
             variance_num: 0,
             variance_den: 1,
-            fullness,
+            fullness: Self::score_val(fullness),
         }
     }
 
     pub fn variance_cmp(&self, other: &Self) -> Ordering {
-        let lhs = self.variance_num.saturating_mul(other.variance_den);
-        let rhs = other.variance_num.saturating_mul(self.variance_den);
+        let lhs = u64::from(self.variance_num) * u64::from(other.variance_den);
+        let rhs = u64::from(other.variance_num) * u64::from(self.variance_den);
         lhs.cmp(&rhs)
     }
 
@@ -60,7 +66,7 @@ impl OrthoScore {
         if self.variance_den == 0 {
             return 0.0;
         }
-        self.variance_num as f64 / self.variance_den as f64
+        f64::from(self.variance_num) / f64::from(self.variance_den)
     }
 }
 
@@ -242,7 +248,7 @@ impl Ortho {
         let next_empty =
             u32::try_from(next_empty).expect("next empty position overflowed cached u32 field");
         let mut score = self.score;
-        score.fullness = fill_count as usize;
+        score.fullness = fill_count;
         Self {
             dims: self.dims,
             dims_len: self.dims_len,
@@ -261,24 +267,22 @@ impl Ortho {
             .iter()
             .map(|x| usize::from(*x).saturating_sub(1))
             .product::<usize>();
-        let dim_count = dims.len() as u128;
-        let dim_sum = dims.iter().map(|&d| u128::from(d)).sum::<u128>();
+        let dim_count = dims.len() as u32;
+        let dim_sum = dims.iter().map(|&d| u32::from(d)).sum::<u32>();
         let dim_sum_sq = dims
             .iter()
             .map(|&d| {
-                let value = u128::from(d);
-                value.saturating_mul(value)
+                let value = u32::from(d);
+                value * value
             })
-            .sum::<u128>();
-        let variance_num = dim_count
-            .saturating_mul(dim_sum_sq)
-            .saturating_sub(dim_sum.saturating_mul(dim_sum));
-        let variance_den = dim_count.saturating_mul(dim_count).max(1);
+            .sum::<u32>();
+        let variance_num = dim_count * dim_sum_sq - dim_sum * dim_sum;
+        let variance_den = (dim_count * dim_count).max(1);
         OrthoScore {
-            volume,
+            volume: OrthoScore::score_val(volume),
             variance_num,
             variance_den,
-            fullness,
+            fullness: OrthoScore::score_val(fullness),
         }
     }
 
@@ -738,7 +742,7 @@ impl Ortho {
         self.score
     }
     pub fn volume(&self) -> usize {
-        self.score.volume
+        self.score.volume as usize
     }
     pub fn fullness(&self) -> usize {
         self.fill_count as usize
@@ -919,6 +923,11 @@ mod tests {
                 fullness: 0,
             }
         );
+    }
+
+    #[test]
+    fn ortho_score_stays_compact() {
+        assert_eq!(std::mem::size_of::<OrthoScore>(), 16);
     }
 
     #[test]
@@ -1364,22 +1373,22 @@ mod tests {
                 .iter()
                 .map(|x| usize::from(*x).saturating_sub(1))
                 .product::<usize>();
-            let dim_count = ortho.dims().len() as u128;
-            let dim_sum = ortho.dims().iter().map(|&d| u128::from(d)).sum::<u128>();
+            let dim_count = ortho.dims().len() as u32;
+            let dim_sum = ortho.dims().iter().map(|&d| u32::from(d)).sum::<u32>();
             let dim_sum_sq = ortho
                 .dims()
                 .iter()
                 .map(|&d| {
-                    let value = u128::from(d);
+                    let value = u32::from(d);
                     value * value
                 })
-                .sum::<u128>();
+                .sum::<u32>();
             let fullness = ortho.fullness();
             OrthoScore {
-                volume,
+                volume: OrthoScore::score_val(volume),
                 variance_num: dim_count * dim_sum_sq - dim_sum * dim_sum,
                 variance_den: dim_count * dim_count,
-                fullness,
+                fullness: OrthoScore::score_val(fullness),
             }
         }
 

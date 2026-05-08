@@ -1,7 +1,7 @@
 use crate::{
     FoldError,
     dfs_checkpoint::{file_name_string, write_atomic},
-    dfs_runner::{BranchOrdering, DfsRunner, SearchToggles, StepScratch},
+    dfs_runner::{DfsRunner, SearchToggles, StepScratch},
     interner::Interner,
     metrics::{Metrics, WorkerMetrics},
     ortho::{Ortho, OrthoScore},
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const WORKER_UPDATE_STEPS: usize = 2048;
 const METRICS_UPDATE_MS: u64 = 500;
 const FRONTIER_BUCKETS: usize = 48;
-const PARALLEL_CHECKPOINT_VERSION: u32 = 3;
+const PARALLEL_CHECKPOINT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct ParallelSearchConfig {
@@ -66,7 +66,6 @@ impl ParallelSearchConfig {
         SearchToggles {
             node_pruning: false,
             completion_pruning: false,
-            branch_ordering: BranchOrdering::WorstFirst,
             ..SearchToggles::default()
         }
     }
@@ -280,8 +279,8 @@ impl ParallelCheckpointStore {
             running_shards: state.running_shards.len(),
             shards_done: state.shards_done,
             total_shards: state.total_shards,
-            incumbent_volume: state.best_incumbent.score().volume,
-            incumbent_fullness: state.best_incumbent.score().fullness,
+            incumbent_volume: state.best_incumbent.score().volume as usize,
+            incumbent_fullness: state.best_incumbent.score().fullness as usize,
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| FoldError::Serialization(e.to_string()))?;
@@ -1201,7 +1200,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dfs_runner::{BranchOrdering, SearchToggles};
+    use crate::dfs_runner::SearchToggles;
     use std::collections::HashSet;
 
     #[test]
@@ -1220,7 +1219,6 @@ mod tests {
         assert!(toggles.node_pruning);
 
         let frontier = config.frontier_toggles();
-        assert_eq!(frontier.branch_ordering, BranchOrdering::WorstFirst);
         assert!(!frontier.completion_pruning);
         assert!(!frontier.node_pruning);
         assert!(frontier.compute_bounds);

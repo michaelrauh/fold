@@ -11,13 +11,53 @@ use fixedbitset::FixedBitSet;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::cmp::Ordering;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[inline(always)]
 fn saturating_pow_usize(base: usize, exp: usize) -> usize {
-    (base as u128)
-        .checked_pow(exp as u32)
-        .unwrap_or(u128::MAX)
-        .min(usize::MAX as u128) as usize
+    match exp {
+        0 => 1,
+        1 => base,
+        2 => base.saturating_mul(base),
+        3 => base.saturating_mul(base).saturating_mul(base),
+        4 => base
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base),
+        5 => base
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base),
+        6 => base
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base),
+        7 => base
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base),
+        8 => base
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base)
+            .saturating_mul(base),
+        _ => {
+            let mut result = 1usize;
+            for _ in 0..exp {
+                result = result.saturating_mul(base);
+            }
+            result
+        }
+    }
 }
 
 #[derive(Default)]
@@ -137,17 +177,9 @@ pub struct StepEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BranchOrdering {
-    BestFirst,
-    Insertion,
-    WorstFirst,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchToggles {
     pub node_pruning: bool,
     pub completion_pruning: bool,
-    pub branch_ordering: BranchOrdering,
     pub compute_bounds: bool,
 }
 
@@ -156,28 +188,9 @@ impl Default for SearchToggles {
         Self {
             node_pruning: true,
             completion_pruning: true,
-            branch_ordering: BranchOrdering::Insertion,
             compute_bounds: true,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SearchProfile {
-    pub total_step_ns: u128,
-    pub existing_bound_ns: u128,
-    pub intersect_ns: u128,
-    pub child_generation_ns: u128,
-    pub reorder_ns: u128,
-    pub node_prune_ns: u128,
-    pub completion_prune_ns: u128,
-    pub completion_bound_ns: u128,
-    pub ctx_reset_ns: u128,
-    pub k_bound_ns: u128,
-    pub depth_counter_ns: u128,
-    pub completion_iter_ns: u128,
-    pub completion_bound_attempts: u64,
-    pub completion_bound_pruned: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -220,15 +233,6 @@ pub struct RunnerSnapshot {
     pub started_unix: u64,
     pub last_improvement_unix: u64,
     pub last_improvement_depth: usize,
-}
-
-fn record_completion_bound_result(pruned: bool, profile: Option<&mut SearchProfile>) {
-    if let Some(profile) = profile {
-        profile.completion_bound_attempts = profile.completion_bound_attempts.saturating_add(1);
-        if pruned {
-            profile.completion_bound_pruned = profile.completion_bound_pruned.saturating_add(1);
-        }
-    }
 }
 
 impl DfsRunner {
@@ -465,7 +469,7 @@ impl DfsRunner {
         toggles: &SearchToggles,
     ) -> Result<StepEvent, FoldError> {
         let mut scratch = StepScratch::default();
-        self.step_with_toggles_profiled(interner, toggles, &mut scratch, None)
+        self.step_with_toggles_and_scratch(interner, toggles, &mut scratch)
     }
 
     pub(crate) fn step_with_toggles_and_scratch(
@@ -474,48 +478,11 @@ impl DfsRunner {
         toggles: &SearchToggles,
         scratch: &mut StepScratch,
     ) -> Result<StepEvent, FoldError> {
-        self.step_with_toggles_profiled(interner, toggles, scratch, None)
-    }
-
-    pub fn step_with_toggles_and_profile(
-        &mut self,
-        interner: &Interner,
-        toggles: &SearchToggles,
-        profile: &mut SearchProfile,
-    ) -> Result<StepEvent, FoldError> {
-        let mut scratch = StepScratch::default();
-        self.step_with_toggles_profiled(interner, toggles, &mut scratch, Some(profile))
-    }
-
-    fn step_with_toggles_profiled(
-        &mut self,
-        interner: &Interner,
-        toggles: &SearchToggles,
-        scratch: &mut StepScratch,
-        mut profile: Option<&mut SearchProfile>,
-    ) -> Result<StepEvent, FoldError> {
-        let profiling = profile.is_some();
-        macro_rules! profile_start {
-            () => {
-                profiling.then(Instant::now)
-            };
-        }
-        macro_rules! profile_end {
-            ($start:expr, $field:ident) => {
-                if let (Some(p), Some(start)) = (profile.as_deref_mut(), $start) {
-                    p.$field = p.$field.saturating_add(start.elapsed().as_nanos());
-                }
-            };
-        }
-
-        let step_start = profile_start!();
         if self.finished {
-            let event = StepEvent {
+            return Ok(StepEvent {
                 finished: true,
                 incumbent_improved: false,
-            };
-            profile_end!(step_start, total_step_ns);
-            return Ok(event);
+            });
         }
 
         let mut incumbent_improved = false;
@@ -529,7 +496,7 @@ impl DfsRunner {
             child_scratch,
         } = scratch;
 
-        let result: Result<StepEvent, FoldError> = 'step: loop {
+        'step: loop {
             let mut incumbent_score = self.incumbent_score();
             let mut actual_incumbent_score = self.incumbent.score();
             let current_depth = self.stack.len();
@@ -543,49 +510,38 @@ impl DfsRunner {
 
             if !frame.prepared {
                 let prune_completions = toggles.compute_bounds && toggles.completion_pruning;
-                let ctx_reset_start = profile_start!();
                 if prune_completions {
                     frame_ctx.reset_for_completion_bounds_compact(&frame.ortho);
                 } else {
                     frame_ctx.reset_for_node_compact(&frame.ortho);
                 }
-                profile_end!(ctx_reset_start, ctx_reset_ns);
                 if toggles.compute_bounds {
                     if !frame.bound_precomputed {
-                        let existing_bound_start = profile_start!();
                         frame.optimistic_bound =
                             existing_ortho_upper_bound_ctx(frame_ctx, interner);
-                        profile_end!(existing_bound_start, existing_bound_ns);
                     }
                 } else {
                     frame.optimistic_bound = frame.ortho.score();
                 }
                 frame.bound_precomputed = false;
-                let node_prune_start = profile_start!();
                 let prune_root = toggles.node_pruning && frame.optimistic_bound <= incumbent_score;
-                profile_end!(node_prune_start, node_prune_ns);
                 if prune_root {
                     self.nodes_pruned = self.nodes_pruned.saturating_add(1);
                     self.stack.pop();
                     continue;
                 }
 
-                let ctx_reset_start = profile_start!();
                 completion_bits.clear();
-                profile_end!(ctx_reset_start, ctx_reset_ns);
-                let intersect_start = profile_start!();
                 frame_ctx.ensure_prefix_ids(interner);
                 let k = interner.intersect_prefix_ids_into_count(
                     frame_ctx.required_prefix_ids(),
                     frame_ctx.forbidden_usize(),
                     completion_bits,
                 );
-                profile_end!(intersect_start, intersect_ns);
 
                 // Tighten bound using intersection count: if only k completions exist,
                 // then each axis can hold at most k values, so vol <= (k-1)^dim_count.
                 let intersection_prune = if toggles.compute_bounds && toggles.node_pruning {
-                    let k_bound_start = profile_start!();
                     let dim_count = frame_ctx.dim_count();
                     let k_vol = saturating_pow_usize(k.saturating_sub(1), dim_count)
                         .max(frame_ctx.base_volume());
@@ -594,9 +550,7 @@ impl DfsRunner {
                     if k_bound < frame.optimistic_bound {
                         frame.optimistic_bound = k_bound;
                     }
-                    let prune_result = frame.optimistic_bound <= incumbent_score;
-                    profile_end!(k_bound_start, k_bound_ns);
-                    prune_result
+                    frame.optimistic_bound <= incumbent_score
                 } else {
                     false
                 };
@@ -611,20 +565,13 @@ impl DfsRunner {
 
                 for completion in completion_bits.ones() {
                     let completion_bound = if prune_completions {
-                        let completion_bound_start = profile_start!();
                         let Some(completion_bound) =
                             completion_upper_bound_ctx(frame_ctx, completion, interner)
                         else {
-                            profile_end!(completion_bound_start, completion_bound_ns);
-                            record_completion_bound_result(true, profile.as_deref_mut());
                             self.completions_pruned = self.completions_pruned.saturating_add(1);
                             continue;
                         };
-                        profile_end!(completion_bound_start, completion_bound_ns);
-                        let completion_prune_start = profile_start!();
                         let prune_completion = completion_bound <= incumbent_score;
-                        profile_end!(completion_prune_start, completion_prune_ns);
-                        record_completion_bound_result(prune_completion, profile.as_deref_mut());
                         if prune_completion {
                             self.completions_pruned = self.completions_pruned.saturating_add(1);
                             continue;
@@ -637,18 +584,14 @@ impl DfsRunner {
                     let completion_val =
                         PayloadVal::try_from(completion).expect("completion overflowed u32");
 
-                    let completion_iter_start = profile_start!();
                     let maybe_axis = frame.ortho.expanding_insert_axis(completion_val);
                     if let Some(axis) = maybe_axis {
                         if axis < frame.min_insert_axis {
-                            profile_end!(completion_iter_start, completion_iter_ns);
                             continue;
                         }
                     }
                     let child_min_insert_axis = maybe_axis.unwrap_or(frame.min_insert_axis);
-                    profile_end!(completion_iter_start, completion_iter_ns);
 
-                    let child_generation_start = profile_start!();
                     child_scratch.clear();
                     frame.ortho.add_into(completion_val, child_scratch);
                     for child in child_scratch.drain(..) {
@@ -670,10 +613,8 @@ impl DfsRunner {
                         {
                             completion_bound.max(child_score)
                         } else if toggles.compute_bounds && prune_completions {
-                            let existing_bound_start = profile_start!();
                             child_ctx.reset_for_node_compact(&child);
                             let bound = existing_ortho_upper_bound_ctx(child_ctx, interner);
-                            profile_end!(existing_bound_start, existing_bound_ns);
                             bound
                         } else {
                             child_score
@@ -686,51 +627,16 @@ impl DfsRunner {
                             min_insert_axis: child_min_insert_axis,
                         });
                     }
-                    profile_end!(child_generation_start, child_generation_ns);
                 }
 
                 if toggles.compute_bounds && !prune_completions && !frame.branches.is_empty() {
-                    let existing_bound_start = profile_start!();
                     for branch in &mut frame.branches {
                         frame_ctx.reset_for_node_compact(&branch.child);
                         branch.optimistic_bound =
                             existing_ortho_upper_bound_ctx(frame_ctx, interner);
                     }
-
-                    profile_end!(existing_bound_start, existing_bound_ns);
                 }
 
-                match toggles.branch_ordering {
-                    BranchOrdering::BestFirst => {
-                        if toggles.compute_bounds {
-                            let reorder_start = profile_start!();
-                            frame.branches.sort_by(|a, b| {
-                                b.optimistic_bound
-                                    .cmp(&a.optimistic_bound)
-                                    .then_with(|| b.child.score().cmp(&a.child.score()))
-                                    .then_with(|| a.completion.cmp(&b.completion))
-                                    .then_with(|| a.child.id().cmp(&b.child.id()))
-                            });
-                            profile_end!(reorder_start, reorder_ns);
-                        }
-                    }
-                    BranchOrdering::Insertion => {}
-                    BranchOrdering::WorstFirst => {
-                        if toggles.compute_bounds {
-                            let reorder_start = profile_start!();
-                            frame.branches.sort_by(|a, b| {
-                                a.optimistic_bound
-                                    .cmp(&b.optimistic_bound)
-                                    .then_with(|| a.child.score().cmp(&b.child.score()))
-                                    .then_with(|| a.completion.cmp(&b.completion))
-                                    .then_with(|| a.child.id().cmp(&b.child.id()))
-                            });
-                            profile_end!(reorder_start, reorder_ns);
-                        }
-                    }
-                }
-
-                frame.branches.reverse();
                 frame.initial_branches_len = frame.branches.len();
                 frame.prepared = true;
                 Self::add_depth_counter(
@@ -746,10 +652,8 @@ impl DfsRunner {
 
             while let Some(branch) = frame.branches.pop() {
                 // Per-dims generational dedup: skip orthos already expanded this generation.
-                let node_prune_start = profile_start!();
                 let prune_branch =
                     toggles.node_pruning && branch.optimistic_bound <= incumbent_score;
-                profile_end!(node_prune_start, node_prune_ns);
                 if prune_branch {
                     self.nodes_pruned = self.nodes_pruned.saturating_add(1);
                     Self::bump_depth_counter(&mut self.pruned_by_depth, current_depth);
@@ -757,7 +661,6 @@ impl DfsRunner {
                 }
 
                 Self::bump_depth_counter(&mut self.descended_by_depth, current_depth);
-                let depth_counter_start = profile_start!();
                 for v in self.seen_by_depth.iter_mut().skip(current_depth) {
                     *v = 0;
                 }
@@ -772,7 +675,6 @@ impl DfsRunner {
                     branch.optimistic_bound,
                     branch.min_insert_axis,
                 ));
-                profile_end!(depth_counter_start, depth_counter_ns);
                 self.max_depth = self.max_depth.max(self.stack.len());
                 break 'step Ok(StepEvent {
                     finished: false,
@@ -781,10 +683,7 @@ impl DfsRunner {
             }
 
             self.stack.pop();
-        };
-        let event = result?;
-        profile_end!(step_start, total_step_ns);
-        Ok(event)
+        }
     }
 
     fn bump_depth_counter(counter: &mut Vec<u64>, depth: usize) {
@@ -843,7 +742,6 @@ mod tests {
         let pruning_toggles = SearchToggles {
             node_pruning: false,
             completion_pruning: true,
-            branch_ordering: BranchOrdering::Insertion,
             compute_bounds: true,
         };
         with_pruning
@@ -870,30 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn disabled_completion_pruning_skips_completion_bound_work() {
-        let interner = Interner::from_text("x y. x z z z z");
-        let score_floor = OrthoScore::optimistic_bound(2, 4);
-        let mut runner = runner_after_word(&interner, "x", score_floor);
-        let toggles = SearchToggles {
-            node_pruning: false,
-            completion_pruning: false,
-            branch_ordering: BranchOrdering::Insertion,
-            compute_bounds: true,
-        };
-        let mut profile = SearchProfile::default();
-
-        runner
-            .step_with_toggles_and_profile(&interner, &toggles, &mut profile)
-            .unwrap();
-
-        assert_eq!(runner.completions_pruned(), 0);
-        assert_eq!(
-            profile.completion_bound_ns, 0,
-            "completion bounds should not be computed when completion pruning is disabled"
-        );
-    }
-
-    #[test]
     fn root_single_span_pruning_is_tied_to_completion_pruning() {
         let interner = Interner::from_text("a b");
         let mut runner = DfsRunner::new();
@@ -901,7 +775,6 @@ mod tests {
         let toggles = SearchToggles {
             node_pruning: false,
             completion_pruning: true,
-            branch_ordering: BranchOrdering::Insertion,
             compute_bounds: true,
         };
 

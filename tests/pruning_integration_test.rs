@@ -50,9 +50,12 @@ fn pruning_skips_low_potential_completion_but_keeps_higher() {
 
     // Choose a best_score that prunes the short branch ([a b]) but not the longer one ([a c ...]).
     let best_score = if potential_c.volume > potential_b.volume {
-        OrthoScore::optimistic_bound(potential_c.volume.saturating_sub(1), usize::MAX)
+        OrthoScore::optimistic_bound(potential_c.volume.saturating_sub(1) as usize, usize::MAX)
     } else {
-        OrthoScore::optimistic_bound(potential_c.volume, potential_c.fullness.saturating_sub(1))
+        OrthoScore::optimistic_bound(
+            potential_c.volume as usize,
+            potential_c.fullness.saturating_sub(1) as usize,
+        )
     };
     assert!(best_score >= potential_b);
     assert!(best_score < potential_c);
@@ -117,11 +120,11 @@ fn impacted_seeding_prunes_hopeless_prefixes() {
             total_ac,
         );
         if potential_ac.volume > potential_ab.volume {
-            OrthoScore::optimistic_bound(potential_ac.volume.saturating_sub(1), usize::MAX)
+            OrthoScore::optimistic_bound(potential_ac.volume.saturating_sub(1) as usize, usize::MAX)
         } else {
             OrthoScore::optimistic_bound(
-                potential_ac.volume,
-                potential_ac.fullness.saturating_sub(1),
+                potential_ac.volume as usize,
+                potential_ac.fullness.saturating_sub(1) as usize,
             )
         }
     };
