@@ -1,6 +1,6 @@
 use crate::{
     interner::Interner,
-    ortho::{EMPTY_CELL, Ortho, OrthoScore, payload_to_usize},
+    ortho::{EMPTY_CELL, MAX_DIMS, Ortho, OrthoScore, payload_to_usize},
     spatial::DimMeta,
 };
 use rustc_hash::FxHashMap;
@@ -445,7 +445,7 @@ fn insert_desc(top_totals: &mut Vec<usize>, value: usize) {
     top_totals.insert(idx, value);
 }
 
-fn upper_bound_score_with_scratch(
+fn upper_bound_score_with_heap_scratch(
     axis_totals: &[usize],
     min_volume: usize,
     min_fullness: usize,
@@ -497,6 +497,91 @@ fn upper_bound_score_with_scratch(
     volume_upper = volume_upper.max(min_volume);
     fullness_upper = fullness_upper.max(min_fullness);
     OrthoScore::optimistic_bound(volume_upper, fullness_upper)
+}
+
+fn upper_bound_score_inline(
+    axis_totals: &[usize],
+    min_volume: usize,
+    min_fullness: usize,
+    dim_count: usize,
+    fallback_total: usize,
+) -> OrthoScore {
+    debug_assert!(dim_count <= MAX_DIMS);
+    let fallback_total = fallback_total.max(2);
+    let mut top_totals = [0usize; MAX_DIMS];
+    let mut top_len = 0usize;
+
+    for &total in axis_totals {
+        if top_len < dim_count {
+            top_totals[top_len] = total;
+            top_len += 1;
+            continue;
+        }
+
+        let mut min_idx = 0usize;
+        let mut min_total = top_totals[0];
+        for (idx, &current) in top_totals[1..dim_count].iter().enumerate() {
+            if current < min_total {
+                min_idx = idx + 1;
+                min_total = current;
+            }
+        }
+
+        if total > min_total {
+            top_totals[min_idx] = total;
+        }
+    }
+
+    let mut volume_upper: usize = 1;
+    let mut fullness_upper: usize = 1;
+
+    for &total in &top_totals[..top_len] {
+        volume_upper = volume_upper.saturating_mul(total.saturating_sub(1));
+        fullness_upper = fullness_upper.saturating_mul(total);
+    }
+
+    if top_len < dim_count {
+        let missing = dim_count - top_len;
+        let fallback_volume = fallback_total.saturating_sub(1);
+        for _ in 0..missing {
+            volume_upper = volume_upper.saturating_mul(fallback_volume);
+            fullness_upper = fullness_upper.saturating_mul(fallback_total);
+        }
+    }
+
+    volume_upper = volume_upper.max(min_volume);
+    fullness_upper = fullness_upper.max(min_fullness);
+    OrthoScore::optimistic_bound(volume_upper, fullness_upper)
+}
+
+fn upper_bound_score_with_scratch(
+    axis_totals: &[usize],
+    min_volume: usize,
+    min_fullness: usize,
+    dim_count: usize,
+    fallback_total: usize,
+    scratch: &mut Vec<usize>,
+) -> OrthoScore {
+    if dim_count == 0 {
+        return OrthoScore::optimistic_bound(min_volume.max(1), min_fullness.max(1));
+    }
+    if dim_count <= MAX_DIMS {
+        return upper_bound_score_inline(
+            axis_totals,
+            min_volume,
+            min_fullness,
+            dim_count,
+            fallback_total,
+        );
+    }
+    upper_bound_score_with_heap_scratch(
+        axis_totals,
+        min_volume,
+        min_fullness,
+        dim_count,
+        fallback_total,
+        scratch,
+    )
 }
 
 /// Compute an upper-bound (volume, fullness) given per-prefix max lengths, dim count, and score floors.
@@ -747,6 +832,15 @@ mod tests {
         let potential = upper_bound_score(&axis_totals, 1, 1, 2, 2);
         assert_eq!(potential.volume, (10 - 1) * (2 - 1));
         assert_eq!(potential.fullness, 10 * 2);
+    }
+
+    #[test]
+    fn upper_bound_fallback_handles_more_than_inline_axes() {
+        let axis_totals = vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let potential = upper_bound_score(&axis_totals, 1, 1, MAX_DIMS + 2, 2);
+
+        assert_eq!(potential.volume, (2..=11).product::<usize>());
+        assert_eq!(potential.fullness, (3..=12).product::<usize>());
     }
 
     #[test]

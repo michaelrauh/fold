@@ -345,3 +345,51 @@ materializes where the operation genuinely needs a dense output bitset.
 Full interner bench spot-checks showed no construction-path regression (`interner_from_text`
 224.19 µs, `interner_from_text_large` 313.40 µs, `interner_add_text` 98.718 µs,
 `interner_merge` 78.114 µs). Decision: keep.
+
+---
+
+## Item 13 — Reuse completion bounds for in-fill child bounds
+
+**Change:** In the DFS branch generation path, normal in-fill children now reuse the
+already-computed completion upper bound as their branch optimistic bound. Expansion children
+still compute the exact existing-child bound, and runs with completion pruning disabled keep the
+old post-generation exact child-bound pass.
+
+An attempted exact prefix-stat reuse path was behaviorally correct but regressed the focused
+bench (about +14%) and was abandoned.
+
+### DFS bench (`baseline_bestfirst_prune_both`)
+
+| Metric | Before | After | Δ |
+|---|---:|---:|---:|
+| Criterion median | 34.725 ms | 35.028 ms | flat / no significant change |
+| 3s probe budget | 2,896,066 steps | 2,880,991 steps | flat |
+| 20k-step probe total | 35.106 ms | 31.121 ms | profiler-only improvement |
+| existing child bound timer | 1.506 ms | 0.161 ms | **−89%** |
+
+Decision: keep as a neutral cleanup. It removes most duplicate existing-child-bound work in the
+default pruning path without a statistically significant throughput regression, but it should not
+be counted as a headline speedup.
+
+---
+
+## Item 14 — Inline small top-k upper-bound scoring
+
+**Change:** Replaced the normal `upper_bound_score_with_scratch` top-k path with a fixed
+`[usize; MAX_DIMS]` buffer. Since real orthos cap `dim_count` at 8, bound scoring now avoids
+`Vec` reserve/insert work in the hot path. The previous `Vec` implementation remains as a
+defensive fallback for any unexpected `dim_count > MAX_DIMS` caller.
+
+### DFS bench (`baseline_bestfirst_prune_both`)
+
+| Metric | Before | After | Δ |
+|---|---:|---:|---:|
+| Criterion median | 34.504 ms | 34.184 ms | flat / not significant |
+| 3s probe budget | 2,987,269 steps | 2,975,114 steps | flat |
+| 20k-step probe total | 35.092 ms | 32.428 ms | profiler-only improvement |
+| completion-bound timer | 8.161 ms | 5.304 ms | **−35%** |
+| k-bound timer | 0.715 ms | 0.707 ms | flat |
+
+Criterion reported `p = 0.07`, so this should not be counted as a statistically significant
+throughput win. Decision: keep as a small cleanup because it removes hot-path scratch allocation
+and showed no measured throughput regression.

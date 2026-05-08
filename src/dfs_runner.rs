@@ -23,6 +23,7 @@ fn saturating_pow_usize(base: usize, exp: usize) -> usize {
 #[derive(Default)]
 pub(crate) struct StepScratch {
     frame_ctx: CompletionContext,
+    child_ctx: CompletionContext,
     completion_bits: FixedBitSet,
     child_scratch: Vec<Ortho>,
 }
@@ -523,6 +524,7 @@ impl DfsRunner {
         }
         let StepScratch {
             frame_ctx,
+            child_ctx,
             completion_bits,
             child_scratch,
         } = scratch;
@@ -607,7 +609,7 @@ impl DfsRunner {
                 }
 
                 for completion in completion_bits.ones() {
-                    if prune_completions {
+                    let completion_bound = if prune_completions {
                         let completion_bound_start = profile_start!();
                         let Some(completion_bound) =
                             completion_upper_bound_ctx(frame_ctx, completion, interner)
@@ -626,7 +628,10 @@ impl DfsRunner {
                             self.completions_pruned = self.completions_pruned.saturating_add(1);
                             continue;
                         }
-                    }
+                        Some(completion_bound)
+                    } else {
+                        None
+                    };
 
                     let completion_val =
                         PayloadVal::try_from(completion).expect("completion overflowed u32");
@@ -658,17 +663,32 @@ impl DfsRunner {
                             self.last_improvement_depth = current_depth.saturating_add(1);
                         }
 
+                        let optimistic_bound = if let Some(completion_bound) = completion_bound
+                            .filter(|_| child.dims() == frame.ortho.dims())
+                            .filter(|_| child.up_axis() == frame.ortho.up_axis())
+                        {
+                            completion_bound.max(child_score)
+                        } else if toggles.compute_bounds && prune_completions {
+                            let existing_bound_start = profile_start!();
+                            child_ctx.reset_for_node(&child);
+                            let bound = existing_ortho_upper_bound_ctx(child_ctx, interner);
+                            profile_end!(existing_bound_start, existing_bound_ns);
+                            bound
+                        } else {
+                            child_score
+                        };
+
                         frame.branches.push(SearchBranch {
                             completion: completion_val,
                             child,
-                            optimistic_bound: child_score,
+                            optimistic_bound,
                             min_insert_axis: child_min_insert_axis,
                         });
                     }
                     profile_end!(child_generation_start, child_generation_ns);
                 }
 
-                if toggles.compute_bounds && !frame.branches.is_empty() {
+                if toggles.compute_bounds && !prune_completions && !frame.branches.is_empty() {
                     let existing_bound_start = profile_start!();
                     for branch in &mut frame.branches {
                         frame_ctx.reset_for_node(&branch.child);

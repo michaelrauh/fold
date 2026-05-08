@@ -39,10 +39,12 @@ All benchmarks run locally (`cargo bench`) unless the item depends on target arc
   - Bench: interner bench locally.
   - Result: Added hybrid `CompletionSet` storage: fanout ≤ 64 uses sorted `Vec<u32>`, larger fanouts keep dense `FixedBitSet` plus cached count. Removed the duplicate `prefix_completion_counts` map and updated intersection/comparison helpers to consume the hybrid representation directly. Local `interner_intersect_e_txt_large_vocab` improved from **99.916 ns → 89.337 ns** (**−10.6%**). Focused comparison benches also stayed healthy after avoiding bitset rematerialization (`interner_impacted_keys` 43.970 µs, `interner_completions_equal_up_to_vocab` 33.044 ns, `interner_all_completions_equal_up_to_vocab` 87.046 ns). Keep.
 
-- [ ] **Reuse completion-bound work for child bounds**
+- [x] **Reuse completion-bound work for child bounds**
   The DFS loop computes completion bounds (`src/dfs_runner.rs` line ~609) then recomputes existing child bounds (`src/dfs_runner.rs` line ~671). For normal in-fill children much of that prefix-stat work is redundant. Cache or thread results from the first pass into the second.
   - Bench: `baseline_bestfirst_prune_both` local DFS bench; target the `completion_bound + ctx_reset` timer (~37% of profiled step time).
+  - Result: Reused the already-computed completion bound directly for normal in-fill child branches, while expansion children and runs without completion pruning still compute exact existing-child bounds. A stricter prefix-stat reuse attempt was correct but regressed and was abandoned. Final focused bench was statistically flat (`baseline_bestfirst_prune_both` 34.725 ms before → 35.028 ms after, no significant Criterion change; 3s budget 2.896M → 2.881M steps), but the duplicate existing-child-bound timer dropped 1.506 ms → 0.161 ms in the 20k-step probe. Keep as a neutral cleanup with no measured throughput regression.
 
-- [ ] **Specialize small top-k bound scoring**
+- [x] **Specialize small top-k bound scoring**
   `upper_bound_score_with_scratch` is ~6.5% CPU. `dim_count <= 8` always. Replace the `Vec` insertion path with a fixed small-array top-k routine (stack-allocated `[u32; 8]` or similar).
   - Bench: `baseline_bestfirst_prune_both` local DFS bench.
+  - Result: Added a `MAX_DIMS`-sized inline top-k path for the normal `dim_count <= 8` case, with the old `Vec` path retained as a defensive fallback for larger callers. Local `baseline_bestfirst_prune_both` was effectively flat by Criterion (`34.504 ms → 34.184 ms`, p=0.07), and 3s probe budget was flat (`2.987M → 2.975M` steps). The 20k-step profiled completion-bound timer dropped from `8.161 ms → 5.304 ms`, mostly by avoiding per-call scratch `Vec` allocation in the public upper-bound helper. Keep as a small cleanup with no measured throughput regression.
