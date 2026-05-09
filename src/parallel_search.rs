@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const WORKER_UPDATE_STEPS: usize = 2048;
 const METRICS_UPDATE_MS: u64 = 500;
 const FRONTIER_BUCKETS: usize = 48;
-const PARALLEL_CHECKPOINT_VERSION: u32 = 4;
+const PARALLEL_CHECKPOINT_VERSION: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub struct ParallelSearchConfig {

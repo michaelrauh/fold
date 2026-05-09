@@ -581,8 +581,8 @@ impl DfsRunner {
                         None
                     };
 
-                    let completion_val =
-                        PayloadVal::try_from(completion).expect("completion overflowed u32");
+                    let completion_val = PayloadVal::try_from(completion)
+                        .expect("completion overflowed payload value");
 
                     let maybe_axis = frame.ortho.expanding_insert_axis(completion_val);
                     if let Some(axis) = maybe_axis {

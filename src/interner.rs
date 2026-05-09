@@ -1,4 +1,4 @@
-use crate::{FoldError, splitter::Splitter};
+use crate::{FoldError, ortho::MAX_VOCAB_SIZE, splitter::Splitter};
 use bytecheck::CheckBytes;
 use fixedbitset::FixedBitSet;
 use fixedbitset::IndexRange;
@@ -237,6 +237,15 @@ impl Interner {
         2
     }
 
+    fn assert_vocab_fits_payload(vocab_len: usize) {
+        assert!(
+            vocab_len <= MAX_VOCAB_SIZE,
+            "vocabulary size {} exceeds payload value capacity {} (u16::MAX reserved for EMPTY_CELL)",
+            vocab_len,
+            MAX_VOCAB_SIZE
+        );
+    }
+
     fn to_serializable(&self) -> InternerSerializable {
         let prefix_vec: Vec<(Vec<usize>, Vec<u32>)> = self
             .prefix_to_completions
@@ -265,6 +274,7 @@ impl Interner {
         } = serialized;
         let mut prefix_to_completions_dense = FxHashMap::default();
         let vocab_len = vocabulary.len();
+        Self::assert_vocab_fits_payload(vocab_len);
         for (prefix, completions) in prefix_vec {
             let mut fbs = FixedBitSet::with_capacity(vocab_len);
             fbs.grow(vocab_len);
@@ -321,6 +331,7 @@ impl Interner {
             }
         }
         let new_vocab_len = vocabulary.len();
+        Self::assert_vocab_fits_payload(new_vocab_len);
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, None);
         let max_prefix_len = Self::compute_max_prefix_len(&prefix_stats);
@@ -374,6 +385,7 @@ impl Interner {
             }
         }
         let new_vocab_len = vocabulary.len();
+        Self::assert_vocab_fits_payload(new_vocab_len);
 
         let (prefix_to_completions, prefix_stats) =
             Self::build_prefix_maps(&phrases, &vocabulary, new_vocab_len, Some(self));
@@ -1328,6 +1340,7 @@ impl Interner {
             }
         }
         let new_vocab_len = vocabulary.len();
+        Self::assert_vocab_fits_payload(new_vocab_len);
 
         // Step 2: Build vocabulary mapping for other interner (old index -> new index)
         let mut other_vocab_map = Vec::with_capacity(other.vocabulary().len());
@@ -2202,7 +2215,9 @@ mod tests {
                 .max()
                 .unwrap_or(0);
             // Child id: apply the word to the ortho (first variant)
-            let child_id = ortho.add(cid as u32).get(0).map(|o| o.id()).unwrap_or(0);
+            let child_value = crate::ortho::PayloadVal::try_from(cid)
+                .expect("candidate overflowed payload value");
+            let child_id = ortho.add(child_value).get(0).map(|o| o.id()).unwrap_or(0);
             candidates.push(OrthoCandidate {
                 word,
                 min_input,

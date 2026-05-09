@@ -7,20 +7,22 @@ use std::fmt;
 use std::hash::Hash;
 
 pub type Dim = u8;
-pub type PayloadVal = u32;
+pub type PayloadVal = u16;
 pub type OrthoId = u64;
 pub type ScoreVal = u32;
 
 pub const MAX_DIMS: usize = 8;
 pub const MAX_PAYLOAD: usize = 64;
 pub const EMPTY_CELL: PayloadVal = PayloadVal::MAX;
+// PayloadVal::MAX is reserved as EMPTY_CELL, so vocabulary IDs must stay below it.
+pub const MAX_VOCAB_SIZE: usize = EMPTY_CELL as usize;
 
 pub fn dim_to_usize(value: Dim) -> usize {
     usize::try_from(value).expect("dim overflowed usize")
 }
 
 pub fn payload_to_usize(value: PayloadVal) -> usize {
-    usize::try_from(value).expect("payload value overflowed usize")
+    usize::from(value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Archive, Serialize, Deserialize)]
@@ -659,7 +661,7 @@ impl Ortho {
                 let idx = payload_to_usize(v);
                 let mapped = vocab_map[idx];
                 new_payload[i] =
-                    PayloadVal::try_from(mapped).expect("vocab map value overflowed u32");
+                    PayloadVal::try_from(mapped).expect("vocab map value overflowed payload value");
             }
         }
         Some(Ortho::from_parts_raw(
@@ -891,13 +893,15 @@ mod tests {
             .into_iter()
             .map(|d| Dim::try_from(d).expect("dim overflowed u8"))
             .collect();
-        let payload_u32: Vec<Option<PayloadVal>> = payload
+        let payload_values: Vec<Option<PayloadVal>> = payload
             .into_iter()
-            .map(|v| v.map(|x| PayloadVal::try_from(x).expect("payload value overflowed u32")))
+            .map(|v| {
+                v.map(|x| PayloadVal::try_from(x).expect("payload value overflowed payload value"))
+            })
             .collect();
         Ortho::from_parts(
             &dims_u8,
-            &payload_u32,
+            &payload_values,
             up_axis.map(|a| Dim::try_from(a).expect("up_axis overflowed u8")),
         )
     }
@@ -927,7 +931,9 @@ mod tests {
 
     #[test]
     fn ortho_score_stays_compact() {
+        assert_eq!(std::mem::size_of::<PayloadVal>(), 2);
         assert_eq!(std::mem::size_of::<OrthoScore>(), 16);
+        assert!(std::mem::size_of::<Ortho>() <= 192);
     }
 
     #[test]
